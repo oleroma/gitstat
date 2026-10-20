@@ -1,3 +1,5 @@
+# Light checks only. Heavy work (release build, Windows test suite) runs on
+# the dev PC; see README. No artifacts are published.
 name: build
 
 on:
@@ -6,8 +8,9 @@ on:
   workflow_dispatch:
 
 jobs:
-  windows:
-    runs-on: windows-latest
+  linux:
+    # The platform-neutral modules and the notify (inotify) integration tests.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -18,15 +21,15 @@ jobs:
         run: cargo test --locked
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
-      - name: Build gitstat.exe
-        run: cargo build --release --locked
-      - name: Smoke test
-        shell: bash
-        run: ./target/release/gitstat.exe --once --no-fetch --config "$RUNNER_TEMP/config.json" || [ $? -eq 1 ]
-      - uses: actions/upload-artifact@v4
+
+  windows:
+    # Compile + lint only; the Windows tests and the release build run on the PC.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          name: gitstat-windows-x64
-          path: |
-            target/release/gitstat.exe
-            README.md
-          if-no-files-found: error
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
