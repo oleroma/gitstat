@@ -1,3 +1,5 @@
+# Checks only. gitstat.exe is built locally (see README), so CI has no
+# release build or artifact.
 name: build
 
 on:
@@ -32,15 +34,3 @@ jobs:
         run: cargo test --locked
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
-      - name: Build gitstat.exe
-        run: cargo build --release --locked
-      - name: Smoke test
-        shell: bash
-        run: ./target/release/gitstat.exe --once --no-fetch --config "$RUNNER_TEMP/config.json" || [ $? -eq 1 ]
-      - uses: actions/upload-artifact@v4
-        with:
-          name: gitstat-windows-x64
-          path: |
-            target/release/gitstat.exe
-            README.md
-          if-no-files-found: error
