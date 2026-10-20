@@ -13,8 +13,11 @@ pub struct AppState {
     pub config_file: PathBuf,
     pub config: Config,
     pub config_error: Option<String>,
-    /// Sorted by name, as `find_repos` returns them.
+    /// Sorted by name (the path below the root), as `find_repos` returns
+    /// them.
     pub statuses: Vec<RepoStatus>,
+    /// Why the repo list may be incomplete: a discovery cap was hit.
+    pub capped: Option<String>,
     pub has_result: bool,
     /// A fetch sweep is running.
     pub sweeping: bool,
@@ -38,6 +41,7 @@ impl AppState {
             config,
             config_error,
             statuses: Vec::new(),
+            capped: None,
             has_result: false,
             sweeping: false,
             in_flight: HashSet::new(),
@@ -77,14 +81,19 @@ impl AppState {
     }
 
     /// Replaces the status with the same path, or inserts it in name order
-    /// (the order `find_repos` uses). Returns whether anything changed.
+    /// (the order `find_repos` uses). A repo whose name changed (a new root
+    /// above it) moves to its new place. Returns whether anything changed.
     pub fn merge_status(&mut self, status: RepoStatus) -> bool {
-        if let Some(existing) = self.statuses.iter_mut().find(|s| s.path == status.path) {
+        if let Some(i) = self.statuses.iter().position(|s| s.path == status.path) {
+            let existing = &mut self.statuses[i];
             if *existing == status {
                 return false;
             }
-            *existing = status;
-            return true;
+            if existing.name == status.name {
+                *existing = status;
+                return true;
+            }
+            self.statuses.remove(i);
         }
         let key = status.name.to_lowercase();
         let at = self
@@ -127,7 +136,10 @@ pub enum Input {
     Tray(tray_icon::TrayIconEvent),
     Menu(tray_icon::menu::MenuEvent),
     Monitor(crate::monitor::Update),
+    /// A click on the badge.
     Overlay,
+    /// The badge was dragged and dropped with its disc here (physical px).
+    OverlayMoved(crate::layout::Rect),
     /// The folder-icon worker's report: skipped folders and why.
     FolderSkips(Vec<(PathBuf, String)>),
 }
@@ -212,6 +224,14 @@ mod tests {
         let names: Vec<&str> = s.statuses.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, ["a", "b", "C", "d"]);
         assert!(s.statuses[2].dirty);
+        // A new root renames a repo: it moves rather than staying put.
+        assert!(s.merge_status(RepoStatus {
+            name: "z".into(),
+            ..repo("a")
+        }));
+        let names: Vec<&str> = s.statuses.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["b", "C", "d", "z"]);
+        assert_eq!(s.statuses.len(), 4);
     }
 
     #[test]

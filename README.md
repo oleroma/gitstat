@@ -1,12 +1,17 @@
 # gitstat
 
-A Windows tray app that watches every git repo directly inside one folder and
-shows at a glance whether they're in sync with their remotes. It's built
-with [GPUI](https://www.gpui.rs/), the UI framework from Zed Industries.
+A Windows tray app that watches every git repo in one folder, down to a few
+levels below it (a whole development drive works too), and shows at a glance
+whether they're in sync with their remotes. It's built with
+[GPUI](https://www.gpui.rs/), the UI framework from Zed Industries.
 
 - **Green ✓**: every repo is current.
 - **Red with a number**: that many repos are unsynced.
 - **Gray …**: the first check is still running.
+
+The icon is drawn at the exact size the notification area uses at your
+display scale, with smooth edges and Segoe UI digits, so it stays crisp at
+125%, 150% and 200%. Above 99 it shows `99+`.
 
 A repo counts as unsynced if it is ahead, behind, diverged, has uncommitted
 changes, has no upstream branch, or its fetch failed. Status texts are `⬆2`,
@@ -25,6 +30,9 @@ icon again.
 
 **Double-click** the tray icon to open the **status window**, a normal window
 with every repo in name order and a **Refresh now** button.
+
+A repo's name is its path below `path`, such as `dev\gitstat`, and lists
+everywhere sort by it.
 
 **Right-click** the tray icon for the menu:
 
@@ -46,7 +54,14 @@ the primary monitor's work area, showing the unsynced count (or ✓, ! for a
 problem, … while checking). Clicking it opens the panel (or the window, if the
 panel is off). It never takes focus, clicks outside the circle go to the
 window underneath, and it follows resolution, DPI and taskbar changes within
-about 2 seconds. By default it hides while a fullscreen app or a presentation
+about 2 seconds.
+
+**Drag it** with the left mouse button to put it anywhere on the primary
+monitor; a press that doesn't move is still a click. gitstat remembers the
+spot as the nearest corner plus the distance from that corner's edges
+(`overlay.corner`, `overlay.offset_x`, `overlay.offset_y`), so the badge keeps
+its place relative to that corner when the resolution or the taskbar changes.
+Picking a corner from **Badge corner ▸** puts it back `margin` from the edges. By default it hides while a fullscreen app or a presentation
 is running; it can also hide while everything is synced.
 
 ### Folder icons in Explorer
@@ -81,12 +96,40 @@ The icons show in Explorer in every view and in the Files app. File Pilot is
 **unverified**: it uses the shell's icons, so it should show them, possibly
 only after F5.
 
+## Which repos
+
+gitstat looks in `path` and up to `depth` folder levels below it (3 by
+default; 1 is just the direct subfolders). A folder holding `.git` is a repo,
+and gitstat doesn't look inside it, so nested repos and submodules aren't
+listed separately. If `path` is itself a repo, it is the only one.
+
+It never looks inside folders named `node_modules`, `target`, `build`,
+`dist`, `out`, `venv`, `__pycache__`, `vendor`, `bin` or `obj`, folders whose
+name starts with `.`, `$Recycle.Bin` and `System Volume Information`, hidden
+or system folders, symlinks, junctions and other reparse points such as
+OneDrive or other cloud-synced folders, or folders it can't read. (A folder
+with one of those names, or of those kinds, that holds `.git` is still a
+repo, so repos directly inside `path` are found even under OneDrive; repos in
+a group folder below it are not.) A link straight to a repo is listed, unless
+the repo itself is found too.
+
+It stops after looking at 50,000 folders or finding 500 repos. The menu and
+the panel then show the count with a `+` (for example `500+ repos`), and the
+panel's footer says which limit was hit; lower `depth` or point `path` at a
+smaller folder. While the list is cut short, only the sweeps (and a removed
+repo) make gitstat look again: new folders can't bring in more repos.
+
 ## How status stays current
 
 **Local changes** (an edit, a commit, a checkout, a push, a new or removed
 repo) are picked up from file-system events, usually within a second of the
 last write. gitstat ignores what git ignores (so `cargo build` or
-`npm install` churn costs nothing after the first check), never checks the
+`npm install` churn costs nothing after the first check), and outside the
+repos it only notices folders appearing or going within `depth` levels, so
+the rest of a watched drive costs next to nothing. The search for new repos
+runs in the background, within about 5 seconds of a folder change even while
+the disk stays busy, and is spaced out so that on a big folder it is never
+searching more than a tenth of the time. It never checks the
 same repo more than once every 2 seconds, and doesn't wake up at all while
 nothing changes. Its own `git status` runs with `GIT_OPTIONAL_LOCKS=0`, so it
 never rewrites `.git/index` or collides with your `index.lock`.
@@ -121,6 +164,7 @@ from an older version keeps working:
 ```json
 {
   "path": "D:/dev",
+  "depth": 3,
   "interval_minutes": 5.0,
   "watch": true,
   "panel": true,
@@ -139,15 +183,17 @@ from an older version keeps working:
 
 | key | default | meaning |
 |---|---|---|
-| `path` | the folder above gitstat's own | The parent folder whose direct subfolders are your repos. `~` and variables like `%USERPROFILE%` are expanded. Use forward slashes or doubled backslashes. |
+| `path` | the folder above gitstat's own | The folder your repos are in, at any level down to `depth`; a whole drive such as `D:/` works. `~` and variables like `%USERPROFILE%` are expanded. Use forward slashes or doubled backslashes. |
+| `depth` | 3 | How many folder levels below `path` to look for repos, 1 to 8. 1 is only `path`'s direct subfolders, which is all earlier versions looked at: set it to keep an older config's repo list as it was, with two exceptions. A `path` that is itself a repo now shows only that repo, not the repos inside it, and a link to a repo that is listed anyway is dropped. See [Which repos](#which-repos). |
 | `interval_minutes` | 5 | How often to fetch, 1 to 1440. |
 | `watch` | true | Pick up local changes from file-system events. false checks on the interval only. |
 | `panel` | true | A tray left-click (and a badge click) opens the status panel. |
 | `window` | true | The status window is available from the menu, a double-click and the panel's ⧉ button. |
 | `overlay.enabled` | false | Show the corner badge. |
 | `overlay.corner` | `bottom-right` | `top-left`, `top-right`, `bottom-left` or `bottom-right`. |
+| `overlay.offset_x`, `overlay.offset_y` | unset | Where the badge was dragged to: px at 100% scale from the left or right, and the top or bottom, edge of the corner. Unset is `margin`. Written by dragging, removed by picking a corner from the menu. |
 | `overlay.size` | 44 | Diameter in px at 100% scale, 24 to 128. |
-| `overlay.margin` | 16 | Distance from the screen edges in px at 100% scale, 0 to 200. |
+| `overlay.margin` | 16 | Distance from the screen edges in px at 100% scale, 0 to 200, unless the badge was dragged. |
 | `overlay.hide_when_synced` | false | Hide the badge while every repo is synced. |
 | `overlay.hide_in_fullscreen` | true | Hide the badge while a fullscreen app or a presentation runs. |
 | `folder_icons` | false | Status icons on the repo folders, see above. Setting it by hand skips the confirmation. |
@@ -195,8 +241,9 @@ folder-icon tests. They also run on Linux (CI runs them there too), where only
 
 ## How it works
 
-- `src/git.rs` runs `git fetch` and `git status --porcelain=v2 --branch` in
-  each repo, with no console windows and no optional locks.
+- `src/git.rs` finds the repos (a breadth-first walk down to `depth`) and
+  runs `git fetch` and `git status --porcelain=v2 --branch` in each one, with
+  no console windows and no optional locks.
 - `src/monitor.rs` is the scheduler thread: one recursive watch on the root
   ([notify](https://crates.io/crates/notify)), the fetch sweep, and up to six
   checks at a time. `src/watch.rs` decides which events matter and debounces
@@ -208,8 +255,10 @@ folder-icon tests. They also run on Linux (CI runs them there too), where only
   place them.
 - `src/tray.rs` owns the notification-area icon and menu
   ([tray-icon](https://crates.io/crates/tray-icon)). `src/icon.rs` draws the
-  tray and folder icons, and `src/folder_icons.rs` applies and reverts the
-  desktop.ini icons.
+  tray and folder icons, anti-aliased at their exact pixel sizes (the tray's
+  digits with [ab_glyph](https://crates.io/crates/ab_glyph) from Segoe UI,
+  or a built-in stroke font without it), and `src/folder_icons.rs` applies
+  and reverts the desktop.ini icons.
 - `src/config.rs` reads and writes `config.json`. `src/autostart.rs` adds or
   removes gitstat under
   `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.

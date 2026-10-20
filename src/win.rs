@@ -17,18 +17,17 @@ use windows_sys::Win32::Graphics::Gdi::{
     MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
     SetWindowRgn,
 };
-use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, GetSystemMetricsForDpi, MDT_EFFECTIVE_DPI};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON};
 use windows_sys::Win32::UI::Shell::{
     QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GWL_EXSTYLE, GetClientRect, GetCursorPos, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
-    HTCAPTION, HWND_TOPMOST, IDYES, IsWindow, IsWindowVisible, MB_ICONQUESTION, MB_SETFOREGROUND,
-    MB_YESNO, MessageBoxW, PostMessageW, SC_MOVE, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE,
-    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WM_SYSCOMMAND, WS_EX_NOACTIVATE,
-    WS_EX_TRANSPARENT,
+    HWND_TOPMOST, IDYES, IsWindow, IsWindowVisible, MB_ICONQUESTION, MB_SETFOREGROUND, MB_YESNO,
+    MessageBoxW, SM_CXSCREEN, SM_CXSMICON, SM_CYSCREEN, SM_SWAPBUTTON, SW_HIDE, SW_SHOWNOACTIVATE,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WS_EX_NOACTIVATE, WS_EX_TRANSPARENT,
 };
 
 /// The HWND of a GPUI window.
@@ -108,6 +107,16 @@ fn monitor_info(mon: HMONITOR) -> MonitorInfo {
     }
 }
 
+/// The notification area's icon size in px: the small-icon size at the
+/// primary monitor's DPI (16 at 100%, 20 at 125%, 24 at 150%, 32 at 200%).
+pub fn tray_icon_size() -> u32 {
+    let dpi = (primary_monitor().scale * 96.0).round() as u32;
+    match unsafe { GetSystemMetricsForDpi(SM_CXSMICON, dpi.max(96)) } {
+        px @ 1..=256 => px as u32,
+        _ => crate::icon::TRAY_SIZE,
+    }
+}
+
 /// The cursor in physical px, or (0, 0) if it can't be read (secure desktop).
 pub fn cursor_pos() -> (i32, i32) {
     let mut p = POINT { x: 0, y: 0 };
@@ -115,15 +124,6 @@ pub fn cursor_pos() -> (i32, i32) {
         return (0, 0);
     }
     (p.x, p.y)
-}
-
-/// The window's outer rect in physical px, if it still exists.
-// Drag-to-snap (phase 4) reads where the badge was dropped.
-#[allow(dead_code)]
-pub fn window_rect(h: isize) -> Option<Rect> {
-    let hwnd = live(h)?;
-    let mut r = RECT::default();
-    (unsafe { GetWindowRect(hwnd, &mut r) } != 0).then(|| rect(r))
 }
 
 /// ORs `extra` into the window's extended style.
@@ -165,19 +165,14 @@ pub unsafe fn style_overlay(h: isize) {
     }
 }
 
-/// Puts the overlay's client area at `r`, topmost and shown without
-/// activation, and clips it (drawing and clicks) to the inscribed circle.
-///
-/// # Safety
-/// Call only from a spawned task outside `update`.
-pub unsafe fn place_overlay(h: isize, r: Rect) {
-    let Some(hwnd) = live(h) else { return };
+/// GPUI's PopUp keeps a frame offset between the window and its client
+/// area: (client left, client top) relative to the window, and how much
+/// wider and taller the window is than its client area.
+unsafe fn frame(hwnd: HWND) -> (i32, i32, i32, i32) {
+    let (mut wr, mut cr) = (RECT::default(), RECT::default());
+    let mut origin = POINT { x: 0, y: 0 };
     unsafe {
-        // GPUI's PopUp keeps a frame offset between the window and its client
-        // area; size the window so the client area is exactly `r`.
-        let (mut wr, mut cr) = (RECT::default(), RECT::default());
-        let mut origin = POINT { x: 0, y: 0 };
-        let (dx, dy, bw, bh) = if GetWindowRect(hwnd, &mut wr) != 0
+        if GetWindowRect(hwnd, &mut wr) != 0
             && GetClientRect(hwnd, &mut cr) != 0
             && ClientToScreen(hwnd, &mut origin) != 0
         {
@@ -189,7 +184,23 @@ pub unsafe fn place_overlay(h: isize, r: Rect) {
             )
         } else {
             (0, 0, 0, 0)
-        };
+        }
+    }
+}
+
+/// Puts the overlay's client area at `r`, topmost and shown without
+/// activation, and clips it (drawing and clicks) to the ellipse inscribed
+/// in `r`. The region is 1-bit, so its edge is jagged: `r` includes
+/// transparent padding around the drawn disc, which keeps the disc's own
+/// anti-aliased edge away from it.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn place_overlay(h: isize, r: Rect) {
+    let Some(hwnd) = live(h) else { return };
+    unsafe {
+        // Size the window so the client area is exactly `r`.
+        let (dx, dy, bw, bh) = frame(hwnd);
         SetWindowPos(
             hwnd,
             HWND_TOPMOST,
@@ -206,6 +217,38 @@ pub unsafe fn place_overlay(h: isize, r: Rect) {
             DeleteObject(rgn);
         }
     }
+}
+
+/// Moves the overlay's client area to (left, top) without resizing it,
+/// activating it or changing its z-order. Its region is relative to the
+/// window, so it moves along. For dragging.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn move_overlay(h: isize, left: i32, top: i32) {
+    let Some(hwnd) = live(h) else { return };
+    unsafe {
+        let (dx, dy, _, _) = frame(hwnd);
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            left - dx,
+            top - dy,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// Whether the primary (left, unless swapped) mouse button is down right now.
+pub fn left_button_down() -> bool {
+    let vk = if unsafe { GetSystemMetrics(SM_SWAPBUTTON) } != 0 {
+        VK_RBUTTON
+    } else {
+        VK_LBUTTON
+    };
+    (unsafe { GetAsyncKeyState(vk as i32) } as u16) & 0x8000 != 0
 }
 
 /// Shows without taking focus, or hides.
@@ -316,18 +359,4 @@ pub fn confirm_box(text: String) -> std::thread::JoinHandle<bool> {
         };
         answer == IDYES
     })
-}
-
-/// Starts a native move of the window under the cursor, as if its caption
-/// were dragged. Posted, never sent: a sent `WM_SYSCOMMAND` runs the modal
-/// move loop inside the caller, while GPUI's App is borrowed.
-// Phase 4 (drag-to-snap); GPUI's pressed-button state after
-// `ReleaseCapture` must be checked on hardware before it is wired up.
-#[allow(dead_code)]
-pub fn begin_native_move(h: isize) {
-    let Some(hwnd) = live(h) else { return };
-    unsafe {
-        ReleaseCapture();
-        PostMessageW(hwnd, WM_SYSCOMMAND, (SC_MOVE | HTCAPTION) as usize, 0);
-    }
 }

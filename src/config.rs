@@ -1,6 +1,7 @@
 //! `config.json` next to the executable: which folder to watch, how often, and
 //! which parts of the UI are on.
 
+use crate::git::{DEFAULT_DEPTH, MAX_DEPTH};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -26,6 +27,14 @@ pub struct OverlayConfig {
     pub size: f32,
     /// Distance from the work-area edges in logical px.
     pub margin: f32,
+    /// Where the badge was dragged to: logical px from the left or right
+    /// edge of the work area that `corner` names. Unset is `margin`; picking
+    /// a corner from the menu unsets both.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset_x: Option<f32>,
+    /// Like `offset_x`, from the top or bottom edge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset_y: Option<f32>,
     pub hide_when_synced: bool,
     pub hide_in_fullscreen: bool,
 }
@@ -37,6 +46,8 @@ impl Default for OverlayConfig {
             corner: Corner::default(),
             size: 44.0,
             margin: 16.0,
+            offset_x: None,
+            offset_y: None,
             hide_when_synced: false,
             hide_in_fullscreen: true,
         }
@@ -47,8 +58,11 @@ impl Default for OverlayConfig {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Parent folder whose direct subfolders are the repos to watch.
+    /// The folder to look for repos in.
     pub path: String,
+    /// How many folder levels below `path` to look for repos; 1 is its
+    /// direct subfolders. See [`Config::depth`].
+    pub depth: i64,
     pub interval_minutes: f64,
     /// Event-driven local status; false checks on the interval only.
     pub watch: bool,
@@ -65,6 +79,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             path: "~/dev".into(),
+            depth: DEFAULT_DEPTH as i64,
             interval_minutes: 5.0,
             watch: true,
             panel: true,
@@ -108,6 +123,11 @@ impl Config {
     /// `path` with `~` and `%VAR%` / `$VAR` expanded.
     pub fn repos_dir(&self) -> PathBuf {
         PathBuf::from(expand(&self.path))
+    }
+
+    /// `depth`, 1 to [`MAX_DEPTH`].
+    pub fn depth(&self) -> usize {
+        self.depth.clamp(1, MAX_DEPTH as i64) as usize
     }
 
     /// The fetch sweep period; the Linux binary only runs `--once`.
@@ -178,6 +198,15 @@ impl Config {
             200.0,
             OverlayConfig::default().margin,
         )
+    }
+
+    /// The badge's distance (x, y) in logical px from its corner's two
+    /// edges: where it was dragged, else the margin. Negative is 0; layout
+    /// keeps a too-large offset on the work area.
+    pub fn overlay_offset(&self) -> (f32, f32) {
+        let margin = self.overlay_margin();
+        let offset = |v: Option<f32>| v.map_or(margin, |v| clamp_f32(v, 0.0, 100_000.0, margin));
+        (offset(self.overlay.offset_x), offset(self.overlay.offset_y))
     }
 }
 
@@ -358,6 +387,67 @@ mod tests {
         assert_eq!(with(1000.0, 1000.0), (128.0, 200.0));
         assert_eq!(with(f32::INFINITY, f32::NEG_INFINITY), (128.0, 0.0));
         assert_eq!(with(f32::NAN, f32::NAN), (44.0, 16.0));
+    }
+
+    #[test]
+    fn overlay_offset_defaults_to_the_margin_and_is_clamped() {
+        let with = |margin: f32, x: Option<f32>, y: Option<f32>| {
+            let mut config = Config::default();
+            config.overlay.margin = margin;
+            config.overlay.offset_x = x;
+            config.overlay.offset_y = y;
+            config.overlay_offset()
+        };
+        assert_eq!(Config::default().overlay_offset(), (16.0, 16.0));
+        assert_eq!(with(30.0, None, None), (30.0, 30.0));
+        assert_eq!(with(-5.0, None, None), (0.0, 0.0));
+        assert_eq!(with(16.0, Some(120.5), None), (120.5, 16.0));
+        assert_eq!(with(16.0, Some(-3.0), Some(f32::NAN)), (0.0, 16.0));
+        assert_eq!(with(16.0, Some(f32::INFINITY), Some(0.0)), (100_000.0, 0.0));
+    }
+
+    #[test]
+    fn overlay_offsets_are_optional_in_the_file() {
+        // Unset offsets aren't written, so an undragged config is unchanged.
+        let text = serde_json::to_string(&Config::default()).unwrap();
+        assert!(!text.contains("offset"), "{text}");
+        let parse = |text: &str| serde_json::from_str::<Config>(text).unwrap().overlay;
+        let old = parse(r#"{ "overlay": { "corner": "top-left", "margin": 8 } }"#);
+        assert_eq!((old.offset_x, old.offset_y), (None, None));
+        let dragged = parse(r#"{ "overlay": { "offset_x": 240.5, "offset_y": 12 } }"#);
+        assert_eq!(
+            (dragged.offset_x, dragged.offset_y),
+            (Some(240.5), Some(12.0))
+        );
+        let mut config = Config::default();
+        config.overlay.offset_x = Some(240.5);
+        let text = serde_json::to_string(&config).unwrap();
+        assert!(text.contains("\"offset_x\":240.5") && !text.contains("offset_y"));
+        assert_eq!(serde_json::from_str::<Config>(&text).unwrap(), config);
+        assert!(serde_json::from_str::<Config>(r#"{ "overlay": { "offset_x": "far" } }"#).is_err());
+    }
+
+    #[test]
+    fn depth_defaults_and_is_clamped() {
+        let depth = |d: i64| {
+            Config {
+                depth: d,
+                ..Config::default()
+            }
+            .depth()
+        };
+        assert_eq!(Config::default().depth(), 3);
+        assert_eq!(depth(1), 1);
+        assert_eq!(depth(8), 8);
+        assert_eq!(depth(0), 1);
+        assert_eq!(depth(-4), 1);
+        assert_eq!(depth(9), 8);
+        assert_eq!(depth(i64::MAX), 8);
+        let parse = |text: &str| serde_json::from_str::<Config>(text);
+        assert_eq!(parse(r#"{ "path": "D:/" }"#).unwrap().depth(), 3);
+        assert_eq!(parse(r#"{ "depth": 1 }"#).unwrap().depth(), 1);
+        assert_eq!(parse(r#"{ "depth": 50 }"#).unwrap().depth(), 8);
+        assert!(parse(r#"{ "depth": "deep" }"#).is_err());
     }
 
     #[test]

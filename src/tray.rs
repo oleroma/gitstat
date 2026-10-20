@@ -5,6 +5,7 @@ use crate::git::RepoStatus;
 use crate::icon::{self, Badge};
 use crate::layout;
 use crate::state::Input;
+use crate::win;
 use futures::channel::mpsc::UnboundedSender;
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -106,6 +107,8 @@ const CORNERS: [(Corner, &str); 4] = [
 pub struct Tray {
     icon: TrayIcon,
     badge: Badge,
+    /// The pixel size `badge` was drawn at: the tray's small-icon size.
+    icon_size: u32,
     tooltip: String,
     menu: Menu,
     summary: MenuItem,
@@ -133,6 +136,8 @@ pub struct TraySnapshot<'a> {
     pub checking: bool,
     pub has_result: bool,
     pub problem: Option<&'a str>,
+    /// A discovery cap cut the repo list short.
+    pub incomplete: bool,
 }
 
 /// Menu positions: summary, separator, then the repo items.
@@ -214,9 +219,10 @@ impl Tray {
         ])
         .map_err(|e| e.to_string())?;
 
+        let icon_size = win::tray_icon_size();
         let icon = TrayIconBuilder::new()
             .with_tooltip("gitstat: checking…")
-            .with_icon(make_icon(Badge::Checking)?)
+            .with_icon(make_icon(Badge::Checking, icon_size)?)
             .with_menu(Box::new(menu.clone()))
             .with_menu_on_left_click(false)
             .build()
@@ -224,6 +230,7 @@ impl Tray {
         let tray = Self {
             icon,
             badge: Badge::Checking,
+            icon_size,
             tooltip: String::new(),
             menu,
             summary,
@@ -264,12 +271,7 @@ impl Tray {
         } else {
             Badge::Unsynced(unsynced)
         };
-        if badge != self.badge
-            && let Ok(icon) = make_icon(badge)
-        {
-            let _ = self.icon.set_icon(Some(icon));
-            self.badge = badge;
-        }
+        self.set_badge(badge, win::tray_icon_size());
 
         let summary = summary(snap, unsynced);
         // Windows caps tooltips at 127 characters.
@@ -321,6 +323,25 @@ impl Tray {
                 }
             }
         }
+    }
+
+    /// Redraws the icon at `size` px when it or the badge changed. Drawing
+    /// at the tray's own size keeps Windows from scaling it, which blurs it
+    /// and makes the edges jagged.
+    fn set_badge(&mut self, badge: Badge, size: u32) {
+        if (badge, size) != (self.badge, self.icon_size)
+            && let Ok(icon) = make_icon(badge, size)
+        {
+            let _ = self.icon.set_icon(Some(icon));
+            self.badge = badge;
+            self.icon_size = size;
+        }
+    }
+
+    /// Follows a DPI change of the primary monitor, which changes the
+    /// tray's icon size. Two Win32 queries; cheap enough for every input.
+    pub fn check_icon_size(&mut self) {
+        self.set_badge(self.badge, win::tray_icon_size());
     }
 
     /// Turns a tray click or menu pick into what the app should do. Anything
@@ -465,11 +486,14 @@ pub fn summary(snap: &TraySnapshot, unsynced: usize) -> String {
     if !snap.has_result {
         return "checking…".to_string();
     }
+    // "500+": the walk stopped early, so there may be more.
+    let more = if snap.incomplete { "+" } else { "" };
     match (snap.statuses.len(), unsynced) {
+        (0, _) if snap.incomplete => "no repos found (search stopped early)".to_string(),
         (0, _) => "no repos found".to_string(),
-        (1, 0) => "the repo is current".to_string(),
-        (total, 0) => format!("all {total} repos current"),
-        (total, n) => format!("{n} of {total} repos unsynced"),
+        (1, 0) if !snap.incomplete => "the repo is current".to_string(),
+        (total, 0) => format!("all {total}{more} repos current"),
+        (total, n) => format!("{n} of {total}{more} repos unsynced"),
     }
 }
 
@@ -518,8 +542,9 @@ fn set_checked(item: &CheckMenuItem, checked: bool) {
     }
 }
 
-fn make_icon(badge: Badge) -> Result<Icon, String> {
-    Icon::from_rgba(icon::render(badge), icon::SIZE, icon::SIZE).map_err(|e| e.to_string())
+/// Straight RGBA, which is what `CreateIcon` (tray-icon's `from_rgba`) takes.
+fn make_icon(badge: Badge, size: u32) -> Result<Icon, String> {
+    Icon::from_rgba(icon::render(badge, size), size, size).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -540,6 +565,30 @@ mod tests {
         assert_eq!(to_layout_rect(&tray_icon::Rect::default()), None);
         assert_eq!(point_rect(f64::NAN, 0.0), None);
         assert_eq!(point_rect(5.0, 6.0), Some(layout::Rect::new(5, 6, 6, 7)));
+    }
+
+    #[test]
+    fn summary_marks_a_capped_list() {
+        let repo = |dirty| RepoStatus {
+            has_upstream: true,
+            dirty,
+            ..Default::default()
+        };
+        let statuses = [repo(true), repo(false)];
+        let snap = |statuses, incomplete| TraySnapshot {
+            statuses,
+            checking: false,
+            has_result: true,
+            problem: None,
+            incomplete,
+        };
+        assert_eq!(summary(&snap(&statuses, true), 1), "1 of 2+ repos unsynced");
+        assert_eq!(summary(&snap(&statuses, false), 1), "1 of 2 repos unsynced");
+        assert_eq!(
+            summary(&snap(&[], true), 0),
+            "no repos found (search stopped early)"
+        );
+        assert_eq!(summary(&snap(&[], false), 0), "no repos found");
     }
 
     #[test]

@@ -3,7 +3,9 @@
 
 use crate::config::Config;
 use crate::git::{self, RepoStatus};
-use crate::watch::{self, CONFIG_QUIET, Class, Debouncer, Need, REPOSET_QUIET, RepoRoute, Router};
+use crate::watch::{
+    self, CONFIG_QUIET, Class, Debouncer, Need, REPOSET_MAX_WAIT, REPOSET_QUIET, RepoRoute, Router,
+};
 use notify::{EventKindMask, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
@@ -31,6 +33,13 @@ const FETCH_BACKOFF: [Duration; 3] = [
     Duration::from_secs(5 * 60),
 ];
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(1);
+/// A rediscovery the user didn't ask for (folder events, a rescan, a local
+/// sweep) starts no sooner than this many walk durations after the last
+/// walk ended, so folder churn on a big root (a whole drive) can't keep the
+/// disk busy walking.
+const WALK_GAP_FACTOR: u32 = 10;
+/// A walk taking longer than this is logged.
+const SLOW_WALK: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WatchMode {
@@ -55,7 +64,11 @@ pub enum Command {
 #[derive(Clone, Debug)]
 pub enum Update {
     Config(Result<Config, String>),
-    Repos(Vec<PathBuf>),
+    Repos {
+        repos: Vec<PathBuf>,
+        /// Why the list may be incomplete (see `Discovery::capped`).
+        capped: Option<String>,
+    },
     Started {
         repo: PathBuf,
         // The app shows every check alike; the tests tell fetches apart.
@@ -72,6 +85,18 @@ enum Msg {
     Cmd(Command),
     Fs(notify::Result<notify::Event>),
     Done(Done),
+    Walked(Walked),
+}
+
+/// A repo walk's result, from the walk thread.
+struct Walked {
+    /// The root generation the walk was started for.
+    generation: u64,
+    /// Which walk this was (see `Scheduler::walks`).
+    seq: u64,
+    /// `None` if the walk panicked.
+    discovery: Option<git::Discovery>,
+    took: Duration,
 }
 
 struct Done {
@@ -137,7 +162,10 @@ struct Scheduler {
     /// The last reload result, so the sweep-time reload reports only changes.
     loaded: Result<Config, String>,
     root: PathBuf,
-    /// Bumped when the root changes; results for an older root are dropped.
+    /// `config.depth()` as of the last re-root.
+    depth: usize,
+    /// Bumped when the root or depth changes; results for an older root are
+    /// dropped.
     generation: u64,
     watcher: Option<RecommendedWatcher>,
     /// Git dirs outside the root that need their own watch.
@@ -146,6 +174,19 @@ struct Scheduler {
     router: Router,
     debouncer: Debouncer,
     repos: Vec<PathBuf>,
+    /// The last walk's cap message, if a cap cut it short.
+    capped: Option<String>,
+    /// When the last repo walk ended and how long it took.
+    walked: Option<(Instant, Duration)>,
+    /// Walks started on the walk thread so far; each one's number.
+    walks: u64,
+    /// The walk running on the walk thread, if one is.
+    walking: Option<u64>,
+    /// Another walk was asked for while one ran: it starts when that ends.
+    walk_again: bool,
+    /// The running sweep's fetches wait for this walk (or a later one), so
+    /// the repos it finds are fetched too.
+    sweep_walk: Option<u64>,
     /// The last status sent per repo, for `keep_fetch_error`.
     statuses: HashMap<PathBuf, RepoStatus>,
     /// Linked worktrees whose git dirs couldn't be read; retried on every
@@ -163,6 +204,9 @@ struct Scheduler {
     poll_at: Option<Instant>,
     retry_watch_at: Option<Instant>,
     reposet_at: Option<Instant>,
+    /// When the first event (or rescan) asking for the pending walk came,
+    /// which bounds how far later ones can push it back.
+    reposet_first: Option<Instant>,
     config_at: Option<Instant>,
     last_wall: SystemTime,
     last_mono: Instant,
@@ -175,20 +219,28 @@ impl Scheduler {
         let loaded = Config::load_or_create(&config_file);
         let config = loaded.clone().unwrap_or_default();
         let root = config.repos_dir();
+        let depth = config.depth();
         Self {
-            router: Router::new(root.clone(), config_file.clone()),
+            router: Router::new(root.clone(), depth, config_file.clone()),
             config_file,
             sink,
             tx,
             config,
             loaded,
             root,
+            depth,
             generation: 0,
             watcher: None,
             external: Vec::new(),
             mode: WatchMode::Off,
             debouncer: Debouncer::default(),
             repos: Vec::new(),
+            capped: None,
+            walked: None,
+            walks: 0,
+            walking: None,
+            walk_again: false,
+            sweep_walk: None,
             statuses: HashMap::new(),
             unresolved: HashSet::new(),
             running: 0,
@@ -201,6 +253,7 @@ impl Scheduler {
             poll_at: None,
             retry_watch_at: None,
             reposet_at: None,
+            reposet_first: None,
             config_at: None,
             last_wall: SystemTime::now(),
             last_mono: Instant::now(),
@@ -211,13 +264,14 @@ impl Scheduler {
     fn run(mut self, rx: mpsc::Receiver<Msg>) {
         let now = Instant::now();
         (self.sink)(Update::Config(self.loaded.clone()));
-        self.rediscover(true, now);
+        // Here, not on the walk thread: there is nothing to do without it.
+        self.walk_here(true, now);
         self.setup_watch(now);
         // `set_mode` reports only changes, and the mode starts out as Off.
         if self.mode == WatchMode::Off {
             self.emit(Update::Mode(WatchMode::Off));
         }
-        self.start_sweep(now);
+        self.start_sweep(false, now);
 
         loop {
             let now = Instant::now();
@@ -235,7 +289,7 @@ impl Scheduler {
                 Ok(Msg::Cmd(Command::RefreshAll)) => {
                     let now = Instant::now();
                     self.poll_config(now);
-                    self.start_sweep(now);
+                    self.start_sweep(true, now);
                 }
                 Ok(Msg::Cmd(Command::Apply(config))) => {
                     if config != self.config {
@@ -244,6 +298,7 @@ impl Scheduler {
                 }
                 Ok(Msg::Fs(event)) => self.on_fs(event, Instant::now()),
                 Ok(Msg::Done(done)) => self.on_done(done, Instant::now()),
+                Ok(Msg::Walked(walked)) => self.on_walked(walked, Instant::now()),
                 Err(RecvTimeoutError::Timeout) => {}
             }
         }
@@ -270,7 +325,7 @@ impl Scheduler {
             self.next_health,
             self.poll_at,
             self.retry_watch_at,
-            self.reposet_at,
+            self.reposet_at.filter(|_| self.walking.is_none()),
             self.config_at,
             debounce,
             self.retries.values().filter_map(|r| r.at).min(),
@@ -308,13 +363,13 @@ impl Scheduler {
             self.config_at = None;
             self.reload_config(now);
         }
-        if due(self.reposet_at) {
-            self.reposet_at = None;
-            self.rediscover(false, now);
+        // While a walk runs this waits for it, to keep the walk gap.
+        if self.walking.is_none() && due(self.reposet_at) {
+            self.spawn_walk();
         }
         if due(self.next_sweep) {
             self.poll_config(now);
-            self.start_sweep(now);
+            self.start_sweep(true, now);
         }
         if due(self.next_health) {
             self.next_health = Some(now + HEALTH_EVERY);
@@ -350,23 +405,26 @@ impl Scheduler {
         let due = self.debouncer.due(now, free);
         // A deferred rescan just ran; it may have missed new repos too.
         if self.debouncer.take_rescanned() {
-            self.rediscover(false, now);
+            self.schedule_walk(now);
         }
         for (repo, need) in due {
             let fetch = need == Need::Fetch;
             let tx = self.tx.clone();
             let generation = self.generation;
             let worker_repo = repo.clone();
+            let root = self.root.clone();
             let spawned = thread::Builder::new()
                 .name("gitstat-check".into())
                 .spawn(move || {
                     // Always report back, even if the check panics, so the repo
                     // never stays in flight.
-                    let (status, ignored) =
-                        std::panic::catch_unwind(|| git::check_repo_detailed(&worker_repo, fetch))
-                            .unwrap_or_else(|_| {
-                                (failed(&worker_repo, "internal error"), Vec::new())
-                            });
+                    let (status, ignored) = std::panic::catch_unwind(|| {
+                        git::check_repo_detailed(&root, &worker_repo, fetch)
+                    })
+                    .unwrap_or_else(|_| {
+                        let status = git::failed(&root, &worker_repo, "internal error");
+                        (status, Vec::new())
+                    });
                     let _ = tx.send(Msg::Done(Done {
                         generation,
                         repo: worker_repo,
@@ -384,7 +442,7 @@ impl Scheduler {
                 self.on_done(
                     Done {
                         generation,
-                        status: failed(&repo, &e.to_string()),
+                        status: git::failed(&self.root, &repo, &e.to_string()),
                         repo,
                         need,
                         ignored: Vec::new(),
@@ -441,29 +499,41 @@ impl Scheduler {
         }
     }
 
-    fn start_sweep(&mut self, now: Instant) {
-        // Every sweep looks for new repos too: events can be dropped
-        // silently (network shares), and `watch: false` has none.
-        self.rediscover(false, now);
+    /// A fetch of every repo. Every sweep looks for new repos first (`walk`,
+    /// unless a walk just ran): events can be dropped silently (network
+    /// shares), and `watch: false` has none. The fetches start once that
+    /// walk is in, so the repos it finds are fetched too.
+    fn start_sweep(&mut self, walk: bool, now: Instant) {
         if !self.sweeping {
             self.sweeping = true;
             self.emit(Update::SweepStarted);
         }
         self.next_sweep = None;
         self.sweeps += 1;
-        for repo in &self.repos {
-            self.sweep.insert(repo.clone());
-            self.debouncer.request(repo, Need::Fetch, now);
-        }
         // The sweep replaces any pending retry.
         for retry in self.retries.values_mut() {
             retry.at = None;
+        }
+        if walk {
+            // The walk started now, or the one queued behind a running one.
+            self.sweep_walk = Some(self.walks + 1);
+            self.request_walk();
+        } else {
+            self.sweep_walk = None;
+            self.fetch_all(now);
+        }
+    }
+
+    fn fetch_all(&mut self, now: Instant) {
+        for repo in &self.repos {
+            self.sweep.insert(repo.clone());
+            self.debouncer.request(repo, Need::Fetch, now);
         }
         self.finish_sweep_if_done(now);
     }
 
     fn finish_sweep_if_done(&mut self, now: Instant) {
-        if self.sweeping && self.sweep.is_empty() {
+        if self.sweeping && self.sweep_walk.is_none() && self.sweep.is_empty() {
             self.sweeping = false;
             let interval = jittered(self.config.interval(), &self.root, self.sweeps);
             self.next_sweep = Some(now + interval);
@@ -474,15 +544,18 @@ impl Scheduler {
     /// A Local check of every repo, and a fresh look for new ones. Events
     /// may have been missed (resume, no watch), so running checks rerun.
     fn local_sweep(&mut self, now: Instant) {
-        self.rediscover(false, now);
+        self.schedule_walk(now);
         for repo in &self.repos {
             self.debouncer.recheck(repo, now);
         }
     }
 
+    /// Lost events: a recheck of every repo and a fresh walk, rate-limited
+    /// together. A deferred rescan rediscovers when it runs, in `dispatch`.
     fn rescan(&mut self, now: Instant) {
-        self.debouncer.rescan(now);
-        self.rediscover(false, now);
+        if self.debouncer.rescan(now) {
+            self.schedule_walk(now);
+        }
     }
 
     fn on_fs(&mut self, event: notify::Result<notify::Event>, now: Instant) {
@@ -511,12 +584,122 @@ impl Scheduler {
                     (Class::Config, _) => self.config_at = Some(now + CONFIG_QUIET),
                     // Only the config file's own watch is live outside Events mode.
                     _ if !events_on => {}
-                    (Class::RepoSet, _) => self.reposet_at = Some(now + REPOSET_QUIET),
+                    (Class::RepoSet, _) => self.schedule_walk(now),
                     (Class::Ignore, _) | (_, None) => {}
                     (class, Some(repo)) => self.debouncer.on_event(&repo, class, now),
                 }
             }
         }
+    }
+
+    /// Asks for a walk the user didn't: after a trailing quiet window, at
+    /// least `WALK_GAP_FACTOR` times the last walk's duration after it
+    /// ended, and no later than `REPOSET_MAX_WAIT` after the first request
+    /// (or that gap), however steady the churn.
+    fn schedule_walk(&mut self, now: Instant) {
+        let gap = self.walked.map(|(end, took)| end + took * WALK_GAP_FACTOR);
+        let first = *self.reposet_first.get_or_insert(now);
+        let quiet = (now + REPOSET_QUIET).max(gap.unwrap_or(now));
+        let latest = first.max(gap.unwrap_or(first)) + REPOSET_MAX_WAIT;
+        self.reposet_at = Some(quiet.min(latest));
+    }
+
+    /// Starts a walk on the walk thread, or queues one behind the walk
+    /// running there.
+    fn request_walk(&mut self) {
+        if self.walking.is_some() {
+            self.walk_again = true;
+        } else {
+            self.spawn_walk();
+        }
+    }
+
+    /// The walk covers whatever asked for one so far.
+    fn spawn_walk(&mut self) {
+        self.walks += 1;
+        self.walk_again = false;
+        self.reposet_at = None;
+        self.reposet_first = None;
+        let (seq, generation) = (self.walks, self.generation);
+        let (root, depth, tx) = (self.root.clone(), self.depth, self.tx.clone());
+        let spawned = thread::Builder::new()
+            .name("gitstat-walk".into())
+            .spawn(move || {
+                let started = Instant::now();
+                let discovery = std::panic::catch_unwind(|| git::find_repos(&root, depth)).ok();
+                let _ = tx.send(Msg::Walked(Walked {
+                    generation,
+                    seq,
+                    discovery,
+                    took: started.elapsed(),
+                }));
+            });
+        self.walking = Some(seq);
+        if spawned.is_err() {
+            // No thread to spare: walk here instead.
+            let started = Instant::now();
+            let discovery = Some(git::find_repos(&self.root, self.depth));
+            let walked = Walked {
+                generation,
+                seq,
+                discovery,
+                took: started.elapsed(),
+            };
+            self.on_walked(walked, Instant::now());
+        }
+    }
+
+    fn on_walked(&mut self, walked: Walked, now: Instant) {
+        let Walked {
+            generation,
+            seq,
+            discovery,
+            took,
+        } = walked;
+        if self.walking == Some(seq) {
+            self.walking = None;
+        }
+        self.walk_took(took, now);
+        // A walk for an older root is dropped; the new root walked already.
+        if generation == self.generation
+            && let Some(discovery) = discovery
+        {
+            self.apply_discovery(discovery, false, now);
+        }
+        if self.walking.is_none() {
+            if self.walk_again {
+                self.spawn_walk();
+            } else if self.reposet_at.is_some() {
+                // Asked for while this one ran: again, after the gap.
+                self.schedule_walk(now);
+            }
+        }
+        if self.sweep_walk.is_some_and(|wanted| seq >= wanted) {
+            self.sweep_walk = None;
+            self.fetch_all(now);
+        }
+    }
+
+    fn walk_took(&mut self, took: Duration, now: Instant) {
+        self.walked = Some((now, took));
+        if took > SLOW_WALK {
+            eprintln!(
+                "gitstat: looking for repos in {} took {took:.1?}",
+                self.root.display()
+            );
+        }
+    }
+
+    /// Walks on this thread, for a start or a new root, where nothing can
+    /// go on without the repo list. `force` reports it even unchanged.
+    fn walk_here(&mut self, force: bool, now: Instant) {
+        let started = Instant::now();
+        let discovery = git::find_repos(&self.root, self.depth);
+        self.reposet_first = None;
+        self.reposet_at = None;
+        let end = Instant::now();
+        self.walk_took(end - started, end);
+        self.apply_discovery(discovery, force, now);
     }
 
     /// The sweep-time reload: a fallback for a missed config event, so it
@@ -549,22 +732,26 @@ impl Scheduler {
     fn apply_config(&mut self, config: Config, now: Instant) {
         let old = std::mem::replace(&mut self.config, config);
         let root = self.config.repos_dir();
-        if !same_root(&root, &self.root) {
+        let depth = self.config.depth();
+        if !same_root(&root, &self.root) || depth != self.depth {
             self.generation += 1;
             self.root = root;
-            self.router = Router::new(self.root.clone(), self.config_file.clone());
+            self.depth = depth;
+            self.router = Router::new(self.root.clone(), depth, self.config_file.clone());
             // Checks still running for the old root keep their repos busy.
             self.debouncer.next_root();
             self.repos.clear();
+            self.capped = None;
             self.statuses.clear();
             self.unresolved.clear();
             self.retries.clear();
             self.sweep.clear();
+            self.sweep_walk = None;
             self.external.clear();
             self.watcher = None;
-            self.rediscover(true, now);
+            self.walk_here(true, now);
             self.setup_watch(now);
-            self.start_sweep(now);
+            self.start_sweep(false, now);
             return;
         }
         if old.watch != self.config.watch {
@@ -579,12 +766,21 @@ impl Scheduler {
         }
     }
 
-    /// Re-reads the repo list and routes. `force` reports it even unchanged.
-    /// Routes are rebuilt when the list changed or a worktree's git dirs
-    /// couldn't be read last time.
-    fn rediscover(&mut self, force: bool, now: Instant) {
-        let found = git::find_repos(&self.root);
-        let changed = found != self.repos;
+    /// Takes in a walk's repo list and rebuilds the routes. `force` reports
+    /// it even unchanged. Routes are rebuilt when the list changed or a
+    /// worktree's git dirs couldn't be read last time.
+    fn apply_discovery(&mut self, discovery: git::Discovery, force: bool, now: Instant) {
+        let git::Discovery {
+            repos: found,
+            capped,
+            pruned,
+            entered,
+        } = discovery;
+        self.router.set_pruned(&pruned);
+        self.router.set_entered(&entered);
+        self.router.set_capped(capped.is_some());
+        let changed = found != self.repos || capped != self.capped;
+        self.capped = capped;
         if !changed && !force && self.unresolved.is_empty() {
             return;
         }
@@ -626,7 +822,10 @@ impl Scheduler {
             }
         }
         if changed || force {
-            self.emit(Update::Repos(self.repos.clone()));
+            self.emit(Update::Repos {
+                repos: self.repos.clone(),
+                capped: self.capped.clone(),
+            });
         }
         self.finish_sweep_if_done(now);
     }
@@ -794,18 +993,6 @@ fn respell(path: &Path, root: &Path) -> PathBuf {
     match real_path.strip_prefix(&real_root) {
         Ok(rel) => root.join(rel),
         Err(_) => path.to_path_buf(),
-    }
-}
-
-fn failed(repo: &Path, error: &str) -> RepoStatus {
-    RepoStatus {
-        name: repo
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-        path: repo.to_path_buf(),
-        error: Some(error.to_string()),
-        ..Default::default()
     }
 }
 
@@ -1062,7 +1249,10 @@ mod tests {
         let a = h.root.join("a");
         let updates = h.until_sweep_done();
         assert!(matches!(&updates[0], Update::Config(Ok(c)) if c.repos_dir() == h.root));
-        assert!(matches!(&updates[1], Update::Repos(r) if *r == vec![a.clone()]));
+        assert!(matches!(
+            &updates[1],
+            Update::Repos { repos: r, capped: None } if *r == vec![a.clone()]
+        ));
         assert!(matches!(&updates[2], Update::Mode(WatchMode::Events)));
         assert!(matches!(&updates[3], Update::SweepStarted));
         assert!(
@@ -1113,18 +1303,163 @@ mod tests {
         let a = h.root.join("a");
         let b = h.root.join("b");
         git(&h.root, &["init", "-q", "b"]);
-        let added = h.wait_for(WAIT, |u| matches!(u, Update::Repos(_)));
+        let added = h.wait_for(WAIT, |u| matches!(u, Update::Repos { .. }));
         assert!(
-            matches!(&added, Some(Update::Repos(r)) if *r == vec![a.clone(), b.clone()]),
+            matches!(&added, Some(Update::Repos { repos: r, .. }) if *r == vec![a.clone(), b.clone()]),
             "{added:?}"
         );
         // Moving it out of the root is a removal there, and works on every OS
         // without fighting read-only object files.
         std::fs::rename(&b, h.dir.join("b-moved")).unwrap();
-        let removed = h.wait_for(WAIT, |u| matches!(u, Update::Repos(_)));
+        let removed = h.wait_for(WAIT, |u| matches!(u, Update::Repos { .. }));
         assert!(
-            matches!(&removed, Some(Update::Repos(r)) if *r == vec![a.clone()]),
+            matches!(&removed, Some(Update::Repos { repos: r, .. }) if *r == vec![a.clone()]),
             "{removed:?}"
+        );
+    }
+
+    #[test]
+    fn finds_repos_cloned_deeper_down() {
+        let h = Harness::new(
+            "deep",
+            |root| {
+                init_repo(&root.join("a"));
+                std::fs::create_dir_all(root.join("group")).unwrap();
+            },
+            |_| {},
+        );
+        h.settle();
+        let a = h.root.join("a");
+        let b = h.root.join("group").join("b");
+        git(
+            &h.root.join("group"),
+            &["clone", "-q", a.to_str().unwrap(), "b"],
+        );
+        let repos = h.wait_for(WAIT, |u| matches!(u, Update::Repos { .. }));
+        assert!(
+            matches!(&repos, Some(Update::Repos { repos: r, .. }) if *r == vec![a.clone(), b.clone()]),
+            "{repos:?}"
+        );
+        let status = h
+            .status("group/b", WAIT)
+            .expect("the new repo was never checked");
+        let sep = std::path::MAIN_SEPARATOR;
+        assert_eq!(status.name, format!("group{sep}b"));
+        assert!(!status.dirty, "{status:?}");
+        // Its edits route to it.
+        std::fs::write(b.join("README"), "changed\n").unwrap();
+        let status = h.status("group/b", WAIT).expect("no status after an edit");
+        assert!(status.dirty, "{status:?}");
+
+        // A folder and a repo inside it at once, before any rediscovery:
+        // the folder's own event is enough.
+        let c = h.root.join("fresh").join("x").join("c");
+        std::fs::create_dir_all(c.parent().unwrap()).unwrap();
+        git(c.parent().unwrap(), &["init", "-q", "c"]);
+        let found = h.wait_for(
+            WAIT,
+            |u| matches!(u, Update::Repos { repos, .. } if repos.contains(&c)),
+        );
+        assert!(found.is_some(), "a repo three levels down was not found");
+    }
+
+    #[test]
+    fn churn_outside_repos_runs_no_git() {
+        let h = Harness::new(
+            "churn",
+            |root| {
+                init_repo(&root.join("a"));
+                std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+                std::fs::create_dir_all(root.join("docs/x/y")).unwrap();
+            },
+            |_| {},
+        );
+        h.settle();
+        for i in 0..20 {
+            // Inside a skipped folder, below the depth limit, and plain files.
+            std::fs::create_dir_all(h.root.join(format!("node_modules/pkg/d{i}"))).unwrap();
+            std::fs::create_dir_all(h.root.join(format!("docs/x/y/z{i}"))).unwrap();
+            std::fs::write(h.root.join(format!("docs/x/n{i}.txt")), "x").unwrap();
+        }
+        let updates = h.collect(Duration::from_millis(2500));
+        assert!(started(&updates).is_empty(), "{updates:?}");
+        assert!(
+            !updates.iter().any(|u| matches!(u, Update::Repos { .. })),
+            "{updates:?}"
+        );
+    }
+
+    #[test]
+    fn steady_folder_churn_still_finds_new_repos() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let h = Harness::new(
+            "steady",
+            |root| {
+                init_repo(&root.join("a"));
+                std::fs::create_dir_all(root.join("tmp")).unwrap();
+            },
+            |_| {},
+        );
+        h.settle();
+        // A folder appearing every 200ms: each one asks for a walk, and
+        // each would push a purely trailing window back again.
+        let stop = Arc::new(AtomicBool::new(false));
+        let churn = {
+            let (stop, tmp) = (stop.clone(), h.root.join("tmp"));
+            thread::spawn(move || {
+                let mut i = 0;
+                while !stop.load(Ordering::Relaxed) && i < 150 {
+                    let _ = std::fs::create_dir(tmp.join(format!("d{i}")));
+                    i += 1;
+                    thread::sleep(Duration::from_millis(200));
+                }
+            })
+        };
+        thread::sleep(Duration::from_millis(500));
+        let b = h.root.join("b");
+        git(&h.root, &["init", "-q", "b"]);
+        let found = h.wait_for(
+            REPOSET_MAX_WAIT + WAIT,
+            |u| matches!(u, Update::Repos { repos, .. } if repos.contains(&b)),
+        );
+        stop.store(true, Ordering::Relaxed);
+        churn.join().unwrap();
+        assert!(found.is_some(), "the new repo waited for the churn to stop");
+    }
+
+    #[test]
+    fn depth_change_rediscovers() {
+        let h = Harness::new(
+            "depth",
+            |root| {
+                init_repo(&root.join("a"));
+                init_repo(&root.join("group").join("b"));
+            },
+            |c| c.depth = 1,
+        );
+        let a = h.root.join("a");
+        let b = h.root.join("group").join("b");
+        let first = h.wait_for(WAIT, |u| matches!(u, Update::Repos { .. }));
+        assert!(
+            matches!(&first, Some(Update::Repos { repos: r, .. }) if *r == vec![a.clone()]),
+            "{first:?}"
+        );
+        h.settle();
+        let mut config = Config::load_or_create(&h.config_file).unwrap();
+        config.depth = 2;
+        write_config(&h.config_file, &config);
+        let repos = h.wait_for(WAIT, |u| matches!(u, Update::Repos { .. }));
+        assert!(
+            matches!(&repos, Some(Update::Repos { repos: r, .. }) if *r == vec![a.clone(), b.clone()]),
+            "{repos:?}"
+        );
+        let sweep = h.until_sweep_done();
+        assert!(
+            sweep
+                .iter()
+                .any(|u| matches!(u, Update::Started { repo, fetch: true } if *repo == b)),
+            "{sweep:?}"
         );
     }
 
@@ -1259,9 +1594,9 @@ mod tests {
         let mut config = Config::load_or_create(&h.config_file).unwrap();
         config.path = other.to_string_lossy().into_owned();
         write_config(&h.config_file, &config);
-        let repos = h.wait_for(WAIT, |u| matches!(u, Update::Repos(_)));
+        let repos = h.wait_for(WAIT, |u| matches!(u, Update::Repos { .. }));
         assert!(
-            matches!(&repos, Some(Update::Repos(r)) if *r == vec![b.clone()]),
+            matches!(&repos, Some(Update::Repos { repos: r, .. }) if *r == vec![b.clone()]),
             "{repos:?}"
         );
         let sweep = h.until_sweep_done();
@@ -1339,9 +1674,9 @@ mod tests {
         let (a, b) = (h.root.join("a"), h.root.join("b"));
         init_repo(&b);
         h.send(Command::RefreshAll);
-        let repos = h.wait_for(WAIT, |u| matches!(u, Update::Repos(_)));
+        let repos = h.wait_for(WAIT, |u| matches!(u, Update::Repos { .. }));
         assert!(
-            matches!(&repos, Some(Update::Repos(r)) if *r == vec![a.clone(), b.clone()]),
+            matches!(&repos, Some(Update::Repos { repos: r, .. }) if *r == vec![a.clone(), b.clone()]),
             "{repos:?}"
         );
         let sweep = h.until_sweep_done();

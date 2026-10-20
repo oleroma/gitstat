@@ -134,9 +134,17 @@ fn run_once(args: &Args) -> i32 {
         }
     };
     let dir = config.repos_dir();
-    let statuses = git::check_all(&dir, args.fetch);
+    let found = git::find_repos(&dir, config.depth());
+    if let Some(capped) = &found.capped {
+        eprintln!("The repo list is incomplete: {capped}.");
+    }
+    let statuses = git::check_all(&dir, &found.repos, args.fetch);
     if statuses.is_empty() {
-        println!("No git repos found in {}", dir.display());
+        println!(
+            "No git repos found in {} (depth {})",
+            dir.display(),
+            config.depth()
+        );
     }
     let width = statuses
         .iter()

@@ -35,6 +35,10 @@ pub struct Entry {
     pub created_ini: bool,
     /// The folder already had ReadOnly or System, so reverting leaves it.
     pub had_readonly: bool,
+    /// The [`ICON_VERSION`] desktop.ini points at. Ledgers from before the
+    /// field read 0, so their folders move to the new artwork once.
+    #[serde(default)]
+    pub icon_version: u32,
 }
 
 impl Ledger {
@@ -137,10 +141,18 @@ pub fn plan(ledger: &Ledger, statuses: &[RepoStatus], enabled: bool, probe: &dyn
             let view = local_view(s);
             let (state, tip) = (FolderState::of(&view), tip(&view));
             // `git clean -X` removes desktop.ini without telling the ledger.
-            if entry.is_some_and(|e| e.state == state && e.tip == tip && probe.ini_present(path)) {
+            // A new ICON_VERSION means new file names to point at.
+            if entry.is_some_and(|e| {
+                e.state == state
+                    && e.tip == tip
+                    && e.icon_version == ICON_VERSION
+                    && probe.ini_present(path)
+            }) {
                 continue;
             }
-            if !probe.eligible(path) {
+            // A drive root (`D:\` as the root and a repo itself) has no
+            // folder icon to replace.
+            if path.parent().is_none() || !probe.eligible(path) {
                 if entry.is_some() {
                     ops.push(Op::Revert(path.clone()));
                 }
@@ -701,6 +713,7 @@ mod shell {
                     None if adopted => false,
                     None => folder_attrs & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM) != 0,
                 },
+                icon_version: ICON_VERSION,
             };
             // Record first, so a crash mid-write still leaves something to revert.
             if prev.is_none() {
@@ -1003,6 +1016,7 @@ mod tests {
                     tip: tip(s),
                     created_ini: true,
                     had_readonly: false,
+                    icon_version: ICON_VERSION,
                 },
             );
         }
@@ -1047,6 +1061,23 @@ mod tests {
     }
 
     #[test]
+    fn new_icon_version_is_reapplied_once() {
+        let (a, b) = (repo("a"), repo("b"));
+        let mut ledger = ledger_of(&[a.clone(), b.clone()]);
+        ledger.entries.get_mut(&key(&a.path)).unwrap().icon_version = ICON_VERSION - 1;
+        let fake = Fake::default();
+        assert_eq!(
+            plan(&ledger, &[a.clone(), b.clone()], true, &fake),
+            vec![apply(&a)]
+        );
+        // A ledger written before the field existed reads as version 0.
+        let old = r#"{ "entries": { "x": { "path": "x", "state": "synced", "tip": "t",
+            "created_ini": true, "had_readonly": false } } }"#;
+        let old: Ledger = serde_json::from_str(old).unwrap();
+        assert_eq!(old.entries["x"].icon_version, 0);
+    }
+
+    #[test]
     fn missing_ini_is_reapplied() {
         let a = repo("a");
         let ledger = ledger_of(std::slice::from_ref(&a));
@@ -1057,6 +1088,19 @@ mod tests {
         assert_eq!(
             plan(&ledger, std::slice::from_ref(&a), true, &fake),
             vec![apply(&a)]
+        );
+    }
+
+    #[test]
+    fn drive_root_is_never_given_an_icon() {
+        let root = RepoStatus {
+            path: PathBuf::from(if cfg!(windows) { "D:\\" } else { "/" }),
+            ..repo("root")
+        };
+        let fake = Fake::default();
+        assert_eq!(
+            plan(&Ledger::default(), std::slice::from_ref(&root), true, &fake),
+            vec![Op::Skip(root.path.clone(), SKIP_INELIGIBLE)]
         );
     }
 

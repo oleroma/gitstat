@@ -2,7 +2,7 @@
 //! the `Router` classifies paths, the `Debouncer` decides when to check.
 
 use notify::EventKind;
-use notify::event::ModifyKind;
+use notify::event::{CreateKind, ModifyKind, RemoveKind};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -18,6 +18,9 @@ pub const MIN_GAP: Duration = Duration::from_secs(2);
 /// A watcher overflow (rescan) checks every repo at most this often.
 pub const RESCAN_MIN_GAP: Duration = Duration::from_secs(10);
 pub const REPOSET_QUIET: Duration = Duration::from_secs(1);
+/// Folder churn that never pauses still gets a rediscovery this long after
+/// its first event (or after the walk gap, if that ends later).
+pub const REPOSET_MAX_WAIT: Duration = Duration::from_secs(5);
 pub const CONFIG_QUIET: Duration = Duration::from_millis(300);
 
 /// What an event means for the repo it belongs to.
@@ -63,21 +66,49 @@ impl Keyed {
 
 pub struct Router {
     root: String,
+    /// How many levels below the root the repo walk looks.
+    depth: usize,
     config_file: String,
     routes: Vec<Keyed>,
+    /// Folders the walk didn't enter, folded (see `Discovery::pruned`).
+    pruned: HashSet<String>,
+    /// Folders the walk went into, folded (see `Discovery::entered`).
+    entered: HashSet<String>,
+    /// A cap cut the last walk short: events outside the listed repos
+    /// can't make the next walk find more, so only sweeps look again.
+    capped: bool,
+    /// Whether a path that just appeared is a folder (or a link to one).
+    is_folder: fn(&Path) -> bool,
 }
 
 impl Router {
-    pub fn new(root: PathBuf, config_file: PathBuf) -> Self {
+    pub fn new(root: PathBuf, depth: usize, config_file: PathBuf) -> Self {
         Self {
             root: key(&root),
+            depth,
             config_file: key(&config_file),
             routes: Vec::new(),
+            pruned: HashSet::new(),
+            entered: HashSet::new(),
+            capped: false,
+            is_folder: folder_on_disk,
         }
     }
 
     pub fn set_repos(&mut self, routes: Vec<RepoRoute>) {
         self.routes = routes.into_iter().map(Keyed::new).collect();
+    }
+
+    pub fn set_pruned(&mut self, pruned: &[PathBuf]) {
+        self.pruned = pruned.iter().map(|p| key(p)).collect();
+    }
+
+    pub fn set_entered(&mut self, entered: &[PathBuf]) {
+        self.entered = entered.iter().map(|p| key(p)).collect();
+    }
+
+    pub fn set_capped(&mut self, capped: bool) {
+        self.capped = capped;
     }
 
     pub fn set_ignored(&mut self, repo: &Path, ignored: Vec<String>) {
@@ -100,11 +131,12 @@ impl Router {
         }
         let rel_root = under(&p, &self.root);
 
-        // `<x>/.git` appearing or going away adds or removes a repo.
+        // `<dir>/.git` appearing or going away adds or removes a repo. With
+        // the list capped, only for a listed repo.
         if let Some(rel) = rel_root
-            && let Some((_, name)) = rel.split_once('/')
-            && name.eq_ignore_ascii_case(".git")
             && structural(kind)
+            && self.is_repo_marker(rel)
+            && (!self.capped || self.repo_of(&p).is_some())
         {
             out.push((None, Class::RepoSet));
             return out;
@@ -118,8 +150,20 @@ impl Router {
         let Some(rel) = rel_root.filter(|rel| !rel.is_empty()) else {
             return out;
         };
-        let Some((_, rest)) = rel.split_once('/') else {
-            // A top-level folder or file. Modify is only attributes or
+        let Some(route) = self.repo_of(&p) else {
+            // Outside every repo only the folder tree the walk sees matters:
+            // a folder appearing, going or renamed there may hold a repo.
+            let class = if !self.capped && self.walked(rel) && self.folder_change(path, &p, kind) {
+                Class::RepoSet
+            } else {
+                Class::Ignore
+            };
+            out.push((None, class));
+            return out;
+        };
+        let inner = under(&p, &route.path).unwrap_or_default();
+        if inner.is_empty() {
+            // The repo folder itself. Modify is only attributes or
             // timestamps, such as our own PathMakeSystemFolder.
             let class = if structural(kind) {
                 Class::RepoSet
@@ -128,26 +172,91 @@ impl Router {
             };
             out.push((None, class));
             return out;
+        }
+        // Our own folder-icon writes, and a linked worktree's `.git` file.
+        let class = if inner.eq_ignore_ascii_case("desktop.ini")
+            || inner.eq_ignore_ascii_case(".git")
+            || is_ignored(route, inner)
+        {
+            Class::Ignore
+        } else {
+            Class::Worktree
         };
-        let route = self
+        out.push((Some(route.route.path.clone()), class));
+        out
+    }
+
+    /// Whether a structural event at `path` (folded: `p`, outside every
+    /// repo) may be a folder appearing or going. Windows reports every
+    /// removal, and a creation whose path is already gone, without saying
+    /// what it was, and renames don't say on any OS. So: a folder the walk
+    /// went into going away (or being renamed away), or a path appearing
+    /// (or renamed into place) that is a folder now.
+    fn folder_change(&self, path: &Path, p: &str, kind: &EventKind) -> bool {
+        use notify::event::RenameMode;
+        let known = || self.entered.contains(p);
+        let appeared = || (self.is_folder)(path);
+        match kind {
+            EventKind::Create(CreateKind::Folder) => true,
+            EventKind::Create(CreateKind::File) | EventKind::Remove(RemoveKind::File) => false,
+            EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
+                appeared()
+            }
+            EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(RenameMode::From)) => known(),
+            // A rename of unknown direction (or both paths of one), or
+            // anything at all.
+            EventKind::Any | EventKind::Modify(ModifyKind::Name(_)) => known() || appeared(),
+            _ => false,
+        }
+    }
+
+    /// The repo `p` is in or is, by the longest repo path that holds it.
+    fn repo_of(&self, p: &str) -> Option<&Keyed> {
+        self.routes
+            .iter()
+            .filter(|r| under(p, &r.path).is_some())
+            .max_by_key(|r| r.path.len())
+    }
+
+    /// Whether `rel` (below the root) is a folder's `.git` that the walk
+    /// would look for: the folder is the root or a level the walk reaches,
+    /// and not inside a repo (the repo itself is fine: its `.git` going
+    /// away removes it).
+    fn is_repo_marker(&self, rel: &str) -> bool {
+        let dir = if rel.eq_ignore_ascii_case(".git") {
+            ""
+        } else {
+            match rel.rsplit_once('/') {
+                Some((dir, name)) if name.eq_ignore_ascii_case(".git") => dir,
+                _ => return false,
+            }
+        };
+        if dir.is_empty() {
+            return true;
+        }
+        let full = format!("{}/{dir}", self.root.trim_end_matches('/'));
+        let inside_repo = self
             .routes
             .iter()
-            .filter(|r| under(&p, &r.path).is_some())
-            .max_by_key(|r| r.path.len());
-        let repo = route.map(|r| r.route.path.clone());
-        let class = match route {
-            // Our own folder-icon writes, and a linked worktree's `.git` file.
-            _ if rest.eq_ignore_ascii_case("desktop.ini") || rest.eq_ignore_ascii_case(".git") => {
-                Class::Ignore
-            }
-            Some(route) if is_ignored(route, under(&p, &route.path).unwrap_or_default()) => {
-                Class::Ignore
-            }
-            Some(_) => Class::Worktree,
-            None => Class::Ignore,
-        };
-        out.push((repo, class));
-        out
+            .any(|r| under(&full, &r.path).is_some_and(|inner| !inner.is_empty()));
+        !inside_repo && self.walked(dir)
+    }
+
+    /// Whether the repo walk lists `rel` (below the root, not inside a
+    /// repo): it is at most `depth` levels down, and every folder above it
+    /// is one the walk enters. Its own name doesn't matter, since a folder
+    /// holding `.git` is a repo whatever it is called.
+    fn walked(&self, rel: &str) -> bool {
+        if rel.split('/').count() > self.depth {
+            return false;
+        }
+        let root = self.root.trim_end_matches('/');
+        rel.match_indices('/').all(|(end, _)| {
+            let parent = &rel[..end];
+            let name = parent.rsplit('/').next().unwrap_or(parent);
+            crate::git::walks_into(name)
+                && (self.pruned.is_empty() || !self.pruned.contains(&format!("{root}/{parent}")))
+        })
     }
 
     /// Classifies a path inside some repo's git dir or common dir. Common-dir
@@ -180,6 +289,11 @@ impl Router {
         }
         Some(targets.into_iter().map(|t| (Some(t), class)).collect())
     }
+}
+
+/// A folder, or a link that may point at one, as found on disk now.
+fn folder_on_disk(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir() || m.file_type().is_symlink())
 }
 
 fn structural(kind: &EventKind) -> bool {
@@ -559,13 +673,21 @@ impl Debouncer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use notify::event::{CreateKind, DataChange, MetadataKind, RemoveKind, RenameMode};
+    use notify::event::{DataChange, MetadataKind, RenameMode};
 
     const MODIFY: EventKind = EventKind::Modify(ModifyKind::Data(DataChange::Content));
     const ATTRIB: EventKind = EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any));
     const CREATE: EventKind = EventKind::Create(CreateKind::Any);
     const REMOVE: EventKind = EventKind::Remove(RemoveKind::Any);
     const RENAME: EventKind = EventKind::Modify(ModifyKind::Name(RenameMode::To));
+    const RENAME_FROM: EventKind = EventKind::Modify(ModifyKind::Name(RenameMode::From));
+    const RENAME_ANY: EventKind = EventKind::Modify(ModifyKind::Name(RenameMode::Any));
+
+    /// Test paths don't exist: a name with an extension is a file, the rest
+    /// are folders.
+    fn fake_folder(path: &Path) -> bool {
+        path.extension().is_none()
+    }
 
     fn route(path: &str, git_dir: &str, common_dir: &str) -> RepoRoute {
         RepoRoute {
@@ -578,7 +700,8 @@ mod tests {
 
     /// `/dev` holds repo `r`, its linked worktree `wt`, and `gitstat` with the config.
     fn router() -> Router {
-        let mut router = Router::new("/dev".into(), "/dev/gitstat/config.json".into());
+        let mut router = Router::new("/dev".into(), 3, "/dev/gitstat/config.json".into());
+        router.is_folder = fake_folder;
         router.set_repos(vec![
             route("/dev/r", "/dev/r/.git", "/dev/r/.git"),
             route("/dev/wt", "/dev/r/.git/worktrees/wt", "/dev/r/.git"),
@@ -688,7 +811,7 @@ mod tests {
 
     #[test]
     fn git_dir_outside_the_root() {
-        let mut router = Router::new("/dev".into(), "/cfg/config.json".into());
+        let mut router = Router::new("/dev".into(), 3, "/cfg/config.json".into());
         router.set_repos(vec![route(
             "/dev/wt",
             "/elsewhere/main/.git/worktrees/wt",
@@ -712,7 +835,9 @@ mod tests {
 
     #[test]
     fn top_level_and_repo_set() {
-        let router = router();
+        let mut router = router();
+        // A folder the last walk went into, so its removal counts.
+        router.set_entered(&[PathBuf::from("/dev/new")]);
         for kind in [CREATE, REMOVE, RENAME] {
             assert_eq!(
                 classes(&router, "/dev/new", kind),
@@ -753,6 +878,258 @@ mod tests {
         );
     }
 
+    /// `/d` (a whole drive, say) with repos at depths 1, 2 and 3.
+    fn deep_router(depth: usize) -> Router {
+        let mut router = Router::new("/d".into(), depth, "/cfg/config.json".into());
+        router.is_folder = fake_folder;
+        // What the walk went into at depth 3.
+        router.set_entered(&[
+            PathBuf::from("/d/dev"),
+            PathBuf::from("/d/dev/grp"),
+            PathBuf::from("/d/old"),
+        ]);
+        router.set_repos(vec![
+            route("/d/a", "/d/a/.git", "/d/a/.git"),
+            route("/d/dev/b", "/d/dev/b/.git", "/d/dev/b/.git"),
+            route("/d/dev/grp/c", "/d/dev/grp/c/.git", "/d/dev/grp/c/.git"),
+        ]);
+        router
+    }
+
+    const NEW_DIR: EventKind = EventKind::Create(CreateKind::Folder);
+    const NEW_FILE: EventKind = EventKind::Create(CreateKind::File);
+    const GONE_FILE: EventKind = EventKind::Remove(RemoveKind::File);
+    const GONE_DIR: EventKind = EventKind::Remove(RemoveKind::Folder);
+
+    #[test]
+    fn routes_repos_at_any_depth() {
+        let router = deep_router(3);
+        assert_eq!(
+            classes(&router, "/d/dev/grp/c/src/main.rs", MODIFY),
+            one("/d/dev/grp/c", Class::Worktree)
+        );
+        assert_eq!(
+            classes(&router, "/d/dev/grp/c/.git/HEAD", MODIFY),
+            one("/d/dev/grp/c", Class::GitMeta)
+        );
+        assert_eq!(
+            classes(&router, "/d/dev/grp/c/.git/refs/remotes/o/m", RENAME),
+            one("/d/dev/grp/c", Class::RemoteRefs)
+        );
+        assert_eq!(
+            classes(&router, "/d/dev/b/deep/er/x.rs", CREATE),
+            one("/d/dev/b", Class::Worktree)
+        );
+        assert_eq!(
+            classes(&router, "/d/dev/b/desktop.ini", CREATE),
+            one("/d/dev/b", Class::Ignore)
+        );
+        // A repo folder's own attributes (our folder icon) don't count.
+        assert_eq!(
+            classes(&router, "/d/dev/grp/c", ATTRIB),
+            vec![(None, Class::Ignore)]
+        );
+        // `c2` only shares a prefix with `c`.
+        assert_eq!(
+            classes(&router, "/d/dev/grp/c2/x", MODIFY),
+            vec![(None, Class::Ignore)]
+        );
+        // Longest prefix wins, should a repo ever sit inside another.
+        let mut nested = deep_router(3);
+        let mut routes: Vec<RepoRoute> = nested.routes().cloned().collect();
+        routes.push(route(
+            "/d/dev/b/inner",
+            "/d/dev/b/inner/.git",
+            "/d/dev/b/inner/.git",
+        ));
+        nested.set_repos(routes);
+        assert_eq!(
+            classes(&nested, "/d/dev/b/inner/f", MODIFY),
+            one("/d/dev/b/inner", Class::Worktree)
+        );
+        assert_eq!(
+            classes(&nested, "/d/dev/b/f", MODIFY),
+            one("/d/dev/b", Class::Worktree)
+        );
+    }
+
+    #[test]
+    fn repo_set_at_depth() {
+        let router = deep_router(3);
+        let repo_set = vec![(None, Class::RepoSet)];
+        let ignore = vec![(None, Class::Ignore)];
+        // Folders appearing at levels 1 to 3, whatever their name.
+        for kind in [CREATE, NEW_DIR, RENAME, RENAME_ANY] {
+            for path in [
+                "/d/new",
+                "/d/dev/new",
+                "/d/dev/grp/new",
+                "/d/dev/node_modules",
+                "/d/dev/.config",
+            ] {
+                assert_eq!(classes(&router, path, kind), repo_set, "{path} {kind:?}");
+            }
+        }
+        // Folders the walk went into going away; others can't take a repo
+        // with them (a repo is routed, see below).
+        for kind in [REMOVE, GONE_DIR, RENAME_FROM, RENAME_ANY] {
+            for path in ["/d/dev", "/d/dev/grp", "/d/old"] {
+                assert_eq!(classes(&router, path, kind), repo_set, "{path} {kind:?}");
+            }
+        }
+        for kind in [REMOVE, GONE_DIR, RENAME_FROM] {
+            for path in ["/d/dev/new", "/d/dev/node_modules", "/d/dev/grp/x"] {
+                assert_eq!(classes(&router, path, kind), ignore, "{path} {kind:?}");
+            }
+        }
+        for kind in [CREATE, NEW_DIR, REMOVE, RENAME] {
+            // Known repos coming and going, and `.git` at levels 0 to 3.
+            for path in [
+                "/d/a",
+                "/d/dev/grp/c",
+                "/d/.git",
+                "/d/new/.git",
+                "/d/dev/new/.git",
+                "/d/dev/grp/new/.git",
+                "/d/dev/grp/c/.git",
+                "/d/dev/node_modules/.git",
+            ] {
+                assert_eq!(classes(&router, path, kind), repo_set, "{path} {kind:?}");
+            }
+            // Too deep, inside a skipped folder, or inside a repo.
+            for path in [
+                "/d/dev/grp/new/x",
+                "/d/dev/grp/new/deeper/.git",
+                "/d/dev/node_modules/pkg",
+                "/d/dev/node_modules/pkg/.git",
+                "/d/Target/x",
+                "/d/.cache/x",
+                "/d/.cache/x/.git",
+                "/d/$Recycle.Bin/S-1-5",
+                "/d/dev/new/.git/HEAD",
+            ] {
+                assert_eq!(classes(&router, path, kind), ignore, "{path} {kind:?}");
+            }
+            assert_eq!(
+                classes(&router, "/d/dev/grp/c/sub/.git", kind),
+                one("/d/dev/grp/c", Class::Worktree),
+                "{kind:?}"
+            );
+        }
+        // Files don't make repos, however they are reported: Windows says
+        // Remove(Any) for every removal and Create(Any) when the file is
+        // already gone, and renames don't say on any OS.
+        for kind in [
+            NEW_FILE,
+            GONE_FILE,
+            MODIFY,
+            CREATE,
+            REMOVE,
+            RENAME,
+            RENAME_FROM,
+            RENAME_ANY,
+        ] {
+            assert_eq!(
+                classes(&router, "/d/dev/notes.txt", kind),
+                ignore,
+                "{kind:?}"
+            );
+            assert_eq!(
+                classes(&router, "/d/Downloads/x.crdownload", kind),
+                ignore,
+                "{kind:?}"
+            );
+        }
+        // A worktree `.git` file is created as a file.
+        assert_eq!(classes(&router, "/d/dev/wt/.git", NEW_FILE), repo_set);
+
+        // At depth 1 only the root's own folders count, as before.
+        let shallow = deep_router(1);
+        assert_eq!(classes(&shallow, "/d/dev", NEW_DIR), repo_set);
+        assert_eq!(classes(&shallow, "/d/dev/new", NEW_DIR), ignore);
+        assert_eq!(classes(&shallow, "/d/new/.git", NEW_DIR), repo_set);
+        assert_eq!(classes(&shallow, "/d/dev/new/.git", NEW_DIR), ignore);
+        // The repos deeper down still route.
+        assert_eq!(
+            classes(&shallow, "/d/dev/grp/c/x", MODIFY),
+            one("/d/dev/grp/c", Class::Worktree)
+        );
+    }
+
+    #[test]
+    fn pruned_folders_are_ignored() {
+        let mut router = deep_router(3);
+        router.set_pruned(&[PathBuf::from("/d/link"), PathBuf::from("/d/dev/Hidden")]);
+        let ignore = vec![(None, Class::Ignore)];
+        for path in ["/d/link/x", "/d/link/x/.git", "/d/dev/Hidden/r"] {
+            assert_eq!(classes(&router, path, NEW_DIR), ignore, "{path}");
+        }
+        // The folder itself may be replaced by a plain one. Its removal
+        // can't take a repo with it: the walk didn't go in.
+        assert_eq!(
+            classes(&router, "/d/link", NEW_DIR),
+            vec![(None, Class::RepoSet)]
+        );
+        assert_eq!(classes(&router, "/d/link", REMOVE), ignore);
+        router.set_pruned(&[]);
+        assert_eq!(
+            classes(&router, "/d/link/x", NEW_DIR),
+            vec![(None, Class::RepoSet)]
+        );
+    }
+
+    #[test]
+    fn capped_walk_ignores_what_it_did_not_list() {
+        let mut router = deep_router(3);
+        router.set_capped(true);
+        let ignore = vec![(None, Class::Ignore)];
+        let repo_set = vec![(None, Class::RepoSet)];
+        // Repo 501 (unlisted), or a folder past the folder cap.
+        for (path, kind) in [
+            ("/d/dev/r501/target", NEW_DIR),
+            ("/d/dev/r501/x.rs", REMOVE),
+            ("/d/dev/new", NEW_DIR),
+            ("/d/dev", REMOVE),
+            ("/d/dev/new/.git", NEW_DIR),
+            ("/d/.git", NEW_DIR),
+        ] {
+            assert_eq!(classes(&router, path, kind), ignore, "{path}");
+        }
+        // A listed repo going away may make room for another.
+        assert_eq!(classes(&router, "/d/dev/grp/c", REMOVE), repo_set);
+        assert_eq!(classes(&router, "/d/dev/grp/c/.git", REMOVE), repo_set);
+        assert_eq!(
+            classes(&router, "/d/a/x", MODIFY),
+            one("/d/a", Class::Worktree)
+        );
+        router.set_capped(false);
+        assert_eq!(classes(&router, "/d/dev/new", NEW_DIR), repo_set);
+    }
+
+    #[test]
+    fn root_that_is_a_repo() {
+        let mut router = Router::new("/r".into(), 3, "/cfg/config.json".into());
+        router.set_repos(vec![route("/r", "/r/.git", "/r/.git")]);
+        assert_eq!(
+            classes(&router, "/r/src/x", NEW_DIR),
+            one("/r", Class::Worktree)
+        );
+        assert_eq!(
+            classes(&router, "/r/.git/index", MODIFY),
+            one("/r", Class::GitMeta)
+        );
+        // A nested repo is part of the worktree; the root's own `.git` isn't.
+        assert_eq!(
+            classes(&router, "/r/sub/.git", NEW_DIR),
+            one("/r", Class::Worktree)
+        );
+        assert_eq!(
+            classes(&router, "/r/.git", REMOVE),
+            vec![(None, Class::RepoSet)]
+        );
+        assert_eq!(classes(&router, "/r", REMOVE), vec![]);
+    }
+
     #[test]
     fn our_own_writes_are_ignored() {
         let router = router();
@@ -783,7 +1160,7 @@ mod tests {
                 (Some("/dev/gitstat".into()), Class::Worktree)
             ]
         );
-        let outside = Router::new("/dev".into(), "/cfg/config.json".into());
+        let outside = Router::new("/dev".into(), 3, "/cfg/config.json".into());
         assert_eq!(
             classes(&outside, "/cfg/config.json", RENAME),
             vec![(None, Class::Config)]
@@ -831,7 +1208,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn case_and_separators_on_windows() {
-        let mut router = Router::new(r"D:\Dev".into(), "d:/dev/gitstat/CONFIG.json".into());
+        let mut router = Router::new(r"D:\Dev".into(), 3, "d:/dev/gitstat/CONFIG.json".into());
         router.set_repos(vec![
             route(r"D:\Dev\r", "D:/Dev/r/.git", "D:/Dev/r/.git"),
             route(
@@ -867,6 +1244,27 @@ mod tests {
         assert_eq!(
             classes(&router, r"d:\dev\X\.Git", CREATE),
             vec![(None, Class::RepoSet)]
+        );
+        // A whole drive as the root.
+        let mut drive = Router::new(r"D:\".into(), 3, r"D:\dev\gitstat\config.json".into());
+        drive.is_folder = fake_folder;
+        drive.set_repos(vec![route(r"D:\Dev\r", "D:/Dev/r/.git", "D:/Dev/r/.git")]);
+        drive.set_pruned(&[PathBuf::from(r"D:\ProgramData")]);
+        assert_eq!(
+            classes(&drive, r"d:\dev\R\src\x.rs", MODIFY),
+            one(r"D:\Dev\r", Class::Worktree)
+        );
+        assert_eq!(
+            classes(&drive, r"D:\Dev\Group\new", CREATE),
+            vec![(None, Class::RepoSet)]
+        );
+        assert_eq!(
+            classes(&drive, r"D:\programdata\x\y", CREATE),
+            vec![(None, Class::Ignore)]
+        );
+        assert_eq!(
+            classes(&drive, r"D:\$RECYCLE.BIN\S-1\x", CREATE),
+            vec![(None, Class::Ignore)]
         );
         assert!(same_path(Path::new(r"D:\Dev\"), Path::new("d:/dev")));
         assert!(is_within(Path::new(r"D:\Dev\x"), Path::new("d:/dev")));

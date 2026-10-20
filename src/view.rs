@@ -293,6 +293,7 @@ impl Render for StatusView {
                 checking: sweeping,
                 has_result: state.has_result,
                 problem: problem.as_deref(),
+                incomplete: state.capped.is_some(),
             },
             unsynced,
         )
@@ -436,6 +437,15 @@ impl Render for StatusView {
         }
 
         let empty = state.has_result && state.statuses.is_empty() && problem.is_none();
+        let empty_text = match state.config.depth() {
+            1 => "No git repos directly inside this folder. Set \"path\" or \"depth\" in \
+                  config.json."
+                .to_string(),
+            depth => format!(
+                "No git repos in this folder, down to {depth} levels below it. Set \"path\" or \
+                 \"depth\" in config.json."
+            ),
+        };
         let list = div()
             .id("repos")
             .flex()
@@ -446,9 +456,7 @@ impl Render for StatusView {
             .bg(p.surface)
             .children(rows)
             .when(empty, |list| {
-                list.child(div().p_4().text_sm().text_color(p.muted).child(
-                    "No git repos directly inside this folder. Set \"path\" in config.json.",
-                ))
+                list.child(div().p_4().text_sm().text_color(p.muted).child(empty_text))
             });
 
         let config_file: PathBuf = state.config_file.clone();
@@ -475,6 +483,11 @@ impl Render for StatusView {
             .border_color(p.border)
             .text_xs()
             .text_color(p.muted);
+        // The cap message, e.g. "showing the first 500 repos found".
+        let capped = state
+            .capped
+            .as_ref()
+            .map(|c| format!("Repo list incomplete: {c}"));
         let footer = match mode {
             Mode::Panel => {
                 let skips = state.folder_skips.len();
@@ -485,6 +498,9 @@ impl Render for StatusView {
                             .flex_col()
                             .min_w_0()
                             .child(div().truncate().child(mode_text(&state.mode)))
+                            .when_some(capped, |d, capped| {
+                                d.child(div().truncate().text_color(p.amber).child(capped))
+                            })
                             .when(skips > 0, |d| {
                                 d.child(
                                     div()
@@ -496,7 +512,13 @@ impl Render for StatusView {
                     .child(edit_config)
             }
             Mode::Window => footer
-                .child("Click a repo to open its folder")
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .when_some(capped.clone(), |d, _| d.text_color(p.amber))
+                        .child(capped.unwrap_or_else(|| "Click a repo to open its folder".into())),
+                )
                 .child(edit_config),
         };
 

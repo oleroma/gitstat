@@ -14,6 +14,9 @@ serde_json = "1"
 notify = { version = "=9.0.0-rc.6", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
+# Rasterizes the tray icon's digits from Segoe UI. Pure Rust; no variable
+# fonts needed (segoeuib.ttf and seguisb.ttf are static).
+ab_glyph = { version = "0.2.32", default-features = false, features = ["std"] }
 gpui = "0.2.2"
 tray-icon = "0.26"
 futures = "0.3"
@@ -36,6 +39,11 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[dev-dependencies]
+# icon.rs is tested on Linux too; there the font is missing and the vector
+# fallback draws the digits.
+ab_glyph = { version = "0.2.32", default-features = false, features = ["std"] }
 
 [profile.release]
 lto = "thin"

@@ -170,6 +170,19 @@ fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
                     Some(ClickAction::Menu) | None => {}
                 }
             }
+            Input::OverlayMoved(rect) => {
+                let (corner, x, y) = overlay::drop_position(rect);
+                change_setting(
+                    |c| {
+                        c.overlay.corner = corner;
+                        c.overlay.offset_x = Some(x);
+                        c.overlay.offset_y = Some(y);
+                    },
+                    cx,
+                );
+                overlay::drop_saved(cx);
+                changed = true;
+            }
             input @ (Input::Tray(_) | Input::Menu(_)) => {
                 let Some(action) = cx.global::<Shared>().tray.map(&input) else {
                     continue;
@@ -184,6 +197,8 @@ fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
     if changed {
         state.update(cx, |_, cx| cx.notify());
         update_outputs(statuses_changed, cx);
+    } else {
+        cx.global_mut::<Shared>().tray.check_icon_size();
     }
     // Monitor updates arrive at least every interval, badge or not.
     view::hide_keepalive_if_shown(cx);
@@ -208,12 +223,14 @@ fn on_update(update: Update, cx: &mut App) -> (bool, bool) {
             state.update(cx, |s, _| s.config_error = Some(config_problem(&e)));
             (true, false)
         }
-        Update::Repos(repos) => state.update(cx, |s, _| {
+        Update::Repos { repos, capped } => state.update(cx, |s, _| {
             let before = s.statuses.len();
             s.statuses.retain(|st| repos.contains(&st.path));
             s.in_flight.retain(|p| repos.contains(p));
             let removed = s.statuses.len() != before;
-            (removed, removed)
+            let capped_changed = s.capped != capped;
+            s.capped = capped;
+            (removed || capped_changed, removed)
         }),
         Update::Started { repo, .. } => {
             state.update(cx, |s, _| s.in_flight.insert(repo));
@@ -254,6 +271,7 @@ fn update_outputs(statuses_changed: bool, cx: &mut App) {
             checking: s.sweeping,
             has_result: s.has_result,
             problem: problem.as_deref(),
+            incomplete: s.capped.is_some(),
         });
         if statuses_changed && s.has_result {
             shared.icons.sync(s.statuses.clone(), s.config.folder_icons);
@@ -293,7 +311,15 @@ fn on_action(action: TrayAction, cx: &mut App) -> bool {
         }
         TrayAction::Toggle(Setting::FolderIcons) if !cfg.folder_icons => ask_folder_icons(cx),
         TrayAction::Toggle(setting) => change_setting(|c| setting.toggle(c), cx),
-        TrayAction::SetCorner(corner) => change_setting(|c| c.overlay.corner = corner, cx),
+        // A corner from the menu drops any dragged offset: margin from both edges.
+        TrayAction::SetCorner(corner) => change_setting(
+            |c| {
+                c.overlay.corner = corner;
+                c.overlay.offset_x = None;
+                c.overlay.offset_y = None;
+            },
+            cx,
+        ),
         TrayAction::SetAutostart(enabled) => {
             if let Err(e) = crate::autostart::set_enabled(enabled) {
                 crate::error_box(format!("Couldn't change the startup setting: {e}"));

@@ -1,5 +1,6 @@
 //! Fetching repos and working out how each one compares to its upstream.
 
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{OnceLock, mpsc};
@@ -71,23 +72,221 @@ impl RepoStatus {
     }
 }
 
-/// Every direct subfolder of `parent` that is a git repo, sorted by name.
-pub fn find_repos(parent: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(parent) else {
-        return Vec::new();
-    };
-    let mut repos: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.join(".git").exists())
-        .collect();
-    repos.sort_by_key(|p| file_name(p).to_lowercase());
-    repos
+/// How deep `find_repos` looks by default, and the most it will.
+pub const DEFAULT_DEPTH: usize = 3;
+pub const MAX_DEPTH: usize = 8;
+/// A walk stops after examining this many folders...
+const MAX_DIRS: usize = 50_000;
+/// ...or finding this many repos, and says so.
+const MAX_REPOS: usize = 500;
+
+/// Folders the walk never descends into: build output, package caches and
+/// system folders, where repos don't live and churn is heavy. Compared
+/// case-insensitively. A folder holding `.git` is still a repo whatever its
+/// name, so a repo called `build` or `bin` isn't lost.
+const SKIP_DIRS: [&str; 13] = [
+    // `$RECYCLE.BIN` on older Windows; the comparison ignores case.
+    "$recycle.bin",
+    "system volume information",
+    "node_modules",
+    "target",
+    "build",
+    "dist",
+    "out",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "vendor",
+    "bin",
+    "obj",
+];
+
+/// The repos `find_repos` found, and why it stopped early if it did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Discovery {
+    /// Sorted by name (see [`repo_name`]), case-insensitively.
+    pub repos: Vec<PathBuf>,
+    /// Set when a cap cut the walk short, so the list may be incomplete.
+    pub capped: Option<String>,
+    /// Folders above `depth` the walk didn't enter for a reason an event
+    /// path doesn't show: links, and on Windows hidden, system and other
+    /// reparse-point folders. The watcher ignores what happens inside them.
+    pub pruned: Vec<PathBuf>,
+    /// The folders below `root` the walk went into. Only removing or
+    /// renaming one of these can take repos away, so the watcher ignores
+    /// other removals (which Windows doesn't say are files or folders).
+    pub entered: Vec<PathBuf>,
 }
 
-/// Checks every repo under `parent`, fetching first when `fetch` is set.
-pub fn check_all(parent: &Path, fetch: bool) -> Vec<RepoStatus> {
-    let repos = find_repos(parent);
+/// Every git repo in `root` or up to `depth` levels below it (1: direct
+/// subfolders only), breadth-first. A repo is a folder holding `.git` (a
+/// folder, or a file for a linked worktree); repos are not descended into,
+/// so nested repos and submodules are not listed. If `root` is itself a repo
+/// it is the only one.
+///
+/// Never descended into: names starting with `.` or in [`SKIP_DIRS`],
+/// symlinks and junctions (no cycles), on Windows hidden or system folders
+/// and other reparse points (OneDrive placeholders), and folders that can't
+/// be read.
+pub fn find_repos(root: &Path, depth: usize) -> Discovery {
+    find_repos_capped(root, depth, MAX_DIRS, MAX_REPOS)
+}
+
+fn find_repos_capped(root: &Path, depth: usize, max_dirs: usize, max_repos: usize) -> Discovery {
+    let depth = depth.clamp(1, MAX_DEPTH);
+    let mut found: Vec<(PathBuf, bool)> = Vec::new();
+    let mut capped = None;
+    let mut pruned = Vec::new();
+    let mut entered = Vec::new();
+    if is_repo(root) {
+        found.push((root.to_path_buf(), false));
+    } else {
+        let mut queue = VecDeque::from([(root.to_path_buf(), 1)]);
+        let mut visited = 0;
+        'walk: while let Some((dir, level)) = queue.pop_front() {
+            // Unreadable (access denied, gone meanwhile): skipped silently.
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Some(link) = folder_kind(&entry) else {
+                    continue;
+                };
+                visited += 1;
+                if visited > max_dirs {
+                    capped = Some(format!(
+                        "stopped looking after {max_dirs} folders; lower \"depth\" or \
+                         point \"path\" at a smaller folder"
+                    ));
+                    break 'walk;
+                }
+                let path = entry.path();
+                if is_repo(&path) {
+                    if found.len() == max_repos {
+                        capped = Some(format!("showing the first {max_repos} repos found"));
+                        break 'walk;
+                    }
+                    found.push((path, link));
+                } else if level < depth && walks_into(&entry.file_name().to_string_lossy()) {
+                    if !link && plain_folder(&entry) {
+                        entered.push(path.clone());
+                        queue.push_back((path, level + 1));
+                    } else {
+                        pruned.push(path);
+                    }
+                }
+            }
+        }
+    }
+    let mut repos = drop_linked_duplicates(found);
+    repos.sort_by_cached_key(|p| repo_name(root, p).to_lowercase());
+    Discovery {
+        repos,
+        capped,
+        pruned,
+        entered,
+    }
+}
+
+fn is_repo(dir: &Path) -> bool {
+    dir.join(".git").exists()
+}
+
+/// `Some(is_link)` for a folder or a link that may point at one (a
+/// dangling link too), `None` for anything else, a link to a file included.
+fn folder_kind(entry: &std::fs::DirEntry) -> Option<bool> {
+    let kind = entry.file_type().ok()?;
+    // On Windows a junction is a symlink here too.
+    if !kind.is_symlink() {
+        return kind.is_dir().then_some(false);
+    }
+    #[cfg(windows)]
+    {
+        // From the directory listing: junctions and folder links are
+        // symlink_dir. Following the link could block on an offline share.
+        use std::os::windows::fs::FileTypeExt;
+        (!kind.is_symlink_file()).then_some(true)
+    }
+    #[cfg(not(windows))]
+    {
+        match std::fs::metadata(entry.path()) {
+            Ok(meta) if !meta.is_dir() => None,
+            _ => Some(true),
+        }
+    }
+}
+
+/// A folder that isn't hidden, system or another kind of reparse point.
+/// Always true off Windows, where hidden is the leading `.` [`walks_into`]
+/// already checks.
+fn plain_folder(entry: &std::fs::DirEntry) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SYSTEM,
+        };
+        // From the directory listing itself: no extra file-system call.
+        let skip = FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_REPARSE_POINT;
+        entry
+            .metadata()
+            .is_ok_and(|meta| meta.file_attributes() & skip == 0)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = entry;
+        true
+    }
+}
+
+/// Whether the walk goes into a (non-repo) folder with this name, by name
+/// alone: what the watcher can tell from an event path.
+pub fn walks_into(name: &str) -> bool {
+    !name.starts_with('.') && !SKIP_DIRS.iter().any(|skip| name.eq_ignore_ascii_case(skip))
+}
+
+/// A link to a repo is listed (as at depth 1 before), unless the walk also
+/// found the repo it points at, or another link to it.
+fn drop_linked_duplicates(found: Vec<(PathBuf, bool)>) -> Vec<PathBuf> {
+    if !found.iter().any(|(_, link)| *link) {
+        return found.into_iter().map(|(path, _)| path).collect();
+    }
+    let real = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let mut seen: HashSet<PathBuf> = found
+        .iter()
+        .filter(|(_, link)| !link)
+        .map(|(path, _)| real(path))
+        .collect();
+    found
+        .into_iter()
+        .filter(|(path, link)| !link || seen.insert(real(path)))
+        .map(|(path, _)| path)
+        .collect()
+}
+
+/// A repo's display name: its path below `root` with the platform's
+/// separator (`dev\gitstat`), or the root's own name when it is the root.
+pub fn repo_name(root: &Path, repo: &Path) -> String {
+    match repo.strip_prefix(root) {
+        Ok(rel) if rel.as_os_str().is_empty() => {
+            let name = file_name(root);
+            if name.is_empty() {
+                root.display().to_string()
+            } else {
+                name
+            }
+        }
+        Ok(rel) => rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(std::path::MAIN_SEPARATOR_STR),
+        Err(_) => file_name(repo),
+    }
+}
+
+/// Checks `repos` (found under `root`), fetching first when `fetch` is set.
+pub fn check_all(root: &Path, repos: &[PathBuf], fetch: bool) -> Vec<RepoStatus> {
     let mut results: Vec<Option<RepoStatus>> = vec![None; repos.len()];
     let (tx, rx) = mpsc::channel();
     let mut next = 0;
@@ -95,15 +294,15 @@ pub fn check_all(parent: &Path, fetch: bool) -> Vec<RepoStatus> {
     while next < repos.len() || running > 0 {
         while running < MAX_PARALLEL && next < repos.len() {
             let tx = tx.clone();
-            let (index, repo) = (next, repos[next].clone());
+            let (index, base, repo) = (next, root.to_path_buf(), repos[next].clone());
             let spawned = thread::Builder::new().spawn(move || {
                 // Always report back, even if the check panics, so the loop can't wait forever.
-                let status = std::panic::catch_unwind(|| check_repo(&repo, fetch))
-                    .unwrap_or_else(|_| failed(&repo, "internal error"));
+                let status = std::panic::catch_unwind(|| check_repo(&base, &repo, fetch))
+                    .unwrap_or_else(|_| failed(&base, &repo, "internal error"));
                 let _ = tx.send((index, status));
             });
             if let Err(e) = spawned {
-                results[index] = Some(failed(&repos[index], &e.to_string()));
+                results[index] = Some(failed(root, &repos[index], &e.to_string()));
                 next += 1;
                 continue;
             }
@@ -119,17 +318,19 @@ pub fn check_all(parent: &Path, fetch: bool) -> Vec<RepoStatus> {
     results.into_iter().flatten().collect()
 }
 
-fn failed(repo: &Path, error: &str) -> RepoStatus {
+/// A repo whose check couldn't run.
+pub fn failed(root: &Path, repo: &Path, error: &str) -> RepoStatus {
     RepoStatus {
-        name: file_name(repo),
+        name: repo_name(root, repo),
         path: repo.to_path_buf(),
         error: Some(error.to_string()),
         ..Default::default()
     }
 }
 
-pub fn check_repo(repo: &Path, fetch: bool) -> RepoStatus {
-    check_repo_detailed(repo, fetch).0
+/// Checks `repo`, which `find_repos` found under `root` (for its name).
+pub fn check_repo(root: &Path, repo: &Path, fetch: bool) -> RepoStatus {
+    check_repo_detailed(root, repo, fetch).0
 }
 
 /// Like [`check_repo`], but also returns the ignored directory prefixes
@@ -137,9 +338,9 @@ pub fn check_repo(repo: &Path, fetch: bool) -> RepoStatus {
 ///
 /// A failed fetch still gets a local check, so the result carries fresh
 /// local state alongside the fetch error (`fetch_failed`).
-pub fn check_repo_detailed(repo: &Path, fetch: bool) -> (RepoStatus, Vec<String>) {
+pub fn check_repo_detailed(root: &Path, repo: &Path, fetch: bool) -> (RepoStatus, Vec<String>) {
     let mut status = RepoStatus {
-        name: file_name(repo),
+        name: repo_name(root, repo),
         path: repo.to_path_buf(),
         ..Default::default()
     };
@@ -778,14 +979,14 @@ mod tests {
             &["remote", "add", "origin", missing.to_str().unwrap()],
         );
         std::fs::write(repo.join("x.txt"), "x").unwrap();
-        let (status, _) = check_repo_detailed(&repo, true);
+        let (status, _) = check_repo_detailed(&root, &repo, true);
         assert!(status.fetch_failed && status.fetch_errored);
         assert!(status.error.as_deref().unwrap().starts_with("fetch failed"));
         assert!(status.dirty);
 
         // Both failing: no local state, but the fetch failure still shows.
         std::fs::write(repo.join(".git").join("index"), "garbage").unwrap();
-        let (status, _) = check_repo_detailed(&repo, true);
+        let (status, _) = check_repo_detailed(&root, &repo, true);
         let _ = std::fs::remove_dir_all(&root);
         assert!(!status.fetch_failed && status.fetch_errored, "{status:?}");
         assert!(status.error.as_deref().unwrap().starts_with("fetch failed"));
@@ -799,13 +1000,13 @@ mod tests {
         init_repo(&repo);
         run(&repo, &["config", "status.showUntrackedFiles", "no"]);
         std::fs::write(repo.join("new.txt"), "x").unwrap();
-        let clean = check_repo(&repo, false);
+        let clean = check_repo(&root, &repo, false);
         let file = repo.join("tracked.txt");
         std::fs::write(&file, "a").unwrap();
         run(&repo, &["add", "tracked.txt"]);
         commit(&repo, "c");
         std::fs::write(&file, "b").unwrap();
-        let dirty = check_repo(&repo, false);
+        let dirty = check_repo(&root, &repo, false);
         let _ = std::fs::remove_dir_all(&root);
         // The user's setting decides: untracked files don't count.
         assert_eq!(clean.error, None, "{clean:?}");
@@ -836,7 +1037,7 @@ mod tests {
         let mtime = || std::fs::metadata(&index).unwrap().modified().unwrap();
         let before = mtime();
 
-        let (status, _) = check_repo_detailed(&repo, false);
+        let (status, _) = check_repo_detailed(&root, &repo, false);
         let after_check = mtime();
         // Control: without GIT_OPTIONAL_LOCKS=0 the same status does write.
         thread::sleep(Duration::from_millis(20));
@@ -859,14 +1060,14 @@ mod tests {
         init_repo(&repo);
         std::fs::remove_dir_all(repo.join(".git").join("info")).unwrap_or_default();
         std::fs::write(repo.join("desktop.ini"), "[.ShellClassInfo]\r\n").unwrap();
-        assert!(check_repo(&repo, false).dirty);
+        assert!(check_repo(&root, &repo, false).dirty);
 
         assert_eq!(ensure_excluded(&repo, "/desktop.ini"), Ok(true));
         assert_eq!(ensure_excluded(&repo, "/desktop.ini"), Ok(false));
         let exclude = std::fs::read_to_string(repo.join(".git/info/exclude")).unwrap();
         assert_eq!(exclude, "# gitstat folder icon\n/desktop.ini\n");
         assert_eq!(output(&repo, &["status", "--porcelain"]), "");
-        assert!(!check_repo(&repo, false).dirty);
+        assert!(!check_repo(&root, &repo, false).dirty);
 
         // A linked worktree shares the main repo's info/exclude.
         let wt = root.join("wt");
@@ -933,6 +1134,227 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Makes each folder (relative to `root`) a repo, as far as discovery
+    /// can tell: it holds a `.git` folder.
+    fn fake_repos(root: &Path, repos: &[&str]) {
+        for repo in repos {
+            std::fs::create_dir_all(root.join(repo).join(".git")).unwrap();
+        }
+    }
+
+    fn names(root: &Path, found: &Discovery) -> Vec<String> {
+        found
+            .repos
+            .iter()
+            .map(|r| repo_name(root, r).replace(std::path::MAIN_SEPARATOR, "/"))
+            .collect()
+    }
+
+    #[test]
+    fn discovery_stops_at_depth() {
+        let root = temp_root("depth");
+        fake_repos(
+            &root,
+            &["a", "g/B", "g/h/c", "g/h/i/d", "g/h/i/j/k/l/m/n/e"],
+        );
+        std::fs::create_dir_all(root.join("empty/x/y")).unwrap();
+        std::fs::write(root.join("g/file.txt"), "x").unwrap();
+        let at = |depth| names(&root, &find_repos(&root, depth));
+        assert_eq!(at(1), ["a"]);
+        assert_eq!(at(2), ["a", "g/B"]);
+        assert_eq!(at(3), ["a", "g/B", "g/h/c"]);
+        assert_eq!(at(4), ["a", "g/B", "g/h/c", "g/h/i/d"]);
+        // Clamped to 1..=MAX_DEPTH.
+        assert_eq!(at(0), at(1));
+        assert_eq!(at(100), at(MAX_DEPTH));
+        assert_eq!(at(MAX_DEPTH).len(), 4, "e is 9 levels down");
+        let found = find_repos(&root, 3);
+        assert_eq!(found.capped, None);
+        assert!(found.pruned.is_empty(), "{:?}", found.pruned);
+        // Only folders above the last level are entered, repos never.
+        let mut entered = found.entered.clone();
+        entered.sort();
+        let expect = ["empty", "empty/x", "g", "g/h"].map(|p| root.join(p));
+        assert_eq!(entered, expect);
+        // Names use the platform's separator.
+        let sep = std::path::MAIN_SEPARATOR;
+        assert_eq!(repo_name(&root, &found.repos[2]), format!("g{sep}h{sep}c"));
+        assert!(find_repos(&root.join("missing"), 3).repos.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn discovery_sorts_by_relative_path_ignoring_case() {
+        let root = temp_root("sort");
+        fake_repos(&root, &["b", "apricot/y", "Apple/z", "C"]);
+        assert_eq!(
+            names(&root, &find_repos(&root, 2)),
+            ["Apple/z", "apricot/y", "b", "C"]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn discovery_skips_build_and_hidden_folders() {
+        let root = temp_root("skip");
+        fake_repos(
+            &root,
+            &[
+                "node_modules/pkg",
+                "web/node_modules/pkg",
+                "Target/x",
+                "build/x",
+                "dist/x",
+                "out/x",
+                ".venv/x",
+                "venv/x",
+                "__pycache__/x",
+                "vendor/x",
+                "BIN/x",
+                "obj/x",
+                "$RECYCLE.BIN/x",
+                "System Volume Information/x",
+                ".hidden/x",
+                "web/app",
+                // A repo is a repo whatever its name; it just isn't entered.
+                "dist",
+                ".dotfiles",
+            ],
+        );
+        assert_eq!(
+            names(&root, &find_repos(&root, 3)),
+            [".dotfiles", "dist", "web/app"]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn discovery_does_not_enter_repos() {
+        let root = temp_root("nested");
+        fake_repos(&root, &["r", "r/sub", "r/x/y", "g/r2", "g/r2/vendor/lib"]);
+        // A linked worktree's `.git` is a file.
+        std::fs::create_dir_all(root.join("g/wt")).unwrap();
+        std::fs::write(root.join("g/wt/.git"), "gitdir: /elsewhere\n").unwrap();
+        assert_eq!(names(&root, &find_repos(&root, 4)), ["g/r2", "g/wt", "r"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn root_that_is_a_repo_is_the_only_one() {
+        let root = temp_root("root-repo");
+        fake_repos(&root, &["", "a", "b/c"]);
+        let found = find_repos(&root, 3);
+        assert_eq!(found.repos, std::slice::from_ref(&root));
+        assert_eq!(repo_name(&root, &root), file_name(&root));
+        assert_eq!(repo_name(Path::new("/"), Path::new("/")), "/");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_survives_symlink_loops() {
+        use std::os::unix::fs::symlink;
+        let root = temp_root("links");
+        let outside = temp_root("links-outside");
+        fake_repos(&root, &["g/r"]);
+        fake_repos(&outside, &["ext", "deep/r"]);
+        // Loops: to the folder itself and to the root.
+        symlink(root.join("g"), root.join("g/loop")).unwrap();
+        symlink(&root, root.join("g/up")).unwrap();
+        // A second name for a repo the walk finds anyway: listed once.
+        symlink(root.join("g/r"), root.join("alias")).unwrap();
+        // A link to a repo elsewhere is listed, as at depth 1 before; a
+        // link to a folder of repos isn't entered.
+        symlink(outside.join("ext"), root.join("ext")).unwrap();
+        symlink(outside.join("deep"), root.join("deep")).unwrap();
+        symlink(root.join("missing"), root.join("dangling")).unwrap();
+        // Links to files are not folders: not counted, not pruned.
+        std::fs::write(root.join("g/file"), "x").unwrap();
+        symlink(root.join("g/file"), root.join("file-link")).unwrap();
+        symlink(root.join("g/file"), root.join("g/file-link")).unwrap();
+        let found = find_repos(&root, MAX_DEPTH);
+        assert_eq!(names(&root, &found), ["ext", "g/r"]);
+        let mut pruned = found.pruned.clone();
+        pruned.sort();
+        let mut expect = vec![
+            root.join("dangling"),
+            root.join("deep"),
+            root.join("g/loop"),
+            root.join("g/up"),
+        ];
+        expect.sort();
+        assert_eq!(pruned, expect);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_links_use_no_folder_budget() {
+        use std::os::unix::fs::symlink;
+        let root = temp_root("file-links");
+        fake_repos(&root, &["r"]);
+        std::fs::write(root.join("f"), "x").unwrap();
+        for i in 0..10 {
+            symlink(root.join("f"), root.join(format!("l{i}"))).unwrap();
+        }
+        // One folder allowed: the repo; the ten file links don't count.
+        let found = find_repos_capped(&root, 3, 1, 100);
+        assert_eq!(names(&root, &found), ["r"]);
+        assert_eq!(found.capped, None);
+        assert!(found.pruned.is_empty(), "{:?}", found.pruned);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn discovery_caps_say_so() {
+        let root = temp_root("caps");
+        fake_repos(&root, &["a", "b", "c", "g/d", "g/e"]);
+        std::fs::create_dir_all(root.join("h/i")).unwrap();
+        let all = find_repos_capped(&root, 3, 100, 100);
+        assert_eq!(all.repos.len(), 5);
+        assert_eq!(all.capped, None);
+
+        let few = find_repos_capped(&root, 3, 100, 2);
+        assert_eq!(few.repos.len(), 2);
+        assert!(few.capped.as_deref().unwrap().contains("first 2 repos"));
+
+        // 5 top-level folders, then g's two: the folder cap stops the walk.
+        let short = find_repos_capped(&root, 3, 5, 100);
+        assert!(short.repos.len() <= 5);
+        assert!(short.capped.as_deref().unwrap().contains("5 folders"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A drive-sized tree: about 5000 folders, 3 levels deep.
+    #[test]
+    fn discovery_of_5000_folders_is_fast() {
+        let root = temp_root("big");
+        for a in 0..10 {
+            for b in 0..20 {
+                for c in 0..25 {
+                    let dir = root.join(format!("a{a}/b{b}/c{c}"));
+                    std::fs::create_dir_all(&dir).unwrap();
+                    if c == 0 {
+                        std::fs::create_dir(dir.join(".git")).unwrap();
+                    }
+                }
+            }
+        }
+        // Churn the walk must not enter.
+        for a in 0..10 {
+            std::fs::create_dir_all(root.join(format!("a{a}/node_modules/x/y"))).unwrap();
+        }
+        let started = Instant::now();
+        let found = find_repos(&root, 3);
+        let took = started.elapsed();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(found.repos.len(), 200);
+        assert_eq!(found.capped, None);
+        eprintln!("walked ~5200 folders in {took:?}");
+        assert!(took < Duration::from_secs(1), "{took:?}");
+    }
+
     #[test]
     fn detects_every_state() {
         let root = std::env::temp_dir().join(format!("gitstat-test-{}", std::process::id()));
@@ -973,7 +1395,9 @@ mod tests {
         commit(&noup, "e");
         std::fs::create_dir_all(dev.join("not-a-repo")).unwrap();
 
-        let statuses = check_all(&dev, true);
+        let found = find_repos(&dev, 1);
+        assert_eq!(found.capped, None);
+        let statuses = check_all(&dev, &found.repos, true);
         // The pre-2.16 fallback must agree with the porcelain v2 parser.
         for s in &statuses {
             let v2 = local_status(&s.path, true).unwrap();
