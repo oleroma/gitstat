@@ -50,7 +50,16 @@ impl Config {
 
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn interval(&self) -> std::time::Duration {
-        std::time::Duration::from_secs_f64(self.interval_minutes.max(1.0) * 60.0)
+        std::time::Duration::from_secs_f64(clamp_minutes(self.interval_minutes) * 60.0)
+    }
+}
+
+/// 1 minute to 1 day; NaN and junk fall back to the default.
+fn clamp_minutes(minutes: f64) -> f64 {
+    if minutes.is_finite() {
+        minutes.clamp(1.0, 1440.0)
+    } else {
+        Config::default().interval_minutes
     }
 }
 

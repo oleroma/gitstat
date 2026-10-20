@@ -86,7 +86,8 @@ impl AppState {
                 state.has_result = true;
                 state.checking = false;
                 state.last_checked = Some(local_time());
-                state.next_check = Instant::now() + state.config.interval();
+                let now = Instant::now();
+                state.next_check = now.checked_add(state.config.interval()).unwrap_or(now);
                 cx.notify();
             })
             .ok();
@@ -108,7 +109,7 @@ pub fn run(config_file: PathBuf) {
         let tray = match Tray::new() {
             Ok(tray) => tray,
             Err(e) => {
-                crate::error_box(&format!("Couldn't create the tray icon: {e}"));
+                let _ = crate::error_box(format!("Couldn't create the tray icon: {e}")).join();
                 cx.quit();
                 return;
             }
@@ -177,13 +178,14 @@ fn tick(cx: &mut App) -> bool {
             TrayAction::OpenRepo(path) => cx.open_with_system(&path),
             TrayAction::SetAutostart(enabled) => {
                 if let Err(e) = crate::autostart::set_enabled(enabled) {
-                    crate::error_box(&format!("Couldn't change the startup setting: {e}"));
+                    crate::error_box(format!("Couldn't change the startup setting: {e}"));
                 }
                 cx.global::<Shared>()
                     .tray
                     .set_autostart_checked(crate::autostart::is_enabled());
             }
             TrayAction::Quit => {
+                cx.global::<Shared>().tray.hide();
                 cx.quit();
                 return false;
             }

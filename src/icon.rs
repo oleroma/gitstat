@@ -14,6 +14,8 @@ pub enum Badge {
     Checking,
     AllSynced,
     Unsynced(usize),
+    /// Bad config or a missing folder.
+    Problem,
 }
 
 /// 5×7 glyphs, one row per byte, high bit on the left.
@@ -30,6 +32,7 @@ fn glyph(c: char) -> [u8; 7] {
         '8' => [0x70, 0x88, 0x88, 0x70, 0x88, 0x88, 0x70],
         '9' => [0x70, 0x88, 0x88, 0x78, 0x08, 0x10, 0x60],
         '+' => [0x00, 0x20, 0x20, 0xF8, 0x20, 0x20, 0x00],
+        '!' => [0x20, 0x20, 0x20, 0x20, 0x20, 0x00, 0x20],
         '…' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xA8],
         _ => [0; 7],
     }
@@ -64,6 +67,10 @@ pub fn render(badge: Badge) -> Vec<u8> {
             ];
             draw_polyline(&mut fg, n, &points, 3.6 * s);
             GREEN
+        }
+        Badge::Problem => {
+            draw_text(&mut fg, n, "!");
+            RED
         }
         Badge::Unsynced(count) => {
             let text = if count > 99 {
@@ -169,6 +176,7 @@ mod tests {
             Badge::Unsynced(3),
             Badge::Unsynced(42),
             Badge::Unsynced(150),
+            Badge::Problem,
         ] {
             let px = render(badge);
             assert_eq!(px.len(), (SIZE * SIZE * 4) as usize);

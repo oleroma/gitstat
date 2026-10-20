@@ -90,9 +90,17 @@ pub fn check_all(parent: &Path, fetch: bool) -> Vec<RepoStatus> {
         while running < MAX_PARALLEL && next < repos.len() {
             let tx = tx.clone();
             let (index, repo) = (next, repos[next].clone());
-            thread::spawn(move || {
-                let _ = tx.send((index, check_repo(&repo, fetch)));
+            let spawned = thread::Builder::new().spawn(move || {
+                // Always report back, even if the check panics, so the loop can't wait forever.
+                let status = std::panic::catch_unwind(|| check_repo(&repo, fetch))
+                    .unwrap_or_else(|_| failed(&repo, "internal error"));
+                let _ = tx.send((index, status));
             });
+            if let Err(e) = spawned {
+                results[index] = Some(failed(&repos[index], &e.to_string()));
+                next += 1;
+                continue;
+            }
             next += 1;
             running += 1;
         }
@@ -103,6 +111,15 @@ pub fn check_all(parent: &Path, fetch: bool) -> Vec<RepoStatus> {
         running -= 1;
     }
     results.into_iter().flatten().collect()
+}
+
+fn failed(repo: &Path, error: &str) -> RepoStatus {
+    RepoStatus {
+        name: file_name(repo),
+        path: repo.to_path_buf(),
+        error: Some(error.to_string()),
+        ..Default::default()
+    }
 }
 
 pub fn check_repo(repo: &Path, fetch: bool) -> RepoStatus {
@@ -190,10 +207,8 @@ fn git(repo: &Path, args: &[&str], timeout: Duration) -> Result<Output, String> 
     })?;
 
     // Drain the pipes on helper threads so a chatty git can't block on a full pipe.
-    let mut stdout = child.stdout.take();
-    let mut stderr = child.stderr.take();
-    let out_reader = thread::spawn(move || read_all(stdout.as_mut()));
-    let err_reader = thread::spawn(move || read_all(stderr.as_mut()));
+    let stdout = spawn_reader(child.stdout.take());
+    let stderr = spawn_reader(child.stderr.take());
 
     let deadline = Instant::now() + timeout;
     let exit = loop {
@@ -208,19 +223,27 @@ fn git(repo: &Path, args: &[&str], timeout: Duration) -> Result<Output, String> 
             Err(e) => return Err(e.to_string()),
         }
     };
+    // Something git started (an ssh master, a credential helper) can keep the
+    // pipes open after git exits, so don't wait on them for long.
+    let collect =
+        |rx: mpsc::Receiver<Vec<u8>>| rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
     Ok(Output {
         status: exit,
-        stdout: out_reader.join().unwrap_or_default(),
-        stderr: err_reader.join().unwrap_or_default(),
+        stdout: collect(stdout),
+        stderr: collect(stderr),
     })
 }
 
-fn read_all(pipe: Option<&mut impl std::io::Read>) -> Vec<u8> {
-    let mut buf = Vec::new();
-    if let Some(pipe) = pipe {
-        let _ = pipe.read_to_end(&mut buf);
-    }
-    buf
+fn spawn_reader(pipe: Option<impl std::io::Read + Send + 'static>) -> mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        let _ = tx.send(buf);
+    });
+    rx
 }
 
 fn file_name(path: &Path) -> String {

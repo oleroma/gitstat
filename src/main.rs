@@ -54,12 +54,11 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn main() {
-    #[cfg(windows)]
-    attach_parent_console();
-
     let args = match parse_args() {
         Ok(args) => args,
         Err(message) => {
+            #[cfg(windows)]
+            attach_parent_console();
             if !message.is_empty() {
                 eprintln!("{message}\n");
             }
@@ -69,13 +68,18 @@ fn main() {
     };
 
     if args.once || cfg!(not(windows)) {
+        #[cfg(windows)]
+        attach_parent_console();
         std::process::exit(run_once(&args));
     }
 
     #[cfg(windows)]
     {
         if !single_instance() {
-            error_box("gitstat is already running. Look for its icon in the notification area.");
+            let _ = error_box(
+                "gitstat is already running. Look for its icon in the notification area.".into(),
+            )
+            .join();
             return;
         }
         app::run(args.config_file);
@@ -111,7 +115,8 @@ fn run_once(args: &Args) -> i32 {
 }
 
 /// A release build has no console of its own; reuse the terminal it was
-/// started from so `--once` and `--help` can print.
+/// started from so `--once` and `--help` can print. Only for those: a tray
+/// app attached to a terminal dies when that terminal closes.
 #[cfg(windows)]
 fn attach_parent_console() {
     use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
@@ -132,17 +137,23 @@ fn single_instance() -> bool {
     !handle.is_null() && unsafe { GetLastError() } != ERROR_ALREADY_EXISTS
 }
 
+/// Shows a warning on its own thread. A message box on the main thread would
+/// pump GPUI's queued tasks while the app is borrowed, and panic.
 #[cfg(windows)]
-pub fn error_box(message: &str) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONWARNING, MB_OK, MessageBoxW};
-    let text: Vec<u16> = message.encode_utf16().chain(Some(0)).collect();
-    let title: Vec<u16> = "gitstat".encode_utf16().chain(Some(0)).collect();
-    unsafe {
-        MessageBoxW(
-            std::ptr::null_mut(),
-            text.as_ptr(),
-            title.as_ptr(),
-            MB_OK | MB_ICONWARNING,
-        )
+pub fn error_box(message: String) -> std::thread::JoinHandle<()> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MB_ICONWARNING, MB_OK, MB_SETFOREGROUND, MessageBoxW,
     };
+    std::thread::spawn(move || {
+        let text: Vec<u16> = message.encode_utf16().chain(Some(0)).collect();
+        let title: Vec<u16> = "gitstat".encode_utf16().chain(Some(0)).collect();
+        unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                text.as_ptr(),
+                title.as_ptr(),
+                MB_OK | MB_ICONWARNING | MB_SETFOREGROUND,
+            )
+        };
+    })
 }

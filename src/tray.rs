@@ -2,9 +2,8 @@
 
 use crate::git::RepoStatus;
 use crate::icon::{self, Badge};
-use std::collections::HashMap;
 use std::path::PathBuf;
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 /// Something the user did in the tray.
@@ -16,14 +15,21 @@ pub enum TrayAction {
     Quit,
 }
 
+/// The menu is built once and changed in place. Replacing it with
+/// `set_menu` while it's open would destroy the menu the user is looking at.
 pub struct Tray {
     icon: TrayIcon,
     badge: Badge,
-    show_id: MenuId,
-    refresh_id: MenuId,
+    tooltip: String,
+    menu: Menu,
+    summary: MenuItem,
+    /// One item per repo, inserted after `summary` and its separator.
+    repos: Vec<(MenuItem, PathBuf, String)>,
+    no_repos: MenuItem,
+    show: MenuItem,
+    refresh: MenuItem,
     autostart: CheckMenuItem,
-    quit_id: MenuId,
-    repo_ids: HashMap<MenuId, PathBuf>,
+    quit: MenuItem,
 }
 
 /// What the tray needs to know to redraw itself.
@@ -34,43 +40,65 @@ pub struct TraySnapshot<'a> {
     pub problem: Option<&'a str>,
 }
 
+/// Menu positions: summary, separator, then the repo items.
+const FIRST_REPO: usize = 2;
+
 impl Tray {
     pub fn new() -> Result<Self, String> {
+        let menu = Menu::new();
+        let summary = MenuItem::new("gitstat: checking…", false, None);
+        let no_repos = MenuItem::new("Checking repos…", false, None);
+        let show = MenuItem::new("Show status window", true, None);
+        let refresh = MenuItem::new("Checking…", false, None);
+        let autostart = CheckMenuItem::new(
+            "Start with Windows",
+            true,
+            crate::autostart::is_enabled(),
+            None,
+        );
+        let quit = MenuItem::new("Quit", true, None);
+        menu.append_items(&[
+            &summary,
+            &PredefinedMenuItem::separator(),
+            &no_repos,
+            &PredefinedMenuItem::separator(),
+            &show,
+            &refresh,
+            &autostart,
+            &PredefinedMenuItem::separator(),
+            &quit,
+        ])
+        .map_err(|e| e.to_string())?;
+
         let icon = TrayIconBuilder::new()
             .with_tooltip("gitstat: checking…")
             .with_icon(make_icon(Badge::Checking))
+            .with_menu(Box::new(menu.clone()))
             .with_menu_on_left_click(false)
             .build()
             .map_err(|e| e.to_string())?;
-        let mut tray = Self {
+        Ok(Self {
             icon,
             badge: Badge::Checking,
-            show_id: MenuId::new("show"),
-            refresh_id: MenuId::new("refresh"),
-            autostart: CheckMenuItem::with_id(
-                "autostart",
-                "Start with Windows",
-                true,
-                crate::autostart::is_enabled(),
-                None,
-            ),
-            quit_id: MenuId::new("quit"),
-            repo_ids: HashMap::new(),
-        };
-        tray.update(&TraySnapshot {
-            statuses: &[],
-            checking: true,
-            has_result: false,
-            problem: None,
-        });
-        Ok(tray)
+            tooltip: String::new(),
+            menu,
+            summary,
+            repos: Vec::new(),
+            no_repos,
+            show,
+            refresh,
+            autostart,
+            quit,
+        })
     }
 
     pub fn update(&mut self, snap: &TraySnapshot) {
         let unsynced = snap.statuses.iter().filter(|s| !s.is_synced()).count();
         let badge = if !snap.has_result {
             Badge::Checking
-        } else if unsynced == 0 && snap.problem.is_none() {
+        } else if snap.problem.is_some() {
+            Badge::Problem
+        } else if unsynced == 0 {
             Badge::AllSynced
         } else {
             Badge::Unsynced(unsynced)
@@ -81,44 +109,55 @@ impl Tray {
         }
 
         let summary = summary(snap, unsynced);
-        // The tooltip is capped at 127 characters by Windows.
+        // Windows caps tooltips at 127 characters.
         let tooltip: String = format!("gitstat: {summary}").chars().take(127).collect();
-        let _ = self.icon.set_tooltip(Some(tooltip));
+        if tooltip != self.tooltip {
+            let _ = self.icon.set_tooltip(Some(&tooltip));
+            self.tooltip = tooltip;
+        }
+        set_text(&self.summary, &summary.replace('&', "&&"));
+        set_text(
+            &self.refresh,
+            if snap.checking {
+                "Checking…"
+            } else {
+                "Refresh now"
+            },
+        );
+        self.refresh.set_enabled(!snap.checking);
 
-        let menu = Menu::new();
-        let _ = menu.append(&MenuItem::new(summary, false, None));
-        let _ = menu.append(&PredefinedMenuItem::separator());
-        self.repo_ids.clear();
-        for (i, status) in snap.statuses.iter().enumerate() {
-            let id = MenuId::new(format!("repo:{i}"));
-            let text = format!("{}\t{}", status.name, status.label()).replace('&', "&&");
-            let _ = menu.append(&MenuItem::with_id(id.clone(), text, true, None));
-            self.repo_ids.insert(id, status.path.clone());
-        }
-        if !snap.statuses.is_empty() {
-            let _ = menu.append(&PredefinedMenuItem::separator());
-        }
-        let _ = menu.append(&MenuItem::with_id(
-            self.show_id.clone(),
-            "Show status window",
-            true,
-            None,
-        ));
-        let refresh_text = if snap.checking {
-            "Checking…"
+        // Repo items: keep the ones whose path is unchanged, so an open menu
+        // only sees its labels change.
+        let same_repos = self.repos.len() == snap.statuses.len()
+            && self
+                .repos
+                .iter()
+                .zip(snap.statuses)
+                .all(|((_, path, _), s)| *path == s.path);
+        if !same_repos && snap.has_result {
+            for (item, _, _) in self.repos.drain(..) {
+                let _ = self.menu.remove(&item);
+            }
+            let _ = self.menu.remove(&self.no_repos);
+            for (i, status) in snap.statuses.iter().enumerate() {
+                let item = MenuItem::new(repo_text(status), true, None);
+                let _ = self.menu.insert(&item, FIRST_REPO + i);
+                self.repos
+                    .push((item, status.path.clone(), repo_text(status)));
+            }
+            if snap.statuses.is_empty() {
+                set_text(&self.no_repos, "No repos found");
+                let _ = self.menu.insert(&self.no_repos, FIRST_REPO);
+            }
         } else {
-            "Refresh now"
-        };
-        let _ = menu.append(&MenuItem::with_id(
-            self.refresh_id.clone(),
-            refresh_text,
-            !snap.checking,
-            None,
-        ));
-        let _ = menu.append(&self.autostart);
-        let _ = menu.append(&PredefinedMenuItem::separator());
-        let _ = menu.append(&MenuItem::with_id(self.quit_id.clone(), "Quit", true, None));
-        self.icon.set_menu(Some(Box::new(menu)));
+            for ((item, _, text), status) in self.repos.iter_mut().zip(snap.statuses) {
+                let new_text = repo_text(status);
+                if *text != new_text {
+                    item.set_text(&new_text);
+                    *text = new_text;
+                }
+            }
+        }
     }
 
     /// Drains pending tray clicks and menu picks.
@@ -140,15 +179,17 @@ impl Tray {
         }
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             let id = event.id;
-            if id == self.show_id {
+            if id == *self.show.id() {
                 actions.push(TrayAction::ShowWindow);
-            } else if id == self.refresh_id {
+            } else if id == *self.refresh.id() {
                 actions.push(TrayAction::Refresh);
-            } else if id == self.quit_id {
+            } else if id == *self.quit.id() {
                 actions.push(TrayAction::Quit);
             } else if id == *self.autostart.id() {
                 actions.push(TrayAction::SetAutostart(self.autostart.is_checked()));
-            } else if let Some(path) = self.repo_ids.get(&id) {
+            } else if let Some((_, path, _)) =
+                self.repos.iter().find(|(item, _, _)| *item.id() == id)
+            {
                 actions.push(TrayAction::OpenRepo(path.clone()));
             }
         }
@@ -157,6 +198,12 @@ impl Tray {
 
     pub fn set_autostart_checked(&self, checked: bool) {
         self.autostart.set_checked(checked);
+    }
+
+    /// Removes the icon from the notification area right away. Otherwise it
+    /// lingers until the mouse passes over it.
+    pub fn hide(&self) {
+        let _ = self.icon.set_visible(false);
     }
 }
 
@@ -172,6 +219,17 @@ pub fn summary(snap: &TraySnapshot, unsynced: usize) -> String {
         (1, 0) => "the repo is current".to_string(),
         (total, 0) => format!("all {total} repos current"),
         (total, n) => format!("{n} of {total} repos unsynced"),
+    }
+}
+
+fn repo_text(status: &RepoStatus) -> String {
+    // A tab right-aligns the status in Windows menus; `&` would mark a mnemonic.
+    format!("{}\t{}", status.name, status.label()).replace('&', "&&")
+}
+
+fn set_text(item: &MenuItem, text: &str) {
+    if item.text() != text {
+        item.set_text(text);
     }
 }
 
