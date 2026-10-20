@@ -1,3 +1,13 @@
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./media/logo_light.svg">
+    <source media="(prefers-color-scheme: light)" srcset="./media/logo_dark.svg">
+    <!-- The fallback image for older browsers -->
+    <img alt="gitstat" src="./media/logo_light.svg" width="200">
+  </picture>
+  <br>
+</h1>
+
 # gitstat
 
 A Windows tray app that watches every git repo directly inside one folder and
