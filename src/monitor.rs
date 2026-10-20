@@ -1196,8 +1196,22 @@ mod tests {
                 .iter()
                 .any(|u| matches!(u, Update::Status(s) if s.path == a && s.is_synced()))
         );
+        // ReadDirectoryChangesW can deliver the fetch's own ref writes after
+        // it ends, which buys one local recheck (a push from a terminal looks
+        // the same). A loop would keep going, so the recheck must be the last.
         let updates = h.collect(Duration::from_secs(3));
-        assert!(started(&updates).is_empty(), "{updates:?}");
+        let rechecks = started(&updates);
+        assert!(
+            rechecks.len() <= 1
+                && rechecks
+                    .iter()
+                    .all(|u| matches!(u, Update::Started { fetch: false, .. })),
+            "{updates:?}"
+        );
+        if !rechecks.is_empty() {
+            let after = h.collect(Duration::from_secs(3));
+            assert!(started(&after).is_empty(), "{after:?}");
+        }
     }
 
     #[test]
