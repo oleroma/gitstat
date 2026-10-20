@@ -5,7 +5,7 @@ and shows at a glance whether they're in sync with their remotes.
 
 - **Green ✓**: every repo is current.
 - **Red with a number**: that many repos are unsynced.
-- **Click the icon** for the list: each repo with its status (`⬆2`, `⬇1`,
+- **Right-click the icon** (click it on macOS) for the list: each repo with its status (`⬆2`, `⬇1`,
   `diverged`, `dirty`, `no upstream`, `✓ current`), plus **Refresh now** and
   **Quit**. Clicking a repo opens its folder.
 
@@ -60,12 +60,22 @@ Replace `/path/to/gitstat` with where you cloned it.
 
 ### Windows
 
-1. Press `Win+R`, type `shell:startup`, press Enter.
-2. In that folder, right-click → New → Shortcut, and enter:
-   ```
-   pythonw.exe "C:\path\to\gitstat\gitstat.py"
-   ```
-   `pythonw` runs it without a console window.
+Run this once in PowerShell from the gitstat folder. It puts a shortcut in
+your Startup folder that launches gitstat with `pythonw`, which runs it
+without a console window:
+
+```powershell
+$pyw = (Get-Command pythonw).Source
+$lnk = (New-Object -ComObject WScript.Shell).CreateShortcut("$([Environment]::GetFolderPath('Startup'))\gitstat.lnk")
+$lnk.TargetPath = $pyw
+$lnk.Arguments = "`"$PWD\gitstat.py`""
+$lnk.WorkingDirectory = "$PWD"
+$lnk.Save()
+```
+
+To start it right away, double-click the new shortcut (`Win+R`,
+`shell:startup`). To stop it starting on login, delete that shortcut. If
+the icon lands in the hidden-icons overflow, drag it onto the taskbar.
 
 ### macOS
 
