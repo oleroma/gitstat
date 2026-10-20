@@ -28,12 +28,23 @@ pub struct Ui {
     pub input: UnboundedSender<Input>,
     /// Starts a fetch sweep now (the refresh buttons).
     pub refresh: Rc<dyn Fn(&mut App)>,
-    /// The never-shown keepalive window, which the overlay's timer hides
-    /// again if GPUI's display-change handling shows it.
+    /// The never-shown keepalive window, hidden again by
+    /// `hide_keepalive_if_shown` if GPUI's display-change handling shows it.
     pub keepalive: Option<isize>,
 }
 
 impl Global for Ui {}
+
+/// GPUI shows every window whose display went away, the never-shown
+/// keepalive included. It is parked off-screen, so this only tidies up.
+/// Win32 queries only; cheap enough for every input batch.
+pub fn hide_keepalive_if_shown(cx: &mut App) {
+    if let Some(k) = cx.try_global::<Ui>().and_then(|ui| ui.keepalive)
+        && win::is_visible(k)
+    {
+        cx.spawn(async move |_| unsafe { win::hide(k) }).detach();
+    }
+}
 
 #[derive(Default)]
 struct WindowSlot {

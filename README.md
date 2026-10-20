@@ -73,8 +73,9 @@ how many folders were skipped. The icon replaces the folder icon rather than
 adding a small overlay, and icons don't update while gitstat isn't running.
 
 To undo: untick the option, or quit gitstat and run
-`gitstat --remove-folder-icons`. Either restores every folder gitstat
-changed, from the list it keeps in `%LOCALAPPDATA%\gitstat\folder-icons.json`.
+`gitstat --remove-folder-icons`, which also turns the option off in
+config.json. Either restores every folder gitstat changed, from the list it
+keeps in `%LOCALAPPDATA%\gitstat\folder-icons.json`.
 
 The icons show in Explorer in every view and in the Files app. File Pilot is
 **unverified**: it uses the shell's icons, so it should show them, possibly
@@ -165,7 +166,7 @@ shows `fetch failed`, so use SSH keys or Git Credential Manager for those.
 gitstat --once                  print every repo's status and exit
 gitstat --once --no-fetch       same, without fetching first
 gitstat --config FILE           use another config file
-gitstat --remove-folder-icons   restore every folder that got a status icon, and exit
+gitstat --remove-folder-icons   turn folder icons off, restore every folder that got one, and exit
 ```
 
 `--once` exits with code 1 if any repo is unsynced. `--remove-folder-icons`

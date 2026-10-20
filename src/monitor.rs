@@ -42,9 +42,13 @@ pub enum WatchMode {
     Off,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     RefreshAll,
+    /// A config the app changed in memory, e.g. a menu toggle that
+    /// config.json (unparsable mid-edit) couldn't take. A later good reload
+    /// of the file replaces it, as it does in the app.
+    Apply(Config),
     Shutdown,
 }
 
@@ -144,6 +148,9 @@ struct Scheduler {
     repos: Vec<PathBuf>,
     /// The last status sent per repo, for `keep_fetch_error`.
     statuses: HashMap<PathBuf, RepoStatus>,
+    /// Linked worktrees whose git dirs couldn't be read; retried on every
+    /// rediscovery until they can.
+    unresolved: HashSet<PathBuf>,
     running: usize,
     /// Repos the current fetch sweep still waits for.
     sweep: HashSet<PathBuf>,
@@ -183,6 +190,7 @@ impl Scheduler {
             debouncer: Debouncer::default(),
             repos: Vec::new(),
             statuses: HashMap::new(),
+            unresolved: HashSet::new(),
             running: 0,
             sweep: HashSet::new(),
             sweeping: false,
@@ -228,6 +236,11 @@ impl Scheduler {
                     let now = Instant::now();
                     self.poll_config(now);
                     self.start_sweep(now);
+                }
+                Ok(Msg::Cmd(Command::Apply(config))) => {
+                    if config != self.config {
+                        self.apply_config(config, Instant::now());
+                    }
                 }
                 Ok(Msg::Fs(event)) => self.on_fs(event, Instant::now()),
                 Ok(Msg::Done(done)) => self.on_done(done, Instant::now()),
@@ -334,7 +347,12 @@ impl Scheduler {
 
     fn dispatch(&mut self, now: Instant) {
         let free = MAX_WORKERS.saturating_sub(self.running);
-        for (repo, need) in self.debouncer.due(now, free) {
+        let due = self.debouncer.due(now, free);
+        // A deferred rescan just ran; it may have missed new repos too.
+        if self.debouncer.take_rescanned() {
+            self.rediscover(false, now);
+        }
+        for (repo, need) in due {
             let fetch = need == Need::Fetch;
             let tx = self.tx.clone();
             let generation = self.generation;
@@ -386,10 +404,12 @@ impl Scheduler {
             ignored,
         } = done;
         self.running = self.running.saturating_sub(1);
+        // A check for an older root still held its repo; release it, then
+        // drop the result.
+        self.debouncer.finished(&repo, now);
         if generation != self.generation {
             return;
         }
-        self.debouncer.finished(&repo, need, now);
         if !self.repos.contains(&repo) {
             return;
         }
@@ -401,7 +421,8 @@ impl Scheduler {
             _ => status,
         };
         if need == Need::Fetch {
-            if status.fetch_failed {
+            // Even when the local status failed too: the fetch still did.
+            if status.fetch_errored {
                 let retry = self.retries.entry(repo.clone()).or_insert(Retry {
                     failures: 0,
                     at: None,
@@ -421,6 +442,9 @@ impl Scheduler {
     }
 
     fn start_sweep(&mut self, now: Instant) {
+        // Every sweep looks for new repos too: events can be dropped
+        // silently (network shares), and `watch: false` has none.
+        self.rediscover(false, now);
         if !self.sweeping {
             self.sweeping = true;
             self.emit(Update::SweepStarted);
@@ -447,11 +471,12 @@ impl Scheduler {
         }
     }
 
-    /// A Local check of every repo, and a fresh look for new ones.
+    /// A Local check of every repo, and a fresh look for new ones. Events
+    /// may have been missed (resume, no watch), so running checks rerun.
     fn local_sweep(&mut self, now: Instant) {
         self.rediscover(false, now);
         for repo in &self.repos {
-            self.debouncer.request(repo, Need::Local, now);
+            self.debouncer.recheck(repo, now);
         }
     }
 
@@ -524,14 +549,15 @@ impl Scheduler {
     fn apply_config(&mut self, config: Config, now: Instant) {
         let old = std::mem::replace(&mut self.config, config);
         let root = self.config.repos_dir();
-        // `D:/dev` and `D:\dev` are the same root.
-        if !watch::same_path(&root, &self.root) {
+        if !same_root(&root, &self.root) {
             self.generation += 1;
             self.root = root;
             self.router = Router::new(self.root.clone(), self.config_file.clone());
-            self.debouncer = Debouncer::default();
+            // Checks still running for the old root keep their repos busy.
+            self.debouncer.next_root();
             self.repos.clear();
             self.statuses.clear();
+            self.unresolved.clear();
             self.retries.clear();
             self.sweep.clear();
             self.external.clear();
@@ -554,9 +580,12 @@ impl Scheduler {
     }
 
     /// Re-reads the repo list and routes. `force` reports it even unchanged.
+    /// Routes are rebuilt when the list changed or a worktree's git dirs
+    /// couldn't be read last time.
     fn rediscover(&mut self, force: bool, now: Instant) {
         let found = git::find_repos(&self.root);
-        if found == self.repos && !force {
+        let changed = found != self.repos;
+        if !changed && !force && self.unresolved.is_empty() {
             return;
         }
         let added: Vec<PathBuf> = found
@@ -576,16 +605,18 @@ impl Scheduler {
             .routes()
             .map(|r| (r.path.clone(), r.ignored.clone()))
             .collect();
-        let routes: Vec<RepoRoute> = self
-            .repos
-            .iter()
-            .map(|repo| {
-                let mut route = route_for(repo, &self.root);
-                route.ignored = ignored.get(repo).cloned().unwrap_or_default();
-                route
-            })
-            .collect();
+        self.unresolved.clear();
+        let mut routes: Vec<RepoRoute> = Vec::new();
+        for repo in &self.repos {
+            let (mut route, resolved) = route_for(repo, &self.root);
+            route.ignored = ignored.get(repo).cloned().unwrap_or_default();
+            if !resolved {
+                self.unresolved.insert(repo.clone());
+            }
+            routes.push(route);
+        }
         self.update_external(&routes);
+        self.debouncer.set_groups(&routes);
         self.router.set_repos(routes);
 
         // The startup sweep or a root change covers every repo already.
@@ -594,7 +625,9 @@ impl Scheduler {
                 self.debouncer.request(repo, Need::Local, now);
             }
         }
-        self.emit(Update::Repos(self.repos.clone()));
+        if changed || force {
+            self.emit(Update::Repos(self.repos.clone()));
+        }
         self.finish_sweep_if_done(now);
     }
 
@@ -720,24 +753,36 @@ fn read_config(file: &Path) -> Option<Result<Config, String>> {
     Some(Config::load_or_create(file))
 }
 
-/// The routing entry for a repo. A `.git` folder needs no git call; a `.git`
-/// file (linked worktree) asks git where its dirs are, mapped back under the
-/// root's spelling when they are inside it.
-fn route_for(repo: &Path, root: &Path) -> RepoRoute {
+/// The routing entry for a repo, and whether its git dirs are known. A
+/// `.git` folder needs no git call; a `.git` file (linked worktree) asks git
+/// where its dirs are, mapped back under the root's spelling when they are
+/// inside it. If git can't say, the route falls back to `.git` (false).
+fn route_for(repo: &Path, root: &Path) -> (RepoRoute, bool) {
     let dot_git = repo.join(".git");
-    let (git_dir, common_dir) = if dot_git.is_dir() {
-        (dot_git.clone(), dot_git)
+    let (git_dir, common_dir, resolved) = if dot_git.is_dir() {
+        (dot_git.clone(), dot_git, true)
     } else {
-        git::git_dirs(repo)
-            .map(|(git_dir, common)| (respell(&git_dir, root), respell(&common, root)))
-            .unwrap_or_else(|| (dot_git.clone(), dot_git))
+        match git::git_dirs(repo) {
+            Some((git_dir, common)) => (respell(&git_dir, root), respell(&common, root), true),
+            None => (dot_git.clone(), dot_git, false),
+        }
     };
-    RepoRoute {
+    let route = RepoRoute {
         path: repo.to_path_buf(),
         git_dir,
         common_dir,
         ignored: Vec::new(),
+    };
+    (route, resolved)
+}
+
+/// `D:/dev` and `D:\dev` are the same root, and so are two spellings of
+/// one existing folder (`D:\dev\.`, a junction, a subst drive).
+fn same_root(a: &Path, b: &Path) -> bool {
+    if watch::same_path(a, b) {
+        return true;
     }
+    matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
 }
 
 /// git reports resolved paths; events use the root as configured (maybe
@@ -807,6 +852,40 @@ mod tests {
         assert_eq!(respell(&dir, &root), dir);
         let missing = dir.join("missing");
         assert_eq!(respell(&missing, &root), missing);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unreadable_worktree_routes_are_marked() {
+        let dir = temp("route");
+        init_repo(&dir.join("r"));
+        let wt = dir.join("wt");
+        git(
+            &dir.join("r"),
+            &["worktree", "add", "-q", wt.to_str().unwrap()],
+        );
+        let (route, resolved) = route_for(&wt, &dir);
+        assert!(resolved);
+        assert_ne!(route.common_dir, wt.join(".git"));
+        // Its metadata gone (pruned, or not written yet): a fallback route,
+        // which `rediscover` retries.
+        std::fs::write(wt.join(".git"), "gitdir: /nonexistent/gitstat\n").unwrap();
+        let (route, resolved) = route_for(&wt, &dir);
+        assert!(!resolved);
+        assert_eq!(route.git_dir, wt.join(".git"));
+        assert!(route_for(&dir.join("r"), &dir).1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_root_spellings() {
+        let dir = temp("same-root");
+        std::fs::create_dir_all(dir.join("x")).unwrap();
+        assert!(same_root(&dir, &dir.join(".")));
+        assert!(same_root(&dir.join("x/.."), &dir));
+        assert!(!same_root(&dir.join("x"), &dir));
+        assert!(!same_root(&dir, &dir.join("missing")));
+        assert!(same_root(Path::new("/no/such/a/"), Path::new("/no/such/a")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1211,6 +1290,52 @@ mod tests {
             h.wait_for(WAIT, |u| matches!(u, Update::Mode(WatchMode::Events)))
                 .is_some(),
             "config edit didn't turn watching on"
+        );
+    }
+
+    #[test]
+    fn applied_config_works_while_the_file_is_broken() {
+        let h = Harness::new("apply", |root| init_repo(&root.join("a")), |_| {});
+        h.settle();
+        let mut config = Config::load_or_create(&h.config_file).unwrap();
+        std::fs::write(&h.config_file, "{ mid-edit").unwrap();
+        assert!(
+            h.wait_for(WAIT, |u| matches!(u, Update::Config(Err(_))))
+                .is_some(),
+            "no reload error"
+        );
+        // A menu toggle that couldn't be saved.
+        config.watch = false;
+        h.send(Command::Apply(config));
+        assert!(
+            h.wait_for(WAIT, |u| matches!(u, Update::Mode(WatchMode::Off)))
+                .is_some(),
+            "the in-memory watch toggle didn't reach the monitor"
+        );
+    }
+
+    #[test]
+    fn sweeps_find_new_repos_without_watching() {
+        let h = Harness::new(
+            "sweep-discovery",
+            |root| init_repo(&root.join("a")),
+            |c| c.watch = false,
+        );
+        h.settle();
+        let (a, b) = (h.root.join("a"), h.root.join("b"));
+        init_repo(&b);
+        h.send(Command::RefreshAll);
+        let repos = h.wait_for(WAIT, |u| matches!(u, Update::Repos(_)));
+        assert!(
+            matches!(&repos, Some(Update::Repos(r)) if *r == vec![a.clone(), b.clone()]),
+            "{repos:?}"
+        );
+        let sweep = h.until_sweep_done();
+        assert!(
+            sweep
+                .iter()
+                .any(|u| matches!(u, Update::Started { repo, fetch: true } if *repo == b)),
+            "{sweep:?}"
         );
     }
 

@@ -3,7 +3,7 @@
 
 use notify::EventKind;
 use notify::event::ModifyKind;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -19,8 +19,6 @@ pub const MIN_GAP: Duration = Duration::from_secs(2);
 pub const RESCAN_MIN_GAP: Duration = Duration::from_secs(10);
 pub const REPOSET_QUIET: Duration = Duration::from_secs(1);
 pub const CONFIG_QUIET: Duration = Duration::from_millis(300);
-/// ReadDirectoryChangesW delivers a fetch's own ref writes late.
-pub const REMOTE_GRACE: Duration = Duration::from_millis(1500);
 
 /// What an event means for the repo it belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -305,9 +303,11 @@ struct Slot {
     /// Something happened during the running check.
     rerun: Option<Need>,
     last_end: Option<Instant>,
-    fetch_end: Option<Instant>,
     /// Removed from the repo list while its check ran; dropped when it ends.
     orphan: bool,
+    /// The running check belongs to an earlier root. Its result is dropped,
+    /// so requests made meanwhile run after it rather than counting on it.
+    stale: bool,
 }
 
 impl Slot {
@@ -333,6 +333,11 @@ pub struct Debouncer {
     last_rescan: Option<Instant>,
     /// A rate-limited rescan waiting for its turn.
     rescan_at: Option<Instant>,
+    /// A deferred rescan ran inside `due`; the scheduler rediscovers repos.
+    rescanned: bool,
+    /// Each repo's common dir, folded: repos sharing one share
+    /// `refs/remotes`, and two fetches there race for the ref locks.
+    groups: HashMap<PathBuf, String>,
 }
 
 impl Debouncer {
@@ -342,14 +347,10 @@ impl Debouncer {
             Class::Worktree => QUIET_WORKTREE,
             Class::Ignore | Class::RepoSet | Class::Config => return,
         };
+        // Remote refs count even during our own fetch: a `git push` from a
+        // terminal writes them too, and a Local recheck can't loop (it
+        // never writes refs).
         let slot = self.slots.entry(repo.to_path_buf()).or_default();
-        if class == Class::RemoteRefs
-            && (slot.in_flight == Some(Need::Fetch)
-                || slot.fetch_end.is_some_and(|end| now < end + REMOTE_GRACE))
-        {
-            // Our own fetch writing refs; its status already reads them.
-            return;
-        }
         if slot.in_flight.is_some() {
             slot.rerun = slot.rerun.max(Some(Need::Local));
             return;
@@ -360,12 +361,13 @@ impl Debouncer {
         slot.quiet_until = Some(until.min(first + MAX_WAIT));
     }
 
-    /// Sweep, rescan or manual refresh: due now, still after `MIN_GAP`.
-    /// A running check of at least `need` already covers the request.
+    /// Sweep or manual refresh: due now, still after `MIN_GAP`. A running
+    /// check of at least `need` already covers the request, unless it
+    /// belongs to an earlier root.
     pub fn request(&mut self, repo: &Path, need: Need, now: Instant) {
         let slot = self.slots.entry(repo.to_path_buf()).or_default();
         if let Some(running) = slot.in_flight {
-            if need > running {
+            if need > running || slot.stale {
                 slot.rerun = slot.rerun.max(Some(need));
             }
             return;
@@ -373,6 +375,17 @@ impl Debouncer {
         slot.pending = slot.pending.max(Some(need));
         slot.first.get_or_insert(now);
         slot.quiet_until = Some(slot.quiet_until.map_or(now, |u| u.min(now)));
+    }
+
+    /// Like `request(repo, Local)`, for when events may have been lost: a
+    /// running check may have read the status before them, so it reruns.
+    pub fn recheck(&mut self, repo: &Path, now: Instant) {
+        let slot = self.slots.entry(repo.to_path_buf()).or_default();
+        if slot.in_flight.is_some() {
+            slot.rerun = slot.rerun.max(Some(Need::Local));
+        } else {
+            self.request(repo, Need::Local, now);
+        }
     }
 
     /// The watcher lost events: a Local check of every known repo, at most
@@ -387,30 +400,78 @@ impl Debouncer {
         self.last_rescan = Some(now);
         self.rescan_at = None;
         for repo in self.known.clone() {
-            self.request(&repo, Need::Local, now);
+            self.recheck(&repo, now);
         }
         true
     }
 
-    /// Checks that are due, marked in flight.
+    /// Whether a deferred rescan ran inside `due` since the last call.
+    pub fn take_rescanned(&mut self) -> bool {
+        std::mem::take(&mut self.rescanned)
+    }
+
+    /// Sets which repos share a common dir.
+    pub fn set_groups(&mut self, routes: &[RepoRoute]) {
+        self.groups = routes
+            .iter()
+            .map(|r| (r.path.clone(), key(&r.common_dir)))
+            .collect();
+    }
+
+    /// Common dirs a fetch is running in.
+    fn fetching_groups(&self) -> HashSet<&str> {
+        self.slots
+            .iter()
+            .filter(|(_, slot)| slot.in_flight == Some(Need::Fetch))
+            .filter_map(|(path, _)| self.groups.get(path).map(String::as_str))
+            .collect()
+    }
+
+    /// A pending fetch waits while another fetch runs in its common dir.
+    fn held(&self, path: &Path, slot: &Slot, fetching: &HashSet<&str>) -> bool {
+        slot.pending == Some(Need::Fetch)
+            && self
+                .groups
+                .get(path)
+                .is_some_and(|g| fetching.contains(g.as_str()))
+    }
+
+    /// Checks that are due, marked in flight. Never two fetches in one
+    /// common dir at once.
     pub fn due(&mut self, now: Instant, free_slots: usize) -> Vec<(PathBuf, Need)> {
         if self.rescan_at.is_some_and(|at| at <= now) {
-            self.rescan(now);
+            self.rescanned |= self.rescan(now);
         }
         if free_slots == 0 {
             return Vec::new();
         }
-        let mut ready: Vec<(Instant, &PathBuf)> = self
+        let mut fetching: HashSet<String> = self
+            .fetching_groups()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let mut ready: Vec<(Instant, &PathBuf, &Slot)> = self
             .slots
             .iter()
-            .filter_map(|(path, slot)| slot.ready_at().filter(|at| *at <= now).map(|at| (at, path)))
+            .filter_map(|(path, slot)| {
+                let at = slot.ready_at().filter(|at| *at <= now)?;
+                Some((at, path, slot))
+            })
             .collect();
-        ready.sort();
-        let picked: Vec<PathBuf> = ready
-            .into_iter()
-            .take(free_slots)
-            .map(|(_, path)| path.clone())
-            .collect();
+        ready.sort_by_key(|&(at, path, _)| (at, path));
+        let mut picked: Vec<PathBuf> = Vec::new();
+        for (_, path, slot) in ready {
+            if picked.len() == free_slots {
+                break;
+            }
+            if slot.pending == Some(Need::Fetch)
+                && let Some(group) = self.groups.get(path)
+                && !fetching.insert(group.clone())
+            {
+                continue;
+            }
+            picked.push(path.clone());
+        }
         picked
             .into_iter()
             .filter_map(|path| {
@@ -424,15 +485,13 @@ impl Debouncer {
             .collect()
     }
 
-    pub fn finished(&mut self, repo: &Path, need: Need, now: Instant) {
+    pub fn finished(&mut self, repo: &Path, now: Instant) {
         let Some(slot) = self.slots.get_mut(repo) else {
             return;
         };
         slot.in_flight = None;
+        slot.stale = false;
         slot.last_end = Some(now);
-        if need == Need::Fetch {
-            slot.fetch_end = Some(now);
-        }
         if slot.orphan {
             self.slots.remove(repo);
             return;
@@ -463,10 +522,35 @@ impl Debouncer {
         });
     }
 
+    /// The root changed: forget everything but the checks still running,
+    /// which keep their repo from starting a second one until they end.
+    pub fn next_root(&mut self) {
+        let slots = std::mem::take(&mut self.slots)
+            .into_iter()
+            .filter_map(|(path, slot)| {
+                let running = Slot {
+                    in_flight: Some(slot.in_flight?),
+                    orphan: true,
+                    stale: true,
+                    ..Default::default()
+                };
+                Some((path, running))
+            })
+            .collect();
+        *self = Debouncer {
+            slots,
+            ..Default::default()
+        };
+    }
+
+    /// A held fetch has no deadline of its own: the end of the fetch it
+    /// waits for wakes the scheduler.
     pub fn next_deadline(&self) -> Option<Instant> {
+        let fetching = self.fetching_groups();
         self.slots
-            .values()
-            .filter_map(Slot::ready_at)
+            .iter()
+            .filter(|(path, slot)| !self.held(path, slot, &fetching))
+            .filter_map(|(_, slot)| slot.ready_at())
             .chain(self.rescan_at)
             .min()
     }
@@ -809,8 +893,8 @@ mod tests {
     /// Runs one check to completion so the next one is subject to `MIN_GAP`.
     fn check(d: &mut Debouncer, at: Instant) -> Vec<(PathBuf, Need)> {
         let due = d.due(at, 6);
-        for (repo, need) in &due {
-            d.finished(repo, *need, at);
+        for (repo, _) in &due {
+            d.finished(repo, at);
         }
         due
     }
@@ -882,10 +966,10 @@ mod tests {
         assert!(d.due(t + ms(5000), 6).is_empty());
         assert_eq!(d.next_deadline(), None);
         let end = t + ms(3000);
-        d.finished(&repo(), Need::Local, end);
+        d.finished(&repo(), end);
         assert_eq!(d.next_deadline(), Some(end + MIN_GAP));
         assert_eq!(d.due(end + MIN_GAP, 6), vec![(repo(), Need::Local)]);
-        d.finished(&repo(), Need::Local, end + MIN_GAP);
+        d.finished(&repo(), end + MIN_GAP);
         assert_eq!(d.next_deadline(), None, "one rerun, not a loop");
     }
 
@@ -898,13 +982,13 @@ mod tests {
         // A sweep or rescan during a fetch needs nothing more.
         d.request(&repo(), Need::Fetch, t);
         d.request(&repo(), Need::Local, t);
-        d.finished(&repo(), Need::Fetch, t + ms(10));
+        d.finished(&repo(), t + ms(10));
         assert_eq!(d.next_deadline(), None);
         // A fetch requested during a local check runs after it.
         d.request(&repo(), Need::Local, t + MIN_GAP * 2);
         assert_eq!(d.due(t + MIN_GAP * 2, 6), vec![(repo(), Need::Local)]);
         d.request(&repo(), Need::Fetch, t + MIN_GAP * 2);
-        d.finished(&repo(), Need::Local, t + MIN_GAP * 3);
+        d.finished(&repo(), t + MIN_GAP * 3);
         assert_eq!(d.due(t + MIN_GAP * 4, 6), vec![(repo(), Need::Fetch)]);
     }
 
@@ -925,35 +1009,132 @@ mod tests {
     }
 
     #[test]
-    fn remote_refs_grace() {
+    fn remote_refs_always_count() {
         let t = Instant::now();
+        let end = t + ms(500);
+        // A `git push` from a terminal while our fetch runs: the status
+        // the fetch reads may predate it, so a Local check follows.
         let mut d = Debouncer::default();
         d.request(&repo(), Need::Fetch, t);
         assert_eq!(d.due(t, 6).len(), 1);
-        // The fetch's own ref writes, during and just after it.
         d.on_event(&repo(), Class::RemoteRefs, t + ms(100));
-        let end = t + ms(500);
-        d.finished(&repo(), Need::Fetch, end);
-        assert_eq!(d.next_deadline(), None);
-        d.on_event(&repo(), Class::RemoteRefs, end + REMOTE_GRACE - ms(1));
-        assert_eq!(d.next_deadline(), None);
-        // A later one (an accepted push) counts.
-        d.on_event(&repo(), Class::RemoteRefs, end + REMOTE_GRACE);
+        d.finished(&repo(), end);
         assert_eq!(d.next_deadline(), Some(end + MIN_GAP));
-        // Other events during a fetch still rerun.
+        assert_eq!(d.due(end + MIN_GAP, 6), vec![(repo(), Need::Local)]);
+        d.finished(&repo(), end + MIN_GAP);
+        assert_eq!(d.next_deadline(), None, "one rerun, not a loop");
+        // Just after a fetch too.
         let mut d = Debouncer::default();
         d.request(&repo(), Need::Fetch, t);
         d.due(t, 6);
-        d.on_event(&repo(), Class::GitMeta, t + ms(100));
-        d.finished(&repo(), Need::Fetch, end);
+        d.finished(&repo(), end);
+        d.on_event(&repo(), Class::RemoteRefs, end + ms(10));
         assert_eq!(d.next_deadline(), Some(end + MIN_GAP));
-        // And remote refs during a local check rerun too.
+        // And during a local check.
         let mut d = Debouncer::default();
         d.request(&repo(), Need::Local, t);
         d.due(t, 6);
         d.on_event(&repo(), Class::RemoteRefs, t + ms(100));
-        d.finished(&repo(), Need::Local, end);
+        d.finished(&repo(), end);
         assert_eq!(d.next_deadline(), Some(end + MIN_GAP));
+    }
+
+    #[test]
+    fn rescan_reruns_a_running_check() {
+        let t = Instant::now();
+        let mut d = Debouncer::default();
+        d.retain(&[repo()]);
+        d.request(&repo(), Need::Local, t);
+        assert_eq!(d.due(t, 6), vec![(repo(), Need::Local)]);
+        // Events lost while the check runs: it may have read status first.
+        assert!(d.rescan(t + ms(100)));
+        let end = t + ms(500);
+        d.finished(&repo(), end);
+        assert_eq!(d.due(end + MIN_GAP, 6), vec![(repo(), Need::Local)]);
+        // `recheck` does the same for one repo, and is plain otherwise.
+        d.recheck(&repo(), end + MIN_GAP);
+        d.finished(&repo(), end + MIN_GAP * 2);
+        assert_eq!(d.due(end + MIN_GAP * 4, 6), vec![(repo(), Need::Local)]);
+        let mut d = Debouncer::default();
+        d.recheck(&repo(), t);
+        assert_eq!(d.due(t, 6), vec![(repo(), Need::Local)]);
+    }
+
+    #[test]
+    fn one_fetch_per_common_dir() {
+        let t = Instant::now();
+        let (r, wt, other) = (
+            PathBuf::from("/dev/r"),
+            PathBuf::from("/dev/wt"),
+            PathBuf::from("/dev/other"),
+        );
+        let mut d = Debouncer::default();
+        d.set_groups(&[
+            route("/dev/r", "/dev/r/.git", "/dev/r/.git"),
+            route("/dev/wt", "/dev/r/.git/worktrees/wt", "/dev/r/.git"),
+            route("/dev/other", "/dev/other/.git", "/dev/other/.git"),
+        ]);
+        for repo in [&r, &wt, &other] {
+            d.request(repo, Need::Fetch, t);
+        }
+        let first = d.due(t, 6);
+        assert_eq!(first.len(), 2, "{first:?}");
+        assert!(first.contains(&(other.clone(), Need::Fetch)));
+        let (shared, _) = first.iter().find(|(p, _)| *p != other).unwrap().clone();
+        let waiting = if shared == r { wt.clone() } else { r.clone() };
+        // Held, not busy-waiting: no deadline until that fetch ends.
+        assert_eq!(d.next_deadline(), None);
+        assert!(d.due(t + ms(5000), 6).is_empty());
+        // A local check in the same common dir isn't held.
+        d.on_event(&waiting, Class::Worktree, t);
+        assert!(d.due(t + ms(5000), 6).is_empty(), "still a pending fetch");
+        let end = t + ms(6000);
+        d.finished(&shared, end);
+        assert_eq!(d.next_deadline(), Some(t + QUIET_WORKTREE));
+        assert_eq!(d.due(end, 6), vec![(waiting, Need::Fetch)]);
+
+        // Without groups (or in different ones) fetches run side by side.
+        let mut d = Debouncer::default();
+        d.request(&r, Need::Fetch, t);
+        d.request(&wt, Need::Fetch, t);
+        assert_eq!(d.due(t, 6).len(), 2);
+    }
+
+    #[test]
+    fn root_change_waits_for_old_checks() {
+        let t = Instant::now();
+        let (a, b) = (PathBuf::from("/dev/a"), PathBuf::from("/dev/b"));
+        let mut d = Debouncer::default();
+        d.request(&a, Need::Fetch, t);
+        d.request(&b, Need::Local, t + ms(1));
+        assert_eq!(d.due(t, 1), vec![(a.clone(), Need::Fetch)]);
+        d.next_root();
+        assert_eq!(
+            d.next_deadline(),
+            None,
+            "b's pending check was the old root's"
+        );
+        // The new root has `a` again (A -> B -> A): its sweep must not
+        // start a second fetch while the old one runs, nor count on it.
+        d.retain(std::slice::from_ref(&a));
+        d.request(&a, Need::Fetch, t + ms(10));
+        assert!(d.due(t + ms(10), 6).is_empty());
+        let end = t + ms(100);
+        d.finished(&a, end);
+        assert_eq!(d.due(end + MIN_GAP, 6), vec![(a.clone(), Need::Fetch)]);
+        // A new-root check is covered as usual.
+        d.request(&a, Need::Fetch, end + MIN_GAP);
+        d.finished(&a, end + MIN_GAP);
+        assert_eq!(d.next_deadline(), None);
+
+        // An old check of a repo the new root doesn't have just ends.
+        let mut d = Debouncer::default();
+        d.request(&a, Need::Local, t);
+        d.due(t, 6);
+        d.next_root();
+        d.retain(&[]);
+        d.finished(&a, t + ms(100));
+        assert!(d.slots.is_empty());
     }
 
     #[test]
@@ -1005,7 +1186,7 @@ mod tests {
         d.retain(std::slice::from_ref(&a));
         d.request(&a, Need::Local, t);
         assert!(d.due(t + ms(100), 6).is_empty());
-        d.finished(&a, Need::Local, t + ms(100));
+        d.finished(&a, t + ms(100));
         assert_eq!(d.next_deadline(), Some(t + ms(100) + MIN_GAP));
 
         // Removed for good: its slot goes when the check ends.
@@ -1013,7 +1194,7 @@ mod tests {
         d.request(&a, Need::Local, t);
         d.due(t, 6);
         d.retain(&[]);
-        d.finished(&a, Need::Local, t + ms(100));
+        d.finished(&a, t + ms(100));
         assert!(d.slots.is_empty());
     }
 }

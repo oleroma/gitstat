@@ -8,7 +8,7 @@
 use crate::config::Corner;
 use crate::icon::Badge;
 use crate::layout::{self, Rect};
-use crate::panel::Anchor;
+use crate::panel::{self, Anchor};
 use crate::state::{AppState, Input};
 use crate::view::{self, Ui};
 use crate::win;
@@ -83,7 +83,12 @@ impl Render for OverlayView {
                 .font_weight(gpui::FontWeight::BOLD)
                 .cursor_pointer()
                 .child(text)
-                .on_click(|_, _, cx| {
+                .on_click(|event, _, cx| {
+                    // A double-click's second click would close the panel
+                    // the first one just opened.
+                    if event.click_count() > 1 {
+                        return;
+                    }
                     // app.rs resolves overlay_click() and anchors the panel.
                     if let Some(ui) = cx.try_global::<Ui>() {
                         ui.input.unbounded_send(Input::Overlay).ok();
@@ -135,6 +140,7 @@ pub fn sync(cx: &mut App) {
         (diameter * scale).round() as i32,
         (margin * scale).round() as i32,
     );
+    let panel = panel::hwnd(cx);
     let slot = cx.default_global::<OverlaySlot>();
     let Some(h) = slot.hwnd else { return };
     if hide {
@@ -145,9 +151,15 @@ pub fn sync(cx: &mut App) {
     } else if !slot.visible || slot.placed != Some(rect) {
         slot.visible = true;
         slot.placed = Some(rect);
-        // Also shows it, topmost and without activation.
-        cx.spawn(async move |_| unsafe { win::place_overlay(h, rect) })
-            .detach();
+        // Also shows it, topmost and without activation. An open panel goes
+        // back above it in the same task, so the badge never covers it.
+        cx.spawn(async move |_| unsafe {
+            win::place_overlay(h, rect);
+            if let Some(p) = panel {
+                win::reassert_topmost(p);
+            }
+        })
+        .detach();
     }
 }
 
@@ -266,14 +278,16 @@ fn tick(id: u64, cx: &mut App) -> bool {
         return false;
     }
     if let Some(h) = slot.hwnd.filter(|_| slot.visible) {
-        cx.spawn(async move |_| unsafe { win::reassert_topmost(h) })
-            .detach();
+        let panel = panel::hwnd(cx);
+        cx.spawn(async move |_| unsafe {
+            win::reassert_topmost(h);
+            // Topmost puts the badge above the panel; put the panel back.
+            if let Some(p) = panel {
+                win::reassert_topmost(p);
+            }
+        })
+        .detach();
     }
-    // GPUI's display-change handling can show the never-shown keepalive.
-    if let Some(k) = cx.try_global::<Ui>().and_then(|ui| ui.keepalive)
-        && win::is_visible(k)
-    {
-        cx.spawn(async move |_| unsafe { win::hide(k) }).detach();
-    }
+    view::hide_keepalive_if_shown(cx);
     true
 }

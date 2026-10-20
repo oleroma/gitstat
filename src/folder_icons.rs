@@ -39,15 +39,22 @@ pub struct Entry {
 
 impl Ledger {
     /// A missing ledger is empty. So is a corrupt one, which is moved aside
-    /// to `*.bad` so nothing overwrites it before someone can look.
-    pub fn load(file: &Path) -> Self {
-        let Ok(text) = std::fs::read_to_string(file) else {
-            return Self::default();
+    /// to `*.bad` so nothing overwrites it before someone can look. One that
+    /// exists but can't be read (locked, no access) is an error: starting
+    /// empty would overwrite it on the next save and lose every entry.
+    pub fn load(file: &Path) -> Result<Self, String> {
+        let bytes = match std::fs::read(file) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(format!("can't read {}: {e}", file.display())),
         };
-        serde_json::from_str(&text).unwrap_or_else(|_| {
+        let parsed = std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|text| serde_json::from_str(text).ok());
+        Ok(parsed.unwrap_or_else(|| {
             let _ = std::fs::rename(file, file.with_extension("json.bad"));
             Self::default()
-        })
+        }))
     }
 
     /// Writes a temp file and renames it over the ledger, so a crash never
@@ -103,15 +110,30 @@ pub enum Op {
 /// What to change so the folders match `statuses`. Folders already showing
 /// the right icon cost no probing beyond one `ini_present`, and the cheap
 /// probes run before the one that spawns git.
+///
+/// Entries no longer wanted are undone first, so a folder that comes back
+/// under another spelling (a new key) is applied to a clean folder.
 pub fn plan(ledger: &Ledger, statuses: &[RepoStatus], enabled: bool, probe: &dyn Probe) -> Vec<Op> {
     let mut ops = Vec::new();
-    let mut wanted = HashSet::new();
+    let wanted: HashSet<String> = if enabled {
+        statuses.iter().map(|s| key(&s.path)).collect()
+    } else {
+        HashSet::new()
+    };
+    for (k, e) in &ledger.entries {
+        if wanted.contains(k) {
+            continue;
+        }
+        ops.push(if probe.exists(&e.path) {
+            Op::Revert(e.path.clone())
+        } else {
+            Op::Forget(e.path.clone())
+        });
+    }
     if enabled {
         for s in statuses {
             let path = &s.path;
-            let k = key(path);
-            let entry = ledger.entries.get(&k);
-            wanted.insert(k);
+            let entry = ledger.entries.get(&key(path));
             let view = local_view(s);
             let (state, tip) = (FolderState::of(&view), tip(&view));
             // `git clean -X` removes desktop.ini without telling the ledger.
@@ -125,17 +147,28 @@ pub fn plan(ledger: &Ledger, statuses: &[RepoStatus], enabled: bool, probe: &dyn
                 ops.push(Op::Skip(path.clone(), SKIP_INELIGIBLE));
                 continue;
             }
-            let reason = if probe.foreign_ini(path) {
+            // The git probe is the costly one: skip it for a foreign file
+            // we have nothing to undo in.
+            let foreign = probe.foreign_ini(path);
+            let tracked = (!foreign || entry.is_some()) && probe.ini_tracked(path);
+            let reason = if foreign {
                 Some(SKIP_FOREIGN)
-            } else if probe.ini_tracked(path) {
+            } else if tracked {
                 Some(SKIP_TRACKED)
             } else {
                 None
             };
             if let Some(reason) = reason {
-                // Never write into a file the user owns, even to undo ours.
                 if entry.is_some() {
-                    ops.push(Op::Forget(path.clone()));
+                    // Never write into a file git tracks, even to undo ours.
+                    // An untracked one with someone else's icon (Properties >
+                    // Customize) still has our InfoTip, which revert removes
+                    // on its own.
+                    ops.push(if tracked {
+                        Op::Forget(path.clone())
+                    } else {
+                        Op::Revert(path.clone())
+                    });
                 }
                 ops.push(Op::Skip(path.clone(), reason));
                 continue;
@@ -146,16 +179,6 @@ pub fn plan(ledger: &Ledger, statuses: &[RepoStatus], enabled: bool, probe: &dyn
                 tip,
             });
         }
-    }
-    for (k, e) in &ledger.entries {
-        if wanted.contains(k) {
-            continue;
-        }
-        ops.push(if probe.exists(&e.path) {
-            Op::Revert(e.path.clone())
-        } else {
-            Op::Forget(e.path.clone())
-        });
     }
     ops
 }
@@ -560,6 +583,9 @@ mod shell {
         data_dir: PathBuf,
         ledger_file: PathBuf,
         ledger: Ledger,
+        /// The ledger exists but couldn't be read: nothing is applied or
+        /// saved until it can, or it would be overwritten.
+        load_error: Option<String>,
         icons_ready: bool,
         notifier: Notifier,
     }
@@ -567,8 +593,13 @@ mod shell {
     impl Engine {
         fn new(data_dir: PathBuf) -> Self {
             let ledger_file = data_dir.join(LEDGER_FILE);
+            let (ledger, load_error) = match Ledger::load(&ledger_file) {
+                Ok(ledger) => (ledger, None),
+                Err(e) => (Ledger::default(), Some(e)),
+            };
             Self {
-                ledger: Ledger::load(&ledger_file),
+                ledger,
+                load_error,
                 ledger_file,
                 data_dir,
                 icons_ready: false,
@@ -579,6 +610,16 @@ mod shell {
         /// Returns the folders left alone (or that failed) with the reason,
         /// and how many were reverted.
         fn sync(&mut self, statuses: &[RepoStatus], enabled: bool) -> (Skips, usize) {
+            if self.load_error.is_some() {
+                // Maybe it was only locked for a moment.
+                match Ledger::load(&self.ledger_file) {
+                    Ok(ledger) => {
+                        self.ledger = ledger;
+                        self.load_error = None;
+                    }
+                    Err(e) => return (vec![(self.ledger_file.clone(), e)], 0),
+                }
+            }
             let probe = ShellProbe::new(icons_dir(&self.data_dir));
             let ops = plan(&self.ledger, statuses, enabled, &probe);
             let (mut skips, mut reverted) = (Vec::new(), 0);
@@ -590,7 +631,8 @@ mod shell {
                         }
                     }
                     Op::Revert(path) => match self.revert(&path) {
-                        Ok(()) => reverted += 1,
+                        Ok(Reverted::Restored) => reverted += 1,
+                        Ok(Reverted::Tracked) => skips.push((path, SKIP_TRACKED.to_string())),
                         Err(e) => skips.push((path, e)),
                     },
                     Op::Forget(path) => {
@@ -640,15 +682,23 @@ mod shell {
             let ini_existed = ini.exists();
             let folder_attrs = attributes(path).ok_or("folder is gone")?;
             let prev = self.ledger.get(path).cloned();
+            // `plan` applies only to a desktop.ini that is missing or points
+            // at our icons, so an existing one with no entry is ours from
+            // before the ledger lost it (folder renamed, ledger corrupt):
+            // the file and the folder's ReadOnly mark both came from us.
+            let adopted = prev.is_none() && ini_existed;
             let entry = Entry {
                 path: path.to_path_buf(),
                 state,
                 tip: tip.to_string(),
-                created_ini: !ini_existed || prev.as_ref().is_some_and(|e| e.created_ini),
-                had_readonly: prev.as_ref().map_or(
-                    folder_attrs & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM) != 0,
-                    |e| e.had_readonly,
-                ),
+                created_ini: !ini_existed
+                    || adopted
+                    || prev.as_ref().is_some_and(|e| e.created_ini),
+                had_readonly: match &prev {
+                    Some(e) => e.had_readonly,
+                    None if adopted => false,
+                    None => folder_attrs & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM) != 0,
+                },
             };
             // Record first, so a crash mid-write still leaves something to revert.
             if prev.is_none() {
@@ -667,14 +717,32 @@ mod shell {
             self.ledger.save(&self.ledger_file)
         }
 
-        fn revert(&mut self, path: &Path) -> Result<(), String> {
+        /// Undoes our changes to a folder and drops its entry. An error
+        /// keeps the entry, so the next sync tries again.
+        fn revert(&mut self, path: &Path) -> Result<Reverted, String> {
             let Some(entry) = self.ledger.get(path).cloned() else {
-                return Ok(());
+                return Ok(Reverted::Restored);
             };
             let ini = path.join(INI);
+            // Committed or pulled in since: the user owns it now. Drop our
+            // record and leave the file and the folder alone.
+            if ini.exists()
+                && path.join(".git").exists()
+                && crate::git::is_tracked(path, Path::new(INI))
+            {
+                self.ledger.entries.remove(&key(path));
+                self.ledger.save(&self.ledger_file)?;
+                return Ok(Reverted::Tracked);
+            }
             // Whatever is left in desktop.ini still needs the folder marked.
             let mut ini_in_use = false;
-            if let Ok(bytes) = std::fs::read(&ini) {
+            let bytes = match std::fs::read(&ini) {
+                Ok(bytes) => Some(bytes),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                // Locked or unreadable: it may still hold our keys.
+                Err(e) => return Err(format!("{}: {e}", ini.display())),
+            };
+            if let Some(bytes) = bytes {
                 let text = decode_ini(&bytes);
                 let icons = icons_dir(&self.data_dir);
                 let icon_ours = ini_icon(&text).is_some_and(|v| is_ours(&v, &icons, &env));
@@ -701,8 +769,15 @@ mod shell {
             }
             self.notifier.push(path);
             self.ledger.entries.remove(&key(path));
-            self.ledger.save(&self.ledger_file)
+            self.ledger.save(&self.ledger_file)?;
+            Ok(Reverted::Restored)
         }
+    }
+
+    enum Reverted {
+        Restored,
+        /// desktop.ini is tracked by git now, so it was left as it is.
+        Tracked,
     }
 
     /// Points desktop.ini at the state's icon and sets the tip, then marks
@@ -831,13 +906,26 @@ mod shell {
             let text = decode_ini(&std::fs::read(&ini).unwrap());
             assert!(is_ours(&ini_icon(&text).unwrap(), &icons_dir(&data), &env));
             assert_eq!(ini_value(&text, SECTION, "InfoTip").unwrap(), tip(&status));
-            assert_eq!(Ledger::load(&data.join(LEDGER_FILE)).entries.len(), 1);
+            assert_eq!(
+                Ledger::load(&data.join(LEDGER_FILE)).unwrap().entries.len(),
+                1
+            );
 
             // Unchanged status: nothing to do.
             assert_eq!(
                 engine.sync(std::slice::from_ref(&status), true),
                 (vec![], 0)
             );
+
+            // The ledger lost track (renamed folder, corrupt ledger): our
+            // desktop.ini is adopted as ours, so revert still restores all.
+            std::fs::remove_file(data.join(LEDGER_FILE)).unwrap();
+            let mut engine = Engine::new(data.clone());
+            let (skips, _) = engine.sync(std::slice::from_ref(&status), true);
+            assert!(skips.is_empty(), "{skips:?}");
+            let entry = engine.ledger.get(&repo).unwrap().clone();
+            assert!(entry.created_ini && !entry.had_readonly, "{entry:?}");
+            drop(engine);
 
             assert_eq!(revert_all_blocking(&data), Ok(1));
             assert!(!ini.exists());
@@ -846,7 +934,12 @@ mod shell {
                 folder & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM),
                 0
             );
-            assert!(Ledger::load(&data.join(LEDGER_FILE)).entries.is_empty());
+            assert!(
+                Ledger::load(&data.join(LEDGER_FILE))
+                    .unwrap()
+                    .entries
+                    .is_empty()
+            );
             let _ = std::fs::remove_dir_all(&root);
         }
     }
@@ -991,7 +1084,13 @@ mod tests {
             ]
         );
 
-        // Folders we had applied: undo where the file is still ours, else let go.
+        // Folders we had applied: undo where the file is untracked (for a
+        // foreign icon, revert removes only our InfoTip), else let go.
+        let d = repo("d");
+        let mut fake = fake;
+        fake.foreign.insert(d.path.clone());
+        fake.tracked.insert(d.path.clone());
+        let all = [a.clone(), b.clone(), c.clone(), d.clone()];
         let mut changed = all.clone();
         for s in &mut changed {
             s.dirty = true;
@@ -1003,9 +1102,25 @@ mod tests {
                 Op::Skip(a.path.clone(), SKIP_INELIGIBLE),
                 Op::Forget(b.path.clone()),
                 Op::Skip(b.path.clone(), SKIP_TRACKED),
-                Op::Forget(c.path.clone()),
+                Op::Revert(c.path.clone()),
                 Op::Skip(c.path.clone(), SKIP_FOREIGN),
+                Op::Forget(d.path.clone()),
+                Op::Skip(d.path.clone(), SKIP_FOREIGN),
             ]
+        );
+    }
+
+    #[test]
+    fn stale_entries_are_undone_first() {
+        // The same folder under a new spelling: the old entry's revert must
+        // run before the new key's apply, or it deletes what apply wrote.
+        let old = repo("a");
+        let mut new = old.clone();
+        new.path = PathBuf::from("S:/a");
+        let ledger = ledger_of(std::slice::from_ref(&old));
+        assert_eq!(
+            plan(&ledger, std::slice::from_ref(&new), true, &Fake::default()),
+            vec![Op::Revert(old.path.clone()), apply(&new)]
         );
     }
 
@@ -1108,20 +1223,34 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("gitstat-ledger-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let file = dir.join(LEDGER_FILE);
-        assert_eq!(Ledger::load(&file), Ledger::default());
+        assert_eq!(Ledger::load(&file), Ok(Ledger::default()));
 
         let ledger = ledger_of(&[repo("a"), repo("B")]);
         ledger.save(&file).unwrap();
-        assert_eq!(Ledger::load(&file), ledger);
-        assert!(Ledger::load(&file).get(Path::new("D:/DEV/b")).is_some());
+        assert_eq!(Ledger::load(&file), Ok(ledger));
+        assert!(
+            Ledger::load(&file)
+                .unwrap()
+                .get(Path::new("D:/DEV/b"))
+                .is_some()
+        );
         assert!(!file.with_extension("json.tmp").exists());
 
         std::fs::write(&file, "{ not json").unwrap();
-        assert_eq!(Ledger::load(&file), Ledger::default());
+        assert_eq!(Ledger::load(&file), Ok(Ledger::default()));
         assert!(
             file.with_extension("json.bad").exists(),
             "kept for inspection"
         );
+        std::fs::write(&file, b"\xff\xfe{}").unwrap();
+        assert_eq!(Ledger::load(&file), Ok(Ledger::default()), "not UTF-8");
+
+        // Exists but can't be read: an error, not an empty ledger that the
+        // next save would write over it.
+        let _ = std::fs::remove_file(&file);
+        std::fs::create_dir_all(&file).unwrap();
+        assert!(Ledger::load(&file).is_err());
+        assert!(file.is_dir());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -251,9 +251,13 @@ pub unsafe fn panel_topmost(h: isize) {
     }
 }
 
+/// Off-screen, where a forced show of the keepalive draws nothing visible.
+const PARKED: i32 = -32000;
+
 /// Makes the never-shown keepalive harmless if GPUI ever shows it (its
 /// `WM_DISPLAYCHANGE` handling does when a monitor disconnects): 1×1,
-/// click-through and never activated.
+/// off-screen, click-through and never activated. `SW_SHOWNORMAL` restores
+/// the normal position, which is this one: it is never minimised or maximised.
 ///
 /// # Safety
 /// Call only from a spawned task outside `update`.
@@ -264,11 +268,11 @@ pub unsafe fn harden_keepalive(h: isize) {
         SetWindowPos(
             hwnd,
             std::ptr::null_mut(),
-            0,
-            0,
+            PARKED,
+            PARKED,
             1,
             1,
-            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            SWP_NOZORDER | SWP_NOACTIVATE,
         );
     }
 }

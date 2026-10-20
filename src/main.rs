@@ -48,7 +48,8 @@ Usage:
                           same, without running git fetch first
   gitstat --config FILE   use FILE instead of config.json next to gitstat.exe
   gitstat --remove-folder-icons
-                          restore every repo folder gitstat gave a status icon, and exit";
+                          turn folder icons off in the config, restore every repo
+                          folder gitstat gave a status icon, and exit";
 
 struct Args {
     once: bool,
@@ -96,7 +97,7 @@ fn main() {
         #[cfg(windows)]
         {
             attach_parent_console();
-            std::process::exit(remove_folder_icons());
+            std::process::exit(remove_folder_icons(&args.config_file));
         }
         #[cfg(not(windows))]
         {
@@ -152,14 +153,34 @@ fn run_once(args: &Args) -> i32 {
     }
 }
 
-/// `--remove-folder-icons`: reverts every folder in the ledger. Folders
-/// that can't be restored stay in the ledger for the next try.
+/// `--remove-folder-icons`: turns `folder_icons` off in config.json, so
+/// the next tray start doesn't put the icons back, then reverts every folder
+/// in the ledger. Folders that can't be restored stay in the ledger for the
+/// next try (or for the tray app, which reverts them with the option off).
 #[cfg(windows)]
-fn remove_folder_icons() -> i32 {
+fn remove_folder_icons(config_file: &std::path::Path) -> i32 {
     // A running tray app would put the icons straight back.
     if !single_instance() {
         eprintln!("gitstat is running. Quit it from its tray menu first.");
         return 2;
+    }
+    // Only an existing file: load_or_create would write a new one.
+    if config_file.exists() {
+        let saved = config::Config::load_or_create(config_file).and_then(|mut config| {
+            if !config.folder_icons {
+                return Ok(false);
+            }
+            config.folder_icons = false;
+            config.save(config_file).map(|()| true)
+        });
+        match saved {
+            Ok(true) => println!("Turned folder_icons off in {}.", config_file.display()),
+            Ok(false) => {}
+            Err(e) => eprintln!(
+                "Couldn't turn folder_icons off; set it to false in config.json, or gitstat \
+                 will restore the icons at its next start.\n{e}"
+            ),
+        }
     }
     match folder_icons::revert_all_blocking(&config::data_dir()) {
         Ok(n) => {

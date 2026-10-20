@@ -33,6 +33,8 @@ pub enum Anchor {
 #[derive(Default)]
 pub struct PanelSlot {
     handle: Option<WindowHandle<StatusView>>,
+    /// The open panel's HWND, so the badge can stay below it.
+    hwnd: Option<isize>,
     toggled_at: Option<Instant>,
 }
 
@@ -57,6 +59,7 @@ pub fn toggle(anchor: Anchor, cx: &mut App) {
 
 pub fn close(cx: &mut App) {
     let slot = cx.default_global::<PanelSlot>();
+    slot.hwnd = None;
     if let Some(handle) = slot.handle.take() {
         slot.toggled_at = Some(Instant::now());
         view::remove(handle.into(), cx);
@@ -69,6 +72,14 @@ pub fn is_open(cx: &App) -> bool {
         .is_some_and(|h| view::is_live(h.into(), cx))
 }
 
+/// The panel's HWND while it is open.
+pub fn hwnd(cx: &App) -> Option<isize> {
+    if !is_open(cx) {
+        return None;
+    }
+    cx.try_global::<PanelSlot>()?.hwnd
+}
+
 /// Closes the panel from inside one of its own handlers, where its window
 /// is borrowed and `close` could only defer.
 pub(crate) fn dismiss(window: &mut Window, cx: &mut App) {
@@ -78,6 +89,7 @@ pub(crate) fn dismiss(window: &mut Window, cx: &mut App) {
         .is_some_and(|h| gpui::AnyWindowHandle::from(h) == window.window_handle())
     {
         slot.handle = None;
+        slot.hwnd = None;
         slot.toggled_at = Some(Instant::now());
     }
     window.remove_window();
@@ -122,6 +134,7 @@ fn open(anchor: Anchor, cx: &mut App) {
         point(logical(r.left), logical(r.top)),
         size(logical(r.width()), logical(r.height())),
     );
+    let mut hwnd = None;
     let handle = cx
         .open_window(
             WindowOptions {
@@ -138,7 +151,8 @@ fn open(anchor: Anchor, cx: &mut App) {
                 // Safe: opened with show: true. The tray click gave us the
                 // foreground right this needs.
                 window.activate_window();
-                if let Some(h) = win::hwnd(window) {
+                hwnd = win::hwnd(window);
+                if let Some(h) = hwnd {
                     // Native z-order calls must run outside this update.
                     cx.spawn(async move |_| unsafe { win::panel_topmost(h) })
                         .detach();
@@ -149,5 +163,6 @@ fn open(anchor: Anchor, cx: &mut App) {
         .ok();
     let slot = cx.default_global::<PanelSlot>();
     slot.handle = handle;
+    slot.hwnd = handle.and(hwnd);
     slot.toggled_at = Some(Instant::now());
 }

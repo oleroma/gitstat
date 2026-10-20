@@ -185,6 +185,8 @@ fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
         state.update(cx, |_, cx| cx.notify());
         update_outputs(statuses_changed, cx);
     }
+    // Monitor updates arrive at least every interval, badge or not.
+    view::hide_keepalive_if_shown(cx);
     true
 }
 
@@ -341,7 +343,8 @@ fn ask_folder_icons(cx: &mut App) {
 
 /// A menu toggle: change one field, save, apply. A save that is refused
 /// (config.json doesn't parse) keeps the change in memory, with one notice
-/// per session.
+/// per session. The monitor gets the change directly either way: it only
+/// rereads a file that saved.
 fn change_setting(f: impl FnOnce(&mut Config), cx: &mut App) {
     let state = cx.global::<Ui>().state.clone();
     let (old, file) = {
@@ -360,16 +363,20 @@ fn change_setting(f: impl FnOnce(&mut Config), cx: &mut App) {
         if !shared.save_notice_shown {
             shared.save_notice_shown = true;
             crate::error_box(format!(
-                "Couldn't save config.json, so this change lasts only until gitstat quits.\n\n{e}"
+                "Couldn't save config.json, so this change lasts only until config.json \
+                 is fixed and reloaded, or gitstat quits.\n\n{e}"
             ));
         }
     }
+    cx.global::<Shared>()
+        .monitor
+        .send(Command::Apply(new.clone()));
     apply_config(&old, new, cx);
 }
 
 /// Makes the app match `new`. Idempotent, so startup applies the file
 /// config over the defaults. The monitor reads `path`, `watch` and the
-/// interval from the file itself.
+/// interval from the file itself, and from `change_setting`.
 fn apply_config(old: &Config, new: Config, cx: &mut App) {
     let state = cx.global::<Ui>().state.clone();
     state.update(cx, |s, cx| {

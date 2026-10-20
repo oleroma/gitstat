@@ -23,6 +23,10 @@ pub struct RepoStatus {
     pub error: Option<String>,
     /// `error` came from `git fetch`, so the local state is still worth keeping.
     pub fetch_failed: bool,
+    /// The fetch failed, whether or not the local state could be read (then
+    /// `fetch_failed` is false). Drives the retry backoff, and lets a later
+    /// local-only recheck keep the fetch error.
+    pub fetch_errored: bool,
 }
 
 impl RepoStatus {
@@ -140,6 +144,7 @@ pub fn check_repo_detailed(repo: &Path, fetch: bool) -> (RepoStatus, Vec<String>
         ..Default::default()
     };
     let fetch_error = if fetch { fetch_repo(repo).err() } else { None };
+    status.fetch_errored = fetch_error.is_some();
 
     match local_status(repo, supports(STATUS_V2)) {
         Ok(local) => {
@@ -164,9 +169,10 @@ pub fn check_repo_detailed(repo: &Path, fetch: bool) -> (RepoStatus, Vec<String>
 /// only to local results, never to fetch results.
 #[cfg(any(windows, test))]
 pub fn keep_fetch_error(prev: &RepoStatus, mut local: RepoStatus) -> RepoStatus {
-    if prev.fetch_failed && local.error.is_none() {
+    if prev.fetch_errored && local.error.is_none() {
         local.error = prev.error.clone();
         local.fetch_failed = true;
+        local.fetch_errored = true;
     }
     local
 }
@@ -202,17 +208,19 @@ fn fetch_repo(repo: &Path) -> Result<(), String> {
 
 fn local_status(repo: &Path, v2: bool) -> Result<Parsed, String> {
     if v2 {
+        let base = ["status", "--porcelain=v2", "-z", "--branch"];
         let out = git(
             repo,
-            &[
-                "status",
-                "--porcelain=v2",
-                "-z",
-                "--branch",
-                "--ignored=matching",
-            ],
+            &[&base[..], &["--ignored=matching"]].concat(),
             LOCAL_TIMEOUT,
         )?;
+        let out = if out.status.success() {
+            out
+        } else {
+            // `status.showUntrackedFiles=no` rejects `--ignored=matching`.
+            // The ignored dirs only spare the watcher some checks.
+            git(repo, &base, LOCAL_TIMEOUT)?
+        };
         if !out.status.success() {
             return Err("not readable".to_string());
         }
@@ -477,6 +485,8 @@ fn run_git(repo: Option<&Path>, args: &[&str], timeout: Duration) -> Result<Outp
         std::io::ErrorKind::NotFound => "git not found on PATH".to_string(),
         _ => e.to_string(),
     })?;
+    #[cfg(windows)]
+    let job = job::Job::assign(&child);
 
     // Drain the pipes on helper threads so a chatty git can't block on a full pipe.
     let stdout = spawn_reader(child.stdout.take());
@@ -487,6 +497,12 @@ fn run_git(repo: Option<&Path>, args: &[&str], timeout: Duration) -> Result<Outp
         match child.try_wait() {
             Ok(Some(exit)) => break exit,
             Ok(None) if Instant::now() >= deadline => {
+                // The whole tree: Git for Windows' `cmd\git.exe` is a
+                // launcher, and `fetch --all` starts a fetch per remote.
+                #[cfg(windows)]
+                if let Some(job) = &job {
+                    job.terminate();
+                }
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err("timed out".to_string());
@@ -504,6 +520,45 @@ fn run_git(repo: Option<&Path>, args: &[&str], timeout: Duration) -> Result<Outp
         stdout: collect(stdout),
         stderr: collect(stderr),
     })
+}
+
+/// A job object holding one git child and everything it starts, so a
+/// timeout can end them all. No kill-on-close: what git leaves running on
+/// purpose (an fsmonitor daemon, a credential cache) outlives a normal exit.
+#[cfg(windows)]
+mod job {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, TerminateJobObject,
+    };
+
+    pub struct Job(HANDLE);
+
+    impl Job {
+        /// `None` if the job can't be made or joined; a timeout then kills
+        /// only the child. The launcher starts the real git only once it
+        /// has loaded, well after this runs.
+        pub fn assign(child: &std::process::Child) -> Option<Job> {
+            let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if handle.is_null() {
+                return None;
+            }
+            let job = Job(handle);
+            let process = child.as_raw_handle() as HANDLE;
+            (unsafe { AssignProcessToJobObject(job.0, process) } != 0).then_some(job)
+        }
+
+        pub fn terminate(&self) {
+            unsafe { TerminateJobObject(self.0, 1) };
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.0) };
+        }
+    }
 }
 
 fn spawn_reader(pipe: Option<impl std::io::Read + Send + 'static>) -> mpsc::Receiver<Vec<u8>> {
@@ -673,6 +728,7 @@ mod tests {
             name: "r".into(),
             error: Some("fetch failed (offline)".into()),
             fetch_failed: true,
+            fetch_errored: true,
             ..Default::default()
         };
         let local = RepoStatus {
@@ -692,9 +748,19 @@ mod tests {
         };
         assert_eq!(keep_fetch_error(&prev, broken.clone()), broken);
 
+        // A fetch that failed alongside the local status still carries over.
+        let both = RepoStatus {
+            fetch_failed: false,
+            ..prev.clone()
+        };
+        let kept = keep_fetch_error(&both, local.clone());
+        assert_eq!(kept.error, prev.error);
+        assert!(kept.fetch_failed && kept.fetch_errored);
+
         // Only fetch errors carry over.
         let local_error = RepoStatus {
             fetch_failed: false,
+            fetch_errored: false,
             error: Some("not readable".into()),
             ..prev
         };
@@ -713,10 +779,39 @@ mod tests {
         );
         std::fs::write(repo.join("x.txt"), "x").unwrap();
         let (status, _) = check_repo_detailed(&repo, true);
-        let _ = std::fs::remove_dir_all(&root);
-        assert!(status.fetch_failed);
+        assert!(status.fetch_failed && status.fetch_errored);
         assert!(status.error.as_deref().unwrap().starts_with("fetch failed"));
         assert!(status.dirty);
+
+        // Both failing: no local state, but the fetch failure still shows.
+        std::fs::write(repo.join(".git").join("index"), "garbage").unwrap();
+        let (status, _) = check_repo_detailed(&repo, true);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(!status.fetch_failed && status.fetch_errored, "{status:?}");
+        assert!(status.error.as_deref().unwrap().starts_with("fetch failed"));
+    }
+
+    #[test]
+    fn status_without_untracked_files() {
+        // `status.showUntrackedFiles=no` rejects `--ignored=matching`.
+        let root = temp_root("no-untracked");
+        let repo = root.join("r");
+        init_repo(&repo);
+        run(&repo, &["config", "status.showUntrackedFiles", "no"]);
+        std::fs::write(repo.join("new.txt"), "x").unwrap();
+        let clean = check_repo(&repo, false);
+        let file = repo.join("tracked.txt");
+        std::fs::write(&file, "a").unwrap();
+        run(&repo, &["add", "tracked.txt"]);
+        commit(&repo, "c");
+        std::fs::write(&file, "b").unwrap();
+        let dirty = check_repo(&repo, false);
+        let _ = std::fs::remove_dir_all(&root);
+        // The user's setting decides: untracked files don't count.
+        assert_eq!(clean.error, None, "{clean:?}");
+        assert!(!clean.dirty, "{clean:?}");
+        assert_eq!(dirty.error, None);
+        assert!(dirty.dirty);
     }
 
     #[test]
