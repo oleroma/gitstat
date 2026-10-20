@@ -6,6 +6,20 @@ on:
   workflow_dispatch:
 
 jobs:
+  linux:
+    # The platform-neutral modules and the notify (inotify) integration tests.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --locked
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
   windows:
     runs-on: windows-latest
     steps:

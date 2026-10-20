@@ -8,17 +8,97 @@ with [GPUI](https://www.gpui.rs/), the UI framework from Zed Industries.
 - **Red with a number**: that many repos are unsynced.
 - **Gray …**: the first check is still running.
 
-**Left-click** the icon to open the status window. It lists every repo with its
-status (`⬆2`, `⬇1`, `diverged`, `dirty`, `no upstream`, `✓ current`, or a fetch
-error) and has a **Refresh now** button. Click a repo to open its folder.
+A repo counts as unsynced if it is ahead, behind, diverged, has uncommitted
+changes, has no upstream branch, or its fetch failed. Status texts are `⬆2`,
+`⬇1`, `diverged`, `dirty`, `no upstream`, `✓ current`, or the error.
 
-**Right-click** the icon for the same list as a menu, plus **Show status
-window**, **Refresh now**, **Start with Windows** and **Quit**.
+gitstat only fetches. It never pulls, merges or pushes.
 
-Every `interval_minutes`, gitstat runs `git fetch` in each repo. It only
-fetches; it never pulls, merges or pushes. A repo counts as unsynced if it is
-ahead, behind, diverged, has uncommitted changes, has no upstream branch, or
-its fetch failed.
+## Using it
+
+**Left-click** the tray icon to open the **status panel**, a flyout next to
+the taskbar. Unsynced repos come first, worst first; the synced ones are
+folded into one "✓ N synced" row that expands on click. Click a repo to open
+its folder. ↻ fetches every repo now and ⧉ pops the list out into the status
+window. The panel closes when you click elsewhere, press Esc or click the tray
+icon again.
+
+**Double-click** the tray icon to open the **status window**, a normal window
+with every repo in name order and a **Refresh now** button.
+
+**Right-click** the tray icon for the menu:
+
+- the summary and every repo (click one to open its folder)
+- **Open status panel**, **Open status window**
+- **Refresh now**
+- **Display ▸**: Status panel on click, Status window, Corner badge, Badge
+  corner ▸, Hide badge when all synced, Hide badge in fullscreen, Folder icons
+  in Explorer
+- **Watch for changes**, **Start with Windows**, **Edit config.json**, **Quit**
+
+With the panel turned off, a left-click opens the window instead; with both
+off, a left-click shows the menu. The right-click menu is always there.
+
+### Corner badge
+
+**Display ▸ Corner badge** puts a small always-on-top circle in a corner of
+the primary monitor's work area, showing the unsynced count (or ✓, ! for a
+problem, … while checking). Clicking it opens the panel (or the window, if the
+panel is off). It never takes focus, clicks outside the circle go to the
+window underneath, and it follows resolution, DPI and taskbar changes within
+about 2 seconds. By default it hides while a fullscreen app or a presentation
+is running; it can also hide while everything is synced.
+
+### Folder icons in Explorer
+
+**Display ▸ Folder icons in Explorer** gives each repo folder an icon that
+shows its status (✓ synced, ⬆ ahead, ⬇ behind, ⬆⬇ diverged, ● dirty, – no
+upstream, ! error) and a tooltip such as `gitstat: ⬆2, uncommitted changes`.
+gitstat asks before turning it on.
+
+What it changes in each repo folder:
+
+- writes a hidden, system `desktop.ini` with `IconResource` and `InfoTip`
+  pointing at icons in `%LOCALAPPDATA%\gitstat\icons`;
+- sets the folder's read-only (or system) attribute, which is how Windows
+  turns on custom folder icons;
+- adds two lines to the repo's `.git/info/exclude`, `# gitstat folder icon`
+  and `/desktop.ini`, so `git status` stays clean. These lines stay after the
+  icons are removed; they are harmless.
+
+It skips folders on network or removable drives, folders inside OneDrive,
+repos that track a `desktop.ini`, and folders that already have a
+`desktop.ini` of their own, which is never touched. The panel's footer shows
+how many folders were skipped. The icon replaces the folder icon rather than
+adding a small overlay, and icons don't update while gitstat isn't running.
+
+To undo: untick the option, or quit gitstat and run
+`gitstat --remove-folder-icons`. Either restores every folder gitstat
+changed, from the list it keeps in `%LOCALAPPDATA%\gitstat\folder-icons.json`.
+
+The icons show in Explorer in every view and in the Files app. File Pilot is
+**unverified**: it uses the shell's icons, so it should show them, possibly
+only after F5.
+
+## How status stays current
+
+**Local changes** (an edit, a commit, a checkout, a push, a new or removed
+repo) are picked up from file-system events, usually within a second of the
+last write. gitstat ignores what git ignores (so `cargo build` or
+`npm install` churn costs nothing after the first check), never checks the
+same repo more than once every 2 seconds, and doesn't wake up at all while
+nothing changes. Its own `git status` runs with `GIT_OPTIONAL_LOCKS=0`, so it
+never rewrites `.git/index` or collides with your `index.lock`.
+
+**Remote changes** can't be seen locally, so every `interval_minutes` gitstat
+runs `git fetch --all --prune` in each repo (about 15 seconds after the PC
+wakes from sleep, on **Refresh now**, and with a 1, 2, then 5 minute backoff
+while a fetch keeps failing). Each sweep also rechecks local state, which
+covers network drives and `\\wsl$`, where events are unreliable.
+
+If the watch fails, the panel's footer says *Polling* and gitstat checks every
+repo once a minute until it can watch again. Untick **Watch for changes** (or
+set `"watch": false`) to check on the interval only, as before v0.3.
 
 ## Install
 
@@ -34,22 +114,47 @@ git must be on your `PATH` (Git for Windows puts it there).
 
 ## Configure
 
-`config.json` lives next to `gitstat.exe`:
+`config.json` lives next to `gitstat.exe`. Every key is optional, and a file
+from an older version keeps working:
 
 ```json
 {
   "path": "D:/dev",
-  "interval_minutes": 5.0
+  "interval_minutes": 5.0,
+  "watch": true,
+  "panel": true,
+  "window": true,
+  "overlay": {
+    "enabled": false,
+    "corner": "bottom-right",
+    "size": 44,
+    "margin": 16,
+    "hide_when_synced": false,
+    "hide_in_fullscreen": true
+  },
+  "folder_icons": false
 }
 ```
 
-`path` is the parent folder whose direct subfolders are your repos. On first
-run it's set to the folder that holds gitstat's own folder, so
-`D:\dev\gitstat\gitstat.exe` watches `D:\dev`. `~` and variables like
-`%USERPROFILE%` are expanded. Use forward slashes or doubled backslashes.
+| key | default | meaning |
+|---|---|---|
+| `path` | the folder above gitstat's own | The parent folder whose direct subfolders are your repos. `~` and variables like `%USERPROFILE%` are expanded. Use forward slashes or doubled backslashes. |
+| `interval_minutes` | 5 | How often to fetch, 1 to 1440. |
+| `watch` | true | Pick up local changes from file-system events. false checks on the interval only. |
+| `panel` | true | A tray left-click (and a badge click) opens the status panel. |
+| `window` | true | The status window is available from the menu, a double-click and the panel's ⧉ button. |
+| `overlay.enabled` | false | Show the corner badge. |
+| `overlay.corner` | `bottom-right` | `top-left`, `top-right`, `bottom-left` or `bottom-right`. |
+| `overlay.size` | 44 | Diameter in px at 100% scale, 24 to 128. |
+| `overlay.margin` | 16 | Distance from the screen edges in px at 100% scale, 0 to 200. |
+| `overlay.hide_when_synced` | false | Hide the badge while every repo is synced. |
+| `overlay.hide_in_fullscreen` | true | Hide the badge while a fullscreen app or a presentation runs. |
+| `folder_icons` | false | Status icons on the repo folders, see above. Setting it by hand skips the confirmation. |
 
-gitstat re-reads the file before every check, so edits apply on the next
-refresh without a restart. **Edit config.json** in the status window opens it.
+Edits apply within about a second, without a restart. **Edit config.json** in
+the menu or the panel opens the file. The menu's toggles write the file too;
+if it doesn't parse (say, an edit in progress), they leave it alone and the
+change lasts until gitstat quits.
 
 Fetches never prompt for credentials. A repo whose remote needs a password
 shows `fetch failed`, so use SSH keys or Git Credential Manager for those.
@@ -57,14 +162,17 @@ shows `fetch failed`, so use SSH keys or Git Credential Manager for those.
 ## Command line
 
 ```
-gitstat --once              print every repo's status and exit
-gitstat --once --no-fetch   same, without fetching first
-gitstat --config FILE       use another config file
+gitstat --once                  print every repo's status and exit
+gitstat --once --no-fetch       same, without fetching first
+gitstat --config FILE           use another config file
+gitstat --remove-folder-icons   restore every folder that got a status icon, and exit
 ```
 
-`--once` exits with code 1 if any repo is unsynced. gitstat.exe is a
-windowed app, so run it from PowerShell as `.\gitstat.exe --once | Out-Host`
-to have the terminal wait for its output.
+`--once` exits with code 1 if any repo is unsynced. `--remove-folder-icons`
+exits with code 1 if some folder couldn't be restored (it lists them, and they
+stay on the list for the next try), and refuses to run while the tray app is
+running. gitstat.exe is a windowed app, so run it from PowerShell as
+`.\gitstat.exe --once | Out-Host` to have the terminal wait for its output.
 
 ## Build from source
 
@@ -77,19 +185,30 @@ cargo build --release
 
 The executable is `target\release\gitstat.exe`. To run your own build, copy it
 into `builds\` (ignored by git) along with a `config.json` whose `path` points
-at your repos folder, since a new config defaults to the folder above the exe's folder. `cargo test` runs the status
-detection tests. They also run on macOS and Linux, where only `--once` is
-available.
+at your repos folder, since a new config defaults to the folder above the
+exe's folder.
+
+`cargo test` runs the status detection, file-watching, layout, config and
+folder-icon tests. They also run on Linux (CI runs them there too), where only
+`--once` is available.
 
 ## How it works
 
-- `src/git.rs` runs `git fetch --all --prune`, `git status --porcelain` and
-  `git rev-list --left-right --count HEAD...@{upstream}` in each repo, six
-  repos at a time, with no console windows.
+- `src/git.rs` runs `git fetch` and `git status --porcelain=v2 --branch` in
+  each repo, with no console windows and no optional locks.
+- `src/monitor.rs` is the scheduler thread: one recursive watch on the root
+  ([notify](https://crates.io/crates/notify)), the fetch sweep, and up to six
+  checks at a time. `src/watch.rs` decides which events matter and debounces
+  them.
+- `src/app.rs` is the GPUI app: startup, and one loop that handles tray,
+  monitor and badge input in batches. It wakes only on input.
+- `src/view.rs`, `src/panel.rs` and `src/overlay.rs` are the status window,
+  the flyout panel and the corner badge; `src/layout.rs` and `src/win.rs`
+  place them.
 - `src/tray.rs` owns the notification-area icon and menu
   ([tray-icon](https://crates.io/crates/tray-icon)). `src/icon.rs` draws the
-  icon.
-- `src/app.rs` is the GPUI app: shared state, the refresh timer, and the
-  status window.
-- `src/autostart.rs` adds or removes gitstat under
+  tray and folder icons, and `src/folder_icons.rs` applies and reverts the
+  desktop.ini icons.
+- `src/config.rs` reads and writes `config.json`. `src/autostart.rs` adds or
+  removes gitstat under
   `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
