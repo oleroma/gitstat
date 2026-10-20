@@ -75,7 +75,9 @@ a Windows SDK. GPUI compiles its shaders with the SDK's `fxc.exe`.
 cargo build --release
 ```
 
-The executable is `target\release\gitstat.exe`. `cargo test` runs the status
+The executable is `target\release\gitstat.exe`. To run your own build, copy it
+into `builds\` (ignored by git) along with a `config.json` whose `path` points
+at your repos folder, since a new config defaults to the folder above the exe's folder. `cargo test` runs the status
 detection tests. They also run on macOS and Linux, where only `--once` is
 available.
 
