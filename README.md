@@ -1,124 +1,93 @@
 # gitstat
 
-A tray / menu-bar icon that watches every git repo directly under one folder
-and shows at a glance whether they're in sync with their remotes.
+A Windows tray app that watches every git repo directly inside one folder and
+shows at a glance whether they're in sync with their remotes. It's built
+with [GPUI](https://www.gpui.rs/), the UI framework from Zed Industries.
 
 - **Green ✓**: every repo is current.
 - **Red with a number**: that many repos are unsynced.
-- **Right-click the icon** (click it on macOS) for the list: each repo with its status (`⬆2`, `⬇1`,
-  `diverged`, `dirty`, `no upstream`, `✓ current`), plus **Refresh now** and
-  **Quit**. Clicking a repo opens its folder.
+- **Gray …**: the first check is still running.
 
-Every `interval_minutes` it runs `git fetch` in each repo. It only fetches; it
-never pulls, merges or pushes. A repo counts as unsynced if it is ahead,
-behind, diverged, has uncommitted changes, has no upstream branch, or its fetch
-failed.
+**Left-click** the icon to open the status window. It lists every repo with its
+status (`⬆2`, `⬇1`, `diverged`, `dirty`, `no upstream`, `✓ current`, or a fetch
+error) and has a **Refresh now** button. Click a repo to open its folder.
 
-## Setup
+**Right-click** the icon for the same list as a menu, plus **Show status
+window**, **Refresh now**, **Start with Windows** and **Quit**.
 
-You need Python 3.8+ and git on your `PATH`.
+Every `interval_minutes`, gitstat runs `git fetch` in each repo. It only
+fetches; it never pulls, merges or pushes. A repo counts as unsynced if it is
+ahead, behind, diverged, has uncommitted changes, has no upstream branch, or
+its fetch failed.
 
-```sh
-git clone https://github.com/oleroma/gitstat.git
-cd gitstat
-python3 -m pip install -r requirements.txt
-```
+## Install
 
-Edit `config.json`:
+1. Download `gitstat-windows-x64` from the latest successful
+   [build](../../actions/workflows/build.yml) and unzip it. Or build it
+   yourself, see below.
+2. Put `gitstat.exe` in a folder of its own, e.g. `D:\dev\gitstat\`.
+3. Run it. The first time, it writes `config.json` next to itself.
+4. Right-click the tray icon and tick **Start with Windows** to have it start
+   on every login.
+
+git must be on your `PATH` (Git for Windows puts it there).
+
+## Configure
+
+`config.json` lives next to `gitstat.exe`:
 
 ```json
 {
-  "path": "~/dev",
-  "interval_minutes": 5
+  "path": "D:/dev",
+  "interval_minutes": 5.0
 }
 ```
 
-`path` is the parent folder whose direct subfolders are your repos (`~` and
-environment variables like `%USERPROFILE%` are expanded). On Windows use
-forward slashes or doubled backslashes, e.g. `"C:/Users/me/dev"`.
+`path` is the parent folder whose direct subfolders are your repos. On first
+run it's set to the folder that holds gitstat's own folder, so
+`D:\dev\gitstat\gitstat.exe` watches `D:\dev`. `~` and variables like
+`%USERPROFILE%` are expanded. Use forward slashes or doubled backslashes.
 
-Check it without the tray first. This prints every repo's status and exits:
+gitstat re-reads the file before every check, so edits apply on the next
+refresh without a restart. **Edit config.json** in the status window opens it.
 
-```sh
-python3 gitstat.py --once
+Fetches never prompt for credentials. A repo whose remote needs a password
+shows `fetch failed`, so use SSH keys or Git Credential Manager for those.
+
+## Command line
+
+```
+gitstat --once              print every repo's status and exit
+gitstat --once --no-fetch   same, without fetching first
+gitstat --config FILE       use another config file
 ```
 
-Then run the tray app:
+`--once` exits with code 1 if any repo is unsynced. gitstat.exe is a
+windowed app, so run it from PowerShell as `.\gitstat.exe --once | Out-Host`
+to have the terminal wait for its output.
 
-```sh
-python3 gitstat.py
+## Build from source
+
+You need [Rust](https://rustup.rs/) and the Visual Studio C++ build tools with
+a Windows SDK. GPUI compiles its shaders with the SDK's `fxc.exe`.
+
+```
+cargo build --release
 ```
 
-Pass `--config other.json` to use a config file somewhere else.
+The executable is `target\release\gitstat.exe`. `cargo test` runs the status
+detection tests. They also run on macOS and Linux, where only `--once` is
+available.
 
-Fetches run non-interactively, so repos whose remotes need a password prompt
-will show `fetch failed`. Use an SSH agent or a credential helper for those.
+## How it works
 
-## Start on login
-
-Replace `/path/to/gitstat` with where you cloned it.
-
-### Windows
-
-Run this once in PowerShell from the gitstat folder. It puts a shortcut in
-your Startup folder that launches gitstat with `pythonw`, which runs it
-without a console window:
-
-```powershell
-$pyw = (Get-Command pythonw).Source
-$lnk = (New-Object -ComObject WScript.Shell).CreateShortcut("$([Environment]::GetFolderPath('Startup'))\gitstat.lnk")
-$lnk.TargetPath = $pyw
-$lnk.Arguments = "`"$PWD\gitstat.py`""
-$lnk.WorkingDirectory = "$PWD"
-$lnk.Save()
-```
-
-To start it right away, double-click the new shortcut (`Win+R`,
-`shell:startup`). To stop it starting on login, delete that shortcut. If
-the icon lands in the hidden-icons overflow, drag it onto the taskbar.
-
-### macOS
-
-Save this as `~/Library/LaunchAgents/com.gitstat.plist`, fixing the two paths
-(`which python3` tells you the first one):
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.gitstat</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/usr/local/bin/python3</string>
-    <string>/path/to/gitstat/gitstat.py</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-</dict>
-</plist>
-```
-
-Load it now (it then starts on every login):
-
-```sh
-launchctl load ~/Library/LaunchAgents/com.gitstat.plist
-```
-
-### Linux
-
-Save this as `~/.config/autostart/gitstat.desktop`:
-
-```ini
-[Desktop Entry]
-Type=Application
-Name=gitstat
-Exec=python3 /path/to/gitstat/gitstat.py
-X-GNOME-Autostart-enabled=true
-```
-
-KDE, XFCE, Cinnamon and most other desktops show tray icons out of the box.
-On GNOME, install the "AppIndicator and KStatusNotifierItem Support"
-extension. If the icon doesn't appear, install the AppIndicator bindings
-(`sudo apt install gir1.2-ayatanaappindicator3-0.1 python3-gi` on
-Debian/Ubuntu) and use the system Python, or create your venv with
-`--system-site-packages`.
+- `src/git.rs` runs `git fetch --all --prune`, `git status --porcelain` and
+  `git rev-list --left-right --count HEAD...@{upstream}` in each repo, six
+  repos at a time, with no console windows.
+- `src/tray.rs` owns the notification-area icon and menu
+  ([tray-icon](https://crates.io/crates/tray-icon)). `src/icon.rs` draws the
+  icon.
+- `src/app.rs` is the GPUI app: shared state, the refresh timer, and the
+  status window.
+- `src/autostart.rs` adds or removes gitstat under
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
