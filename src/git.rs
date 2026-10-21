@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 /// hammering a remote that hosts most of the repos.
 const MAX_PARALLEL: usize = 6;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
-const LOCAL_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const LOCAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RepoStatus {
@@ -652,7 +652,7 @@ fn parse_version(text: &str) -> Option<(u32, u32)> {
 }
 
 /// Runs git in `repo`; see [`run_git`].
-fn git(repo: &Path, args: &[&str], timeout: Duration) -> Result<Output, String> {
+pub(crate) fn git(repo: &Path, args: &[&str], timeout: Duration) -> Result<Output, String> {
     run_git(Some(repo), args, timeout)
 }
 

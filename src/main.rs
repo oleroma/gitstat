@@ -11,6 +11,10 @@ mod git;
 #[cfg(any(windows, test))]
 mod folder_icons;
 #[cfg(any(windows, test))]
+mod graph;
+#[cfg(any(windows, test))]
+mod history;
+#[cfg(any(windows, test))]
 mod icon;
 #[cfg(any(windows, test))]
 mod layout;
@@ -18,6 +22,8 @@ mod layout;
 mod monitor;
 #[cfg(any(windows, test))]
 mod repo_icon;
+#[cfg(any(windows, test))]
+mod repo_info;
 #[cfg(any(windows, test))]
 mod state;
 #[cfg(any(windows, test))]
