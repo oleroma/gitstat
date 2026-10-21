@@ -17,6 +17,8 @@ mod layout;
 #[cfg(any(windows, test))]
 mod monitor;
 #[cfg(any(windows, test))]
+mod repo_icon;
+#[cfg(any(windows, test))]
 mod state;
 #[cfg(any(windows, test))]
 mod watch;

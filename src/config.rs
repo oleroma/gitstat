@@ -18,6 +18,18 @@ pub enum Corner {
     BottomRight,
 }
 
+/// What a repo folder's icon in Explorer is drawn from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FolderIconMode {
+    /// A folder with a status badge.
+    #[default]
+    Status,
+    /// The repo's own `.gitstat/icon.svg` in its status colour, where it
+    /// has one; the status folder elsewhere.
+    RepoSvg,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OverlayConfig {
@@ -73,6 +85,8 @@ pub struct Config {
     pub overlay: OverlayConfig,
     /// desktop.ini status icons on the repo folders.
     pub folder_icons: bool,
+    /// What those icons are drawn from; only matters with `folder_icons`.
+    pub folder_icon_mode: FolderIconMode,
 }
 
 impl Default for Config {
@@ -86,6 +100,7 @@ impl Default for Config {
             window: true,
             overlay: OverlayConfig::default(),
             folder_icons: false,
+            folder_icon_mode: FolderIconMode::default(),
         }
     }
 }
@@ -349,6 +364,7 @@ mod tests {
             }
         );
         assert!(config.watch && config.panel && config.window && !config.folder_icons);
+        assert_eq!(config.folder_icon_mode, FolderIconMode::Status);
         assert_eq!(config.overlay, OverlayConfig::default());
         assert!(!config.overlay.enabled && config.overlay.hide_in_fullscreen);
         // A partial overlay section keeps the other overlay defaults.
@@ -372,6 +388,33 @@ mod tests {
             assert_eq!(serde_json::from_str::<Corner>(text).unwrap(), corner);
         }
         assert!(serde_json::from_str::<Corner>("\"BottomRight\"").is_err());
+    }
+
+    #[test]
+    fn folder_icon_mode_defaults_to_status() {
+        let parse = |text: &str| serde_json::from_str::<Config>(text);
+        // Files from before the key, with or without folder icons on.
+        assert_eq!(
+            parse(r#"{ "folder_icons": true }"#)
+                .unwrap()
+                .folder_icon_mode,
+            FolderIconMode::Status
+        );
+        assert_eq!(Config::default().folder_icon_mode, FolderIconMode::Status);
+        let svg = parse(r#"{ "folder_icons": true, "folder_icon_mode": "repo-svg" }"#).unwrap();
+        assert_eq!(svg.folder_icon_mode, FolderIconMode::RepoSvg);
+        assert_eq!(
+            parse(r#"{ "folder_icon_mode": "status" }"#)
+                .unwrap()
+                .folder_icon_mode,
+            FolderIconMode::Status
+        );
+        // Spelled as in the README only.
+        assert!(parse(r#"{ "folder_icon_mode": "RepoSvg" }"#).is_err());
+        assert!(parse(r#"{ "folder_icon_mode": "svg" }"#).is_err());
+        let text = serde_json::to_string(&svg).unwrap();
+        assert!(text.contains(r#""folder_icon_mode":"repo-svg""#), "{text}");
+        assert_eq!(parse(&text).unwrap(), svg);
     }
 
     #[test]
@@ -501,6 +544,7 @@ mod tests {
         config.overlay.corner = Corner::TopLeft;
         config.overlay.enabled = true;
         config.folder_icons = true;
+        config.folder_icon_mode = FolderIconMode::RepoSvg;
         // Creates a missing file.
         config.save(&file).unwrap();
         assert_eq!(Config::load_or_create(&file).unwrap(), config);

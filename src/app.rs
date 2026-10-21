@@ -1,7 +1,7 @@
 //! The GPUI side: startup, the one input loop, and the settings the tray
 //! menu changes. The views live in view.rs, panel.rs and overlay.rs.
 
-use crate::config::{self, ClickAction, Config};
+use crate::config::{self, ClickAction, Config, FolderIconMode};
 use crate::folder_icons;
 use crate::monitor::{Command, Monitor, Update};
 use crate::panel::{self, Anchor};
@@ -147,13 +147,13 @@ async fn input_loop(mut rx: UnboundedReceiver<Input>, cx: &mut gpui::AsyncApp) {
 fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
     let state = cx.global::<Ui>().state.clone();
     let mut changed = false;
-    let mut statuses_changed = false;
+    let mut icons_stale = false;
     for input in batch {
         match input {
             Input::Monitor(update) => {
                 let (c, s) = on_update(update, cx);
                 changed |= c;
-                statuses_changed |= s;
+                icons_stale |= s;
             }
             Input::FolderSkips(skips) => {
                 state.update(cx, |s, _| s.folder_skips = skips);
@@ -196,7 +196,10 @@ fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
     }
     if changed {
         state.update(cx, |_, cx| cx.notify());
-        update_outputs(statuses_changed, cx);
+    }
+    // An icon.svg change alone changes nothing on screen.
+    if changed || icons_stale {
+        update_outputs(icons_stale, cx);
     } else {
         cx.global_mut::<Shared>().tray.check_icon_size();
     }
@@ -206,9 +209,14 @@ fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
 }
 
 /// Folds one monitor update into the state. Returns (anything changed,
-/// statuses changed).
+/// the folder icons need a sync: statuses changed, or a repo's own icon
+/// may have).
 fn on_update(update: Update, cx: &mut App) -> (bool, bool) {
     let state = cx.global::<Ui>().state.clone();
+    let repo_svgs = {
+        let config = &state.read(cx).config;
+        config.folder_icons && config.folder_icon_mode == FolderIconMode::RepoSvg
+    };
     match update {
         Update::Config(Ok(new)) => {
             state.update(cx, |s, _| s.config_error = None);
@@ -249,10 +257,13 @@ fn on_update(update: Update, cx: &mut App) -> (bool, bool) {
             s.sweeping = false;
             s.last_checked = Some(local_time());
             // The first result: the folder-icon worker can start now.
+            // Every sweep has another look at the repos' own icons, which
+            // covers a missed event and `watch: false`.
             let first = !s.has_result;
             s.has_result = true;
-            (true, first)
+            (true, first || repo_svgs)
         }),
+        Update::RepoIcons => (false, repo_svgs),
         Update::Mode(mode) => {
             state.update(cx, |s, _| s.mode = mode);
             (true, false)
@@ -260,8 +271,9 @@ fn on_update(update: Update, cx: &mut App) -> (bool, bool) {
     }
 }
 
-/// Brings the tray, the folder icons and the badge up to date with the state.
-fn update_outputs(statuses_changed: bool, cx: &mut App) {
+/// Brings the tray, the folder icons and the badge up to date with the
+/// state; the folder icons only with `sync_icons`.
+fn update_outputs(sync_icons: bool, cx: &mut App) {
     let state = cx.global::<Ui>().state.clone();
     cx.update_global::<Shared, _>(|shared, cx| {
         let s = state.read(cx);
@@ -273,8 +285,13 @@ fn update_outputs(statuses_changed: bool, cx: &mut App) {
             problem: problem.as_deref(),
             incomplete: s.capped.is_some(),
         });
-        if statuses_changed && s.has_result {
-            shared.icons.sync(s.statuses.clone(), s.config.folder_icons);
+        if sync_icons && s.has_result {
+            let config = &s.config;
+            shared.icons.sync(
+                s.statuses.clone(),
+                config.folder_icons,
+                config.folder_icon_mode,
+            );
         }
     });
     overlay::sync(cx);
@@ -320,6 +337,7 @@ fn on_action(action: TrayAction, cx: &mut App) -> bool {
             },
             cx,
         ),
+        TrayAction::SetFolderIconMode(mode) => change_setting(|c| c.folder_icon_mode = mode, cx),
         TrayAction::SetAutostart(enabled) => {
             if let Err(e) = crate::autostart::set_enabled(enabled) {
                 crate::error_box(format!("Couldn't change the startup setting: {e}"));
@@ -419,12 +437,17 @@ fn apply_config(old: &Config, new: Config, cx: &mut App) {
         overlay::sync(cx);
     }
     let s = state.read(cx);
-    // Turning icons off reverts even before the first result.
-    let sync_icons = new.folder_icons != old.folder_icons && (s.has_result || !new.folder_icons);
+    // Turning icons off reverts even before the first result. A new mode
+    // matters only while they are on.
+    let icons_changed = new.folder_icons != old.folder_icons
+        || (new.folder_icons && new.folder_icon_mode != old.folder_icon_mode);
+    let sync_icons = icons_changed && (s.has_result || !new.folder_icons);
     let statuses = s.statuses.clone();
     let shared = cx.global::<Shared>();
     if sync_icons {
-        shared.icons.sync(statuses, new.folder_icons);
+        shared
+            .icons
+            .sync(statuses, new.folder_icons, new.folder_icon_mode);
     }
     shared.tray.sync_settings(&new);
 }

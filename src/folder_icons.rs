@@ -1,11 +1,17 @@
 //! Status icons on the repo folders in Explorer, through desktop.ini. A
 //! ledger in `data_dir` remembers what we changed so it can be undone.
 //!
+//! In the `repo-svg` mode a repo with a `.gitstat/icon.svg` gets that
+//! picture in its status colour instead (see repo_icon.rs), one .ico per
+//! repo, colour and picture.
+//!
 //! [`plan`] decides what to do and is pure; the Windows [`Worker`] carries
 //! it out off the UI thread.
 
+use crate::config::FolderIconMode;
 use crate::git::RepoStatus;
 use crate::icon::{FolderState, ICON_VERSION};
+use crate::repo_icon;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -23,6 +29,18 @@ pub const SKIP_FOREIGN: &str = "folder already has its own desktop.ini";
 pub struct Ledger {
     /// Keyed by [`key`]: the lowercased folder path.
     pub entries: BTreeMap<String, Entry>,
+    /// Repo icons that folders we let go of still show, see [`Kept`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kept: Vec<Kept>,
+}
+
+/// A repo icon whose folder left the ledger with its desktop.ini as it was
+/// (git tracks the file now), so the file still points at the icon. It is
+/// kept until it doesn't, rather than deleted from under it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Kept {
+    pub path: PathBuf,
+    pub repo_icon: String,
 }
 
 /// A folder whose icon we applied, and what to restore when reverting.
@@ -39,6 +57,22 @@ pub struct Entry {
     /// field read 0, so their folders move to the new artwork once.
     #[serde(default)]
     pub icon_version: u32,
+    /// The mode it was applied in; older ledgers knew only `Status`.
+    #[serde(default)]
+    pub mode: FolderIconMode,
+    /// In `RepoSvg` mode, the repo's icon.svg as `repo_icon::fingerprint`
+    /// saw it. With `state` and `mode`, what decides whether to re-apply.
+    /// `None` after a failure worth another try, so the next sync has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub svg: Option<String>,
+    /// The icon.svg couldn't be used, so the status folder shows: why. Only
+    /// the file's own faults, which last until it changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub svg_error: Option<String>,
+    /// The repo icon's file name in the icons dir, for cleaning up the
+    /// ones no folder points at any more.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_icon: Option<String>,
 }
 
 impl Ledger {
@@ -77,6 +111,30 @@ impl Ledger {
     pub fn get(&self, path: &Path) -> Option<&Entry> {
         self.entries.get(&key(path))
     }
+
+    /// Drops `path`'s entry and leaves the folder as it is, keeping the
+    /// repo icon its desktop.ini points at.
+    fn forget(&mut self, path: &Path) {
+        if let Some(entry) = self.entries.remove(&key(path))
+            && let Some(repo_icon) = entry.repo_icon
+        {
+            let kept = Kept {
+                path: entry.path,
+                repo_icon,
+            };
+            if !self.kept.contains(&kept) {
+                self.kept.push(kept);
+            }
+        }
+    }
+
+    /// Lets go of the kept repo icons that `points_at(folder, icon)` says
+    /// their folder no longer shows. Whether there were any.
+    fn prune_kept(&mut self, points_at: impl Fn(&Path, &str) -> bool) -> bool {
+        let before = self.kept.len();
+        self.kept.retain(|k| points_at(&k.path, &k.repo_icon));
+        self.kept.len() != before
+    }
 }
 
 /// Ledger key: Windows paths compare case-insensitively.
@@ -96,6 +154,8 @@ pub trait Probe {
     fn foreign_ini(&self, p: &Path) -> bool;
     fn exists(&self, p: &Path) -> bool;
     fn ini_present(&self, p: &Path) -> bool;
+    /// `repo_icon::fingerprint`: the repo's icon.svg, `None` without one.
+    fn repo_svg(&self, p: &Path) -> Option<String>;
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -104,11 +164,17 @@ pub enum Op {
         path: PathBuf,
         state: FolderState,
         tip: String,
+        mode: FolderIconMode,
+        /// The icon.svg to draw (`RepoSvg` mode only), by fingerprint.
+        svg: Option<String>,
     },
     Revert(PathBuf),
     /// Drop the ledger entry without touching the folder.
     Forget(PathBuf),
     Skip(PathBuf, &'static str),
+    /// Up to date, but showing the status folder because the repo's
+    /// icon.svg couldn't be used: why, reported like a skip.
+    Note(PathBuf, String),
 }
 
 /// What to change so the folders match `statuses`. Folders already showing
@@ -117,7 +183,17 @@ pub enum Op {
 ///
 /// Entries no longer wanted are undone first, so a folder that comes back
 /// under another spelling (a new key) is applied to a clean folder.
-pub fn plan(ledger: &Ledger, statuses: &[RepoStatus], enabled: bool, probe: &dyn Probe) -> Vec<Op> {
+///
+/// A folder is up to date when its state, tip, `mode` and (in `RepoSvg`
+/// mode) icon.svg are what was applied, so a change to any of them
+/// re-applies it once, and a mode switch re-applies every folder.
+pub fn plan(
+    ledger: &Ledger,
+    statuses: &[RepoStatus],
+    enabled: bool,
+    mode: FolderIconMode,
+    probe: &dyn Probe,
+) -> Vec<Op> {
     let mut ops = Vec::new();
     let wanted: HashSet<String> = if enabled {
         statuses.iter().map(|s| key(&s.path)).collect()
@@ -140,15 +216,26 @@ pub fn plan(ledger: &Ledger, statuses: &[RepoStatus], enabled: bool, probe: &dyn
             let entry = ledger.entries.get(&key(path));
             let view = local_view(s);
             let (state, tip) = (FolderState::of(&view), tip(&view));
+            let read_svg = || match mode {
+                FolderIconMode::RepoSvg => probe.repo_svg(path),
+                FolderIconMode::Status => None,
+            };
             // `git clean -X` removes desktop.ini without telling the ledger.
-            // A new ICON_VERSION means new file names to point at.
-            if entry.is_some_and(|e| {
-                e.state == state
-                    && e.tip == tip
-                    && e.icon_version == ICON_VERSION
-                    && probe.ini_present(path)
+            // A new ICON_VERSION means new file names to point at. The
+            // icon.svg is read only for a folder that may be up to date,
+            // or is about to be applied.
+            let mut svg = None;
+            if let Some(e) = entry.filter(|e| {
+                e.state == state && e.tip == tip && e.icon_version == ICON_VERSION && e.mode == mode
             }) {
-                continue;
+                let now = read_svg();
+                if e.svg == now && probe.ini_present(path) {
+                    if let Some(why) = &e.svg_error {
+                        ops.push(Op::Note(path.clone(), why.clone()));
+                    }
+                    continue;
+                }
+                svg = Some(now);
             }
             // A drive root (`D:\` as the root and a repo itself) has no
             // folder icon to replace.
@@ -189,6 +276,8 @@ pub fn plan(ledger: &Ledger, statuses: &[RepoStatus], enabled: bool, probe: &dyn
                 path: path.clone(),
                 state,
                 tip,
+                mode,
+                svg: svg.unwrap_or_else(read_svg),
             });
         }
     }
@@ -242,6 +331,70 @@ fn icons_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("icons")
 }
 
+/// Repo icons (and their temp files) among `names`, the icons dir's
+/// files, that no ledger entry points at and none is kept: their repo is
+/// gone, or now shows another colour or picture.
+fn stale_repo_icons(ledger: &Ledger, names: impl IntoIterator<Item = String>) -> Vec<String> {
+    let used: HashSet<&str> = ledger
+        .entries
+        .values()
+        .filter_map(|e| e.repo_icon.as_deref())
+        .chain(ledger.kept.iter().map(|k| k.repo_icon.as_str()))
+        .collect();
+    names
+        .into_iter()
+        .filter(|name| repo_icon::is_repo_icon_file(name) && !used.contains(name.as_str()))
+        .collect()
+}
+
+/// What an apply in `RepoSvg` mode records about the repo's icon.svg.
+#[derive(Debug, Default, PartialEq)]
+struct SvgOutcome {
+    /// For the ledger entry's fields of the same names.
+    svg: Option<String>,
+    svg_error: Option<String>,
+    repo_icon: Option<String>,
+    /// Why the status folder shows instead, to report this time.
+    note: Option<String>,
+}
+
+/// Loads and draws the icon.svg that `plan` saw as `planned`; `draw`
+/// returns the .ico's file name.
+///
+/// The file's own faults are recorded with its fingerprint, so it isn't
+/// tried again until it changes. Any other failure (it couldn't be read,
+/// drawing it took too long, the .ico couldn't be saved) records no
+/// fingerprint, so the next sync tries again, this run or the next.
+fn draw_repo_svg(
+    planned: String,
+    load: impl FnOnce() -> Result<Option<Vec<u8>>, repo_icon::Error>,
+    draw: impl FnOnce(&[u8]) -> Result<String, repo_icon::Error>,
+) -> SvgOutcome {
+    let (svg, drawn) = match load() {
+        // Gone since: the status folder is right.
+        Ok(None) => return SvgOutcome::default(),
+        Ok(Some(bytes)) => (repo_icon::fingerprint_of(&bytes), draw(&bytes)),
+        Err(e) => (planned, Err(e)),
+    };
+    match drawn {
+        Ok(name) => SvgOutcome {
+            svg: Some(svg),
+            repo_icon: Some(name),
+            ..SvgOutcome::default()
+        },
+        Err(e) if e.transient => SvgOutcome {
+            note: Some(e.message),
+            ..SvgOutcome::default()
+        },
+        Err(e) => SvgOutcome {
+            svg: Some(svg),
+            svg_error: Some(e.message.clone()),
+            repo_icon: None,
+            note: Some(e.message),
+        },
+    }
+}
+
 /// desktop.ini text. The shell writes UTF-16 with a BOM, people write ANSI.
 fn decode_ini(bytes: &[u8]) -> String {
     if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
@@ -285,6 +438,11 @@ fn ini_has_keys(text: &str) -> bool {
 /// The icon desktop.ini points at: `IconResource`, or the older `IconFile`.
 fn ini_icon(text: &str) -> Option<String> {
     ini_value(text, SECTION, "IconResource").or_else(|| ini_value(text, SECTION, "IconFile"))
+}
+
+/// Whether desktop.ini's icon is the file named `name`, wherever it is.
+fn ini_points_at(text: &str, name: &str) -> bool {
+    ini_icon(text).is_some_and(|icon| norm(&icon).contains(&norm(name)))
 }
 
 /// Whether an `IconResource` value (`path,index`, maybe quoted or with
@@ -412,7 +570,7 @@ mod shell {
 
     const INI: &str = "desktop.ini";
 
-    type Job = (Vec<RepoStatus>, bool);
+    type Job = (Vec<RepoStatus>, bool, FolderIconMode);
     type Skips = Vec<(PathBuf, String)>;
 
     /// Applies plans on its own thread, coalescing to the latest request.
@@ -436,7 +594,7 @@ mod shell {
                             job = newer;
                         }
                         let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            engine.sync(&job.0, job.1).0
+                            engine.sync(&job.0, job.1, job.2).0
                         }));
                         if let Ok(skips) = run
                             && last.as_ref() != Some(&skips)
@@ -449,8 +607,9 @@ mod shell {
             Self { tx }
         }
 
-        pub fn sync(&self, statuses: Vec<RepoStatus>, enabled: bool) {
-            let _ = self.tx.send((statuses, enabled));
+        /// Repo icons are drawn here too, on the worker's thread.
+        pub fn sync(&self, statuses: Vec<RepoStatus>, enabled: bool, mode: FolderIconMode) {
+            let _ = self.tx.send((statuses, enabled, mode));
         }
     }
 
@@ -461,7 +620,7 @@ mod shell {
         // Its own thread, so COM on the caller's thread stays as it was.
         let joined = std::thread::spawn(move || {
             let _com = Com::init();
-            Engine::new(data_dir).sync(&[], false)
+            Engine::new(data_dir).sync(&[], false, FolderIconMode::Status)
         })
         .join();
         let (failed, reverted) = joined.map_err(|_| "internal error".to_string())?;
@@ -557,6 +716,10 @@ mod shell {
         fn ini_present(&self, p: &Path) -> bool {
             p.join(INI).exists()
         }
+
+        fn repo_svg(&self, p: &Path) -> Option<String> {
+            repo_icon::fingerprint(p)
+        }
     }
 
     /// Queued `SHCNE_UPDATEITEM`s, sent through the [`Throttle`].
@@ -601,7 +764,11 @@ mod shell {
         /// saved until it can, or it would be overwritten.
         load_error: Option<String>,
         icons_ready: bool,
+        /// Repo icons may have fallen out of use since the last cleanup.
+        /// True at first, for what an earlier run left.
+        repo_icons_dirty: bool,
         notifier: Notifier,
+        renderer: repo_icon::Renderer,
     }
 
     impl Engine {
@@ -617,13 +784,20 @@ mod shell {
                 ledger_file,
                 data_dir,
                 icons_ready: false,
+                repo_icons_dirty: true,
                 notifier: Notifier::default(),
+                renderer: repo_icon::Renderer::default(),
             }
         }
 
         /// Returns the folders left alone (or that failed) with the reason,
         /// and how many were reverted.
-        fn sync(&mut self, statuses: &[RepoStatus], enabled: bool) -> (Skips, usize) {
+        fn sync(
+            &mut self,
+            statuses: &[RepoStatus],
+            enabled: bool,
+            mode: FolderIconMode,
+        ) -> (Skips, usize) {
             if self.load_error.is_some() {
                 // Maybe it was only locked for a moment.
                 match Ledger::load(&self.ledger_file) {
@@ -635,31 +809,42 @@ mod shell {
                 }
             }
             let probe = ShellProbe::new(icons_dir(&self.data_dir));
-            let ops = plan(&self.ledger, statuses, enabled, &probe);
+            let ops = plan(&self.ledger, statuses, enabled, mode, &probe);
             let (mut skips, mut reverted) = (Vec::new(), 0);
             for op in ops {
+                if !matches!(op, Op::Skip(..) | Op::Note(..)) {
+                    self.repo_icons_dirty = true;
+                }
                 match op {
-                    Op::Apply { path, state, tip } => {
-                        if let Err(e) = self.apply(&path, state, &tip) {
-                            skips.push((path, e));
-                        }
-                    }
+                    Op::Apply {
+                        path,
+                        state,
+                        tip,
+                        mode,
+                        svg,
+                    } => match self.apply(&path, state, &tip, mode, svg) {
+                        Ok(None) => {}
+                        Ok(Some(note)) => skips.push((path, note)),
+                        Err(e) => skips.push((path, e)),
+                    },
                     Op::Revert(path) => match self.revert(&path) {
                         Ok(Reverted::Restored) => reverted += 1,
                         Ok(Reverted::Tracked) => skips.push((path, SKIP_TRACKED.to_string())),
                         Err(e) => skips.push((path, e)),
                     },
                     Op::Forget(path) => {
-                        self.ledger.entries.remove(&key(&path));
+                        self.ledger.forget(&path);
                         if let Err(e) = self.ledger.save(&self.ledger_file) {
                             skips.push((path, e));
                         }
                     }
                     Op::Skip(path, why) => skips.push((path, why.to_string())),
+                    Op::Note(path, why) => skips.push((path, why)),
                 }
                 self.notifier.pump(false);
             }
             self.notifier.pump(true);
+            self.remove_stale_repo_icons();
             skips.sort_by(|a, b| a.0.cmp(&b.0));
             (skips, reverted)
         }
@@ -673,21 +858,81 @@ mod shell {
             let fail = |e: std::io::Error| format!("can't write icons in {}: {e}", dir.display());
             std::fs::create_dir_all(&dir).map_err(fail)?;
             for state in FolderState::ALL {
-                let file = icon_file(&self.data_dir, state);
-                let bytes = icon::folder_ico(state);
-                if std::fs::read(&file).ok().as_deref() == Some(&bytes[..]) {
-                    continue;
-                }
-                let tmp = file.with_extension("ico.tmp");
-                std::fs::write(&tmp, &bytes).map_err(fail)?;
-                std::fs::rename(&tmp, &file).map_err(fail)?;
+                write_if_changed(&icon_file(&self.data_dir, state), &icon::folder_ico(state))
+                    .map_err(fail)?;
             }
             self.icons_ready = true;
             Ok(())
         }
 
-        fn apply(&mut self, path: &Path, state: FolderState, tip: &str) -> Result<(), String> {
+        /// Draws the repo's icon.svg, `svg`, in `state`'s colour into its
+        /// own .ico and returns that file's name. Errors say why the status
+        /// folder shows instead.
+        fn write_repo_icon(
+            &self,
+            path: &Path,
+            state: FolderState,
+            svg: &[u8],
+        ) -> Result<String, repo_icon::Error> {
+            let tone = state.tone();
+            let ico = self.renderer.render(&key(path), svg, tone)?;
+            let name = repo_icon::file_name(path, tone, svg);
+            let file = icons_dir(&self.data_dir).join(&name);
+            write_if_changed(&file, &ico).map_err(|e| repo_icon::Error {
+                message: format!("{}: {e}", file.display()),
+                transient: true,
+            })?;
+            Ok(name)
+        }
+
+        /// Deletes the repo icons no ledger entry points at, and lets go of
+        /// kept ones whose folder shows another icon now.
+        fn remove_stale_repo_icons(&mut self) {
+            if !std::mem::take(&mut self.repo_icons_dirty) {
+                return;
+            }
+            if self.ledger.prune_kept(shows_icon) {
+                // Or with the next change.
+                let _ = self.ledger.save(&self.ledger_file);
+            }
+            let dir = icons_dir(&self.data_dir);
+            let Ok(listing) = std::fs::read_dir(&dir) else {
+                return;
+            };
+            let names = listing
+                .flatten()
+                .filter_map(|e| e.file_name().into_string().ok());
+            for name in stale_repo_icons(&self.ledger, names) {
+                // Maybe in use by Explorer this moment: next time, then.
+                if std::fs::remove_file(dir.join(&name)).is_err() {
+                    self.repo_icons_dirty = true;
+                }
+            }
+        }
+
+        /// Returns why the status folder shows instead of the repo's
+        /// icon.svg, if it does in `RepoSvg` mode.
+        fn apply(
+            &mut self,
+            path: &Path,
+            state: FolderState,
+            tip: &str,
+            mode: FolderIconMode,
+            svg: Option<String>,
+        ) -> Result<Option<String>, String> {
             self.ensure_icons()?;
+            let drawn = match svg {
+                Some(planned) => draw_repo_svg(
+                    planned,
+                    || repo_icon::load(path),
+                    |svg| self.write_repo_icon(path, state, svg),
+                ),
+                None => SvgOutcome::default(),
+            };
+            let icon = match &drawn.repo_icon {
+                Some(name) => icons_dir(&self.data_dir).join(name),
+                None => icon_file(&self.data_dir, state),
+            };
             // Before desktop.ini exists, or the repo shows as dirty.
             crate::git::ensure_excluded(path, &format!("/{INI}"))
                 .map_err(|e| format!("can't exclude desktop.ini: {e}"))?;
@@ -714,6 +959,10 @@ mod shell {
                     None => folder_attrs & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM) != 0,
                 },
                 icon_version: ICON_VERSION,
+                mode,
+                svg: drawn.svg,
+                svg_error: drawn.svg_error,
+                repo_icon: drawn.repo_icon,
             };
             // Record first, so a crash mid-write still leaves something to revert.
             if prev.is_none() {
@@ -723,13 +972,14 @@ mod shell {
                     return Err(e);
                 }
             }
-            if let Err(e) = write_settings(path, &ini, ini_existed, state, tip, &self.data_dir) {
+            if let Err(e) = write_settings(path, &ini, ini_existed, &icon, tip) {
                 let _ = self.revert(path);
                 return Err(e);
             }
             self.ledger.entries.insert(key(path), entry);
             self.notifier.push(path);
-            self.ledger.save(&self.ledger_file)
+            self.ledger.save(&self.ledger_file)?;
+            Ok(drawn.note)
         }
 
         /// Undoes our changes to a folder and drops its entry. An error
@@ -745,7 +995,7 @@ mod shell {
                 && path.join(".git").exists()
                 && crate::git::is_tracked(path, Path::new(INI))
             {
-                self.ledger.entries.remove(&key(path));
+                self.ledger.forget(path);
                 self.ledger.save(&self.ledger_file)?;
                 return Ok(Reverted::Tracked);
             }
@@ -795,15 +1045,34 @@ mod shell {
         Tracked,
     }
 
-    /// Points desktop.ini at the state's icon and sets the tip, then marks
-    /// the folder so the shell reads it.
+    /// Whether `folder`'s desktop.ini points at the icon file `name`, or
+    /// may: one that can't be read this moment counts.
+    fn shows_icon(folder: &Path, name: &str) -> bool {
+        match std::fs::read(folder.join(INI)) {
+            Ok(bytes) => ini_points_at(&decode_ini(&bytes), name),
+            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+        }
+    }
+
+    /// Writes `bytes` to `file` through a temp file and a rename, unless
+    /// it holds them already.
+    fn write_if_changed(file: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        if std::fs::read(file).ok().as_deref() == Some(bytes) {
+            return Ok(());
+        }
+        let tmp = file.with_extension("ico.tmp");
+        std::fs::write(&tmp, bytes)?;
+        std::fs::rename(&tmp, file)
+    }
+
+    /// Points desktop.ini at `icon` and sets the tip, then marks the
+    /// folder so the shell reads it.
     fn write_settings(
         folder: &Path,
         ini: &Path,
         ini_existed: bool,
-        state: FolderState,
+        icon: &Path,
         tip: &str,
-        data_dir: &Path,
     ) -> Result<(), String> {
         if !ini_existed {
             // Profile APIs keep a file's encoding, and an ANSI ini would turn
@@ -814,7 +1083,7 @@ mod shell {
                 .collect();
             std::fs::write(ini, seed).map_err(|e| format!("{}: {e}", ini.display()))?;
         }
-        let mut icon = wide(icon_file(data_dir, state).as_os_str());
+        let mut icon = wide(icon.as_os_str());
         let mut tip = wide(tip.as_ref());
         let folder_w = wide(folder.as_os_str());
         // All-zero is valid for this plain C struct: null pointers and zero counts.
@@ -905,7 +1174,8 @@ mod shell {
             };
             let _com = Com::init();
             let mut engine = Engine::new(data.clone());
-            let (skips, _) = engine.sync(std::slice::from_ref(&status), true);
+            let status_mode = FolderIconMode::Status;
+            let (skips, _) = engine.sync(std::slice::from_ref(&status), true, status_mode);
             assert!(skips.is_empty(), "{skips:?}");
 
             let ini = repo.join(INI);
@@ -928,7 +1198,7 @@ mod shell {
 
             // Unchanged status: nothing to do.
             assert_eq!(
-                engine.sync(std::slice::from_ref(&status), true),
+                engine.sync(std::slice::from_ref(&status), true, status_mode),
                 (vec![], 0)
             );
 
@@ -936,14 +1206,84 @@ mod shell {
             // desktop.ini is adopted as ours, so revert still restores all.
             std::fs::remove_file(data.join(LEDGER_FILE)).unwrap();
             let mut engine = Engine::new(data.clone());
-            let (skips, _) = engine.sync(std::slice::from_ref(&status), true);
+            let (skips, _) = engine.sync(std::slice::from_ref(&status), true, status_mode);
             assert!(skips.is_empty(), "{skips:?}");
             let entry = engine.ledger.get(&repo).unwrap().clone();
             assert!(entry.created_ini && !entry.had_readonly, "{entry:?}");
+
+            // The repo's own icon: its own .ico, which a new picture
+            // replaces, and a broken one falls back with a note.
+            let svg_mode = FolderIconMode::RepoSvg;
+            let ini_icon_of = || ini_icon(&decode_ini(&std::fs::read(&ini).unwrap())).unwrap();
+            let repo_icons = || {
+                let mut names: Vec<String> = std::fs::read_dir(icons_dir(&data))
+                    .unwrap()
+                    .flatten()
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .filter(|n| repo_icon::is_repo_icon_file(n))
+                    .collect();
+                names.sort();
+                names
+            };
+            std::fs::create_dir_all(repo.join(repo_icon::DIR)).unwrap();
+            let svg = |fill: &str| {
+                format!(
+                    r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 8 8"><rect width="8" height="8" fill="{fill}"/></svg>"#
+                )
+            };
+            std::fs::write(repo_icon::svg_path(&repo), svg("currentColor")).unwrap();
+            let (skips, _) = engine.sync(std::slice::from_ref(&status), true, svg_mode);
+            assert!(skips.is_empty(), "{skips:?}");
+            let first = engine.ledger.get(&repo).unwrap().repo_icon.clone().unwrap();
+            assert!(ini_icon_of().contains(&first), "{}", ini_icon_of());
+            assert_eq!(repo_icons(), std::slice::from_ref(&first));
+            assert_eq!(
+                engine.sync(std::slice::from_ref(&status), true, svg_mode),
+                (vec![], 0),
+                "applied once"
+            );
+            std::fs::write(repo_icon::svg_path(&repo), svg("#123456")).unwrap();
+            let (skips, _) = engine.sync(std::slice::from_ref(&status), true, svg_mode);
+            assert!(skips.is_empty(), "{skips:?}");
+            let second = engine.ledger.get(&repo).unwrap().repo_icon.clone().unwrap();
+            assert_ne!(first, second);
+            assert_eq!(repo_icons(), [second], "the old picture is cleaned up");
+            std::fs::write(repo_icon::svg_path(&repo), "<svg").unwrap();
+            for _ in 0..2 {
+                let (skips, _) = engine.sync(std::slice::from_ref(&status), true, svg_mode);
+                assert_eq!(skips.len(), 1, "{skips:?}");
+                assert!(skips[0].1.contains("icon.svg"), "{skips:?}");
+            }
+            let entry = engine.ledger.get(&repo).unwrap().clone();
+            assert!(entry.svg_error.is_some() && entry.repo_icon.is_none());
+            assert!(is_ours(&ini_icon_of(), &icons_dir(&data), &env));
+            assert!(repo_icons().is_empty());
+            std::fs::write(repo_icon::svg_path(&repo), svg("currentColor")).unwrap();
+            let (skips, _) = engine.sync(std::slice::from_ref(&status), true, svg_mode);
+            assert!(skips.is_empty(), "{skips:?}");
+            assert_eq!(repo_icons().len(), 1);
+
+            // desktop.ini committed: the folder is let go of as it is, and
+            // the icon it shows is kept. Untracked again, it is adopted.
+            git(&repo, &["add", "-f", INI]);
+            let mut changed = status.clone();
+            changed.ahead = 1;
+            let (skips, _) = engine.sync(std::slice::from_ref(&changed), true, svg_mode);
+            assert_eq!(skips, [(repo.clone(), SKIP_TRACKED.to_string())]);
+            assert!(engine.ledger.get(&repo).is_none());
+            assert_eq!(engine.ledger.kept.len(), 1, "{:?}", engine.ledger.kept);
+            let icons = repo_icons();
+            assert_eq!(icons.len(), 1);
+            assert!(ini_icon_of().contains(&icons[0]), "{}", ini_icon_of());
+            git(&repo, &["rm", "--cached", "-q", INI]);
+            let (skips, _) = engine.sync(std::slice::from_ref(&status), true, svg_mode);
+            assert!(skips.is_empty(), "{skips:?}");
+            assert_eq!(repo_icons(), icons);
             drop(engine);
 
             assert_eq!(revert_all_blocking(&data), Ok(1));
             assert!(!ini.exists());
+            assert!(repo_icons().is_empty(), "no folder uses them now");
             let folder = attributes(&repo).unwrap();
             assert_eq!(
                 folder & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM),
@@ -963,7 +1303,9 @@ mod shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use FolderIconMode::{RepoSvg, Status};
     use std::cell::RefCell;
+    use std::collections::HashMap;
 
     #[derive(Default)]
     struct Fake {
@@ -972,6 +1314,7 @@ mod tests {
         foreign: HashSet<PathBuf>,
         missing: HashSet<PathBuf>,
         no_ini: HashSet<PathBuf>,
+        svgs: HashMap<PathBuf, String>,
         calls: RefCell<Vec<&'static str>>,
     }
 
@@ -993,6 +1336,9 @@ mod tests {
         }
         fn ini_present(&self, p: &Path) -> bool {
             !self.no_ini.contains(p)
+        }
+        fn repo_svg(&self, p: &Path) -> Option<String> {
+            self.svgs.get(p).cloned()
         }
     }
 
@@ -1017,6 +1363,10 @@ mod tests {
                     created_ini: true,
                     had_readonly: false,
                     icon_version: ICON_VERSION,
+                    mode: Status,
+                    svg: None,
+                    svg_error: None,
+                    repo_icon: None,
                 },
             );
         }
@@ -1024,11 +1374,387 @@ mod tests {
     }
 
     fn apply(s: &RepoStatus) -> Op {
+        apply_in(s, Status, None)
+    }
+
+    fn apply_in(s: &RepoStatus, mode: FolderIconMode, svg: Option<&str>) -> Op {
         Op::Apply {
             path: s.path.clone(),
             state: FolderState::of(s),
             tip: tip(s),
+            mode,
+            svg: svg.map(str::to_string),
         }
+    }
+
+    /// The ledger after applying `op`, as the engine records it.
+    fn record(ledger: &mut Ledger, op: &Op, svg_error: Option<&str>) {
+        let Op::Apply {
+            path,
+            state,
+            tip,
+            mode,
+            svg,
+        } = op
+        else {
+            panic!("not an apply: {op:?}");
+        };
+        let repo_icon = (svg.is_some() && svg_error.is_none()).then(|| format!("repo-{state:?}"));
+        ledger.entries.insert(
+            key(path),
+            Entry {
+                path: path.clone(),
+                state: *state,
+                tip: tip.clone(),
+                created_ini: true,
+                had_readonly: false,
+                icon_version: ICON_VERSION,
+                mode: *mode,
+                svg: svg.clone(),
+                svg_error: svg_error.map(str::to_string),
+                repo_icon,
+            },
+        );
+    }
+
+    #[test]
+    fn repo_svg_changes_apply_once() {
+        let (a, b) = (repo("a"), repo("b"));
+        let mut fake = Fake {
+            svgs: HashMap::from([(a.path.clone(), "h1".to_string())]),
+            ..Default::default()
+        };
+        let both = [a.clone(), b.clone()];
+        // Switching modes re-applies every folder, with or without an icon.svg.
+        let mut ledger = ledger_of(&both);
+        let ops = plan(&ledger, &both, true, RepoSvg, &fake);
+        assert_eq!(
+            ops,
+            vec![
+                apply_in(&a, RepoSvg, Some("h1")),
+                apply_in(&b, RepoSvg, None)
+            ]
+        );
+        for op in &ops {
+            record(&mut ledger, op, None);
+        }
+        assert_eq!(plan(&ledger, &both, true, RepoSvg, &fake), vec![]);
+
+        // A new picture, once.
+        fake.svgs.insert(a.path.clone(), "h2".into());
+        let ops = plan(&ledger, &both, true, RepoSvg, &fake);
+        assert_eq!(ops, vec![apply_in(&a, RepoSvg, Some("h2"))]);
+        record(&mut ledger, &ops[0], None);
+        assert_eq!(plan(&ledger, &both, true, RepoSvg, &fake), vec![]);
+
+        // One that can't be drawn: applied once, then noted every time.
+        fake.svgs.insert(a.path.clone(), "bad".into());
+        let ops = plan(&ledger, &both, true, RepoSvg, &fake);
+        assert_eq!(ops, vec![apply_in(&a, RepoSvg, Some("bad"))]);
+        record(&mut ledger, &ops[0], Some("icon.svg isn't usable SVG"));
+        for _ in 0..2 {
+            assert_eq!(
+                plan(&ledger, &both, true, RepoSvg, &fake),
+                vec![Op::Note(a.path.clone(), "icon.svg isn't usable SVG".into())]
+            );
+        }
+
+        // An icon.svg added or removed counts too; the state as well.
+        fake.svgs.insert(b.path.clone(), "h3".into());
+        fake.svgs.remove(&a.path);
+        let mut dirty_b = b.clone();
+        dirty_b.dirty = true;
+        let changed = [a.clone(), dirty_b.clone()];
+        let ops = plan(&ledger, &changed, true, RepoSvg, &fake);
+        assert_eq!(
+            ops,
+            vec![
+                apply_in(&a, RepoSvg, None),
+                apply_in(&dirty_b, RepoSvg, Some("h3"))
+            ]
+        );
+        for op in &ops {
+            record(&mut ledger, op, None);
+        }
+        assert_eq!(plan(&ledger, &changed, true, RepoSvg, &fake), vec![]);
+
+        // And back to the status folders: all again, the icon.svg unread.
+        let ops = plan(&ledger, &changed, true, Status, &fake);
+        assert_eq!(ops, vec![apply(&a), apply(&dirty_b)]);
+        for op in &ops {
+            record(&mut ledger, op, None);
+        }
+        assert_eq!(plan(&ledger, &changed, true, Status, &fake), vec![]);
+        // Off reverts whatever the mode.
+        assert_eq!(
+            plan(&ledger, &changed, false, RepoSvg, &fake),
+            vec![Op::Revert(a.path.clone()), Op::Revert(b.path.clone())]
+        );
+    }
+
+    /// Counts icon.svg reads.
+    struct Reads<'a>(&'a Fake, RefCell<usize>);
+
+    impl Probe for Reads<'_> {
+        fn eligible(&self, p: &Path) -> bool {
+            self.0.eligible(p)
+        }
+        fn ini_tracked(&self, p: &Path) -> bool {
+            self.0.ini_tracked(p)
+        }
+        fn foreign_ini(&self, p: &Path) -> bool {
+            self.0.foreign_ini(p)
+        }
+        fn exists(&self, p: &Path) -> bool {
+            self.0.exists(p)
+        }
+        fn ini_present(&self, p: &Path) -> bool {
+            self.0.ini_present(p)
+        }
+        fn repo_svg(&self, p: &Path) -> Option<String> {
+            *self.1.borrow_mut() += 1;
+            self.0.repo_svg(p)
+        }
+    }
+
+    #[test]
+    fn icon_svgs_are_read_only_when_needed() {
+        let (a, b, c) = (repo("a"), repo("b"), repo("c"));
+        let fake = Fake {
+            ineligible: HashSet::from([b.path.clone()]),
+            foreign: HashSet::from([c.path.clone()]),
+            svgs: HashMap::from([(a.path.clone(), "h".to_string())]),
+            ..Default::default()
+        };
+        let all = [a.clone(), b.clone(), c.clone()];
+        let reads = Reads(&fake, RefCell::new(0));
+        // Skipped folders aren't read; the one applied is, once.
+        let ops = plan(&Ledger::default(), &all, true, RepoSvg, &reads);
+        assert_eq!(ops[0], apply_in(&a, RepoSvg, Some("h")));
+        assert_eq!(*reads.1.borrow(), 1);
+        // Up to date: one read each to tell. Status mode: none.
+        let mut ledger = Ledger::default();
+        record(&mut ledger, &ops[0], None);
+        *reads.1.borrow_mut() = 0;
+        assert_eq!(
+            plan(&ledger, std::slice::from_ref(&a), true, RepoSvg, &reads),
+            vec![]
+        );
+        assert_eq!(*reads.1.borrow(), 1);
+        *reads.1.borrow_mut() = 0;
+        plan(&ledger, &all, true, Status, &reads);
+        assert_eq!(*reads.1.borrow(), 0);
+    }
+
+    #[test]
+    fn old_ledgers_mean_status_mode() {
+        let old = r#"{ "entries": { "x": { "path": "x", "state": "synced", "tip": "t",
+            "created_ini": true, "had_readonly": false, "icon_version": 2 } } }"#;
+        let old: Ledger = serde_json::from_str(old).unwrap();
+        let e = &old.entries["x"];
+        assert_eq!(
+            (e.mode, &e.svg, &e.svg_error, &e.repo_icon),
+            (Status, &None, &None, &None)
+        );
+        assert!(old.kept.is_empty());
+        // Status-mode entries are written as before.
+        let text = serde_json::to_string(&ledger_of(&[repo("a")])).unwrap();
+        assert!(
+            !text.contains("svg") && !text.contains("repo_icon") && !text.contains("kept"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_new_render_version_redraws_once() {
+        let a = repo("a");
+        let svg = b"<svg/>";
+        let fake = Fake {
+            svgs: HashMap::from([(a.path.clone(), repo_icon::fingerprint_of(svg))]),
+            ..Default::default()
+        };
+        // Drawn by the version before.
+        let old = repo_icon::fingerprint_at(repo_icon::RENDER_VERSION.wrapping_sub(1), svg);
+        let mut ledger = Ledger::default();
+        record(&mut ledger, &apply_in(&a, RepoSvg, Some(&old)), None);
+        let ops = plan(&ledger, std::slice::from_ref(&a), true, RepoSvg, &fake);
+        let now = repo_icon::fingerprint_of(svg);
+        assert_eq!(ops, vec![apply_in(&a, RepoSvg, Some(&now))]);
+        record(&mut ledger, &ops[0], None);
+        assert_eq!(
+            plan(&ledger, std::slice::from_ref(&a), true, RepoSvg, &fake),
+            vec![]
+        );
+    }
+
+    fn file_error(message: &str) -> repo_icon::Error {
+        repo_icon::Error {
+            message: message.into(),
+            transient: false,
+        }
+    }
+
+    fn transient(message: &str) -> repo_icon::Error {
+        repo_icon::Error {
+            message: message.into(),
+            transient: true,
+        }
+    }
+
+    #[test]
+    fn only_the_files_own_faults_are_remembered() {
+        let bytes = b"<svg/>".to_vec();
+        let seen = repo_icon::fingerprint_of(&bytes);
+        let planned = || "planned".to_string();
+        let loaded = || Ok(Some(bytes.clone()));
+        let unreachable = |_: &[u8]| -> Result<String, repo_icon::Error> { panic!("drawn") };
+        // Drawn.
+        assert_eq!(
+            draw_repo_svg(planned(), loaded, |_| Ok("repo-1.ico".into())),
+            SvgOutcome {
+                svg: Some(seen.clone()),
+                repo_icon: Some("repo-1.ico".into()),
+                ..Default::default()
+            }
+        );
+        // The file's fault: remembered with what was drawn, not what plan
+        // saw, so it waits for the file to change.
+        assert_eq!(
+            draw_repo_svg(planned(), loaded, |_| Err(file_error("bad"))),
+            SvgOutcome {
+                svg: Some(seen),
+                svg_error: Some("bad".into()),
+                repo_icon: None,
+                note: Some("bad".into()),
+            }
+        );
+        assert_eq!(
+            draw_repo_svg(planned(), || Err(file_error("a link")), unreachable),
+            SvgOutcome {
+                svg: Some(planned()),
+                svg_error: Some("a link".into()),
+                repo_icon: None,
+                note: Some("a link".into()),
+            }
+        );
+        // Anything else: noted this time, and no fingerprint, so the next
+        // sync tries again.
+        let retry = |why: &str| SvgOutcome {
+            note: Some(why.into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            draw_repo_svg(planned(), loaded, |_| Err(transient("too long"))),
+            retry("too long")
+        );
+        assert_eq!(
+            draw_repo_svg(planned(), || Err(transient("locked")), unreachable),
+            retry("locked")
+        );
+        // Gone since: nothing to note.
+        assert_eq!(
+            draw_repo_svg(planned(), || Ok(None), unreachable),
+            SvgOutcome::default()
+        );
+
+        // As plan sees them: a remembered fault is only noted, a transient
+        // one is tried again, every time until it works.
+        let a = repo("a");
+        let fake = Fake {
+            svgs: HashMap::from([(a.path.clone(), "h".to_string())]),
+            ..Default::default()
+        };
+        let mut ledger = Ledger::default();
+        let op = apply_in(&a, RepoSvg, Some("h"));
+        record(&mut ledger, &op, Some("bad"));
+        assert_eq!(
+            plan(&ledger, std::slice::from_ref(&a), true, RepoSvg, &fake),
+            vec![Op::Note(a.path.clone(), "bad".into())]
+        );
+        let retried = apply_in(&a, RepoSvg, None);
+        record(&mut ledger, &retried, None);
+        for _ in 0..2 {
+            assert_eq!(
+                plan(&ledger, std::slice::from_ref(&a), true, RepoSvg, &fake),
+                vec![op.clone()]
+            );
+        }
+    }
+
+    #[test]
+    fn a_folder_let_go_of_keeps_its_repo_icon() {
+        let (a, b) = (repo("a"), repo("b"));
+        let mut ledger = ledger_of(&[a.clone(), b.clone()]);
+        ledger.entries.get_mut(&key(&a.path)).unwrap().repo_icon =
+            Some("repo-1-green-2.ico".into());
+        let names = || ["repo-1-green-2.ico".to_string()];
+        assert!(stale_repo_icons(&ledger, names()).is_empty());
+        // Forgotten (desktop.ini tracked now): still used.
+        ledger.forget(&a.path);
+        ledger.forget(&b.path);
+        assert!(ledger.entries.is_empty());
+        let kept = Kept {
+            path: a.path.clone(),
+            repo_icon: "repo-1-green-2.ico".into(),
+        };
+        assert_eq!(ledger.kept, std::slice::from_ref(&kept));
+        assert!(stale_repo_icons(&ledger, names()).is_empty());
+        // Applied and forgotten again: kept once.
+        let mut again = ledger_of(std::slice::from_ref(&a));
+        again.entries.get_mut(&key(&a.path)).unwrap().repo_icon = Some("repo-1-green-2.ico".into());
+        ledger.entries.append(&mut again.entries);
+        ledger.forget(&a.path);
+        assert_eq!(ledger.kept, std::slice::from_ref(&kept));
+        // Saved and loaded with the ledger.
+        let text = serde_json::to_string(&ledger).unwrap();
+        assert_eq!(serde_json::from_str::<Ledger>(&text).unwrap(), ledger);
+        // Until its folder shows another icon.
+        assert!(!ledger.prune_kept(|_, _| true));
+        assert_eq!(ledger.kept, [kept]);
+        assert!(ledger.prune_kept(|path, name| path != a.path || name != "repo-1-green-2.ico"));
+        assert!(ledger.kept.is_empty());
+        assert_eq!(stale_repo_icons(&ledger, names()), names());
+    }
+
+    #[test]
+    fn desktop_ini_pointing_at_an_icon() {
+        let ini = "[.ShellClassInfo]\r\nIconResource=C:\\Users\\me\\AppData\\Local\\gitstat\\icons\\Repo-1-GREEN-2.ico,0\r\n";
+        assert!(ini_points_at(ini, "repo-1-green-2.ico"));
+        assert!(!ini_points_at(ini, "repo-1-amber-2.ico"));
+        assert!(ini_points_at(
+            "[.ShellClassInfo]\nIconFile=D:/x/repo-1-green-2.ico\n",
+            "repo-1-green-2.ico"
+        ));
+        assert!(!ini_points_at(
+            "[.ShellClassInfo]\nInfoTip=repo-1-green-2.ico\n",
+            "repo-1-green-2.ico"
+        ));
+    }
+
+    #[test]
+    fn unused_repo_icons_are_stale() {
+        let (a, b) = (repo("a"), repo("b"));
+        let mut ledger = ledger_of(&[a.clone(), b.clone()]);
+        ledger.entries.get_mut(&key(&a.path)).unwrap().repo_icon =
+            Some("repo-1-green-2.ico".into());
+        let names = [
+            "repo-1-green-2.ico",
+            "repo-1-amber-2.ico",
+            "repo-3-red-4.ico",
+            "repo-1-green-2.ico.tmp",
+            "synced-v2.ico",
+            "dirty-v2.ico.tmp",
+            "notes.txt",
+        ]
+        .map(String::from);
+        assert_eq!(
+            stale_repo_icons(&ledger, names),
+            [
+                "repo-1-amber-2.ico",
+                "repo-3-red-4.ico",
+                "repo-1-green-2.ico.tmp"
+            ]
+        );
     }
 
     #[test]
@@ -1036,18 +1762,27 @@ mod tests {
         let (a, mut b) = (repo("a"), repo("b"));
         let fake = Fake::default();
         assert_eq!(
-            plan(&Ledger::default(), &[a.clone(), b.clone()], true, &fake),
+            plan(
+                &Ledger::default(),
+                &[a.clone(), b.clone()],
+                true,
+                Status,
+                &fake
+            ),
             vec![apply(&a), apply(&b)]
         );
 
         let ledger = ledger_of(&[a.clone(), b.clone()]);
         fake.calls.borrow_mut().clear();
-        assert_eq!(plan(&ledger, &[a.clone(), b.clone()], true, &fake), vec![]);
+        assert_eq!(
+            plan(&ledger, &[a.clone(), b.clone()], true, Status, &fake),
+            vec![]
+        );
         assert!(fake.calls.borrow().is_empty(), "up to date: no probing");
 
         b.ahead = 2;
         assert_eq!(
-            plan(&ledger, &[a.clone(), b.clone()], true, &fake),
+            plan(&ledger, &[a.clone(), b.clone()], true, Status, &fake),
             vec![apply(&b)]
         );
         // The tip alone changing counts too.
@@ -1055,7 +1790,7 @@ mod tests {
         b3.ahead = 3;
         let ledger = ledger_of(&[a.clone(), b.clone()]);
         assert_eq!(
-            plan(&ledger, &[a, b3.clone()], true, &fake),
+            plan(&ledger, &[a, b3.clone()], true, Status, &fake),
             vec![apply(&b3)]
         );
     }
@@ -1067,7 +1802,7 @@ mod tests {
         ledger.entries.get_mut(&key(&a.path)).unwrap().icon_version = ICON_VERSION - 1;
         let fake = Fake::default();
         assert_eq!(
-            plan(&ledger, &[a.clone(), b.clone()], true, &fake),
+            plan(&ledger, &[a.clone(), b.clone()], true, Status, &fake),
             vec![apply(&a)]
         );
         // A ledger written before the field existed reads as version 0.
@@ -1086,7 +1821,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            plan(&ledger, std::slice::from_ref(&a), true, &fake),
+            plan(&ledger, std::slice::from_ref(&a), true, Status, &fake),
             vec![apply(&a)]
         );
     }
@@ -1099,7 +1834,13 @@ mod tests {
         };
         let fake = Fake::default();
         assert_eq!(
-            plan(&Ledger::default(), std::slice::from_ref(&root), true, &fake),
+            plan(
+                &Ledger::default(),
+                std::slice::from_ref(&root),
+                true,
+                Status,
+                &fake
+            ),
             vec![Op::Skip(root.path.clone(), SKIP_INELIGIBLE)]
         );
     }
@@ -1115,7 +1856,7 @@ mod tests {
         };
         let all = [a.clone(), b.clone(), c.clone()];
         assert_eq!(
-            plan(&Ledger::default(), &all, true, &fake),
+            plan(&Ledger::default(), &all, true, Status, &fake),
             vec![
                 Op::Skip(a.path.clone(), SKIP_INELIGIBLE),
                 Op::Skip(b.path.clone(), SKIP_TRACKED),
@@ -1142,7 +1883,7 @@ mod tests {
             s.dirty = true;
         }
         assert_eq!(
-            plan(&ledger_of(&all), &changed, true, &fake),
+            plan(&ledger_of(&all), &changed, true, Status, &fake),
             vec![
                 Op::Revert(a.path.clone()),
                 Op::Skip(a.path.clone(), SKIP_INELIGIBLE),
@@ -1165,7 +1906,13 @@ mod tests {
         new.path = PathBuf::from("S:/a");
         let ledger = ledger_of(std::slice::from_ref(&old));
         assert_eq!(
-            plan(&ledger, std::slice::from_ref(&new), true, &Fake::default()),
+            plan(
+                &ledger,
+                std::slice::from_ref(&new),
+                true,
+                Status,
+                &Fake::default()
+            ),
             vec![Op::Revert(old.path.clone()), apply(&new)]
         );
     }
@@ -1178,7 +1925,7 @@ mod tests {
         offline.error = Some("could not resolve host".into());
         offline.fetch_failed = true;
         assert_eq!(
-            plan(&ledger, &[offline.clone()], true, &Fake::default()),
+            plan(&ledger, &[offline.clone()], true, Status, &Fake::default()),
             vec![]
         );
 
@@ -1187,14 +1934,14 @@ mod tests {
         let mut local = a.clone();
         local.dirty = true;
         assert_eq!(
-            plan(&ledger, &[offline], true, &Fake::default()),
+            plan(&ledger, &[offline], true, Status, &Fake::default()),
             vec![apply(&local)]
         );
 
         // A real error does change the icon.
         let mut broken = a.clone();
         broken.error = Some("not a git repository".into());
-        let ops = plan(&ledger, &[broken], true, &Fake::default());
+        let ops = plan(&ledger, &[broken], true, Status, &Fake::default());
         assert!(matches!(
             &ops[..],
             [Op::Apply {
@@ -1213,7 +1960,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            plan(&ledger, std::slice::from_ref(&a), true, &fake),
+            plan(&ledger, std::slice::from_ref(&a), true, Status, &fake),
             vec![Op::Revert(b.path.clone()), Op::Forget(c.path.clone())]
         );
     }
@@ -1227,10 +1974,13 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            plan(&ledger, &[a.clone(), b.clone()], false, &fake),
+            plan(&ledger, &[a.clone(), b.clone()], false, Status, &fake),
             vec![Op::Revert(a.path.clone()), Op::Forget(b.path.clone())]
         );
-        assert_eq!(plan(&Ledger::default(), &[a, b], false, &fake), vec![]);
+        assert_eq!(
+            plan(&Ledger::default(), &[a, b], false, Status, &fake),
+            vec![]
+        );
     }
 
     #[test]

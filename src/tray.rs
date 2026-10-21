@@ -1,6 +1,6 @@
 //! The notification-area icon and its right-click menu.
 
-use crate::config::{ClickAction, Config, Corner};
+use crate::config::{ClickAction, Config, Corner, FolderIconMode};
 use crate::git::RepoStatus;
 use crate::icon::{self, Badge};
 use crate::layout;
@@ -52,6 +52,7 @@ pub enum TrayAction {
     EditConfig,
     Toggle(Setting),
     SetCorner(Corner),
+    SetFolderIconMode(FolderIconMode),
     SetAutostart(bool),
     Quit,
 }
@@ -102,6 +103,11 @@ const CORNERS: [(Corner, &str); 4] = [
     (Corner::BottomRight, "Bottom right"),
 ];
 
+const FOLDER_ICON_MODES: [(FolderIconMode, &str); 2] = [
+    (FolderIconMode::Status, "Status folder"),
+    (FolderIconMode::RepoSvg, "Repo icon"),
+];
+
 /// The menu is built once and changed in place. Replacing it with
 /// `set_menu` while it's open would destroy the menu the user is looking at.
 pub struct Tray {
@@ -125,6 +131,8 @@ pub struct Tray {
     settings: Vec<(CheckMenuItem, Setting)>,
     corner_menu: Submenu,
     corners: Vec<(CheckMenuItem, Corner)>,
+    folder_icon_menu: Submenu,
+    folder_icon_modes: Vec<(CheckMenuItem, FolderIconMode)>,
     autostart: CheckMenuItem,
     edit_config: MenuItem,
     quit: MenuItem,
@@ -178,6 +186,17 @@ impl Tray {
         for (item, _) in &corners {
             corner_menu.append(item).map_err(|e| e.to_string())?;
         }
+        let folder_icon_menu = Submenu::new("Folder icon style", defaults.folder_icons);
+        let folder_icon_modes: Vec<(CheckMenuItem, FolderIconMode)> = FOLDER_ICON_MODES
+            .iter()
+            .map(|&(mode, label)| {
+                let on = mode == defaults.folder_icon_mode;
+                (CheckMenuItem::new(label, true, on, None), mode)
+            })
+            .collect();
+        for (item, _) in &folder_icon_modes {
+            folder_icon_menu.append(item).map_err(|e| e.to_string())?;
+        }
 
         let display = Submenu::new("Display", true);
         display
@@ -191,6 +210,7 @@ impl Tray {
                 &hide_fullscreen.0,
                 &PredefinedMenuItem::separator(),
                 &folder_icons.0,
+                &folder_icon_menu,
             ])
             .map_err(|e| e.to_string())?;
 
@@ -252,6 +272,8 @@ impl Tray {
             ],
             corner_menu,
             corners,
+            folder_icon_menu,
+            folder_icon_modes,
             autostart,
             edit_config,
             quit,
@@ -385,6 +407,14 @@ impl Tray {
             // Picking the checked corner again unchecks it; keep exactly one.
             self.check_corner(*corner);
             Some(TrayAction::SetCorner(*corner))
+        } else if let Some((_, mode)) = self
+            .folder_icon_modes
+            .iter()
+            .find(|(item, _)| item.id() == id)
+        {
+            // Like the corners: exactly one stays checked.
+            self.check_folder_icon_mode(*mode);
+            Some(TrayAction::SetFolderIconMode(*mode))
         } else {
             self.repos
                 .iter()
@@ -418,6 +448,8 @@ impl Tray {
             set_checked(item, setting.is_on(cfg));
         }
         self.check_corner(cfg.overlay.corner);
+        self.check_folder_icon_mode(cfg.folder_icon_mode);
+        self.folder_icon_menu.set_enabled(cfg.folder_icons);
 
         let badge = cfg.overlay.enabled;
         self.corner_menu.set_enabled(badge);
@@ -465,6 +497,12 @@ impl Tray {
     fn check_corner(&self, corner: Corner) {
         for (item, c) in &self.corners {
             set_checked(item, *c == corner);
+        }
+    }
+
+    fn check_folder_icon_mode(&self, mode: FolderIconMode) {
+        for (item, m) in &self.folder_icon_modes {
+            set_checked(item, *m == mode);
         }
     }
 

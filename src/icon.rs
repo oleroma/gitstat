@@ -485,6 +485,15 @@ impl FolderState {
         }
     }
 
+    /// The colour a repo's own icon takes on (folder icon mode `repo-svg`).
+    pub fn tone(self) -> Tone {
+        match self {
+            Self::Synced => Tone::Synced,
+            Self::Dirty | Self::Ahead | Self::NoUpstream => Tone::Local,
+            Self::Behind | Self::Diverged | Self::Error => Tone::Attention,
+        }
+    }
+
     fn color(self) -> [u8; 3] {
         match self {
             Self::Synced => GREEN,
@@ -525,6 +534,40 @@ impl FolderState {
                 strokes: vec![vec![(0.0, -0.5), (0.0, 0.12)]],
                 dots: vec![((0.0, 0.46), 0.15)],
             },
+        }
+    }
+}
+
+/// The three colours a repo's own icon is drawn in: fewer than the status
+/// folders' seven, so it reads at a glance whatever its shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tone {
+    /// Nothing to do.
+    Synced,
+    /// Work that is only here: uncommitted, unpushed, or no upstream.
+    Local,
+    /// Needs a pull or a look: behind, diverged, or an error.
+    Attention,
+}
+
+impl Tone {
+    #[cfg(test)]
+    pub const ALL: [Tone; 3] = [Tone::Synced, Tone::Local, Tone::Attention];
+
+    pub fn color(self) -> [u8; 3] {
+        match self {
+            Self::Synced => GREEN,
+            Self::Local => AMBER,
+            Self::Attention => RED,
+        }
+    }
+
+    /// Stable name for file names.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Synced => "green",
+            Self::Local => "amber",
+            Self::Attention => "red",
         }
     }
 }
@@ -946,6 +989,30 @@ mod tests {
         assert_eq!(FolderState::of(&status(2, 1, true, true, false)), Diverged);
         assert_eq!(FolderState::of(&status(0, 1, true, true, false)), Behind);
         assert_eq!(FolderState::of(&status(2, 1, true, true, true)), Error);
+    }
+
+    #[test]
+    fn tones_group_the_states() {
+        use FolderState::*;
+        let tones: Vec<_> = FolderState::ALL.iter().map(|s| (*s, s.tone())).collect();
+        assert_eq!(
+            tones,
+            [
+                (Synced, Tone::Synced),
+                (Ahead, Tone::Local),
+                (Behind, Tone::Attention),
+                (Diverged, Tone::Attention),
+                (Dirty, Tone::Local),
+                (NoUpstream, Tone::Local),
+                (Error, Tone::Attention),
+            ]
+        );
+        // The status palette: green, amber, red.
+        assert_eq!(Tone::Synced.color(), GREEN);
+        assert_eq!(Tone::Local.color(), AMBER);
+        assert_eq!(Tone::Attention.color(), RED);
+        let names: std::collections::HashSet<_> = Tone::ALL.iter().map(|t| t.name()).collect();
+        assert_eq!(names.len(), 3);
     }
 
     #[test]

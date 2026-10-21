@@ -4,7 +4,8 @@
 use crate::config::Config;
 use crate::git::{self, RepoStatus};
 use crate::watch::{
-    self, CONFIG_QUIET, Class, Debouncer, Need, REPOSET_MAX_WAIT, REPOSET_QUIET, RepoRoute, Router,
+    self, CONFIG_QUIET, Class, Debouncer, Need, REPO_ICON_QUIET, REPOSET_MAX_WAIT, REPOSET_QUIET,
+    RepoRoute, Router,
 };
 use notify::{EventKindMask, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::hash_map::DefaultHasher;
@@ -79,6 +80,9 @@ pub enum Update {
     SweepStarted,
     SweepDone,
     Mode(WatchMode),
+    /// A repo's `.gitstat/icon.svg` changed: the folder icons need another
+    /// look even if no status did.
+    RepoIcons,
 }
 
 enum Msg {
@@ -208,6 +212,8 @@ struct Scheduler {
     /// which bounds how far later ones can push it back.
     reposet_first: Option<Instant>,
     config_at: Option<Instant>,
+    /// When to send `RepoIcons` for the icon.svg changes seen since the last.
+    repo_icons_at: Option<Instant>,
     last_wall: SystemTime,
     last_mono: Instant,
     /// The deadline the loop last waited for, to notice oversleeping.
@@ -255,6 +261,7 @@ impl Scheduler {
             reposet_at: None,
             reposet_first: None,
             config_at: None,
+            repo_icons_at: None,
             last_wall: SystemTime::now(),
             last_mono: Instant::now(),
             waited_until: None,
@@ -327,6 +334,7 @@ impl Scheduler {
             self.retry_watch_at,
             self.reposet_at.filter(|_| self.walking.is_none()),
             self.config_at,
+            self.repo_icons_at,
             debounce,
             self.retries.values().filter_map(|r| r.at).min(),
         ]
@@ -362,6 +370,10 @@ impl Scheduler {
         if due(self.config_at) {
             self.config_at = None;
             self.reload_config(now);
+        }
+        if due(self.repo_icons_at) {
+            self.repo_icons_at = None;
+            self.emit(Update::RepoIcons);
         }
         // While a walk runs this waits for it, to keep the walk gap.
         if self.walking.is_none() && due(self.reposet_at) {
@@ -585,6 +597,11 @@ impl Scheduler {
                     // Only the config file's own watch is live outside Events mode.
                     _ if !events_on => {}
                     (Class::RepoSet, _) => self.schedule_walk(now),
+                    // From the first change, so a steady stream of them
+                    // still gets a look every `REPO_ICON_QUIET`.
+                    (Class::RepoIcon, _) => {
+                        self.repo_icons_at.get_or_insert(now + REPO_ICON_QUIET);
+                    }
                     (Class::Ignore, _) | (_, None) => {}
                     (class, Some(repo)) => self.debouncer.on_event(&repo, class, now),
                 }
@@ -1563,6 +1580,43 @@ mod tests {
         std::fs::set_permissions(&a, original).unwrap();
         let updates = h.collect(Duration::from_millis(2500));
         assert!(started(&updates).is_empty(), "{updates:?}");
+    }
+
+    #[test]
+    fn repo_icon_changes_are_reported() {
+        let h = Harness::new(
+            "repo-icon",
+            |root| {
+                let a = root.join("a");
+                init_repo(&a);
+                std::fs::write(a.join(".gitignore"), "/.gitstat/\n").unwrap();
+                git(&a, &["add", ".gitignore"]);
+                git(&a, &["commit", "-q", "-m", "ignore"]);
+                std::fs::create_dir_all(a.join(".gitstat")).unwrap();
+                std::fs::write(a.join(".gitstat/notes.txt"), "x").unwrap();
+            },
+            |_| {},
+        );
+        h.settle();
+        let svg = h.root.join("a/.gitstat/icon.svg");
+        // An editor's save: a burst of writes, one look.
+        for _ in 0..3 {
+            std::fs::write(&svg, "<svg/>").unwrap();
+        }
+        let updates = h.collect(REPO_ICON_QUIET + Duration::from_millis(1500));
+        let looks = updates
+            .iter()
+            .filter(|u| matches!(u, Update::RepoIcons))
+            .count();
+        assert_eq!(looks, 1, "{updates:?}");
+        // Gitignored here, so no status check.
+        assert!(started(&updates).is_empty(), "{updates:?}");
+        // The folder going (with the file) counts as well.
+        std::fs::remove_dir_all(h.root.join("a/.gitstat")).unwrap();
+        assert!(
+            h.wait_for(WAIT, |u| matches!(u, Update::RepoIcons))
+                .is_some()
+        );
     }
 
     #[test]

@@ -18,6 +18,12 @@ notify = { version = "=9.0.0-rc.6", default-features = false }
 # fonts needed (segoeuib.ttf and seguisb.ttf are static).
 ab_glyph = { version = "0.2.32", default-features = false, features = ["std"] }
 gpui = "0.2.2"
+# Renders a repo's own .gitstat/icon.svg into its folder icon. No text, fonts
+# or raster images: an icon needs shapes, and every loader is attack surface.
+resvg = { version = "0.48.1", default-features = false }
+# resvg's CSS parser, to see which elements a repo icon's style sheet
+# applies references to before resvg expands them. Same version as resvg's.
+simplecss = "0.2.2"
 tray-icon = "0.26"
 futures = "0.3"
 raw-window-handle = "0.6"
@@ -44,6 +50,8 @@ windows-sys = { version = "0.61", features = [
 # icon.rs is tested on Linux too; there the font is missing and the vector
 # fallback draws the digits.
 ab_glyph = { version = "0.2.32", default-features = false, features = ["std"] }
+resvg = { version = "0.48.1", default-features = false }
+simplecss = "0.2.2"
 
 [profile.release]
 lto = "thin"

@@ -22,6 +22,9 @@ pub const REPOSET_QUIET: Duration = Duration::from_secs(1);
 /// its first event (or after the walk gap, if that ends later).
 pub const REPOSET_MAX_WAIT: Duration = Duration::from_secs(5);
 pub const CONFIG_QUIET: Duration = Duration::from_millis(300);
+/// How long after a repo's `.gitstat/icon.svg` changes the folder icons
+/// get another look: an editor's save is done by then.
+pub const REPO_ICON_QUIET: Duration = Duration::from_millis(500);
 
 /// What an event means for the repo it belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,6 +35,8 @@ pub enum Class {
     RemoteRefs,
     RepoSet,
     Config,
+    /// The repo's own folder icon, `.gitstat/icon.svg`, or its folder.
+    RepoIcon,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -173,6 +178,13 @@ impl Router {
             out.push((None, class));
             return out;
         }
+        let repo = Some(route.route.path.clone());
+        // Whatever git thinks of it: it is often ignored, and a change to
+        // a committed one may leave the status as it was. Our own writes
+        // never go there.
+        if is_repo_icon(inner) {
+            out.push((repo.clone(), Class::RepoIcon));
+        }
         // Our own folder-icon writes, and a linked worktree's `.git` file.
         let class = if inner.eq_ignore_ascii_case("desktop.ini")
             || inner.eq_ignore_ascii_case(".git")
@@ -182,7 +194,7 @@ impl Router {
         } else {
             Class::Worktree
         };
-        out.push((Some(route.route.path.clone()), class));
+        out.push((repo, class));
         out
     }
 
@@ -325,6 +337,21 @@ fn git_class(rel: &str) -> Class {
     }
 }
 
+/// `.gitstat/icon.svg` below a repo, or the `.gitstat` folder, which can
+/// appear or go with the file inside (a checkout, a rename) and only
+/// report itself. As exact as the file system: any case on Windows.
+fn is_repo_icon(rel: &str) -> bool {
+    let (dir, file) = (crate::repo_icon::DIR, crate::repo_icon::FILE);
+    #[cfg(windows)]
+    let same = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+    #[cfg(not(windows))]
+    let same = |a: &str, b: &str| a == b;
+    match rel.split_once('/') {
+        None => same(rel, dir),
+        Some((d, f)) => same(d, dir) && same(f, file),
+    }
+}
+
 fn is_per_worktree(rel: &str) -> bool {
     rel.eq_ignore_ascii_case("HEAD") || rel.eq_ignore_ascii_case("index")
 }
@@ -459,7 +486,7 @@ impl Debouncer {
         let quiet = match class {
             Class::GitMeta | Class::RemoteRefs => QUIET_META,
             Class::Worktree => QUIET_WORKTREE,
-            Class::Ignore | Class::RepoSet | Class::Config => return,
+            Class::Ignore | Class::RepoSet | Class::Config | Class::RepoIcon => return,
         };
         // Remote refs count even during our own fetch: a `git push` from a
         // terminal writes them too, and a Local recheck can't loop (it
@@ -1151,6 +1178,71 @@ mod tests {
     }
 
     #[test]
+    fn repo_icon_changes() {
+        let mut router = router();
+        let icon = |repo: &str, check: Class| {
+            vec![
+                (Some(repo.to_string()), Class::RepoIcon),
+                (Some(repo.to_string()), check),
+            ]
+        };
+        for kind in [CREATE, MODIFY, REMOVE, RENAME, RENAME_FROM] {
+            assert_eq!(
+                classes(&router, "/dev/r/.gitstat/icon.svg", kind),
+                icon("/dev/r", Class::Worktree),
+                "{kind:?}"
+            );
+            assert_eq!(
+                classes(&router, "/dev/r/.gitstat", kind),
+                icon("/dev/r", Class::Worktree),
+                "{kind:?}"
+            );
+        }
+        // Gitignored, it still counts, without a status check.
+        router.set_ignored(Path::new("/dev/r"), vec![".gitstat/".into()]);
+        assert_eq!(
+            classes(&router, "/dev/r/.gitstat/icon.svg", MODIFY),
+            icon("/dev/r", Class::Ignore)
+        );
+        assert_eq!(
+            classes(&router, "/dev/r/.gitstat", CREATE),
+            icon("/dev/r", Class::Ignore)
+        );
+        // Every repo has its own, at any depth.
+        let deep = deep_router(3);
+        assert_eq!(
+            classes(&deep, "/d/dev/grp/c/.gitstat/icon.svg", RENAME),
+            icon("/d/dev/grp/c", Class::Worktree)
+        );
+        // Other files there, deeper ones, and ones outside a repo don't.
+        for path in [
+            "/dev/r/.gitstat/icon.svg.tmp",
+            "/dev/r/.gitstat/other.svg",
+            "/dev/r/src/.gitstat/icon.svg",
+            "/dev/r/.gitstat/icon.svg/x",
+        ] {
+            let found = classes(&router, path, MODIFY);
+            assert!(
+                !found.iter().any(|(_, c)| *c == Class::RepoIcon),
+                "{path}: {found:?}"
+            );
+        }
+        assert_eq!(
+            classes(&router, "/dev/notes/.gitstat/icon.svg", MODIFY),
+            vec![(None, Class::Ignore)]
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            classes(&self::router(), "/dev/r/.gitstat/Icon.SVG", MODIFY),
+            one("/dev/r", Class::Worktree)
+        );
+        // It never schedules a check of its own.
+        let mut d = Debouncer::default();
+        d.on_event(Path::new("/dev/r"), Class::RepoIcon, Instant::now());
+        assert_eq!(d.next_deadline(), None);
+    }
+
+    #[test]
     fn config_file_inside_a_repo() {
         let router = router();
         assert_eq!(
@@ -1244,6 +1336,13 @@ mod tests {
         assert_eq!(
             classes(&router, r"d:\dev\X\.Git", CREATE),
             vec![(None, Class::RepoSet)]
+        );
+        assert_eq!(
+            classes(&router, r"D:\DEV\r\.GitStat\Icon.SVG", MODIFY),
+            vec![
+                (Some(r"D:\Dev\r".into()), Class::RepoIcon),
+                (Some(r"D:\Dev\r".into()), Class::Worktree)
+            ]
         );
         // A whole drive as the root.
         let mut drive = Router::new(r"D:\".into(), 3, r"D:\dev\gitstat\config.json".into());

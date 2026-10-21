@@ -41,7 +41,7 @@ everywhere sort by it.
 - **Refresh now**
 - **Display ▸**: Status panel on click, Status window, Corner badge, Badge
   corner ▸, Hide badge when all synced, Hide badge in fullscreen, Folder icons
-  in Explorer
+  in Explorer, Folder icon style ▸ (Status folder or Repo icon)
 - **Watch for changes**, **Start with Windows**, **Edit config.json**, **Quit**
 
 With the panel turned off, a left-click opens the window instead; with both
@@ -96,6 +96,46 @@ The icons show in Explorer in every view and in the Files app. File Pilot is
 **unverified**: it uses the shell's icons, so it should show them, possibly
 only after F5.
 
+#### Repo icons
+
+**Display ▸ Folder icon style ▸ Repo icon** (`"folder_icon_mode": "repo-svg"`)
+shows a repo's own picture instead, for every repo that has a
+`.gitstat/icon.svg` (that exact name; any case on Windows). Repos without
+one keep the status folder. The picture takes one of three colours:
+
+- **green**: synced;
+- **amber**: work that is only local: uncommitted changes, unpushed commits,
+  or no upstream;
+- **red**: needs you: behind, diverged, or an error.
+
+Every fill or stroke that is `currentColor` gets that colour, and every other
+colour stays as drawn. A file that never mentions `currentColor` is drawn as
+a silhouette instead: its shape, all in that colour. For example, this
+icon.svg is a coloured disc with a white check mark:
+
+```svg
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">
+  <circle cx="8" cy="8" r="8" fill="currentColor"/>
+  <path d="M4 8.5l2.5 2.5L12 5.5" fill="none" stroke="#fff" stroke-width="2"/>
+</svg>
+```
+
+The picture is scaled to fill the icon square, keeping its proportions,
+centred. gitstat draws it into `%LOCALAPPDATA%\gitstat\icons` (never into
+the repo) whenever the file, the repo's colour or the style changes; saving
+the file updates the folder within a second or so, and each sweep has
+another look too. Old drawings are deleted once no folder uses them.
+
+The file comes from the repo, so gitstat treats it with care: files over
+1 MiB, links, DTD entities, deep nesting, filters, references that loop and
+more than 10,000 shapes are refused, counting every copy that `<use>`,
+patterns, gradients, clip paths, masks and markers make. Nothing it refers
+to is loaded (other files, web addresses, embedded images, fonts: text isn't
+drawn), and like any viewer gitstat shows only what is inside the `viewBox`.
+If the file can't be used, the folder shows the status icon and the panel
+counts it as skipped until the file changes. If it can't be read, or takes
+more than 10 seconds to draw, gitstat tries again on a later check.
+
 ## Which repos
 
 gitstat looks in `path` and up to `depth` folder levels below it (3 by
@@ -146,9 +186,8 @@ set `"watch": false`) to check on the interval only, as before v0.3.
 
 ## Install
 
-1. Download `gitstat-windows-x64` from the latest successful
-   [build](../../actions/workflows/build.yml) and unzip it. Or build it
-   yourself, see below.
+1. Build `gitstat.exe` yourself, see [Build from source](#build-from-source).
+   CI only runs tests and clippy; it doesn't publish an exe.
 2. Put `gitstat.exe` in a folder of its own, e.g. `D:\dev\gitstat\`.
 3. Run it. The first time, it writes `config.json` next to itself.
 4. Right-click the tray icon and tick **Start with Windows** to have it start
@@ -177,7 +216,8 @@ from an older version keeps working:
     "hide_when_synced": false,
     "hide_in_fullscreen": true
   },
-  "folder_icons": false
+  "folder_icons": false,
+  "folder_icon_mode": "status"
 }
 ```
 
@@ -197,6 +237,7 @@ from an older version keeps working:
 | `overlay.hide_when_synced` | false | Hide the badge while every repo is synced. |
 | `overlay.hide_in_fullscreen` | true | Hide the badge while a fullscreen app or a presentation runs. |
 | `folder_icons` | false | Status icons on the repo folders, see above. Setting it by hand skips the confirmation. |
+| `folder_icon_mode` | `status` | `status` for the status folders, `repo-svg` for each repo's own `.gitstat/icon.svg` where it has one, see [Repo icons](#repo-icons). Only matters while `folder_icons` is on. |
 
 Edits apply within about a second, without a restart. **Edit config.json** in
 the menu or the panel opens the file. The menu's toggles write the file too;
@@ -257,8 +298,10 @@ folder-icon tests. They also run on Linux (CI runs them there too), where only
   ([tray-icon](https://crates.io/crates/tray-icon)). `src/icon.rs` draws the
   tray and folder icons, anti-aliased at their exact pixel sizes (the tray's
   digits with [ab_glyph](https://crates.io/crates/ab_glyph) from Segoe UI,
-  or a built-in stroke font without it), and `src/folder_icons.rs` applies
-  and reverts the desktop.ini icons.
+  or a built-in stroke font without it), `src/repo_icon.rs` draws a repo's
+  own `.gitstat/icon.svg` ([resvg](https://crates.io/crates/resvg), with no
+  text, fonts or image loading), and `src/folder_icons.rs` applies and
+  reverts the desktop.ini icons.
 - `src/config.rs` reads and writes `config.json`. `src/autostart.rs` adds or
   removes gitstat under
   `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
