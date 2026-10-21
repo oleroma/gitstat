@@ -102,8 +102,10 @@ pub fn run(config_file: PathBuf) {
             let _ = icons_tx.unbounded_send(Input::FolderSkips(skips));
         });
 
+        let timelines = cx.new(|cx| crate::timeline::Timelines::new(&state, cx));
         cx.set_global(Ui {
             state: state.clone(),
+            timelines,
             input: tx,
             refresh: Rc::new(|cx: &mut App| {
                 if let Some(shared) = cx.try_global::<Shared>() {

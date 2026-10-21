@@ -13,14 +13,12 @@
 //! index and untracked files that would clutter the graph) and read
 //! separately, to hang off the commit each one was made on.
 
-// Wired into the tray and window views in a later milestone.
-#![allow(dead_code)]
-
 use crate::git;
 use std::collections::HashMap;
 use std::path::Path;
 
 /// Commits per page.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub const PAGE_SIZE: usize = 300;
 
 /// Field and record separators in `git log` output. Neither can appear in a
@@ -42,6 +40,7 @@ pub struct Commit {
 }
 
 impl Commit {
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn short(&self) -> &str {
         &self.id[..self.id.len().min(7)]
     }
@@ -217,6 +216,89 @@ pub fn stashes(repo: &Path) -> Result<Vec<Stash>, String> {
         return Ok(Vec::new());
     }
     Ok(parse_stashes(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Lines added and removed, and files changed, by one commit; a merge
+/// against its first parent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stat {
+    pub files: u32,
+    pub added: u32,
+    pub removed: u32,
+}
+
+pub fn stat(repo: &Path, id: &str) -> Result<Stat, String> {
+    if !(id.len() >= 40 && id.bytes().all(|b| b.is_ascii_hexdigit())) {
+        return Err("not a commit id".to_string());
+    }
+    let out = git::git(
+        repo,
+        &[
+            "show",
+            "--no-color",
+            "--shortstat",
+            "--format=",
+            "--diff-merges=first-parent",
+            id,
+            "--",
+        ],
+        git::LOCAL_TIMEOUT,
+    )?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(parse_stat(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// ` 3 files changed, 10 insertions(+), 2 deletions(-)`; empty for no change.
+fn parse_stat(out: &str) -> Stat {
+    let mut stat = Stat::default();
+    for part in out.trim().split(", ") {
+        let mut words = part.split_whitespace();
+        let n = words.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+        match words.next() {
+            Some(w) if w.starts_with("file") => stat.files = n,
+            Some(w) if w.starts_with("insertion") => stat.added = n,
+            Some(w) if w.starts_with("deletion") => stat.removed = n,
+            _ => {}
+        }
+    }
+    stat
+}
+
+/// `5m`, `3h`, `2d`, `4mo`, `1y` since `time`; `now` for anything under a
+/// minute or in the future.
+pub fn ago(now: i64, time: i64) -> String {
+    let s = now - time;
+    match s {
+        ..60 => "now".to_string(),
+        60..3_600 => format!("{}m", s / 60),
+        3_600..86_400 => format!("{}h", s / 3_600),
+        86_400..2_592_000 => format!("{}d", s / 86_400),
+        2_592_000..31_536_000 => format!("{}mo", s / 2_592_000),
+        _ => format!("{}y", s / 31_536_000),
+    }
+}
+
+/// `2026-10-21 18:35` UTC.
+pub fn utc(time: i64) -> String {
+    let days = time.div_euclid(86_400);
+    let secs = time.rem_euclid(86_400);
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}",
+        secs / 3_600,
+        secs % 3_600 / 60
+    )
 }
 
 fn log(repo: &Path, tips: &[String], skip: usize, n: usize) -> Result<String, String> {
@@ -401,6 +483,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn parses_stats_and_times() {
+        assert_eq!(
+            parse_stat(" 3 files changed, 10 insertions(+), 2 deletions(-)\n"),
+            Stat {
+                files: 3,
+                added: 10,
+                removed: 2
+            }
+        );
+        assert_eq!(
+            parse_stat(" 1 file changed, 1 deletion(-)"),
+            Stat {
+                files: 1,
+                added: 0,
+                removed: 1
+            }
+        );
+        assert_eq!(parse_stat(""), Stat::default());
+        assert_eq!(ago(1000, 1000), "now");
+        assert_eq!(ago(1000, 2000), "now");
+        assert_eq!(ago(7200, 0), "2h");
+        assert_eq!(ago(86_400 * 3, 0), "3d");
+        assert_eq!(ago(31_536_000 * 2, 0), "2y");
+        assert_eq!(utc(0), "1970-01-01 00:00");
+        assert_eq!(utc(1_792_607_746), "2026-10-21 18:35");
+        assert_eq!(utc(951_782_400), "2000-02-29 00:00");
+    }
+
+    #[test]
     fn parses_refs() {
         let out = "aaa\x1f\x1frefs/heads/main\n\
                    aaa\x1f\x1frefs/remotes/origin/main\n\
@@ -496,6 +607,9 @@ pub(crate) mod tests {
 
         let page = first_page(&dir, &[], 10).unwrap();
         assert_eq!(page.commits.len(), 1, "stash commits leaked into the walk");
+        let st = stat(&dir, &page.commits[0].id).unwrap();
+        assert_eq!((st.files, st.added, st.removed), (1, 1, 0));
+        assert!(stat(&dir, "--help").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

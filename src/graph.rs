@@ -18,9 +18,6 @@
 //! and lanes are positions that the view maps to the strip (rows run right
 //! to left) or the column (rows run down), or anything in between.
 
-// Wired into the tray and window views in a later milestone.
-#![allow(dead_code)]
-
 use crate::history::{Commit, Ref, Refs};
 use std::collections::{HashMap, HashSet};
 
@@ -147,7 +144,7 @@ struct Source {
     branch: Option<usize>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Layout {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
@@ -155,7 +152,6 @@ pub struct Layout {
     pub branches: Vec<String>,
     /// The most lanes any row used.
     pub width: usize,
-    rows: HashMap<String, usize>,
     lanes: Vec<Option<Slot>>,
     /// Commits still to come that are on the default branch's first-parent
     /// line, or merged into it.
@@ -188,18 +184,14 @@ impl Layout {
         }
     }
 
-    pub fn row(&self, id: &str) -> Option<usize> {
-        self.rows.get(id).copied()
-    }
-
     /// Edges still waiting for a parent below the last loaded row.
+    #[cfg(test)]
     pub fn open_edges(&self) -> impl Iterator<Item = &Edge> {
         self.open.keys().map(|&i| &self.edges[i])
     }
 
     fn add(&mut self, commit: &Commit, ctx: &Context) {
         let row = self.nodes.len();
-        self.rows.insert(commit.id.clone(), row);
 
         let waiting: Vec<usize> = (0..self.lanes.len())
             .filter(|&i| matches!(&self.lanes[i], Some(s) if s.target == commit.id))

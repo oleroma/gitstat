@@ -2,9 +2,6 @@
 //! counts and the last merge, plus the commits that are unpushed or
 //! unpulled, which the graph colours.
 
-// Wired into the tray and window views in a later milestone.
-#![allow(dead_code)]
-
 use crate::git;
 use crate::history::{Ref, Refs};
 use std::collections::HashSet;
@@ -53,6 +50,8 @@ pub struct Info {
     pub last_merge: Option<Merge>,
     pub unpushed: HashSet<String>,
     pub unpulled: HashSet<String>,
+    /// `https://github.com/owner/repo` for a GitHub `origin`.
+    pub web: Option<String>,
 }
 
 impl Info {
@@ -100,7 +99,10 @@ pub fn read(repo: &Path, refs: &Refs) -> Result<Info, String> {
         Default::default()
     };
 
+    let web = text(repo, &["remote", "get-url", "origin"]).and_then(|u| github_web(u.trim()));
+
     Ok(Info {
+        web,
         checkout,
         worktrees,
         local_branches,
@@ -187,6 +189,26 @@ fn sync_sets(repo: &Path, has_remotes: bool) -> (HashSet<String>, HashSet<String
     (unpushed, HashSet::new())
 }
 
+/// The GitHub page of a remote URL, from its https, ssh or scp form.
+pub fn github_web(url: &str) -> Option<String> {
+    let path = url
+        .strip_prefix("https://github.com/")
+        .or_else(|| url.strip_prefix("http://github.com/"))
+        .or_else(|| url.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| url.strip_prefix("git@github.com:"))?;
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let mut parts = path.split('/');
+    let (owner, repo) = (parts.next()?, parts.next()?);
+    let ok = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    };
+    (parts.next().is_none() && ok(owner) && ok(repo))
+        .then(|| format!("https://github.com/{owner}/{repo}"))
+}
+
 fn parse_left_right(out: &str) -> (HashSet<String>, HashSet<String>) {
     let mut left = HashSet::new();
     let mut right = HashSet::new();
@@ -253,6 +275,18 @@ mod tests {
         assert!(w[2].prunable);
         assert_eq!(w[2].path, PathBuf::from("/gone"));
         assert!(parse_worktrees("").is_empty());
+    }
+
+    #[test]
+    fn github_web_urls() {
+        let want = Some("https://github.com/oleroma/gitstat".to_string());
+        assert_eq!(github_web("https://github.com/oleroma/gitstat.git"), want);
+        assert_eq!(github_web("https://github.com/oleroma/gitstat/"), want);
+        assert_eq!(github_web("git@github.com:oleroma/gitstat.git"), want);
+        assert_eq!(github_web("ssh://git@github.com/oleroma/gitstat"), want);
+        assert_eq!(github_web("https://gitlab.com/a/b"), None);
+        assert_eq!(github_web("https://github.com/a/b/c"), None);
+        assert_eq!(github_web("https://github.com/a/b?x=<y>"), None);
     }
 
     #[test]

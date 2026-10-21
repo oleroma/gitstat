@@ -5,6 +5,7 @@ use crate::git::RepoStatus;
 use crate::monitor::WatchMode;
 use crate::panel;
 use crate::state::{AppState, Input};
+use crate::timeline::Timelines;
 use crate::tray::TraySnapshot;
 use crate::win;
 use futures::channel::mpsc::UnboundedSender;
@@ -24,6 +25,8 @@ const WINDOW_MARGIN: f32 = 16.0;
 /// it once with `cx.set_global` before opening any of them.
 pub struct Ui {
     pub state: Entity<AppState>,
+    /// Every repo's loaded history, for the timeline strips.
+    pub timelines: Entity<Timelines>,
     /// The app's one input channel; the overlay posts its clicks here.
     pub input: UnboundedSender<Input>,
     /// Starts a fetch sweep now (the refresh buttons).
@@ -140,6 +143,7 @@ pub enum Mode {
 
 pub struct StatusView {
     state: Entity<AppState>,
+    timelines: Option<Entity<Timelines>>,
     mode: Mode,
     show_synced: bool,
     focus: FocusHandle,
@@ -156,6 +160,10 @@ impl StatusView {
         cx: &mut Context<Self>,
     ) -> Self {
         cx.observe(&state, |_, _, cx| cx.notify()).detach();
+        let timelines = cx.try_global::<Ui>().map(|ui| ui.timelines.clone());
+        if let Some(t) = &timelines {
+            cx.observe(t, |_, _, cx| cx.notify()).detach();
+        }
         cx.observe_window_appearance(window, |_, _, cx| cx.notify())
             .detach();
         if mode == Mode::Panel {
@@ -173,6 +181,7 @@ impl StatusView {
         focus.focus(window);
         Self {
             state,
+            timelines,
             mode,
             show_synced: false,
             focus,
@@ -203,7 +212,7 @@ fn mode_text(mode: &WatchMode) -> String {
     }
 }
 
-fn status_color(s: &RepoStatus, p: &Palette) -> Hsla {
+pub(crate) fn status_color(s: &RepoStatus, p: &Palette) -> Hsla {
     if s.error.is_some() || s.is_diverged() || s.behind > 0 {
         p.red
     } else if !s.is_synced() {
@@ -282,8 +291,19 @@ fn icon_button(
 impl Render for StatusView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::for_appearance(window.appearance());
+        let dark = matches!(
+            window.appearance(),
+            WindowAppearance::Dark | WindowAppearance::VibrantDark
+        );
         let mode = self.mode;
-        let state = self.state.read(cx);
+        let timelines = self.timelines.clone();
+        // A repo row: a timeline strip in the panel, a plain row elsewhere.
+        let row = |i: usize, s: &RepoStatus, cx: &App| match (&timelines, mode) {
+            (Some(t), Mode::Panel) => Timelines::strip(t, i, s, &p, dark, cx),
+            _ => repo_row(i, s, &p, mode),
+        };
+        let state = self.state.clone();
+        let state = state.read(cx);
         let unsynced = state.unsynced();
         let problem = state.problem();
         let sweeping = state.sweeping;
@@ -398,7 +418,7 @@ impl Render for StatusView {
                 let (bad, good): (Vec<&RepoStatus>, Vec<&RepoStatus>) =
                     sorted.into_iter().partition(|s| !s.is_synced());
                 for (i, s) in bad.iter().enumerate() {
-                    rows.push(repo_row(i, s, &p, mode));
+                    rows.push(row(i, s, cx));
                 }
                 if !good.is_empty() {
                     let open = self.show_synced;
@@ -429,7 +449,7 @@ impl Render for StatusView {
                     if open {
                         let offset = bad.len();
                         for (i, s) in good.iter().enumerate() {
-                            rows.push(repo_row(offset + i, s, &p, mode));
+                            rows.push(row(offset + i, s, cx));
                         }
                     }
                 }
@@ -542,6 +562,11 @@ impl Render for StatusView {
             .child(header)
             .child(list)
             .child(footer)
+            .children(
+                self.timelines
+                    .as_ref()
+                    .and_then(|t| t.read(cx).hover_card(&p, dark)),
+            )
     }
 }
 
