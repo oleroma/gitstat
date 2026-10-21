@@ -1,6 +1,6 @@
-# Light checks only. Heavy work (release build, Windows test suite) runs on
-# the dev PC; see README. No artifacts are published.
-name: build
+# Tests and lint only, on Linux. All builds, including every Windows build
+# and the Windows tests, run on the dev PC; see README. Nothing is published.
+name: checks
 
 on:
   push:
@@ -19,17 +19,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Test
         run: cargo test --locked
-      - name: Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
-
-  windows:
-    # Compile + lint only; the Windows tests and the release build run on the PC.
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
