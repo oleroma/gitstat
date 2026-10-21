@@ -1,5 +1,5 @@
-# Tests and lint only, on Linux. All builds, including every Windows build
-# and the Windows tests, run on the dev PC; see README. Nothing is published.
+# Tests and lint only. Release builds happen on the dev PC (see README);
+# CI builds no exe and publishes nothing.
 name: checks
 
 on:
@@ -11,6 +11,20 @@ jobs:
   linux:
     # The platform-neutral modules and the notify (inotify) integration tests.
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --locked
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+  windows:
+    # The full test suite, including the Windows-only tests. No release build.
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
