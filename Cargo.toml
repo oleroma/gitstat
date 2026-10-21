@@ -1,6 +1,6 @@
 [package]
 name = "gitstat"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Tray icon showing whether the git repos in one folder are in sync with their remotes"
 license = "MIT"
@@ -9,11 +9,49 @@ publish = false
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# 8.x silently drops a watch when the ReadDirectoryChangesW buffer overflows;
+# 9.0 turns that into a Rescan event. Pinned: the RC API may still change.
+notify = { version = "=9.0.0-rc.6", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
+# Rasterizes the tray icon's digits from Segoe UI. Pure Rust; no variable
+# fonts needed (segoeuib.ttf and seguisb.ttf are static).
+ab_glyph = { version = "0.2.32", default-features = false, features = ["std"] }
 gpui = "0.2.2"
+# Renders a repo's own .gitstat/icon.svg into its folder icon. No text, fonts
+# or raster images: an icon needs shapes, and every loader is attack surface.
+resvg = { version = "0.48.1", default-features = false }
+# resvg's CSS parser, to see which elements a repo icon's style sheet
+# applies references to before resvg expands them. Same version as resvg's.
+simplecss = "0.2.2"
 tray-icon = "0.26"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+futures = "0.3"
+raw-window-handle = "0.6"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+# icon.rs is tested on Linux too; there the font is missing and the vector
+# fallback draws the digits.
+ab_glyph = { version = "0.2.32", default-features = false, features = ["std"] }
+resvg = { version = "0.48.1", default-features = false }
+simplecss = "0.2.2"
 
 [profile.release]
 lto = "thin"

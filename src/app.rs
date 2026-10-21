@@ -1,111 +1,89 @@
-//! The GPUI side: shared state, the refresh loop, and the status window.
+//! The GPUI side: startup, the one input loop, and the settings the tray
+//! menu changes. The views live in view.rs, panel.rs and overlay.rs.
 
-use crate::config::Config;
-use crate::git::{self, RepoStatus};
-use crate::tray::{Tray, TrayAction, TraySnapshot};
+use crate::config::{self, ClickAction, Config, FolderIconMode};
+use crate::folder_icons;
+use crate::monitor::{Command, Monitor, Update};
+use crate::panel::{self, Anchor};
+use crate::state::{AppState, Input};
+use crate::tray::{Setting, Tray, TrayAction, TraySnapshot};
+use crate::view::{self, Ui};
+use crate::{overlay, win};
+use futures::StreamExt;
+use futures::channel::mpsc::{UnboundedReceiver, unbounded};
 use gpui::{
-    App, AppContext, Application, Bounds, Context, Entity, Global, Hsla, IntoElement,
-    ParentElement, Render, SharedString, Styled, Window, WindowAppearance, WindowBounds,
-    WindowHandle, WindowKind, WindowOptions, div, point, prelude::*, px, rgb, size,
+    App, AppContext, Application, BorrowAppContext, Bounds, Context, Global, IntoElement, Render,
+    Window, WindowBounds, WindowKind, WindowOptions, div, point, px, size,
 };
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::rc::Rc;
 
-const POLL_EVERY: Duration = Duration::from_millis(100);
-const WINDOW_SIZE: (f32, f32) = (420.0, 520.0);
+/// Inputs handled per UI update; the rest wait for the next pass.
+const MAX_BATCH: usize = 512;
 
-pub struct AppState {
-    config_file: PathBuf,
-    config: Config,
-    config_error: Option<String>,
-    statuses: Vec<RepoStatus>,
-    has_result: bool,
-    checking: bool,
-    last_checked: Option<String>,
-    next_check: Instant,
-}
+const FOLDER_ICONS_CONSENT: &str = "\
+Show each repo's status as its folder icon in Explorer?
 
-impl AppState {
-    fn new(config_file: PathBuf) -> Self {
-        let mut state = Self {
-            config_file,
-            config: Config::default(),
-            config_error: None,
-            statuses: Vec::new(),
-            has_result: false,
-            checking: false,
-            last_checked: None,
-            next_check: Instant::now(),
-        };
-        state.reload_config();
-        state
-    }
+gitstat will write a hidden desktop.ini into each repo folder on local fixed \
+drives, mark the folder read-only (which is how Windows enables custom folder \
+icons), and add /desktop.ini to the repo's .git/info/exclude so git ignores it.
 
-    /// Re-reads config.json so edits apply on the next check without a restart.
-    fn reload_config(&mut self) {
-        match Config::load_or_create(&self.config_file) {
-            Ok(config) => {
-                self.config = config;
-                self.config_error = None;
-            }
-            Err(e) => self.config_error = Some(format!("config.json: {e}")),
-        }
-    }
+Folders with their own desktop.ini, OneDrive folders and network drives are \
+skipped. Turning the option off, or running gitstat --remove-folder-icons, \
+restores the folders.";
 
-    fn unsynced(&self) -> usize {
-        self.statuses.iter().filter(|s| !s.is_synced()).count()
-    }
-
-    /// A problem worth showing instead of the repo summary.
-    fn problem(&self) -> Option<String> {
-        if let Some(e) = &self.config_error {
-            return Some(e.clone());
-        }
-        let dir = self.config.repos_dir();
-        if self.has_result && !dir.is_dir() {
-            return Some(format!("folder not found: {}", dir.display()));
-        }
-        None
-    }
-
-    fn refresh(&mut self, cx: &mut Context<Self>) {
-        if self.checking {
-            return;
-        }
-        self.reload_config();
-        self.checking = true;
-        cx.notify();
-        let dir = self.config.repos_dir();
-        let work = cx
-            .background_executor()
-            .spawn(async move { git::check_all(&dir, true) });
-        cx.spawn(async move |this, cx| {
-            let statuses = work.await;
-            this.update(cx, |state, cx| {
-                state.statuses = statuses;
-                state.has_result = true;
-                state.checking = false;
-                state.last_checked = Some(local_time());
-                let now = Instant::now();
-                state.next_check = now.checked_add(state.config.interval()).unwrap_or(now);
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-}
-
+/// What only the input loop touches.
 struct Shared {
-    state: Entity<AppState>,
     tray: Tray,
-    window: Option<WindowHandle<StatusView>>,
+    monitor: Monitor,
+    icons: folder_icons::Worker,
+    /// The "couldn't save config.json" notice was shown this session.
+    save_notice_shown: bool,
+    /// The folder-icon consent box is open.
+    consent_pending: bool,
 }
 
 impl Global for Shared {}
 
 pub fn run(config_file: PathBuf) {
     Application::new().run(move |cx: &mut App| {
+        let (tx, rx) = unbounded::<Input>();
+        // Before Tray::new: the handlers can be set only once.
+        crate::tray::install_handlers(tx.clone());
+
+        // GPUI quits when its last window closes. A window that is never
+        // shown keeps the app alive while the panel and window are closed.
+        let mut keepalive = None;
+        cx.open_window(
+            WindowOptions {
+                show: false,
+                focus: false,
+                titlebar: None,
+                kind: WindowKind::PopUp,
+                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                    point(px(0.), px(0.)),
+                    size(px(1.), px(1.)),
+                ))),
+                ..Default::default()
+            },
+            |window, cx| {
+                keepalive = win::hwnd(window);
+                if let Some(h) = keepalive {
+                    // GPUI can show it on a display change; make that harmless.
+                    cx.spawn(async move |_| unsafe { win::harden_keepalive(h) })
+                        .detach();
+                }
+                cx.new(|_| Keepalive)
+            },
+        )
+        .ok();
+
+        let (cfg, config_error) = match Config::load_or_create(&config_file) {
+            Ok(cfg) => (cfg, None),
+            Err(e) => (Config::default(), Some(config_problem(&e))),
+        };
+        let state = cx.new(|_| AppState::new(config_file.clone(), cfg.clone(), config_error));
+
         let tray = match Tray::new() {
             Ok(tray) => tray,
             Err(e) => {
@@ -115,129 +93,367 @@ pub fn run(config_file: PathBuf) {
             }
         };
 
-        // GPUI quits when its last window closes. A window that is never shown
-        // keeps the app alive while the status window is closed.
-        cx.open_window(
-            WindowOptions {
-                show: false,
-                focus: false,
-                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
-                    point(px(0.), px(0.)),
-                    size(px(1.), px(1.)),
-                ))),
-                ..Default::default()
-            },
-            |_, cx| cx.new(|_| Keepalive),
-        )
-        .ok();
-
-        let state = cx.new(|_| AppState::new(config_file));
-        cx.observe(&state, |state, cx| {
-            let s = state.read(cx);
-            let (statuses, checking, has_result, problem) =
-                (s.statuses.clone(), s.checking, s.has_result, s.problem());
-            cx.update_global::<Shared, _>(|shared, _| {
-                shared.tray.update(&TraySnapshot {
-                    statuses: &statuses,
-                    checking,
-                    has_result,
-                    problem: problem.as_deref(),
-                })
-            });
-        })
-        .detach();
-        cx.set_global(Shared {
-            state: state.clone(),
-            tray,
-            window: None,
+        let monitor_tx = tx.clone();
+        let monitor = Monitor::start(config_file, move |u| {
+            let _ = monitor_tx.unbounded_send(Input::Monitor(u));
+        });
+        let icons_tx = tx.clone();
+        let icons = folder_icons::Worker::start(config::data_dir(), move |skips| {
+            let _ = icons_tx.unbounded_send(Input::FolderSkips(skips));
         });
 
-        // Tray events arrive on channels; poll them, and kick off checks when due.
-        cx.spawn(async move |cx| {
-            loop {
-                cx.background_executor().timer(POLL_EVERY).await;
-                let keep_going = cx.update(tick).unwrap_or(false);
-                if !keep_going {
-                    break;
+        cx.set_global(Ui {
+            state: state.clone(),
+            input: tx,
+            refresh: Rc::new(|cx: &mut App| {
+                if let Some(shared) = cx.try_global::<Shared>() {
+                    shared.monitor.send(Command::RefreshAll);
                 }
-            }
-        })
-        .detach();
+            }),
+            keepalive,
+        });
+        cx.set_global(Shared {
+            tray,
+            monitor,
+            icons,
+            save_notice_shown: false,
+            consent_pending: false,
+        });
+        apply_config(&Config::default(), cfg, cx);
+        update_outputs(false, cx);
+
+        cx.spawn(async move |cx| input_loop(rx, cx).await).detach();
     });
 }
 
-/// One pass of the main loop. Returns false once the app is quitting.
-fn tick(cx: &mut App) -> bool {
-    let shared = cx.global::<Shared>();
-    let state = shared.state.clone();
-    let actions = shared.tray.poll();
-    for action in actions {
-        match action {
-            TrayAction::ShowWindow => show_window(cx),
-            TrayAction::Refresh => state.update(cx, |s, cx| s.refresh(cx)),
-            TrayAction::OpenRepo(path) => cx.open_with_system(&path),
-            TrayAction::SetAutostart(enabled) => {
-                if let Err(e) = crate::autostart::set_enabled(enabled) {
-                    crate::error_box(format!("Couldn't change the startup setting: {e}"));
-                }
-                cx.global::<Shared>()
-                    .tray
-                    .set_autostart_checked(crate::autostart::is_enabled());
+/// The one foreground task: waits for input, then handles everything
+/// already queued in one update so a burst of statuses redraws once.
+async fn input_loop(mut rx: UnboundedReceiver<Input>, cx: &mut gpui::AsyncApp) {
+    while let Some(first) = rx.next().await {
+        let mut batch = vec![first];
+        while batch.len() < MAX_BATCH {
+            match rx.try_recv() {
+                Ok(input) => batch.push(input),
+                Err(_) => break,
             }
-            TrayAction::Quit => {
-                cx.global::<Shared>().tray.hide();
-                cx.quit();
-                return false;
+        }
+        if !cx.update(|cx| handle_batch(batch, cx)).unwrap_or(false) {
+            break;
+        }
+    }
+}
+
+/// Returns false once the app is quitting.
+fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
+    let state = cx.global::<Ui>().state.clone();
+    let mut changed = false;
+    let mut icons_stale = false;
+    for input in batch {
+        match input {
+            Input::Monitor(update) => {
+                let (c, s) = on_update(update, cx);
+                changed |= c;
+                icons_stale |= s;
+            }
+            Input::FolderSkips(skips) => {
+                state.update(cx, |s, _| s.folder_skips = skips);
+                changed = true;
+            }
+            Input::Overlay => {
+                let click = state.read(cx).config.overlay_click();
+                match click {
+                    Some(ClickAction::Panel) => {
+                        let anchor = overlay::anchor(cx).unwrap_or(Anchor::Tray(None));
+                        panel::toggle(anchor, cx);
+                    }
+                    Some(ClickAction::Window) => view::show_window(cx),
+                    Some(ClickAction::Menu) | None => {}
+                }
+            }
+            Input::OverlayMoved(rect) => {
+                let (corner, x, y) = overlay::drop_position(rect);
+                change_setting(
+                    |c| {
+                        c.overlay.corner = corner;
+                        c.overlay.offset_x = Some(x);
+                        c.overlay.offset_y = Some(y);
+                    },
+                    cx,
+                );
+                overlay::drop_saved(cx);
+                changed = true;
+            }
+            input @ (Input::Tray(_) | Input::Menu(_)) => {
+                let Some(action) = cx.global::<Shared>().tray.map(&input) else {
+                    continue;
+                };
+                if !on_action(action, cx) {
+                    return false;
+                }
+                changed = true;
             }
         }
     }
-    if Instant::now() >= state.read(cx).next_check {
-        state.update(cx, |s, cx| s.refresh(cx));
+    if changed {
+        state.update(cx, |_, cx| cx.notify());
+    }
+    // An icon.svg change alone changes nothing on screen.
+    if changed || icons_stale {
+        update_outputs(icons_stale, cx);
+    } else {
+        cx.global_mut::<Shared>().tray.check_icon_size();
+    }
+    // Monitor updates arrive at least every interval, badge or not.
+    view::hide_keepalive_if_shown(cx);
+    true
+}
+
+/// Folds one monitor update into the state. Returns (anything changed,
+/// the folder icons need a sync: statuses changed, or a repo's own icon
+/// may have).
+fn on_update(update: Update, cx: &mut App) -> (bool, bool) {
+    let state = cx.global::<Ui>().state.clone();
+    let repo_svgs = {
+        let config = &state.read(cx).config;
+        config.folder_icons && config.folder_icon_mode == FolderIconMode::RepoSvg
+    };
+    match update {
+        Update::Config(Ok(new)) => {
+            state.update(cx, |s, _| s.config_error = None);
+            let old = state.read(cx).config.clone();
+            // Our own writes come back equal, and are not re-applied.
+            if new != old {
+                apply_config(&old, new, cx);
+            }
+            (true, false)
+        }
+        Update::Config(Err(e)) => {
+            state.update(cx, |s, _| s.config_error = Some(config_problem(&e)));
+            (true, false)
+        }
+        Update::Repos { repos, capped } => state.update(cx, |s, _| {
+            let before = s.statuses.len();
+            s.statuses.retain(|st| repos.contains(&st.path));
+            s.in_flight.retain(|p| repos.contains(p));
+            let removed = s.statuses.len() != before;
+            let capped_changed = s.capped != capped;
+            s.capped = capped;
+            (removed || capped_changed, removed)
+        }),
+        Update::Started { repo, .. } => {
+            state.update(cx, |s, _| s.in_flight.insert(repo));
+            (false, false)
+        }
+        Update::Status(status) => state.update(cx, |s, _| {
+            s.in_flight.remove(&status.path);
+            let changed = s.merge_status(status);
+            (changed, changed)
+        }),
+        Update::SweepStarted => {
+            state.update(cx, |s, _| s.sweeping = true);
+            (true, false)
+        }
+        Update::SweepDone => state.update(cx, |s, _| {
+            s.sweeping = false;
+            s.last_checked = Some(local_time());
+            // The first result: the folder-icon worker can start now.
+            // Every sweep has another look at the repos' own icons, which
+            // covers a missed event and `watch: false`.
+            let first = !s.has_result;
+            s.has_result = true;
+            (true, first || repo_svgs)
+        }),
+        Update::RepoIcons => (false, repo_svgs),
+        Update::Mode(mode) => {
+            state.update(cx, |s, _| s.mode = mode);
+            (true, false)
+        }
+    }
+}
+
+/// Brings the tray, the folder icons and the badge up to date with the
+/// state; the folder icons only with `sync_icons`.
+fn update_outputs(sync_icons: bool, cx: &mut App) {
+    let state = cx.global::<Ui>().state.clone();
+    cx.update_global::<Shared, _>(|shared, cx| {
+        let s = state.read(cx);
+        let problem = s.problem();
+        shared.tray.update(&TraySnapshot {
+            statuses: &s.statuses,
+            checking: s.sweeping,
+            has_result: s.has_result,
+            problem: problem.as_deref(),
+            incomplete: s.capped.is_some(),
+        });
+        if sync_icons && s.has_result {
+            let config = &s.config;
+            shared.icons.sync(
+                s.statuses.clone(),
+                config.folder_icons,
+                config.folder_icon_mode,
+            );
+        }
+    });
+    overlay::sync(cx);
+}
+
+/// Runs a tray action. Returns false once the app is quitting.
+fn on_action(action: TrayAction, cx: &mut App) -> bool {
+    let cfg = cx.global::<Ui>().state.read(cx).config.clone();
+    match action {
+        TrayAction::LeftClick(rect) => match cfg.left_click() {
+            ClickAction::Panel => panel::toggle(Anchor::Tray(rect), cx),
+            ClickAction::Window => view::show_window(cx),
+            // tray-icon shows the menu itself (`set_show_menu_on_left_click`).
+            ClickAction::Menu => {}
+        },
+        TrayAction::DoubleClick => {
+            if cfg.window {
+                panel::close(cx);
+                view::show_window(cx);
+            }
+        }
+        TrayAction::OpenPanel => {
+            if !panel::is_open(cx) {
+                let rect = cx.global::<Shared>().tray.icon_rect();
+                panel::toggle(Anchor::Tray(rect), cx);
+            }
+        }
+        TrayAction::ShowWindow => view::show_window(cx),
+        TrayAction::Refresh => cx.global::<Shared>().monitor.send(Command::RefreshAll),
+        TrayAction::OpenRepo(path) => cx.open_with_system(&path),
+        TrayAction::EditConfig => {
+            let file = cx.global::<Ui>().state.read(cx).config_file.clone();
+            cx.open_with_system(&file);
+        }
+        TrayAction::Toggle(Setting::FolderIcons) if !cfg.folder_icons => ask_folder_icons(cx),
+        TrayAction::Toggle(setting) => change_setting(|c| setting.toggle(c), cx),
+        // A corner from the menu drops any dragged offset: margin from both edges.
+        TrayAction::SetCorner(corner) => change_setting(
+            |c| {
+                c.overlay.corner = corner;
+                c.overlay.offset_x = None;
+                c.overlay.offset_y = None;
+            },
+            cx,
+        ),
+        TrayAction::SetFolderIconMode(mode) => change_setting(|c| c.folder_icon_mode = mode, cx),
+        TrayAction::SetAutostart(enabled) => {
+            if let Err(e) = crate::autostart::set_enabled(enabled) {
+                crate::error_box(format!("Couldn't change the startup setting: {e}"));
+            }
+            cx.global::<Shared>()
+                .tray
+                .set_autostart_checked(crate::autostart::is_enabled());
+        }
+        TrayAction::Quit => {
+            let shared = cx.global::<Shared>();
+            shared.monitor.send(Command::Shutdown);
+            shared.tray.hide();
+            cx.quit();
+            return false;
+        }
     }
     true
 }
 
-fn show_window(cx: &mut App) {
-    if let Some(handle) = cx.global::<Shared>().window
-        && handle
-            .update(cx, |_, window, _| window.activate_window())
-            .is_ok()
-    {
+/// Folder icons change the user's repo folders, so turning them on from the
+/// menu asks first. A hand edit of config.json is consent enough.
+fn ask_folder_icons(cx: &mut App) {
+    let cfg = cx.global::<Ui>().state.read(cx).config.clone();
+    let shared = cx.global_mut::<Shared>();
+    // Windows has already ticked the item; untick it until the answer.
+    shared.tray.sync_settings(&cfg);
+    if shared.consent_pending {
         return;
     }
-    let (width, height) = (px(WINDOW_SIZE.0), px(WINDOW_SIZE.1));
-    // Bottom-right of the primary display, above where the taskbar usually sits.
-    let bounds = match cx.primary_display() {
-        Some(display) => {
-            let d = display.bounds();
-            let origin = point(
-                d.origin.x + d.size.width - width - px(16.),
-                d.origin.y + d.size.height - height - px(64.),
-            );
-            Bounds::new(origin, size(width, height))
-        }
-        None => Bounds::centered(None, size(width, height), cx),
-    };
-    let state = cx.global::<Shared>().state.clone();
-    let handle = cx
-        .open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                kind: WindowKind::Normal,
-                titlebar: Some(gpui::TitlebarOptions {
-                    title: Some("gitstat".into()),
-                    ..Default::default()
-                }),
-                window_min_size: Some(size(px(300.), px(200.))),
-                ..Default::default()
-            },
-            |window, cx| {
-                window.activate_window();
-                cx.new(|cx| StatusView::new(state, cx))
-            },
-        )
+    shared.consent_pending = true;
+    let answer = win::confirm_box(FOLDER_ICONS_CONSENT.to_string());
+    let wait = cx
+        .background_executor()
+        .spawn(async move { answer.join().unwrap_or(false) });
+    cx.spawn(async move |cx| {
+        let yes = wait.await;
+        cx.update(|cx| {
+            cx.global_mut::<Shared>().consent_pending = false;
+            if yes {
+                change_setting(|c| c.folder_icons = true, cx);
+            }
+        })
         .ok();
-    cx.global_mut::<Shared>().window = handle;
+    })
+    .detach();
+}
+
+/// A menu toggle: change one field, save, apply. A save that is refused
+/// (config.json doesn't parse) keeps the change in memory, with one notice
+/// per session. The monitor gets the change directly either way: it only
+/// rereads a file that saved.
+fn change_setting(f: impl FnOnce(&mut Config), cx: &mut App) {
+    let state = cx.global::<Ui>().state.clone();
+    let (old, file) = {
+        let s = state.read(cx);
+        (s.config.clone(), s.config_file.clone())
+    };
+    let mut new = old.clone();
+    f(&mut new);
+    if new == old {
+        // The menu may have flipped a check mark on its own.
+        cx.global::<Shared>().tray.sync_settings(&old);
+        return;
+    }
+    if let Err(e) = new.save(&file) {
+        let shared = cx.global_mut::<Shared>();
+        if !shared.save_notice_shown {
+            shared.save_notice_shown = true;
+            crate::error_box(format!(
+                "Couldn't save config.json, so this change lasts only until config.json \
+                 is fixed and reloaded, or gitstat quits.\n\n{e}"
+            ));
+        }
+    }
+    cx.global::<Shared>()
+        .monitor
+        .send(Command::Apply(new.clone()));
+    apply_config(&old, new, cx);
+}
+
+/// Makes the app match `new`. Idempotent, so startup applies the file
+/// config over the defaults. The monitor reads `path`, `watch` and the
+/// interval from the file itself, and from `change_setting`.
+fn apply_config(old: &Config, new: Config, cx: &mut App) {
+    let state = cx.global::<Ui>().state.clone();
+    state.update(cx, |s, cx| {
+        s.config = new.clone();
+        cx.notify();
+    });
+    if !new.panel {
+        panel::close(cx);
+    }
+    if !new.window {
+        view::close_window(cx);
+    }
+    if new.overlay != old.overlay {
+        overlay::sync(cx);
+    }
+    let s = state.read(cx);
+    // Turning icons off reverts even before the first result. A new mode
+    // matters only while they are on.
+    let icons_changed = new.folder_icons != old.folder_icons
+        || (new.folder_icons && new.folder_icon_mode != old.folder_icon_mode);
+    let sync_icons = icons_changed && (s.has_result || !new.folder_icons);
+    let statuses = s.statuses.clone();
+    let shared = cx.global::<Shared>();
+    if sync_icons {
+        shared
+            .icons
+            .sync(statuses, new.folder_icons, new.folder_icon_mode);
+    }
+    shared.tray.sync_settings(&new);
+}
+
+fn config_problem(e: &str) -> String {
+    format!("config.json: {e}")
 }
 
 struct Keepalive;
@@ -245,234 +461,6 @@ struct Keepalive;
 impl Render for Keepalive {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()
-    }
-}
-
-struct StatusView {
-    state: Entity<AppState>,
-}
-
-impl StatusView {
-    fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        cx.observe(&state, |_, _, cx| cx.notify()).detach();
-        Self { state }
-    }
-}
-
-struct Palette {
-    bg: Hsla,
-    surface: Hsla,
-    hover: Hsla,
-    border: Hsla,
-    text: Hsla,
-    muted: Hsla,
-    green: Hsla,
-    red: Hsla,
-    amber: Hsla,
-    button: Hsla,
-    button_text: Hsla,
-}
-
-impl Palette {
-    fn for_appearance(appearance: WindowAppearance) -> Self {
-        let dark = matches!(
-            appearance,
-            WindowAppearance::Dark | WindowAppearance::VibrantDark
-        );
-        if dark {
-            Self {
-                bg: rgb(0x1e1f22).into(),
-                surface: rgb(0x2b2d31).into(),
-                hover: rgb(0x35373c).into(),
-                border: rgb(0x3a3c42).into(),
-                text: rgb(0xe8e8ea).into(),
-                muted: rgb(0x9a9ca3).into(),
-                green: rgb(0x3fb950).into(),
-                red: rgb(0xf26b6b).into(),
-                amber: rgb(0xd6a33b).into(),
-                button: rgb(0x3d6fe0).into(),
-                button_text: rgb(0xffffff).into(),
-            }
-        } else {
-            Self {
-                bg: rgb(0xf6f7f9).into(),
-                surface: rgb(0xffffff).into(),
-                hover: rgb(0xeef0f4).into(),
-                border: rgb(0xdcdfe5).into(),
-                text: rgb(0x1f2328).into(),
-                muted: rgb(0x656d76).into(),
-                green: rgb(0x1a7f37).into(),
-                red: rgb(0xcf222e).into(),
-                amber: rgb(0x9a6700).into(),
-                button: rgb(0x2f5fd0).into(),
-                button_text: rgb(0xffffff).into(),
-            }
-        }
-    }
-}
-
-impl Render for StatusView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = Palette::for_appearance(window.appearance());
-        let state = self.state.read(cx);
-        let unsynced = state.unsynced();
-        let problem = state.problem();
-        let headline: SharedString = crate::tray::summary(
-            &TraySnapshot {
-                statuses: &state.statuses,
-                checking: state.checking,
-                has_result: state.has_result,
-                problem: problem.as_deref(),
-            },
-            unsynced,
-        )
-        .into();
-        let headline_color = if problem.is_some() || unsynced > 0 {
-            p.red
-        } else if state.has_result {
-            p.green
-        } else {
-            p.muted
-        };
-        let mut subline = state.config.repos_dir().display().to_string();
-        if state.checking {
-            subline.push_str(" · checking…");
-        } else if let Some(time) = &state.last_checked {
-            subline.push_str(&format!(" · checked at {time}"));
-        }
-
-        let entity = self.state.clone();
-        let refresh = div()
-            .id("refresh")
-            .px_3()
-            .py_1()
-            .rounded_md()
-            .text_sm()
-            .bg(p.button)
-            .text_color(p.button_text)
-            .when(state.checking, |b| b.opacity(0.6))
-            .when(!state.checking, |b| {
-                b.cursor_pointer().hover(|s| s.opacity(0.9))
-            })
-            .child(if state.checking {
-                "Checking…"
-            } else {
-                "Refresh now"
-            })
-            .on_click(move |_, _, cx| entity.update(cx, |s, cx| s.refresh(cx)));
-
-        let header = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap_3()
-            .px_4()
-            .py_3()
-            .border_b_1()
-            .border_color(p.border)
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .min_w_0()
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(headline_color)
-                            .child(headline),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(p.muted)
-                            .truncate()
-                            .child(subline),
-                    ),
-            )
-            .child(refresh);
-
-        let rows = state.statuses.iter().enumerate().map(|(i, s)| {
-            let color = if s.error.is_some() || s.is_diverged() || s.behind > 0 {
-                p.red
-            } else if !s.is_synced() {
-                p.amber
-            } else {
-                p.green
-            };
-            let path = s.path.clone();
-            div()
-                .id(("repo", i))
-                .flex()
-                .items_center()
-                .gap_3()
-                .px_4()
-                .py_2()
-                .cursor_pointer()
-                .hover(|style| style.bg(p.hover))
-                .on_click(move |_, _, cx| cx.open_with_system(&path))
-                .child(div().size_2().rounded_full().bg(color).flex_none())
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_color(p.text)
-                        .child(s.name.clone()),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .text_sm()
-                        .text_color(color)
-                        .child(s.label()),
-                )
-        });
-
-        let empty = state.has_result && state.statuses.is_empty() && problem.is_none();
-        let list = div()
-            .id("repos")
-            .flex()
-            .flex_col()
-            .flex_1()
-            .overflow_y_scroll()
-            .bg(p.surface)
-            .children(rows)
-            .when(empty, |list| {
-                list.child(div().p_4().text_sm().text_color(p.muted).child(
-                    "No git repos directly inside this folder. Set \"path\" in config.json.",
-                ))
-            });
-
-        let config_file = self.state.read(cx).config_file.clone();
-        let footer = div()
-            .flex()
-            .justify_between()
-            .px_4()
-            .py_2()
-            .border_t_1()
-            .border_color(p.border)
-            .text_xs()
-            .text_color(p.muted)
-            .child("Click a repo to open its folder")
-            .child(
-                div()
-                    .id("config")
-                    .cursor_pointer()
-                    .hover(|s| s.text_color(p.text))
-                    .child("Edit config.json")
-                    .on_click(move |_, _, cx| cx.open_with_system(&config_file)),
-            );
-
-        div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .bg(p.bg)
-            .text_color(p.text)
-            .child(header)
-            .child(list)
-            .child(footer)
     }
 }
 

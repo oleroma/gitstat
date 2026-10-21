@@ -6,15 +6,37 @@
 
 mod config;
 mod git;
+
+// Platform-neutral, but only the tray app uses them; tests cover them on Linux.
+#[cfg(any(windows, test))]
+mod folder_icons;
 #[cfg(any(windows, test))]
 mod icon;
+#[cfg(any(windows, test))]
+mod layout;
+#[cfg(any(windows, test))]
+mod monitor;
+#[cfg(any(windows, test))]
+mod repo_icon;
+#[cfg(any(windows, test))]
+mod state;
+#[cfg(any(windows, test))]
+mod watch;
 
 #[cfg(windows)]
 mod app;
 #[cfg(windows)]
 mod autostart;
 #[cfg(windows)]
+mod overlay;
+#[cfg(windows)]
+mod panel;
+#[cfg(windows)]
 mod tray;
+#[cfg(windows)]
+mod view;
+#[cfg(windows)]
+mod win;
 
 use std::path::PathBuf;
 
@@ -26,10 +48,14 @@ Usage:
   gitstat --once          print every repo's status and exit (exit code 1 if any is unsynced)
   gitstat --once --no-fetch
                           same, without running git fetch first
-  gitstat --config FILE   use FILE instead of config.json next to gitstat.exe";
+  gitstat --config FILE   use FILE instead of config.json next to gitstat.exe
+  gitstat --remove-folder-icons
+                          turn folder icons off in the config, restore every repo
+                          folder gitstat gave a status icon, and exit";
 
 struct Args {
     once: bool,
+    remove_folder_icons: bool,
     fetch: bool,
     config_file: PathBuf,
 }
@@ -37,6 +63,7 @@ struct Args {
 fn parse_args() -> Result<Args, String> {
     let mut args = Args {
         once: false,
+        remove_folder_icons: false,
         fetch: true,
         config_file: config::default_file(),
     };
@@ -45,6 +72,7 @@ fn parse_args() -> Result<Args, String> {
         match arg.as_str() {
             "--once" => args.once = true,
             "--no-fetch" => args.fetch = false,
+            "--remove-folder-icons" => args.remove_folder_icons = true,
             "--config" => args.config_file = iter.next().ok_or("--config needs a file")?.into(),
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument: {other}")),
@@ -66,6 +94,19 @@ fn main() {
             std::process::exit(if message.is_empty() { 0 } else { 2 });
         }
     };
+
+    if args.remove_folder_icons {
+        #[cfg(windows)]
+        {
+            attach_parent_console();
+            std::process::exit(remove_folder_icons(&args.config_file));
+        }
+        #[cfg(not(windows))]
+        {
+            eprintln!("--remove-folder-icons is only available on Windows");
+            std::process::exit(2);
+        }
+    }
 
     if args.once || cfg!(not(windows)) {
         #[cfg(windows)]
@@ -95,9 +136,17 @@ fn run_once(args: &Args) -> i32 {
         }
     };
     let dir = config.repos_dir();
-    let statuses = git::check_all(&dir, args.fetch);
+    let found = git::find_repos(&dir, config.depth());
+    if let Some(capped) = &found.capped {
+        eprintln!("The repo list is incomplete: {capped}.");
+    }
+    let statuses = git::check_all(&dir, &found.repos, args.fetch);
     if statuses.is_empty() {
-        println!("No git repos found in {}", dir.display());
+        println!(
+            "No git repos found in {} (depth {})",
+            dir.display(),
+            config.depth()
+        );
     }
     let width = statuses
         .iter()
@@ -111,6 +160,47 @@ fn run_once(args: &Args) -> i32 {
         0
     } else {
         1
+    }
+}
+
+/// `--remove-folder-icons`: turns `folder_icons` off in config.json, so
+/// the next tray start doesn't put the icons back, then reverts every folder
+/// in the ledger. Folders that can't be restored stay in the ledger for the
+/// next try (or for the tray app, which reverts them with the option off).
+#[cfg(windows)]
+fn remove_folder_icons(config_file: &std::path::Path) -> i32 {
+    // A running tray app would put the icons straight back.
+    if !single_instance() {
+        eprintln!("gitstat is running. Quit it from its tray menu first.");
+        return 2;
+    }
+    // Only an existing file: load_or_create would write a new one.
+    if config_file.exists() {
+        let saved = config::Config::load_or_create(config_file).and_then(|mut config| {
+            if !config.folder_icons {
+                return Ok(false);
+            }
+            config.folder_icons = false;
+            config.save(config_file).map(|()| true)
+        });
+        match saved {
+            Ok(true) => println!("Turned folder_icons off in {}.", config_file.display()),
+            Ok(false) => {}
+            Err(e) => eprintln!(
+                "Couldn't turn folder_icons off; set it to false in config.json, or gitstat \
+                 will restore the icons at its next start.\n{e}"
+            ),
+        }
+    }
+    match folder_icons::revert_all_blocking(&config::data_dir()) {
+        Ok(n) => {
+            println!("Restored {n} folder(s).");
+            0
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            1
+        }
     }
 }
 
