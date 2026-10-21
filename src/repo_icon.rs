@@ -1089,8 +1089,10 @@ mod tests {
 
     #[test]
     fn the_readme_example_draws() {
-        let readme =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md")).unwrap();
+        // Git for Windows checks README.md out with CRLF under core.autocrlf.
+        let readme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
+            .unwrap()
+            .replace("\r\n", "\n");
         let start = readme.find("```svg\n").expect("an svg example") + 7;
         let svg = &readme[start..start + readme[start..].find("```").unwrap()];
         let rgba = draw(svg, Tone::Local, 48);
