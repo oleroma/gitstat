@@ -4,8 +4,8 @@ use crate::config::Config;
 use crate::git::RepoStatus;
 use crate::icon::Badge;
 use crate::monitor::WatchMode;
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 // Only the Windows UI reads most fields; Linux builds this for its tests.
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -23,6 +23,9 @@ pub struct AppState {
     pub sweeping: bool,
     /// Repos with a check running.
     pub in_flight: HashSet<PathBuf>,
+    /// Finished checks by repo, counted even when the status came back the
+    /// same: a new tag or stash changes the timeline but not the status.
+    checks: HashMap<PathBuf, u64>,
     pub last_checked: Option<String>,
     pub mode: WatchMode,
     /// Folders the folder-icon worker skipped, with the reason.
@@ -45,6 +48,7 @@ impl AppState {
             has_result: false,
             sweeping: false,
             in_flight: HashSet::new(),
+            checks: HashMap::new(),
             last_checked: None,
             mode,
             folder_skips: Vec::new(),
@@ -101,6 +105,25 @@ impl AppState {
             .partition_point(|s| s.name.to_lowercase() < key);
         self.statuses.insert(at, status);
         true
+    }
+
+    /// Counts a finished check of `path`.
+    pub fn checked(&mut self, path: &Path) {
+        *self.checks.entry(path.to_path_buf()).or_default() += 1;
+    }
+
+    /// How many checks of `path` have finished; the timeline reloads a
+    /// strip when this moves past what it last loaded.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn checks(&self, path: &Path) -> u64 {
+        self.checks.get(path).copied().unwrap_or(0)
+    }
+
+    /// Forgets repos no longer in the list.
+    pub fn retain_repos(&mut self, keep: impl Fn(&Path) -> bool) {
+        self.statuses.retain(|s| keep(&s.path));
+        self.in_flight.retain(|p| keep(p));
+        self.checks.retain(|p, _| keep(p));
     }
 
     /// Worst first, then by name.
@@ -232,6 +255,21 @@ mod tests {
         let names: Vec<&str> = s.statuses.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, ["b", "C", "d", "z"]);
         assert_eq!(s.statuses.len(), 4);
+    }
+
+    #[test]
+    fn every_check_counts_even_when_the_status_is_unchanged() {
+        let mut s = state(vec![repo("a")]);
+        let a = Path::new("a");
+        assert_eq!(s.checks(a), 0);
+        assert!(!s.merge_status(repo("a")));
+        s.checked(a);
+        s.checked(a);
+        assert_eq!(s.checks(a), 2);
+        assert_eq!(s.checks(Path::new("b")), 0);
+        s.retain_repos(|p| p != a);
+        assert_eq!(s.checks(a), 0);
+        assert!(s.statuses.is_empty());
     }
 
     #[test]

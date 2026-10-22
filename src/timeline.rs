@@ -2,10 +2,12 @@
 //! noodles, newest at the right next to the repo's name, the tail running
 //! off the left edge.
 //!
-//! `Timelines` owns every repo's loaded graph, loads it off the UI thread
-//! and reloads it whenever a status check of that repo finishes. The strip
-//! itself is a canvas that paints only the dots and noodles in view and
-//! hit-tests the mouse against the dots it painted.
+//! `Timelines` owns every repo's loaded graph and loads it off the UI
+//! thread, only once its strip is on screen: when the panel opens or the
+//! row scrolls into view. A check of a repo marks its strip stale, and a
+//! stale strip reloads the next time it is drawn. The strip itself is a
+//! canvas that paints only the dots and noodles in view and hit-tests the
+//! mouse against the dots it painted.
 
 use crate::git::RepoStatus;
 use crate::graph::{self, Class, Seg};
@@ -20,7 +22,7 @@ use gpui::{
     deferred, div, fill, linear_color_stop, linear_gradient, outline, point, prelude::*, px, rgb,
     size,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -53,6 +55,11 @@ struct Slot {
     error: Option<String>,
     /// Bumped on every load, so a slower, older load can't land last.
     generation: u64,
+    /// The repo's check count the graph, or the load under way, reflects;
+    /// `None` until first loaded.
+    checks: Option<u64>,
+    /// A reload is queued or running.
+    loading: bool,
     loading_more: bool,
     /// Px the strip is scrolled into the past; 0 shows HEAD.
     scroll: f32,
@@ -68,10 +75,12 @@ pub struct Hover {
 }
 
 pub struct Timelines {
+    state: Entity<AppState>,
     slots: HashMap<PathBuf, Slot>,
-    /// The repos being checked as of the last state change; a repo leaving
-    /// this set has just been checked, so its history may have changed.
-    in_flight: HashSet<PathBuf>,
+    /// Reloads waiting for one of the `git::MAX_PARALLEL` places, so a
+    /// panel of many repos doesn't tie up every background thread.
+    queue: VecDeque<PathBuf>,
+    running: usize,
     hover: Option<Hover>,
     /// Line stats by commit id, read on first hover.
     stats: HashMap<String, Stat>,
@@ -83,63 +92,95 @@ impl Timelines {
         cx.observe(state, |this, state, cx| this.sync(&state, cx))
             .detach();
         Self {
+            state: state.clone(),
             slots: HashMap::new(),
-            in_flight: HashSet::new(),
+            queue: VecDeque::new(),
+            running: 0,
             hover: None,
             stats: HashMap::new(),
             stats_pending: HashSet::new(),
         }
     }
 
-    /// Loads repos that are new, reloads the ones a check just finished
-    /// with, and forgets the ones gone from the list.
+    /// Forgets the repos gone from the list. Checks need nothing here: the
+    /// state change redraws the panel, and drawing reloads stale strips.
     fn sync(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
-        let (paths, in_flight) = {
-            let s = state.read(cx);
-            let paths: Vec<PathBuf> = s.statuses.iter().map(|s| s.path.clone()).collect();
-            (paths, s.in_flight.clone())
-        };
-        self.slots.retain(|p, _| paths.contains(p));
-        for path in paths {
-            let checked = self.in_flight.contains(&path) && !in_flight.contains(&path);
-            if checked || !self.slots.contains_key(&path) {
-                self.reload(path, cx);
-            }
+        let listed: HashSet<&Path> = state
+            .read(cx)
+            .statuses
+            .iter()
+            .map(|s| s.path.as_path())
+            .collect();
+        self.slots.retain(|p, _| listed.contains(p.as_path()));
+        self.queue.retain(|p| listed.contains(p.as_path()));
+    }
+
+    /// `path`'s strip is on screen: loads it if it never was, or reloads it
+    /// if the repo was checked since.
+    fn shown(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let checks = self.state.read(cx).checks(path);
+        let slot = self.slots.entry(path.to_path_buf()).or_default();
+        // A load under way finishes first; its redraw comes back here.
+        if slot.loading || slot.checks == Some(checks) {
+            return;
         }
-        self.in_flight = in_flight;
+        slot.checks = Some(checks);
+        self.reload(path.to_path_buf(), cx);
     }
 
     fn reload(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let slot = self.slots.entry(path.clone()).or_default();
         slot.generation += 1;
+        slot.loading = true;
         slot.loading_more = false;
-        let generation = slot.generation;
-        let prev = slot.graph.clone();
-        let repo = path.clone();
-        let task = cx.background_spawn(async move {
-            RepoGraph::load(&repo, prev.as_deref(), history::PAGE_SIZE)
-        });
-        cx.spawn(async move |this, cx| {
-            let result = task.await;
-            this.update(cx, |this, cx| {
-                let Some(slot) = this.slots.get_mut(&path) else {
-                    return;
-                };
-                if slot.generation != generation {
-                    return;
-                }
-                match result {
-                    Ok(g) => {
-                        slot.graph = Some(Arc::new(g));
-                        slot.error = None;
+        if !self.queue.contains(&path) {
+            self.queue.push_back(path);
+        }
+        self.start_loads(cx);
+    }
+
+    /// Starts queued reloads while there is room.
+    fn start_loads(&mut self, cx: &mut Context<Self>) {
+        while self.running < crate::git::MAX_PARALLEL {
+            let Some(path) = self.queue.pop_front() else {
+                return;
+            };
+            let Some(slot) = self.slots.get(&path) else {
+                continue;
+            };
+            self.running += 1;
+            let generation = slot.generation;
+            let prev = slot.graph.clone();
+            let repo = path.clone();
+            let task = cx.background_spawn(async move {
+                RepoGraph::load(&repo, prev.as_deref(), history::PAGE_SIZE)
+            });
+            cx.spawn(async move |this, cx| {
+                let result = task.await;
+                this.update(cx, |this, cx| {
+                    this.running -= 1;
+                    this.start_loads(cx);
+                    let Some(slot) = this.slots.get_mut(&path) else {
+                        return;
+                    };
+                    if slot.generation != generation {
+                        return;
                     }
-                    Err(e) => slot.error = Some(e),
-                }
-                cx.notify();
+                    slot.loading = false;
+                    match result {
+                        Ok(Some(g)) => {
+                            slot.graph = Some(Arc::new(g));
+                            slot.error = None;
+                        }
+                        Ok(None) => slot.error = None,
+                        Err(e) => slot.error = Some(e),
+                    }
+                    cx.notify();
+                })
+                .ok();
             })
-            .ok();
-        })
-        .detach();
+            .detach();
+        }
     }
 
     fn load_more(&mut self, path: &Path, cx: &mut Context<Self>) {
@@ -149,7 +190,8 @@ impl Timelines {
         let Some(graph) = slot.graph.clone() else {
             return;
         };
-        if slot.loading_more || graph.end {
+        // A reload under way would land under the page, or the page on it.
+        if slot.loading || slot.loading_more || graph.end {
             return;
         }
         slot.loading_more = true;
@@ -306,9 +348,16 @@ impl Timelines {
 
         let entity = this.clone();
         let paint_path = path.clone();
+        let (shown, shown_path) = (this.clone(), path.clone());
         let surface = p.surface;
         let painter = canvas(
-            |bounds, _, _| bounds,
+            // Only strips inside the list's scrolled viewport load.
+            move |bounds, window, cx| {
+                if window.content_mask().bounds.intersects(&bounds) {
+                    shown.update(cx, |t, cx| t.shown(&shown_path, cx));
+                }
+                bounds
+            },
             move |bounds, _, window, _cx| {
                 let Some(g) = graph else { return };
                 let dots = window.with_content_mask(Some(ContentMask { bounds }), |window| {

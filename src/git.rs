@@ -8,8 +8,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 /// Parallel `git fetch`es. Enough to hide network latency without
-/// hammering a remote that hosts most of the repos.
-const MAX_PARALLEL: usize = 6;
+/// hammering a remote that hosts most of the repos. The timeline caps its
+/// history loads at this too.
+pub(crate) const MAX_PARALLEL: usize = 6;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const LOCAL_TIMEOUT: Duration = Duration::from_secs(30);
 

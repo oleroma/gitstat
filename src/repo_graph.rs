@@ -30,12 +30,27 @@ pub enum More {
 
 impl RepoGraph {
     /// Reads the repo. With `prev`, commits it already holds are kept and
-    /// only new ones are read, unless history was rewritten.
-    pub fn load(repo: &Path, prev: Option<&RepoGraph>, page: usize) -> Result<RepoGraph, String> {
+    /// only new ones are read, unless history was rewritten. `None` when
+    /// nothing changed since `prev`.
+    pub fn load(
+        repo: &Path,
+        prev: Option<&RepoGraph>,
+        page: usize,
+    ) -> Result<Option<RepoGraph>, String> {
         let refs = history::refs(repo)?;
+        let stashes = history::stashes(repo).unwrap_or_default();
+        // Most checks move no ref: skip the other git calls and the layout.
+        if let Some(prev) = prev.filter(|p| p.ctx.refs == refs) {
+            if prev.stashes == stashes {
+                return Ok(None);
+            }
+            return Ok(Some(RepoGraph {
+                stashes,
+                ..prev.clone()
+            }));
+        }
         let info = repo_info::read(repo, &refs)?;
         let tips = info.worktree_tips(refs.head.as_deref());
-        let stashes = history::stashes(repo).unwrap_or_default();
         let first = history::first_page(repo, &tips, page)?;
         let (commits, end) =
             match prev.and_then(|p| Some((p, history::new_since(&first, &p.commits)?))) {
@@ -54,7 +69,7 @@ impl RepoGraph {
         };
         let mut layout = Layout::new(&ctx);
         layout.push(&commits, &ctx);
-        Ok(RepoGraph {
+        Ok(Some(RepoGraph {
             commits,
             layout,
             ctx,
@@ -62,7 +77,7 @@ impl RepoGraph {
             stashes,
             end,
             tips,
-        })
+        }))
     }
 
     /// Reads the page after what is loaded.
@@ -104,7 +119,7 @@ mod tests {
         for i in 0..5 {
             commit(&dir, &format!("c{i}"), &mut n);
         }
-        let mut g = RepoGraph::load(&dir, None, 2).unwrap();
+        let mut g = RepoGraph::load(&dir, None, 2).unwrap().unwrap();
         assert_eq!(g.commits.len(), 2);
         assert!(!g.end);
         match g.more(&dir, 2).unwrap() {
@@ -115,7 +130,7 @@ mod tests {
         assert_eq!(g.layout.nodes.len(), 4);
 
         commit(&dir, "c5", &mut n);
-        let g2 = RepoGraph::load(&dir, Some(&g), 2).unwrap();
+        let g2 = RepoGraph::load(&dir, Some(&g), 2).unwrap().unwrap();
         // The new commit on top of the four already loaded.
         assert_eq!(g2.commits.len(), 5);
         assert_eq!(g2.commits[0].subject, "c5");
@@ -127,6 +142,33 @@ mod tests {
 
         run(&dir, &["stash", "list"]);
         assert_eq!(g2.stashes_at(0).count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reuses_the_graph_until_a_ref_or_stash_moves() {
+        let dir = temp_repo("repo-graph-same");
+        let mut n = 0;
+        std::fs::write(dir.join("f"), "a").unwrap();
+        run(&dir, &["add", "f"]);
+        for i in 0..3 {
+            commit(&dir, &format!("c{i}"), &mut n);
+        }
+        let g = RepoGraph::load(&dir, None, 10).unwrap().unwrap();
+        assert!(RepoGraph::load(&dir, Some(&g), 10).unwrap().is_none());
+
+        // A tag moves no branch or HEAD, but is a ref the strip draws.
+        run(&dir, &["tag", "v1"]);
+        let g = RepoGraph::load(&dir, Some(&g), 10).unwrap().unwrap();
+        assert_eq!(g.ctx.refs.at(&g.commits[0].id).len(), 2);
+        assert!(RepoGraph::load(&dir, Some(&g), 10).unwrap().is_none());
+
+        // A stash moves only refs/stash.
+        std::fs::write(dir.join("f"), "b").unwrap();
+        run(&dir, &["stash"]);
+        let g2 = RepoGraph::load(&dir, Some(&g), 10).unwrap().unwrap();
+        assert_eq!(g2.stashes_at(0).count(), 1);
+        assert_eq!(g2.commits, g.commits);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
