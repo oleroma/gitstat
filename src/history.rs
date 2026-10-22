@@ -189,9 +189,10 @@ pub fn next_page(
 /// - the fresh page no longer reaches the newest loaded commit, or reaches
 ///   it in another order (a rebase, a force push, a fetched branch with
 ///   commits dated among the loaded ones);
-/// - a ref moved to, or was deleted from, somewhere the fresh page doesn't
-///   show (a fetched branch dated older than the page, a deleted branch
-///   whose commits sat deeper), since the loaded pages below may be stale;
+/// - a ref moved to, or away from, somewhere the fresh page doesn't show
+///   (a fetched branch dated older than the page, a deleted, rebased or
+///   reset branch whose commits sat deeper), since the loaded pages below
+///   may be stale;
 /// - a new commit's parent is neither new nor loaded (new commits dated
 ///   older than the page, or a branch off history not loaded yet).
 pub fn new_since(fresh: &Page, loaded: &[Commit], old: &Refs, new: &Refs) -> Option<Vec<Commit>> {
@@ -206,12 +207,12 @@ pub fn new_since(fresh: &Page, loaded: &[Commit], old: &Refs, new: &Refs) -> Opt
     if overlap.into_iter().any(|(a, b)| a.id != b.id) {
         return None;
     }
-    // A moved ref is only safe where the fresh page can vouch for it: its
-    // new commit, or for a deleted one, its old commit still walked.
+    // A moved ref is only safe where the fresh page can vouch for both
+    // ends: the commit it left may have been all that kept deeper loaded
+    // commits walked.
     let in_page = |id: &str| fresh.commits.iter().any(|c| c.id == id);
-    let vouched = |(from, to): (Option<&str>, Option<&str>)| match to {
-        Some(to) => in_page(to),
-        None => from.is_none_or(in_page),
+    let vouched = |(from, to): (Option<&str>, Option<&str>)| {
+        from.is_none_or(in_page) && to.is_none_or(in_page)
     };
     if !old.moved(new).all(vouched) {
         return None;
@@ -650,6 +651,7 @@ pub(crate) mod tests {
         // Side branches, all older than main's commits.
         run(&dir, &["checkout", "-q", "-b", "deep"]);
         commit(&dir, "deep", &mut n);
+        let deep = run(&dir, &["rev-parse", "HEAD"]);
         run(&dir, &["checkout", "-q", "-b", "old", &root]);
         commit(&dir, "old", &mut n);
         let old = run(&dir, &["rev-parse", "HEAD"]);
@@ -663,6 +665,19 @@ pub(crate) mod tests {
         // Unmoved refs and a new commit on top still splice.
         let new = splice_after(&dir, 2, || commit(&dir, "m5", &mut n)).unwrap();
         assert_eq!(new.len(), 1);
+
+        // So does moving it, or HEAD, away from them.
+        let force = || {
+            run(&dir, &["branch", "-q", "-f", "deep", "main"]);
+        };
+        assert_eq!(splice_after(&dir, 2, force), None);
+        run(&dir, &["branch", "-q", "-f", "deep", &deep]);
+        let detach = || {
+            run(&dir, &["checkout", "-q", "--detach", "main"]);
+        };
+        run(&dir, &["checkout", "-q", "--detach", &root]);
+        assert_eq!(splice_after(&dir, 2, detach), None);
+        run(&dir, &["checkout", "-q", "main"]);
 
         // Deleting a branch whose commits sit below the page loses them.
         let delete = || {

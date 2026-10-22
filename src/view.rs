@@ -565,7 +565,7 @@ impl Render for StatusView {
             .children(
                 self.timelines
                     .as_ref()
-                    .and_then(|t| t.read(cx).hover_card(&p, dark)),
+                    .and_then(|t| t.read(cx).hover_card(&p, dark, cx)),
             )
     }
 }

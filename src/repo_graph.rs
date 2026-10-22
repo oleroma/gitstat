@@ -24,6 +24,8 @@ pub struct RepoGraph {
     /// walked them too since git 2.16; passing them again costs nothing and
     /// keeps an older git from losing a worktree's detached commits.
     tips: Vec<String>,
+    /// What `info` was read from besides the refs.
+    setup: repo_info::Setup,
 }
 
 /// What `more` found.
@@ -44,8 +46,9 @@ impl RepoGraph {
     ) -> Result<Option<RepoGraph>, String> {
         let refs = history::refs(repo)?;
         let stashes = history::stashes(repo).unwrap_or_default();
+        let setup = repo_info::setup(repo);
         // Most checks move no ref: skip the other git calls and the layout.
-        if let Some(prev) = prev.filter(|p| p.ctx.refs == refs) {
+        if let Some(prev) = prev.filter(|p| p.ctx.refs == refs && p.setup == setup) {
             if prev.stashes == stashes {
                 return Ok(None);
             }
@@ -54,7 +57,7 @@ impl RepoGraph {
                 ..prev.clone()
             }));
         }
-        let info = repo_info::read(repo, &refs)?;
+        let info = repo_info::read(repo, &refs, &setup)?;
         let tips = info.worktree_tips(refs.head.as_deref());
         let first = history::first_page(repo, &tips, page)?;
         let spliced = prev.and_then(|p| {
@@ -69,9 +72,18 @@ impl RepoGraph {
                 commits.extend(prev.commits.iter().cloned());
                 (commits, prev.end)
             }
-            _ => (first.commits, first.end),
+            // Rewritten: read as deep as was loaded, so a strip scrolled
+            // past the first page still finds the commit it showed.
+            _ => match prev.map_or(0, |p| p.commits.len()) {
+                deep if deep > page && !first.end => {
+                    let all = history::first_page(repo, &tips, deep)?;
+                    (all.commits, all.end)
+                }
+                _ => (first.commits, first.end),
+            },
         };
         let ctx = Context {
+            default_branch: info.default_branch.clone(),
             default_tip: info.default_tip.clone(),
             unpushed: info.unpushed.clone(),
             unpulled: info.unpulled.clone(),
@@ -89,6 +101,7 @@ impl RepoGraph {
             stashes,
             end,
             tips,
+            setup,
         }))
     }
 
@@ -212,6 +225,32 @@ mod tests {
         let g2 = RepoGraph::load(&dir, Some(&g), 10).unwrap().unwrap();
         assert_eq!(g2.stashes_at(0).count(), 1);
         assert_eq!(g2.commits, g.commits);
+
+        // A worktree, or origin/HEAD, changes the header with no ref moved.
+        let wt = std::env::temp_dir().join(format!("gitstat-rg-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&wt);
+        run(
+            &dir,
+            &["worktree", "add", "-q", "--detach", wt.to_str().unwrap()],
+        );
+        let g3 = RepoGraph::load(&dir, Some(&g2), 10).unwrap().unwrap();
+        assert_eq!(g3.info.worktrees.len(), 2);
+        assert!(RepoGraph::load(&dir, Some(&g3), 10).unwrap().is_none());
+        run(&dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        run(&dir, &["update-ref", "refs/remotes/origin/dev", "HEAD~1"]);
+        let g4 = RepoGraph::load(&dir, Some(&g3), 10).unwrap().unwrap();
+        assert_eq!(g4.info.default_branch.as_deref(), Some("origin/main"));
+        run(
+            &dir,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/dev",
+            ],
+        );
+        let g5 = RepoGraph::load(&dir, Some(&g4), 10).unwrap().unwrap();
+        assert_eq!(g5.info.default_branch.as_deref(), Some("origin/dev"));
+        let _ = std::fs::remove_dir_all(&wt);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -252,6 +291,34 @@ mod tests {
         assert!(!g.commits.is_empty());
         assert_eq!(g.head_row, None);
         assert_eq!(g.home(), 0.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scroll_holds_past_the_first_page_when_history_is_rewritten() {
+        let dir = temp_repo("repo-graph-deep");
+        let mut n = 0;
+        for i in 0..8 {
+            commit(&dir, &format!("c{i}"), &mut n);
+        }
+        let mut g = RepoGraph::load(&dir, None, 2).unwrap().unwrap();
+        for _ in 0..2 {
+            match g.more(&dir, 2).unwrap() {
+                More::Page(c, end) => g.append(c, end),
+                More::Reload => panic!("history didn't move"),
+            }
+        }
+        assert_eq!(g.commits.len(), 6);
+        // Amending HEAD drops the newest loaded commit: no splice.
+        run(
+            &dir,
+            &["commit", "-q", "--amend", "--allow-empty", "-m", "c7'"],
+        );
+        let g2 = RepoGraph::load(&dir, Some(&g), 2).unwrap().unwrap();
+        assert_eq!(g2.commits.len(), 6);
+        assert!(!g2.end);
+        let row = g2.carry_scroll(&g, 4.0);
+        assert_eq!(g2.commits[row as usize].id, g.commits[4].id);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

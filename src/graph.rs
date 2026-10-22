@@ -125,10 +125,21 @@ impl Edge {
 #[derive(Clone, Debug, Default)]
 pub struct Context {
     pub refs: Refs,
+    /// The default branch, `origin/main` or a local `main`.
+    pub default_branch: Option<String>,
     /// The default branch's tip, e.g. `origin/main`'s commit.
     pub default_tip: Option<String>,
     pub unpushed: HashSet<String>,
     pub unpulled: HashSet<String>,
+}
+
+impl Context {
+    /// Whether local branch `name` is the default branch or tracks it.
+    fn is_default(&self, name: &str) -> bool {
+        self.default_branch
+            .as_deref()
+            .is_some_and(|d| d == name || d.split_once('/').is_some_and(|(_, n)| n == name))
+    }
 }
 
 /// A lane waiting for a commit: the noodles that will end on it.
@@ -213,6 +224,26 @@ impl Layout {
         far.into_iter()
             .map(|i| &self.edges[i])
             .chain(self.edges[near..end].iter().filter(move |e| reaches(e)))
+    }
+
+    /// The lowest lane no noodle runs in between rows `row - 1` and `row`,
+    /// for a marker drawn in that gap.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn free_lane_above(&self, row: usize) -> usize {
+        let Some(prev) = row.checked_sub(1) else {
+            return 0;
+        };
+        let mut used = HashSet::new();
+        for e in self.visible_edges(prev, row) {
+            for seg in e.segments(self.nodes.len()) {
+                let (Seg::Straight(a, b) | Seg::Curve(a, b)) = seg;
+                if a.row <= prev as f32 && b.row >= row as f32 {
+                    used.insert(a.lane as usize);
+                    used.insert(b.lane as usize);
+                }
+            }
+        }
+        (0..).find(|l| !used.contains(l)).unwrap_or(0)
     }
 
     /// Edges still waiting for a parent below the last loaded row.
@@ -360,14 +391,16 @@ impl Layout {
         // carries to takes the branch pointing at it, local before remote.
         // A local branch also takes over from one carried down, so stacked
         // branches each keep their own colour, except from HEAD's, which
-        // runs straight down its lane, and from its own remote.
+        // runs straight down its lane, and from its own remote. On the
+        // default branch's line only that branch does, so a merged branch
+        // never deleted doesn't rename the trunk below it.
         let refs = ctx.refs.at(id);
         let local = refs.iter().find(|r| matches!(r, Ref::Local(_)));
         let own = local
             .or_else(|| refs.iter().find(|r| matches!(r, Ref::Remote(_))))
             .map(|r| self.branch_id(r.name()));
         let branch = match (inherited, local) {
-            (Some(b), Some(local)) if self.takes_over(b, local.name(), ctx) => own,
+            (Some(b), Some(local)) if self.takes_over(b, local.name(), on_trunk, ctx) => own,
             _ => inherited.or(own),
         };
 
@@ -387,7 +420,10 @@ impl Layout {
 
     /// Whether a local branch `name` on a commit starts a new branch below
     /// the one carried down, `carried`.
-    fn takes_over(&self, carried: usize, name: &str, ctx: &Context) -> bool {
+    fn takes_over(&self, carried: usize, name: &str, on_trunk: bool, ctx: &Context) -> bool {
+        if on_trunk && !ctx.is_default(name) {
+            return false;
+        }
         let carried = self.branches[carried].as_str();
         let own_remote = carried.split_once('/').is_some_and(|(_, n)| n == name)
             && ctx.refs.tip(&Ref::Remote(carried.to_string())).is_some();
@@ -696,6 +732,65 @@ mod tests {
         let l = layout(&commits, &behind);
         let branch = |row: usize| l.nodes[row].branch.map(|b| l.branches[b].as_str());
         assert_eq!(branch(1), Some("origin/topic1"));
+    }
+
+    #[test]
+    fn stale_branches_dont_rename_the_trunk() {
+        //   m2     main, origin/main
+        //   | f1   f (HEAD)
+        //   m1 |   fix-123, merged long ago and never deleted
+        //   |/
+        //   m0
+        let commits = [
+            c("m2", &["m1"]),
+            c("f1", &["m0"]),
+            c("m1", &["m0"]),
+            c("m0", &[]),
+        ];
+        let mut ctx = ctx(
+            "f1",
+            &[
+                ("m2", Ref::Local("main".into())),
+                ("m2", Ref::Remote("origin/main".into())),
+                ("f1", Ref::Local("f".into())),
+                ("m1", Ref::Local("fix-123".into())),
+            ],
+        );
+        ctx.refs.head_branch = Some("f".into());
+        ctx.default_branch = Some("origin/main".into());
+        ctx.default_tip = Some("m2".into());
+        let l = layout(&commits, &ctx);
+        let branch = |row: usize| l.nodes[row].branch.map(|b| l.branches[b].as_str());
+        assert_eq!(branch(0), Some("main"));
+        assert_eq!(branch(2), Some("main"));
+
+        // Off the trunk a stacked branch still takes over.
+        ctx.default_tip = None;
+        let l = layout(&commits, &ctx);
+        let branch = |row: usize| l.nodes[row].branch.map(|b| l.branches[b].as_str());
+        assert_eq!(branch(2), Some("fix-123"));
+    }
+
+    #[test]
+    fn free_lane_above_skips_noodles_into_head() {
+        //   m      merges h in as its second parent
+        //   | x    unpulled, on top of h
+        //   h |    HEAD
+        //   |/
+        //   r
+        let commits = [
+            c("m", &["r", "h"]),
+            c("x", &["h"]),
+            c("h", &["r"]),
+            c("r", &[]),
+        ];
+        let l = layout(&commits, &ctx("h", &[]));
+        assert_eq!(l.nodes[2].lane, 0);
+        let free = l.free_lane_above(2);
+        // m's noodle into h runs along lane 0, x bends in from its own.
+        assert_ne!(free, 0);
+        assert_ne!(free, l.nodes[1].lane);
+        assert_eq!(l.free_lane_above(0), 0);
     }
 
     #[test]

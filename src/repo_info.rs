@@ -66,7 +66,24 @@ impl Info {
     }
 }
 
-pub fn read(repo: &Path, refs: &Refs) -> Result<Info, String> {
+/// What `read` depends on that can change while no ref moves: the
+/// worktrees (added, removed, or a detached one committed to) and where
+/// `origin/HEAD` points. Cheap to read, so a check can tell whether `Info`
+/// is still good.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Setup {
+    worktrees: Option<String>,
+    origin_head: Option<String>,
+}
+
+pub fn setup(repo: &Path) -> Setup {
+    Setup {
+        worktrees: text(repo, &["worktree", "list", "--porcelain"]),
+        origin_head: text(repo, &["symbolic-ref", "-q", "refs/remotes/origin/HEAD"]),
+    }
+}
+
+pub fn read(repo: &Path, refs: &Refs, setup: &Setup) -> Result<Info, String> {
     let checkout = match (&refs.head_branch, &refs.head) {
         (Some(branch), Some(_)) => Checkout::Branch(branch.clone()),
         (Some(branch), None) => Checkout::Unborn(branch.clone()),
@@ -74,15 +91,17 @@ pub fn read(repo: &Path, refs: &Refs) -> Result<Info, String> {
         (None, None) => Checkout::Detached(String::new()),
     };
 
-    let worktrees = text(repo, &["worktree", "list", "--porcelain"])
-        .map(|t| parse_worktrees(&t))
+    let worktrees = setup
+        .worktrees
+        .as_deref()
+        .map(parse_worktrees)
         .unwrap_or_default();
 
     let all: Vec<&Ref> = refs.all().collect();
     let local_branches = all.iter().filter(|r| matches!(r, Ref::Local(_))).count();
     let remote_branches = all.iter().filter(|r| matches!(r, Ref::Remote(_))).count();
 
-    let default_branch = default_branch(repo, refs);
+    let default_branch = default_branch(setup, refs);
     let default_tip = default_branch.as_ref().and_then(|name| {
         let r = if refs.tip(&Ref::Remote(name.clone())).is_some() {
             Ref::Remote(name.clone())
@@ -123,8 +142,10 @@ fn text(repo: &Path, args: &[&str]) -> Option<String> {
 }
 
 /// `origin/HEAD`'s branch, else the first of the usual names that exists.
-fn default_branch(repo: &Path, refs: &Refs) -> Option<String> {
-    if let Some(name) = text(repo, &["symbolic-ref", "-q", "refs/remotes/origin/HEAD"])
+fn default_branch(setup: &Setup, refs: &Refs) -> Option<String> {
+    if let Some(name) = setup
+        .origin_head
+        .as_deref()
         .and_then(|t| t.trim().strip_prefix("refs/remotes/").map(str::to_string))
     {
         return Some(name);
@@ -345,7 +366,7 @@ mod tests {
         );
 
         let refs = history::refs(&dir).unwrap();
-        let info = read(&dir, &refs).unwrap();
+        let info = read(&dir, &refs, &setup(&dir)).unwrap();
         assert_eq!(info.checkout, Checkout::Branch("main".into()));
         assert_eq!(info.worktrees.len(), 2);
         assert_eq!(info.local_branches, 1);
@@ -369,7 +390,7 @@ mod tests {
     fn repo_without_remote_or_commits() {
         let dir = temp_repo("info-bare");
         let refs = history::refs(&dir).unwrap();
-        let info = read(&dir, &refs).unwrap();
+        let info = read(&dir, &refs, &setup(&dir)).unwrap();
         assert_eq!(info.checkout, Checkout::Unborn("main".into()));
         assert_eq!(info.default_branch, None);
         assert!(info.unpushed.is_empty());
@@ -377,7 +398,7 @@ mod tests {
         let mut n = 0;
         commit(&dir, "one", &mut n);
         let refs = history::refs(&dir).unwrap();
-        let info = read(&dir, &refs).unwrap();
+        let info = read(&dir, &refs, &setup(&dir)).unwrap();
         assert_eq!(info.default_branch.as_deref(), Some("main"));
         assert_eq!(info.default_tip, refs.head);
         // No remote: nothing is "unpushed".

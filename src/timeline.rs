@@ -61,7 +61,7 @@ const CARD_GAP: f32 = 8.0;
 struct Slot {
     graph: Option<Arc<RepoGraph>>,
     error: Option<String>,
-    /// Bumped on every load, so a slower, older load can't land last.
+    /// The load under way, so a slower, older load can't land last.
     generation: u64,
     /// The repo's check count the graph, or the load under way, reflects;
     /// `None` until first loaded.
@@ -90,15 +90,35 @@ pub struct Hover {
     pub at: Point<Pixels>,
     /// The card goes above the dot, as it sits in the window's lower half.
     pub above: bool,
+    /// The tree was dirty: a change moves every dot a step, and the WIP dot
+    /// comes or goes, so the hover holds only while it doesn't.
+    pub dirty: bool,
+}
+
+/// What a queued load reads.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Load {
+    Reload,
+    More,
+}
+
+/// What a load read.
+enum Loaded {
+    Graph(Option<Box<RepoGraph>>),
+    Page(More),
 }
 
 pub struct Timelines {
     state: Entity<AppState>,
     slots: HashMap<PathBuf, Slot>,
-    /// Reloads waiting for one of the `git::MAX_PARALLEL` places, so a
-    /// panel of many repos doesn't tie up every background thread.
-    queue: VecDeque<PathBuf>,
+    /// Loads waiting for one of the `git::MAX_PARALLEL` places, so a
+    /// panel of many repos doesn't tie up every background thread, nor a
+    /// Shift+wheel paging them all at once.
+    queue: VecDeque<(PathBuf, Load)>,
     running: usize,
+    /// Only ever grows, so a load for a slot since dropped and made again
+    /// can't pass for the new slot's.
+    generation: u64,
     hover: Option<Hover>,
     /// The hover has lasted `CARD_DELAY`, so its card shows.
     card: bool,
@@ -121,6 +141,7 @@ impl Timelines {
             slots: HashMap::new(),
             queue: VecDeque::new(),
             running: 0,
+            generation: 0,
             hover: None,
             card: false,
             hover_generation: 0,
@@ -141,7 +162,7 @@ impl Timelines {
             .map(|s| s.path.as_path())
             .collect();
         self.slots.retain(|p, _| listed.contains(p.as_path()));
-        self.queue.retain(|p| listed.contains(p.as_path()));
+        self.queue.retain(|(p, _)| listed.contains(p.as_path()));
     }
 
     /// `path`'s strip is on screen: loads it if it never was, or reloads it
@@ -158,63 +179,53 @@ impl Timelines {
     }
 
     fn reload(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.generation += 1;
         let slot = self.slots.entry(path.clone()).or_default();
-        slot.generation += 1;
+        slot.generation = self.generation;
         slot.loading = true;
         slot.loading_more = false;
-        if !self.queue.contains(&path) {
-            self.queue.push_back(path);
+        // A page queued for the old graph would land on the new one.
+        self.queue
+            .retain(|(p, load)| !(*p == path && *load == Load::More));
+        let entry = (path, Load::Reload);
+        if !self.queue.contains(&entry) {
+            self.queue.push_back(entry);
         }
         self.start_loads(cx);
     }
 
-    /// Starts queued reloads while there is room.
+    /// Starts queued loads while there is room.
     fn start_loads(&mut self, cx: &mut Context<Self>) {
         while self.running < crate::git::MAX_PARALLEL {
-            let Some(path) = self.queue.pop_front() else {
+            let Some((path, load)) = self.queue.pop_front() else {
                 return;
             };
-            let Some(slot) = self.slots.get(&path) else {
+            let Some(slot) = self.slots.get_mut(&path) else {
                 continue;
             };
-            self.running += 1;
             let generation = slot.generation;
             let prev = slot.graph.clone();
             let repo = path.clone();
-            let task = cx.background_spawn(async move {
-                RepoGraph::load(&repo, prev.as_deref(), history::PAGE_SIZE)
-            });
+            let task = match (load, prev) {
+                (Load::Reload, prev) => cx.background_spawn(async move {
+                    RepoGraph::load(&repo, prev.as_deref(), history::PAGE_SIZE)
+                        .map(|g| Loaded::Graph(g.map(Box::new)))
+                }),
+                (Load::More, Some(graph)) => cx.background_spawn(async move {
+                    graph.more(&repo, history::PAGE_SIZE).map(Loaded::Page)
+                }),
+                (Load::More, None) => {
+                    slot.loading_more = false;
+                    continue;
+                }
+            };
+            self.running += 1;
             cx.spawn(async move |this, cx| {
                 let result = task.await;
                 this.update(cx, |this, cx| {
                     this.running -= 1;
                     this.start_loads(cx);
-                    let Some(slot) = this.slots.get_mut(&path) else {
-                        return;
-                    };
-                    if slot.generation != generation {
-                        return;
-                    }
-                    slot.loading = false;
-                    match result {
-                        Ok(Some(g)) => {
-                            // Rows shift under a reload; the view keeps its commit.
-                            let at = slot.scroll / STEP;
-                            let row = match &slot.graph {
-                                Some(old) => g.carry_scroll(old, at),
-                                None => g.home(),
-                            };
-                            slot.scroll = row * STEP;
-                            slot.graph = Some(Arc::new(g));
-                            slot.error = None;
-                            if this.hover.as_ref().is_some_and(|h| h.repo == path) {
-                                this.unhover();
-                            }
-                        }
-                        Ok(None) => slot.error = None,
-                        Err(e) => slot.error = Some(e),
-                    }
-                    cx.notify();
+                    this.landed(path, generation, result, cx);
                 })
                 .ok();
             })
@@ -222,11 +233,62 @@ impl Timelines {
         }
     }
 
+    fn landed(
+        &mut self,
+        path: PathBuf,
+        generation: u64,
+        result: Result<Loaded, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(slot) = self.slots.get_mut(&path) else {
+            return;
+        };
+        if slot.generation != generation {
+            return;
+        }
+        match result {
+            Ok(Loaded::Graph(Some(g))) => {
+                slot.loading = false;
+                // Rows shift under a reload; the view keeps its commit.
+                let at = slot.scroll / STEP;
+                let row = match &slot.graph {
+                    Some(old) => g.carry_scroll(old, at),
+                    None => g.home(),
+                };
+                slot.scroll = row * STEP;
+                slot.graph = Some(Arc::new(*g));
+                slot.error = None;
+                if self.hover.as_ref().is_some_and(|h| h.repo == path) {
+                    self.unhover();
+                }
+            }
+            Ok(Loaded::Graph(None)) => {
+                slot.loading = false;
+                slot.error = None;
+            }
+            // The last frame's paint has let go of the graph, so this
+            // appends in place rather than copying it all.
+            Ok(Loaded::Page(More::Page(commits, end))) => {
+                slot.loading_more = false;
+                if let Some(g) = &mut slot.graph {
+                    Arc::make_mut(g).append(commits, end);
+                }
+            }
+            Ok(Loaded::Page(More::Reload)) => self.reload(path, cx),
+            Err(e) => {
+                slot.loading = false;
+                slot.loading_more = false;
+                slot.error = Some(e);
+            }
+        }
+        cx.notify();
+    }
+
     fn load_more(&mut self, path: &Path, cx: &mut Context<Self>) {
         let Some(slot) = self.slots.get_mut(path) else {
             return;
         };
-        let Some(graph) = slot.graph.clone() else {
+        let Some(graph) = &slot.graph else {
             return;
         };
         // A reload under way would land under the page, or the page on it.
@@ -234,36 +296,8 @@ impl Timelines {
             return;
         }
         slot.loading_more = true;
-        let generation = slot.generation;
-        let repo = path.to_path_buf();
-        let path = path.to_path_buf();
-        let task = cx.background_spawn(async move { graph.more(&repo, history::PAGE_SIZE) });
-        cx.spawn(async move |this, cx| {
-            let result = task.await;
-            this.update(cx, |this, cx| {
-                let Some(slot) = this.slots.get_mut(&path) else {
-                    return;
-                };
-                if slot.generation != generation {
-                    return;
-                }
-                slot.loading_more = false;
-                match result {
-                    // The last frame's paint has let go of the graph, so
-                    // this appends in place rather than copying it all.
-                    Ok(More::Page(commits, end)) => {
-                        if let Some(g) = &mut slot.graph {
-                            Arc::make_mut(g).append(commits, end);
-                        }
-                    }
-                    Ok(More::Reload) => this.reload(path, cx),
-                    Err(e) => slot.error = Some(e),
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+        self.queue.push_back((path.to_path_buf(), Load::More));
+        self.start_loads(cx);
     }
 
     /// Scrolls one strip, or every strip with `all`, by `dx` px into the
@@ -302,22 +336,34 @@ impl Timelines {
         }
     }
 
-    /// The mouse moved over `path`'s strip, onto a dot or off them.
+    /// The mouse moved to `pos` over `path`'s strip, onto a dot or off them.
     fn hover_at(
         &mut self,
         path: &Path,
-        hit: Option<(Dot, Point<Pixels>, bool)>,
+        pos: Point<Pixels>,
+        hit: Option<(Dot, Point<Pixels>, bool, bool)>,
         cx: &mut Context<Self>,
     ) {
         let new = match hit {
-            Some((dot, at, above)) => Some(Hover {
+            Some((dot, at, above, dirty)) => Some(Hover {
                 repo: path.to_path_buf(),
                 dot,
                 at,
                 above,
+                dirty,
             }),
             // Another strip's hover is not ours to clear.
             None if self.hover.as_ref().is_some_and(|h| h.repo != path) => return,
+            // A card snapped over its dot, in a short window, hides the dot
+            // from the strip; dropping the hover would hide the card and
+            // bring it back on every move.
+            None if self.card
+                && self.hover.as_ref().is_some_and(|h| {
+                    f32::from(h.at.x - pos.x).hypot(f32::from(h.at.y - pos.y)) <= HIT
+                }) =>
+            {
+                return;
+            }
             None => None,
         };
         if new == self.hover {
@@ -419,14 +465,18 @@ impl Timelines {
         let graph = slot.and_then(|s| s.graph.clone());
         let scroll = slot.map_or(0.0, |s| s.scroll);
         let error = slot.and_then(|s| s.error.clone());
-        let hovered = t.hover.as_ref().filter(|h| h.repo == path).map(|h| h.dot);
+        let dirty = status.dirty;
+        let hovered = t
+            .hover
+            .as_ref()
+            .filter(|h| h.repo == path && h.dirty == dirty)
+            .map(|h| h.dot);
         let copied = t
             .copied
             .as_ref()
             .filter(|(p, _)| *p == path)
             .map(|&(_, row)| row);
         let colors = Colors::new(dark, p);
-        let dirty = status.dirty;
         let web = graph.as_ref().and_then(|g| g.info.web.clone());
 
         let checkout = match graph.as_ref().map(|g| &g.info.checkout) {
@@ -485,9 +535,9 @@ impl Timelines {
                         .flatten()
                         .map(|(dot, at)| {
                             let above = at.y > window.viewport_size().height / 2.0;
-                            (dot, at, above)
+                            (dot, at, above, dirty)
                         });
-                    e1.update(cx, |t, cx| t.hover_at(&path1, found, cx));
+                    e1.update(cx, |t, cx| t.hover_at(&path1, e.position, found, cx));
                 });
                 window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
                     if phase != DispatchPhase::Bubble
@@ -538,6 +588,14 @@ impl Timelines {
                 } else if x.abs() > y.abs() {
                     (x, false)
                 } else {
+                    // The strips move under the mouse, and no mouse move
+                    // follows to say so: the hover and its card go.
+                    entity.update(cx, |t, cx| {
+                        if t.hover.is_some() {
+                            t.unhover();
+                            cx.notify();
+                        }
+                    });
                     return;
                 };
                 // The list would read a sideways delta as a vertical one.
@@ -602,8 +660,19 @@ impl Timelines {
 
     /// The card for the dot under the mouse, drawn above everything once
     /// the mouse has settled, beside the dot rather than over it.
-    pub fn hover_card(&self, p: &Palette, dark: bool) -> Option<AnyElement> {
+    pub fn hover_card(&self, p: &Palette, dark: bool, cx: &App) -> Option<AnyElement> {
         let h = self.hover.as_ref().filter(|_| self.card)?;
+        // Gone with the dot when the tree turned clean or dirty under it.
+        let dirty = self
+            .state
+            .read(cx)
+            .statuses
+            .iter()
+            .find(|s| s.path == h.repo)?
+            .dirty;
+        if dirty != h.dirty {
+            return None;
+        }
         let g = self.slots.get(&h.repo)?.graph.as_ref()?;
         let colors = Colors::new(dark, p);
         let card = match h.dot {
@@ -856,11 +925,17 @@ fn paint_strip(
 ) -> Vec<(Point<Pixels>, Dot)> {
     let rows = g.layout.nodes.len();
     let (left, right) = (f32::from(bounds.left()), f32::from(bounds.right()));
+    let head = g.head_row.filter(|&row| row < rows);
+    // The work-in-progress dot takes a column of its own right of HEAD:
+    // rows newer than HEAD move a step further right to make room.
+    let gap = head
+        .filter(|&row| dirty && row > 0)
+        .map_or(0.0, |row| row as f32);
     // The newest row's x; at home HEAD sits PAD in, one step further when
     // the work-in-progress dot leads it.
     let top_x = right - PAD - if dirty { STEP } else { 0.0 } + scroll;
     let cy = f32::from(bounds.center().y);
-    let x = |row: f32| top_x - row * STEP;
+    let x = |row: f32| top_x - row * STEP + if row < gap - 0.5 { STEP } else { 0.0 };
     let y = |lane: f32| cy + lane_offset(lane.round() as usize);
     let at = |pos: graph::Pos| point(px(x(pos.row)), px(y(pos.lane)));
     let folded = |lane: f32| lane.round() as usize >= LANES;
@@ -923,14 +998,17 @@ fn paint_strip(
     }
 
     if dirty {
-        // Right of HEAD on its lane, which nothing newer uses; with no HEAD
-        // commit (unborn, or not loaded yet) right of the newest row, alone.
-        let head = g.head_row.filter(|&row| row < rows);
-        let (hx, hy) = match head {
-            Some(row) => (x(row as f32), y(g.layout.nodes[row].lane as f32)),
-            None => (x(0.0), cy),
+        // Right of HEAD, on a lane no noodle crosses that column in; with no
+        // HEAD commit (unborn, or not loaded yet) right of the newest row.
+        let (hx, hy, lane) = match head {
+            Some(row) => (
+                x(row as f32),
+                y(g.layout.nodes[row].lane as f32),
+                g.layout.free_lane_above(row),
+            ),
+            None => (x(0.0), cy, 0),
         };
-        let center = point(px(hx + STEP), px(hy));
+        let center = point(px(hx + STEP), px(y(lane as f32)));
         dots.push((center, Dot::Wip));
         let r = if hovered == Some(Dot::Wip) {
             DOT_HOVER
@@ -941,10 +1019,16 @@ fn paint_strip(
             outline(circle(center, r), colors.unpushed, BorderStyle::Dashed).corner_radii(px(r)),
         );
         if head.is_some() {
-            // Joined to HEAD by a short dashed line.
+            // Joined to HEAD by a short dashed noodle.
+            let (from, to) = ((hx + DOT, hy), (hx + STEP - r, f32::from(center.y)));
+            let [_, c1, c2, _] = graph::noodle(to, from, (-1.0, 0.0));
             let mut path = PathBuilder::stroke(px(1.0)).dash_array(&[px(2.0), px(2.0)]);
-            path.move_to(point(px(hx + DOT), px(hy)));
-            path.line_to(point(px(hx + STEP - r), px(hy)));
+            path.move_to(point(px(from.0), px(from.1)));
+            path.cubic_bezier_to(
+                point(px(to.0), px(to.1)),
+                point(px(c2.0), px(c2.1)),
+                point(px(c1.0), px(c1.1)),
+            );
             if let Ok(path) = path.build() {
                 window.paint_path(path, colors.unpushed.opacity(0.8));
             }
