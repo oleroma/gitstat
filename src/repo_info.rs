@@ -234,7 +234,8 @@ fn parse_worktrees(out: &str) -> Vec<Worktree> {
                     w.path = PathBuf::from(value);
                     seen = true;
                 }
-                "HEAD" => w.head = Some(value.to_string()),
+                // An unborn branch's HEAD is all zeros: no commit to walk.
+                "HEAD" if value.bytes().any(|b| b != b'0') => w.head = Some(value.to_string()),
                 "branch" => {
                     w.branch = Some(
                         value
@@ -275,6 +276,13 @@ mod tests {
         assert!(w[2].prunable);
         assert_eq!(w[2].path, PathBuf::from("/gone"));
         assert!(parse_worktrees("").is_empty());
+
+        // An unborn branch has no commit to walk.
+        let unborn = format!(
+            "worktree /u\nHEAD {}\nbranch refs/heads/main\n",
+            "0".repeat(40)
+        );
+        assert_eq!(parse_worktrees(&unborn)[0].head, None);
     }
 
     #[test]

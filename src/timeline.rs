@@ -61,7 +61,8 @@ struct Slot {
     /// A reload is queued or running.
     loading: bool,
     loading_more: bool,
-    /// Px the strip is scrolled into the past; 0 shows HEAD.
+    /// Px the strip is scrolled into the past from the newest row; HEAD's
+    /// row, `RepoGraph::home`, is where it rests.
     scroll: f32,
 }
 
@@ -169,8 +170,18 @@ impl Timelines {
                     slot.loading = false;
                     match result {
                         Ok(Some(g)) => {
+                            // Rows shift under a reload; the view keeps its commit.
+                            let at = slot.scroll / STEP;
+                            let row = match &slot.graph {
+                                Some(old) => g.carry_scroll(old, at),
+                                None => g.home(),
+                            };
+                            slot.scroll = row * STEP;
                             slot.graph = Some(Arc::new(g));
                             slot.error = None;
+                            if this.hover.as_ref().is_some_and(|h| h.repo == path) {
+                                this.hover = None;
+                            }
                         }
                         Ok(None) => slot.error = None,
                         Err(e) => slot.error = Some(e),
@@ -256,7 +267,7 @@ impl Timelines {
 
     fn scroll_home(&mut self, path: &Path, cx: &mut Context<Self>) {
         if let Some(slot) = self.slots.get_mut(path) {
-            slot.scroll = 0.0;
+            slot.scroll = slot.graph.as_ref().map_or(0.0, |g| g.home() * STEP);
             cx.notify();
         }
     }
@@ -691,17 +702,18 @@ fn paint_strip(
 ) -> Vec<(Point<Pixels>, usize)> {
     let rows = g.layout.nodes.len();
     let (left, right) = (f32::from(bounds.left()), f32::from(bounds.right()));
-    // HEAD's x, one step further in when the work-in-progress dot leads.
-    let head_x = right - PAD - if dirty { STEP } else { 0.0 } + scroll;
+    // The newest row's x; at home HEAD sits PAD in, one step further when
+    // the work-in-progress dot leads it.
+    let top_x = right - PAD - if dirty { STEP } else { 0.0 } + scroll;
     let cy = f32::from(bounds.center().y);
-    let x = |row: f32| head_x - row * STEP;
+    let x = |row: f32| top_x - row * STEP;
     let y = |lane: f32| cy + lane_offset(lane.round() as usize);
     let at = |pos: graph::Pos| point(px(x(pos.row)), px(y(pos.lane)));
     let folded = |lane: f32| lane.round() as usize >= LANES;
 
     // Rows whose dots are in view, one step of slack each side.
-    let lo = (((head_x - right) / STEP).floor() - 1.0).max(0.0) as usize;
-    let hi = ((((head_x - left) / STEP).ceil() + 1.0).max(0.0) as usize).min(rows);
+    let lo = (((top_x - right) / STEP).floor() - 1.0).max(0.0) as usize;
+    let hi = ((((top_x - left) / STEP).ceil() + 1.0).max(0.0) as usize).min(rows);
     if lo >= hi && rows > 0 && lo >= rows {
         return Vec::new();
     }
@@ -760,17 +772,26 @@ fn paint_strip(
     }
 
     if dirty {
-        let center = point(px(head_x + STEP), px(cy));
+        // Right of HEAD on its lane, which nothing newer uses; with no HEAD
+        // commit (unborn, or not loaded yet) right of the newest row, alone.
+        let head = g.head_row.filter(|&row| row < rows);
+        let (hx, hy) = match head {
+            Some(row) => (x(row as f32), y(g.layout.nodes[row].lane as f32)),
+            None => (x(0.0), cy),
+        };
+        let center = point(px(hx + STEP), px(hy));
         let r = DOT + 0.5;
         window.paint_quad(
             outline(circle(center, r), colors.unpushed, BorderStyle::Dashed).corner_radii(px(r)),
         );
-        // Joined to HEAD by a short dashed line.
-        let mut path = PathBuilder::stroke(px(1.0)).dash_array(&[px(2.0), px(2.0)]);
-        path.move_to(point(px(head_x + DOT), px(cy)));
-        path.line_to(point(px(head_x + STEP - r), px(cy)));
-        if let Ok(path) = path.build() {
-            window.paint_path(path, colors.unpushed.opacity(0.8));
+        if head.is_some() {
+            // Joined to HEAD by a short dashed line.
+            let mut path = PathBuilder::stroke(px(1.0)).dash_array(&[px(2.0), px(2.0)]);
+            path.move_to(point(px(hx + DOT), px(hy)));
+            path.line_to(point(px(hx + STEP - r), px(hy)));
+            if let Ok(path) = path.build() {
+                window.paint_path(path, colors.unpushed.opacity(0.8));
+            }
         }
     }
 
