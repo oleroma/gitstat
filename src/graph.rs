@@ -87,35 +87,37 @@ pub enum Seg {
 
 impl Edge {
     /// The noodle as straight runs and bends. An edge still waiting for its
-    /// parent ends at `last_row`.
-    pub fn segments(&self, last_row: usize) -> Vec<Seg> {
+    /// parent ends at `last_row`. At most three pieces, kept off the heap
+    /// since every visible edge is cut up every frame.
+    pub fn segments(&self, last_row: usize) -> impl Iterator<Item = Seg> {
         let (r1, l1) = self.child;
         let (r2, l2) = self.parent.unwrap_or((last_row.max(r1 + 1), self.via));
         let v = self.via;
+        let mut segs = [None; 3];
         if r2 <= r1 + 1 {
-            return if l1 == l2 {
-                vec![Seg::Straight(pos(r1, l1), pos(r2, l2))]
+            segs[0] = Some(if l1 == l2 {
+                Seg::Straight(pos(r1, l1), pos(r2, l2))
             } else {
-                vec![Seg::Curve(pos(r1, l1), pos(r2, l2))]
-            };
+                Seg::Curve(pos(r1, l1), pos(r2, l2))
+            });
+            return segs.into_iter().flatten();
         }
-        let mut segs = Vec::with_capacity(3);
         let mut at = pos(r1, l1);
         if l1 != v {
             let next = pos(r1 + 1, v);
-            segs.push(Seg::Curve(at, next));
+            segs[0] = Some(Seg::Curve(at, next));
             at = next;
         }
         let bend = if l2 != v { r2 - 1 } else { r2 };
         if (at.row as usize) < bend {
             let next = pos(bend, v);
-            segs.push(Seg::Straight(at, next));
+            segs[1] = Some(Seg::Straight(at, next));
             at = next;
         }
         if l2 != v {
-            segs.push(Seg::Curve(at, pos(r2, l2)));
+            segs[2] = Some(Seg::Curve(at, pos(r2, l2)));
         }
-        segs
+        segs.into_iter().flatten()
     }
 }
 
@@ -161,7 +163,13 @@ pub struct Layout {
     /// Edges waiting for a parent not loaded yet, by the parent's id, so
     /// closing one looks only at the edges into that commit.
     open: HashMap<String, Vec<usize>>,
+    /// Closed edges spanning more than `LONG` rows: the only ones besides
+    /// the open ones that can cross a range from a child far before it.
+    long: Vec<usize>,
 }
+
+/// Rows an edge may span and still be found by its child's row alone.
+const LONG: usize = 32;
 
 impl Layout {
     pub fn new(ctx: &Context) -> Self {
@@ -183,6 +191,28 @@ impl Layout {
         for commit in commits {
             self.add(commit, ctx);
         }
+    }
+
+    /// The edges that can cross rows `lo..=hi`, in the order they were
+    /// added: those starting near the range, found by binary search since
+    /// edges are added in child-row order, plus the long and open ones
+    /// reaching into it from further back.
+    pub fn visible_edges(&self, lo: usize, hi: usize) -> impl Iterator<Item = &Edge> {
+        let rows = self.nodes.len();
+        let reaches = move |e: &Edge| e.parent.map_or(rows, |p| p.0) >= lo && e.child.0 <= hi;
+        let near = self.edges.partition_point(|e| e.child.0 + LONG < lo);
+        let end = self.edges.partition_point(|e| e.child.0 <= hi).max(near);
+        let mut far: Vec<usize> = self
+            .long
+            .iter()
+            .chain(self.open.values().flatten())
+            .copied()
+            .filter(|&i| i < near && reaches(&self.edges[i]))
+            .collect();
+        far.sort_unstable();
+        far.into_iter()
+            .map(|i| &self.edges[i])
+            .chain(self.edges[near..end].iter().filter(move |e| reaches(e)))
     }
 
     /// Edges still waiting for a parent below the last loaded row.
@@ -292,6 +322,9 @@ impl Layout {
         if let Some(n) = found {
             let i = open.swap_remove(n);
             self.edges[i].parent = Some(at);
+            if at.0 > child.0 + LONG {
+                self.long.push(i);
+            }
         }
     }
 
@@ -478,7 +511,7 @@ mod tests {
         assert_eq!(f_down.via, 1);
         assert_eq!(f_down.parent, Some((3, 0)));
         assert_eq!(
-            f_down.segments(4),
+            f_down.segments(4).collect::<Vec<_>>(),
             vec![
                 Seg::Straight(pos(1, 1), pos(2, 1)),
                 Seg::Curve(pos(2, 1), pos(3, 0)),
@@ -556,7 +589,10 @@ mod tests {
         l.push(&commits[..2], &ctx);
         assert_eq!(l.open_edges().count(), 1);
         let open = *l.open_edges().next().unwrap();
-        assert_eq!(open.segments(2), vec![Seg::Straight(pos(1, 0), pos(2, 0))]);
+        assert_eq!(
+            open.segments(2).collect::<Vec<_>>(),
+            vec![Seg::Straight(pos(1, 0), pos(2, 0))]
+        );
         l.push(&commits[2..], &ctx);
         assert_eq!(l.open_edges().count(), 0);
         assert_eq!(edge(&l, 1, 2).parent, Some((2, 0)));
@@ -671,7 +707,7 @@ mod tests {
             first: false,
         };
         assert_eq!(
-            e.segments(10),
+            e.segments(10).collect::<Vec<_>>(),
             vec![
                 Seg::Curve(pos(0, 0), pos(1, 2)),
                 Seg::Straight(pos(1, 2), pos(4, 2)),
@@ -684,7 +720,10 @@ mod tests {
             parent: Some((4, 0)),
             first: true,
         };
-        assert_eq!(hop.segments(10), vec![Seg::Curve(pos(3, 1), pos(4, 0))]);
+        assert_eq!(
+            hop.segments(10).collect::<Vec<_>>(),
+            vec![Seg::Curve(pos(3, 1), pos(4, 0))]
+        );
     }
 
     #[test]
@@ -697,6 +736,55 @@ mod tests {
         let [_, c1, c2, _] = noodle((0.0, 0.0), (10.0, 20.0), (0.0, 1.0));
         assert_eq!(c1, (0.0, 10.0));
         assert_eq!(c2, (10.0, 10.0));
+    }
+
+    #[test]
+    fn visible_edges_are_the_ones_crossing_the_range() {
+        // A trunk with side branches of every length, the longest far over
+        // LONG, merged back; the last page leaves edges open.
+        let mut commits = Vec::new();
+        let n: usize = 400;
+        for i in (0..n).rev() {
+            let id = format!("t{i}");
+            let mut parents = Vec::new();
+            if i > 0 {
+                parents.push(format!("t{}", i - 1));
+            }
+            if i % 7 == 0 && i > 0 {
+                parents.push(format!("b{i}"));
+            }
+            commits.push(c(
+                &id,
+                &parents.iter().map(String::as_str).collect::<Vec<_>>(),
+            ));
+            if i % 7 == 0 && i > 0 {
+                let base = i.saturating_sub(1 + (i * 13) % 90);
+                commits.push(c(&format!("b{i}"), &[&format!("t{base}")]));
+            }
+        }
+        let ctx = ctx("t399", &[]);
+        let mut l = Layout::new(&ctx);
+        for page in commits[..commits.len() - 40].chunks(100) {
+            l.push(page, &ctx);
+        }
+        assert!(l.open_edges().count() > 0 && !l.long.is_empty());
+        let rows = l.nodes.len();
+        for (lo, hi) in [
+            (0, 10),
+            (50, 70),
+            (100, 101),
+            (200, 260),
+            (rows - 5, rows),
+            (rows, rows + 9),
+        ] {
+            let want: Vec<&Edge> = l
+                .edges
+                .iter()
+                .filter(|e| e.parent.map_or(rows, |p| p.0) >= lo && e.child.0 <= hi)
+                .collect();
+            let got: Vec<&Edge> = l.visible_edges(lo, hi).collect();
+            assert_eq!(got, want, "rows {lo}..={hi}");
+        }
     }
 
     #[test]

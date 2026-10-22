@@ -16,15 +16,16 @@ use crate::repo_graph::{More, RepoGraph};
 use crate::state::AppState;
 use crate::view::Palette;
 use gpui::{
-    AnyElement, App, AppContext, BorderStyle, Bounds, ClipboardItem, ContentMask, Context,
-    DispatchPhase, Entity, Hsla, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ParentElement, PathBuilder, Pixels, Point, ScrollWheelEvent, Styled, Window, anchored, canvas,
-    deferred, div, fill, linear_color_stop, linear_gradient, outline, point, prelude::*, px, rgb,
-    size,
+    AnyElement, App, AppContext, BorderStyle, Bounds, ClipboardItem, ContentMask, Context, Corner,
+    DispatchPhase, Entity, HitboxBehavior, Hsla, IntoElement, MouseButton, MouseDownEvent,
+    MouseMoveEvent, ParentElement, PathBuilder, Pixels, Point, ScrollWheelEvent, Styled, Window,
+    anchored, canvas, deferred, div, fill, linear_color_stop, linear_gradient, outline, point,
+    prelude::*, px, rgb, size,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// A strip's height; the panel's row height in `layout`.
 pub const STRIP_HEIGHT: f32 = 36.0;
@@ -48,6 +49,13 @@ const HIT: f32 = 7.0;
 /// Load the next page while fewer than this many px of history are left
 /// past the left edge.
 const PRELOAD: f32 = 1200.0;
+/// The mouse rests on a dot this long before its card shows, so sweeping
+/// across a strip doesn't flash cards.
+const CARD_DELAY: Duration = Duration::from_millis(150);
+/// How long a dot shows it was copied.
+const COPIED_FOR: Duration = Duration::from_millis(900);
+/// Px between a hovered dot and its card.
+const CARD_GAP: f32 = 8.0;
 
 #[derive(Default)]
 struct Slot {
@@ -66,13 +74,22 @@ struct Slot {
     scroll: f32,
 }
 
+/// A dot on a strip: a commit's row, or the uncommitted changes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Dot {
+    Commit(usize),
+    Wip,
+}
+
 /// The dot under the mouse.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Hover {
     pub repo: PathBuf,
-    pub row: usize,
+    pub dot: Dot,
     /// Window position of the dot, where the card is anchored.
     pub at: Point<Pixels>,
+    /// The card goes above the dot, as it sits in the window's lower half.
+    pub above: bool,
 }
 
 pub struct Timelines {
@@ -83,6 +100,13 @@ pub struct Timelines {
     queue: VecDeque<PathBuf>,
     running: usize,
     hover: Option<Hover>,
+    /// The hover has lasted `CARD_DELAY`, so its card shows.
+    card: bool,
+    /// Bumped on every hover change, so an older card timer does nothing.
+    hover_generation: u64,
+    /// The commit whose id was just copied, flashed until its timer ends.
+    copied: Option<(PathBuf, usize)>,
+    copied_generation: u64,
     /// Line stats by commit id, read on first hover.
     stats: HashMap<String, Stat>,
     stats_pending: HashSet<String>,
@@ -98,6 +122,10 @@ impl Timelines {
             queue: VecDeque::new(),
             running: 0,
             hover: None,
+            card: false,
+            hover_generation: 0,
+            copied: None,
+            copied_generation: 0,
             stats: HashMap::new(),
             stats_pending: HashSet::new(),
         }
@@ -180,7 +208,7 @@ impl Timelines {
                             slot.graph = Some(Arc::new(g));
                             slot.error = None;
                             if this.hover.as_ref().is_some_and(|h| h.repo == path) {
-                                this.hover = None;
+                                this.unhover();
                             }
                         }
                         Ok(None) => slot.error = None,
@@ -257,8 +285,14 @@ impl Timelines {
         for p in more {
             self.load_more(&p, cx);
         }
-        self.hover = None;
+        self.unhover();
         cx.notify();
+    }
+
+    fn unhover(&mut self) {
+        self.hover = None;
+        self.card = false;
+        self.hover_generation += 1;
     }
 
     fn scroll_home(&mut self, path: &Path, cx: &mut Context<Self>) {
@@ -272,14 +306,15 @@ impl Timelines {
     fn hover_at(
         &mut self,
         path: &Path,
-        hit: Option<(usize, Point<Pixels>)>,
+        hit: Option<(Dot, Point<Pixels>, bool)>,
         cx: &mut Context<Self>,
     ) {
         let new = match hit {
-            Some((row, at)) => Some(Hover {
+            Some((dot, at, above)) => Some(Hover {
                 repo: path.to_path_buf(),
-                row,
+                dot,
                 at,
+                above,
             }),
             // Another strip's hover is not ours to clear.
             None if self.hover.as_ref().is_some_and(|h| h.repo != path) => return,
@@ -288,10 +323,55 @@ impl Timelines {
         if new == self.hover {
             return;
         }
-        if let Some(h) = &new {
-            self.request_stat(&h.repo, h.row, cx);
+        if let Some(Hover {
+            dot: Dot::Commit(row),
+            repo,
+            ..
+        }) = &new
+        {
+            self.request_stat(repo, *row, cx);
         }
+        // Sliding from dot to dot keeps a card already up; a fresh hover
+        // waits for the mouse to settle.
+        let sliding = self.card && self.hover.is_some() && new.is_some();
         self.hover = new;
+        self.hover_generation += 1;
+        self.card = sliding;
+        if self.hover.is_some() && !sliding {
+            let generation = self.hover_generation;
+            let timer = cx.background_executor().timer(CARD_DELAY);
+            cx.spawn(async move |this, cx| {
+                timer.await;
+                this.update(cx, |this, cx| {
+                    if this.hover_generation == generation {
+                        this.card = true;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        }
+        cx.notify();
+    }
+
+    /// Flashes `row`'s dot, its id now on the clipboard.
+    fn flash_copied(&mut self, path: &Path, row: usize, cx: &mut Context<Self>) {
+        self.copied = Some((path.to_path_buf(), row));
+        self.copied_generation += 1;
+        let generation = self.copied_generation;
+        let timer = cx.background_executor().timer(COPIED_FOR);
+        cx.spawn(async move |this, cx| {
+            timer.await;
+            this.update(cx, |this, cx| {
+                if this.copied_generation == generation {
+                    this.copied = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
         cx.notify();
     }
 
@@ -339,7 +419,12 @@ impl Timelines {
         let graph = slot.and_then(|s| s.graph.clone());
         let scroll = slot.map_or(0.0, |s| s.scroll);
         let error = slot.and_then(|s| s.error.clone());
-        let hovered = t.hover.as_ref().filter(|h| h.repo == path).map(|h| h.row);
+        let hovered = t.hover.as_ref().filter(|h| h.repo == path).map(|h| h.dot);
+        let copied = t
+            .copied
+            .as_ref()
+            .filter(|(p, _)| *p == path)
+            .map(|&(_, row)| row);
         let colors = Colors::new(dark, p);
         let dirty = status.dirty;
         let web = graph.as_ref().and_then(|g| g.info.web.clone());
@@ -363,54 +448,51 @@ impl Timelines {
                 if window.content_mask().bounds.intersects(&bounds) {
                     shown.update(cx, |t, cx| t.shown(&shown_path, cx));
                 }
-                bounds
+                // The mouse handlers act only while this hitbox is hovered,
+                // so the hover card, which occludes it, keeps its clicks.
+                window.insert_hitbox(bounds, HitboxBehavior::Normal)
             },
-            move |bounds, _, window, _cx| {
+            move |bounds, hitbox, window, _cx| {
                 let Some(g) = graph else { return };
                 let dots = window.with_content_mask(Some(ContentMask { bounds }), |window| {
-                    paint_strip(bounds, &g, scroll, hovered, dirty, &colors, window)
+                    paint_strip(bounds, &g, scroll, hovered, copied, dirty, &colors, window)
                 });
                 fade(bounds, surface, window);
 
                 let (e1, e2) = (entity.clone(), entity);
                 let (path1, path2) = (paint_path.clone(), paint_path);
+                let dots = Arc::new(dots);
                 let dots2 = dots.clone();
-                let hit = move |pos: Point<Pixels>| -> Option<(usize, Point<Pixels>)> {
-                    if !bounds.contains(&pos) {
-                        return None;
-                    }
+                // The nearest dot within reach.
+                let nearest = |dots: &[(Point<Pixels>, Dot)], pos: Point<Pixels>| {
                     dots.iter()
-                        .map(|&(at, row)| {
-                            (
-                                row,
-                                at,
-                                f32::from(at.x - pos.x).hypot(f32::from(at.y - pos.y)),
-                            )
+                        .map(|&(at, dot)| {
+                            let d = f32::from(at.x - pos.x).hypot(f32::from(at.y - pos.y));
+                            (dot, at, d)
                         })
                         .filter(|&(_, _, d)| d <= HIT)
                         .min_by(|a, b| a.2.total_cmp(&b.2))
-                        .map(|(row, at, _)| (row, at))
+                        .map(|(dot, at, _)| (dot, at))
                 };
-                let hit2 = {
-                    let dots = dots2;
-                    move |pos: Point<Pixels>| -> Option<usize> {
-                        dots.iter()
-                            .find(|(at, _)| {
-                                f32::from(at.x - pos.x).hypot(f32::from(at.y - pos.y)) <= HIT
-                            })
-                            .map(|&(_, row)| row)
+                let hitbox2 = hitbox.clone();
+                window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, cx| {
+                    if phase != DispatchPhase::Bubble {
+                        return;
                     }
-                };
-                window.on_mouse_event(move |e: &MouseMoveEvent, phase, _window, cx| {
-                    if phase == DispatchPhase::Bubble {
-                        let found = hit(e.position);
-                        e1.update(cx, |t, cx| t.hover_at(&path1, found, cx));
-                    }
+                    let found = hitbox
+                        .is_hovered(window)
+                        .then(|| nearest(&dots, e.position))
+                        .flatten()
+                        .map(|(dot, at)| {
+                            let above = at.y > window.viewport_size().height / 2.0;
+                            (dot, at, above)
+                        });
+                    e1.update(cx, |t, cx| t.hover_at(&path1, found, cx));
                 });
-                window.on_mouse_event(move |e: &MouseDownEvent, phase, _window, cx| {
+                window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
                     if phase != DispatchPhase::Bubble
                         || e.button != MouseButton::Left
-                        || !bounds.contains(&e.position)
+                        || !hitbox2.is_hovered(window)
                     {
                         return;
                     }
@@ -418,13 +500,18 @@ impl Timelines {
                         e2.update(cx, |t, cx| t.scroll_home(&path2, cx));
                         return;
                     }
-                    let Some(row) = hit2(e.position) else { return };
+                    let Some((Dot::Commit(row), _)) = nearest(&dots2, e.position) else {
+                        return;
+                    };
                     let Some(id) = e2.read(cx).commit_id(&path2, row) else {
                         return;
                     };
                     match (&web, e.modifiers.control) {
                         (Some(web), true) => cx.open_url(&format!("{web}/commit/{id}")),
-                        _ => cx.write_to_clipboard(ClipboardItem::new_string(id)),
+                        _ => {
+                            cx.write_to_clipboard(ClipboardItem::new_string(id));
+                            e2.update(cx, |t, cx| t.flash_copied(&path2, row, cx));
+                        }
                     }
                 });
             },
@@ -442,13 +529,19 @@ impl Timelines {
             .h(px(STRIP_HEIGHT))
             .on_scroll_wheel(move |e: &ScrollWheelEvent, _, cx| {
                 let d = e.delta.pixel_delta(px(STEP * 3.0));
-                // Up or left goes back in time.
-                let dx = if f32::from(d.x) != 0.0 {
-                    f32::from(d.x)
+                let (x, y) = (f32::from(d.x), f32::from(d.y));
+                // A plain wheel scrolls the panel's list. Shift+wheel, which
+                // Windows sends sideways, scrolls every strip; a sideways
+                // swipe or tilt scrolls this one. Up or left goes back in time.
+                let (dx, all) = if e.modifiers.shift {
+                    (if x != 0.0 { x } else { y }, true)
+                } else if x.abs() > y.abs() {
+                    (x, false)
                 } else {
-                    f32::from(d.y)
+                    return;
                 };
-                let all = e.modifiers.shift;
+                // The list would read a sideways delta as a vertical one.
+                cx.stop_propagation();
                 entity.update(cx, |t, cx| t.scroll(&wheel_path, dx, all, cx));
             })
             .child(painter)
@@ -507,13 +600,65 @@ impl Timelines {
             .into_any_element()
     }
 
-    /// The card for the dot under the mouse, drawn above everything.
+    /// The card for the dot under the mouse, drawn above everything once
+    /// the mouse has settled, beside the dot rather than over it.
     pub fn hover_card(&self, p: &Palette, dark: bool) -> Option<AnyElement> {
-        let h = self.hover.as_ref()?;
+        let h = self.hover.as_ref().filter(|_| self.card)?;
         let g = self.slots.get(&h.repo)?.graph.as_ref()?;
-        let c = g.commits.get(h.row)?;
-        let node = g.layout.nodes.get(h.row)?;
         let colors = Colors::new(dark, p);
+        let card = match h.dot {
+            Dot::Commit(row) => self.commit_card(g, row, &h.repo, &colors, p)?,
+            Dot::Wip => wip_card(g, &colors, p),
+        };
+        let card = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .max_w(px(320.))
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .border_1()
+            .border_color(p.border)
+            .bg(p.bg)
+            .shadow_md()
+            .text_xs()
+            .text_color(p.text)
+            // The strips under it don't see the mouse, so a click here
+            // copies nothing.
+            .occlude()
+            .children(card);
+        let gap = px(DOT_HOVER + CARD_GAP);
+        let x = h.at.x - px(12.);
+        let (corner, y) = if h.above {
+            (Corner::BottomLeft, h.at.y - gap)
+        } else {
+            (Corner::TopLeft, h.at.y + gap)
+        };
+        Some(
+            deferred(
+                anchored()
+                    .anchor(corner)
+                    .position(point(x, y))
+                    .snap_to_window_with_margin(px(8.))
+                    .child(card),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
+    }
+
+    /// A commit card's lines.
+    fn commit_card(
+        &self,
+        g: &RepoGraph,
+        row: usize,
+        repo: &Path,
+        colors: &Colors,
+        p: &Palette,
+    ) -> Option<Vec<AnyElement>> {
+        let c = g.commits.get(row)?;
+        let node = g.layout.nodes.get(row)?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() as i64);
@@ -526,7 +671,7 @@ impl Timelines {
                 Ref::Tag(t) => format!("tag {t}"),
                 r => r.name().to_string(),
             })
-            .chain(g.stashes_at(h.row).map(|s| s.name.clone()))
+            .chain(g.stashes_at(row).map(|s| s.name.clone()))
             .collect();
         let stat = self.stats.get(&c.id).map_or_else(
             || "…".to_string(),
@@ -548,62 +693,73 @@ impl Timelines {
             Class::Merged => "merged",
             Class::Branch => "",
         };
-        let card = div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .max_w(px(320.))
-            .px_3()
-            .py_2()
-            .rounded_md()
-            .border_1()
-            .border_color(p.border)
-            .bg(p.bg)
-            .shadow_md()
-            .text_xs()
-            .text_color(p.text)
-            .child(
+        let copied = self
+            .copied
+            .as_ref()
+            .is_some_and(|(p, r)| p == repo && *r == row);
+        let mut lines = vec![
+            div()
+                .flex()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_none()
+                        .font_family("Consolas")
+                        .text_color(colors.node(g, row))
+                        .child(c.short().to_string()),
+                )
+                .child(div().min_w_0().truncate().child(c.subject.clone()))
+                .when(copied, |d| {
+                    d.child(div().flex_none().text_color(p.muted).child("copied"))
+                })
+                .into_any_element(),
+            div()
+                .text_color(p.muted)
+                .child(format!(
+                    "{} · {} ago · {} UTC",
+                    c.author,
+                    history::ago(now, c.time),
+                    history::utc(c.time)
+                ))
+                .into_any_element(),
+            div().text_color(p.muted).child(stat).into_any_element(),
+        ];
+        if head || !what.is_empty() || !refs.is_empty() {
+            let mut parts = Vec::new();
+            if head {
+                parts.push("HEAD".to_string());
+            }
+            parts.extend(refs);
+            if !what.is_empty() {
+                parts.push(what.to_string());
+            }
+            lines.push(
                 div()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_none()
-                            .font_family("Consolas")
-                            .text_color(colors.node(g, h.row))
-                            .child(c.short().to_string()),
-                    )
-                    .child(div().min_w_0().truncate().child(c.subject.clone())),
-            )
-            .child(div().text_color(p.muted).child(format!(
-                "{} · {} ago · {} UTC",
-                c.author,
-                history::ago(now, c.time),
-                history::utc(c.time)
-            )))
-            .child(div().text_color(p.muted).child(stat))
-            .when(head || !what.is_empty() || !refs.is_empty(), |d| {
-                let mut parts = Vec::new();
-                if head {
-                    parts.push("HEAD".to_string());
-                }
-                parts.extend(refs);
-                if !what.is_empty() {
-                    parts.push(what.to_string());
-                }
-                d.child(div().text_color(p.muted).child(parts.join(" · ")))
-            });
-        Some(
-            deferred(
-                anchored()
-                    .position(point(h.at.x - px(12.), h.at.y + px(10.)))
-                    .snap_to_window_with_margin(px(8.))
-                    .child(card),
-            )
-            .with_priority(1)
-            .into_any_element(),
-        )
+                    .text_color(p.muted)
+                    .child(parts.join(" · "))
+                    .into_any_element(),
+            );
+        }
+        Some(lines)
     }
+}
+
+/// The work-in-progress card's lines. The repo's status says only that the
+/// tree is dirty, not how many files, so the card can't count them.
+fn wip_card(g: &RepoGraph, colors: &Colors, p: &Palette) -> Vec<AnyElement> {
+    let on = match &g.info.checkout {
+        crate::repo_info::Checkout::Branch(b) | crate::repo_info::Checkout::Unborn(b) => {
+            format!("on {b}")
+        }
+        crate::repo_info::Checkout::Detached(h) => format!("on @{h}"),
+    };
+    vec![
+        div()
+            .text_color(colors.unpushed)
+            .child("Uncommitted changes")
+            .into_any_element(),
+        div().text_color(p.muted).child(on).into_any_element(),
+    ]
 }
 
 /// The strip's colours: GitHub's Primer palette.
@@ -686,16 +842,18 @@ fn lane_offset(lane: usize) -> f32 {
 }
 
 /// Paints the visible part of a strip; returns where each painted dot is
-/// and its row, for hit-testing.
+/// and what it is, for hit-testing.
+#[allow(clippy::too_many_arguments)]
 fn paint_strip(
     bounds: Bounds<Pixels>,
     g: &RepoGraph,
     scroll: f32,
-    hovered: Option<usize>,
+    hovered: Option<Dot>,
+    copied: Option<usize>,
     dirty: bool,
     colors: &Colors,
     window: &mut Window,
-) -> Vec<(Point<Pixels>, usize)> {
+) -> Vec<(Point<Pixels>, Dot)> {
     let rows = g.layout.nodes.len();
     let (left, right) = (f32::from(bounds.left()), f32::from(bounds.right()));
     // The newest row's x; at home HEAD sits PAD in, one step further when
@@ -714,11 +872,8 @@ fn paint_strip(
         return Vec::new();
     }
 
-    for e in &g.layout.edges {
-        let end = e.parent.map_or(rows, |p| p.0);
-        if end < lo || e.child.0 > hi {
-            continue;
-        }
+    let mut dots = Vec::with_capacity(hi.saturating_sub(lo) + 1);
+    for e in g.layout.visible_edges(lo, hi) {
         let base = if e.first {
             colors.node(g, e.child.0)
         } else {
@@ -776,7 +931,12 @@ fn paint_strip(
             None => (x(0.0), cy),
         };
         let center = point(px(hx + STEP), px(hy));
-        let r = DOT + 0.5;
+        dots.push((center, Dot::Wip));
+        let r = if hovered == Some(Dot::Wip) {
+            DOT_HOVER
+        } else {
+            DOT + 0.5
+        };
         window.paint_quad(
             outline(circle(center, r), colors.unpushed, BorderStyle::Dashed).corner_radii(px(r)),
         );
@@ -791,11 +951,10 @@ fn paint_strip(
         }
     }
 
-    let mut dots = Vec::with_capacity(hi.saturating_sub(lo));
     for row in lo..hi {
         let node = &g.layout.nodes[row];
         let center = point(px(x(row as f32)), px(y(node.lane as f32)));
-        dots.push((center, row));
+        dots.push((center, Dot::Commit(row)));
         let color = colors.node(g, row);
         let color = if node.lane >= LANES {
             color.opacity(0.5)
@@ -804,7 +963,20 @@ fn paint_strip(
         };
         let id = &g.commits[row].id;
         let head = g.ctx.refs.is_head(id);
-        let r = if hovered == Some(row) { DOT_HOVER } else { DOT };
+        let r = if hovered == Some(Dot::Commit(row)) {
+            DOT_HOVER
+        } else {
+            DOT
+        };
+        if copied == Some(row) {
+            // Its id just went to the clipboard.
+            let ring = r + 3.0;
+            window.paint_quad(
+                outline(circle(center, ring), colors.head, BorderStyle::Solid)
+                    .corner_radii(px(ring))
+                    .border_widths(px(1.0)),
+            );
+        }
         if head {
             let glow = r + 3.0;
             window.paint_quad(
@@ -826,19 +998,40 @@ fn paint_strip(
             diamond(point(center.x, center.y - px(r + 4.0)), 2.5, color, window);
         }
         if g.stashes_at(row).next().is_some() {
-            let s = 2.5;
-            let at = point(center.x, center.y + px(r + 5.0));
-            window.paint_quad(outline(
-                Bounds::new(
-                    point(at.x - px(s), at.y - px(s)),
-                    size(px(2.0 * s), px(2.0 * s)),
-                ),
-                colors.stash,
-                BorderStyle::Solid,
-            ));
+            stash(center, r, colors.stash, window);
         }
     }
     dots
+}
+
+/// A hollow square for the stashes made on the commit at `base`, newer than
+/// it so to its right, joined to it by a dotted noodle.
+fn stash(base: Point<Pixels>, r: f32, color: Hsla, window: &mut Window) {
+    let s = 2.5;
+    let at = point(base.x + px(STEP * 0.6), base.y + px(r + 5.0));
+    let [_, c1, c2, _] = graph::noodle(
+        (f32::from(at.x) - s, f32::from(at.y)),
+        (f32::from(base.x), f32::from(base.y) + r),
+        (-1.0, 0.0),
+    );
+    let mut path = PathBuilder::stroke(px(1.0)).dash_array(&[px(1.0), px(1.5)]);
+    path.move_to(point(at.x - px(s), at.y));
+    path.cubic_bezier_to(
+        point(base.x, base.y + px(r)),
+        point(px(c1.0), px(c1.1)),
+        point(px(c2.0), px(c2.1)),
+    );
+    if let Ok(path) = path.build() {
+        window.paint_path(path, color.opacity(0.8));
+    }
+    window.paint_quad(outline(
+        Bounds::new(
+            point(at.x - px(s), at.y - px(s)),
+            size(px(2.0 * s), px(2.0 * s)),
+        ),
+        color,
+        BorderStyle::Solid,
+    ));
 }
 
 fn circle(center: Point<Pixels>, r: f32) -> Bounds<Pixels> {
