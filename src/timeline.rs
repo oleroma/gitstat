@@ -209,17 +209,7 @@ impl Timelines {
         let generation = slot.generation;
         let repo = path.to_path_buf();
         let path = path.to_path_buf();
-        let task = cx.background_spawn(async move {
-            match graph.more(&repo, history::PAGE_SIZE) {
-                Ok(More::Page(commits, end)) => {
-                    let mut g = (*graph).clone();
-                    g.append(commits, end);
-                    Ok(Some(g))
-                }
-                Ok(More::Reload) => Ok(None),
-                Err(e) => Err(e),
-            }
-        });
+        let task = cx.background_spawn(async move { graph.more(&repo, history::PAGE_SIZE) });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
@@ -231,8 +221,14 @@ impl Timelines {
                 }
                 slot.loading_more = false;
                 match result {
-                    Ok(Some(g)) => slot.graph = Some(Arc::new(g)),
-                    Ok(None) => this.reload(path, cx),
+                    // The last frame's paint has let go of the graph, so
+                    // this appends in place rather than copying it all.
+                    Ok(More::Page(commits, end)) => {
+                        if let Some(g) = &mut slot.graph {
+                            Arc::make_mut(g).append(commits, end);
+                        }
+                    }
+                    Ok(More::Reload) => this.reload(path, cx),
                     Err(e) => slot.error = Some(e),
                 }
                 cx.notify();

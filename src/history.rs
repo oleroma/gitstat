@@ -14,7 +14,7 @@
 //! separately, to hang off the commit each one was made on.
 
 use crate::git;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// Commits per page.
@@ -69,7 +69,9 @@ impl Ref {
 /// Every branch and tag, by the commit it points at.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Refs {
-    pub by_commit: HashMap<String, Vec<Ref>>,
+    by_commit: HashMap<String, Vec<Ref>>,
+    /// The other way round, so `tip` needn't scan every ref.
+    tips: HashMap<Ref, String>,
     /// The commit HEAD points at; `None` in a repo with no commits.
     pub head: Option<String>,
     /// The branch HEAD is on; `None` when detached.
@@ -77,6 +79,11 @@ pub struct Refs {
 }
 
 impl Refs {
+    pub fn insert(&mut self, id: &str, r: Ref) {
+        self.tips.insert(r.clone(), id.to_string());
+        self.by_commit.entry(id.to_string()).or_default().push(r);
+    }
+
     pub fn at(&self, id: &str) -> &[Ref] {
         self.by_commit.get(id).map_or(&[], Vec::as_slice)
     }
@@ -87,10 +94,31 @@ impl Refs {
 
     /// The commit a branch or tag points at.
     pub fn tip(&self, r: &Ref) -> Option<&str> {
-        self.by_commit
+        self.tips.get(r).map(String::as_str)
+    }
+
+    pub fn all(&self) -> impl Iterator<Item = &Ref> {
+        self.tips.keys()
+    }
+
+    /// Where each ref that differs in `new` pointed and points now, HEAD
+    /// included; `None` for a ref that is gone or not there yet.
+    fn moved<'a>(
+        &'a self,
+        new: &'a Refs,
+    ) -> impl Iterator<Item = (Option<&'a str>, Option<&'a str>)> {
+        let gone_or_moved = self
+            .tips
             .iter()
-            .find(|(_, refs)| refs.contains(r))
-            .map(|(id, _)| id.as_str())
+            .filter(|(r, id)| new.tips.get(*r) != Some(*id))
+            .map(|(r, id)| (Some(id.as_str()), new.tip(r)));
+        let added = new
+            .tips
+            .iter()
+            .filter(|(r, _)| !self.tips.contains_key(*r))
+            .map(|(_, id)| (None, Some(id.as_str())));
+        let head = (self.head != new.head).then_some((self.head.as_deref(), new.head.as_deref()));
+        gone_or_moved.chain(added).chain(head)
     }
 }
 
@@ -153,11 +181,20 @@ pub fn next_page(
     })
 }
 
-/// Splices a fresh first page onto history already loaded. Returns the
-/// commits that are new, newest first, or `None` when the fresh page no
-/// longer reaches the newest loaded commit (a rebase, a force push, a
-/// deleted branch) and everything has to be reloaded.
-pub fn new_since(fresh: &Page, loaded: &[Commit]) -> Option<Vec<Commit>> {
+/// Splices a fresh first page onto history already loaded, given the refs
+/// it was loaded with (`old`) and the refs now (`new`). Returns the commits
+/// that are new, newest first, or `None` when they can't simply go on top
+/// and everything has to be reloaded:
+///
+/// - the fresh page no longer reaches the newest loaded commit, or reaches
+///   it in another order (a rebase, a force push, a fetched branch with
+///   commits dated among the loaded ones);
+/// - a ref moved to, or was deleted from, somewhere the fresh page doesn't
+///   show (a fetched branch dated older than the page, a deleted branch
+///   whose commits sat deeper), since the loaded pages below may be stale;
+/// - a new commit's parent is neither new nor loaded (new commits dated
+///   older than the page, or a branch off history not loaded yet).
+pub fn new_since(fresh: &Page, loaded: &[Commit], old: &Refs, new: &Refs) -> Option<Vec<Commit>> {
     let Some(newest) = loaded.first() else {
         return Some(fresh.commits.clone());
     };
@@ -169,7 +206,28 @@ pub fn new_since(fresh: &Page, loaded: &[Commit]) -> Option<Vec<Commit>> {
     if overlap.into_iter().any(|(a, b)| a.id != b.id) {
         return None;
     }
-    Some(fresh.commits[..at].to_vec())
+    // A moved ref is only safe where the fresh page can vouch for it: its
+    // new commit, or for a deleted one, its old commit still walked.
+    let in_page = |id: &str| fresh.commits.iter().any(|c| c.id == id);
+    let vouched = |(from, to): (Option<&str>, Option<&str>)| match to {
+        Some(to) => in_page(to),
+        None => from.is_none_or(in_page),
+    };
+    if !old.moved(new).all(vouched) {
+        return None;
+    }
+    let added = &fresh.commits[..at];
+    if !added.is_empty() {
+        let known: HashSet<&str> = added.iter().chain(loaded).map(|c| c.id.as_str()).collect();
+        if added
+            .iter()
+            .flat_map(|c| &c.parents)
+            .any(|p| !known.contains(p.as_str()))
+        {
+            return None;
+        }
+    }
+    Some(added.to_vec())
 }
 
 pub fn refs(repo: &Path) -> Result<Refs, String> {
@@ -384,10 +442,7 @@ fn parse_refs(out: &str) -> Refs {
         } else {
             continue;
         };
-        refs.by_commit
-            .entry(target.to_string())
-            .or_default()
-            .push(r);
+        refs.insert(target, r);
     }
     refs
 }
@@ -537,6 +592,7 @@ pub(crate) mod tests {
             commit(&dir, &format!("c{i}"), &mut n);
         }
         let first = first_page(&dir, &[], 3).unwrap();
+        let first_refs = refs(&dir).unwrap();
         assert_eq!(first.commits.len(), 3);
         assert!(!first.end);
         assert_eq!(first.commits[0].subject, "c6");
@@ -557,7 +613,7 @@ pub(crate) mod tests {
 
         // And the refresh splices only the new commit on top.
         let fresh = first_page(&dir, &[], 3).unwrap();
-        let new = new_since(&fresh, &first.commits).unwrap();
+        let new = new_since(&fresh, &first.commits, &first_refs, &refs(&dir).unwrap()).unwrap();
         assert_eq!(new.len(), 1);
         assert_eq!(new[0].subject, "c7");
 
@@ -565,12 +621,67 @@ pub(crate) mod tests {
         run(&dir, &["reset", "-q", "--hard", "HEAD~3"]);
         commit(&dir, "other", &mut n);
         let fresh = first_page(&dir, &[], 3).unwrap();
-        assert_eq!(new_since(&fresh, &first.commits), None);
+        let now = refs(&dir).unwrap();
+        assert_eq!(new_since(&fresh, &first.commits, &first_refs, &now), None);
 
         let refs = refs(&dir).unwrap();
         assert_eq!(refs.head_branch.as_deref(), Some("main"));
         assert!(refs.is_head(&fresh.commits[0].id));
         assert_eq!(refs.at(&fresh.commits[0].id), [Ref::Local("main".into())]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Loads `n` commits of `dir`, makes `change`, and splices the fresh
+    /// first page onto them.
+    fn splice_after(dir: &Path, n: usize, change: impl FnOnce()) -> Option<Vec<Commit>> {
+        let loaded = first_page(dir, &[], n).unwrap().commits;
+        let old = refs(dir).unwrap();
+        change();
+        let fresh = first_page(dir, &[], n).unwrap();
+        new_since(&fresh, &loaded, &old, &refs(dir).unwrap())
+    }
+
+    #[test]
+    fn splice_sees_refs_moved_below_the_page() {
+        let dir = temp_repo("history-refs-moved");
+        let mut n = 0;
+        commit(&dir, "root", &mut n);
+        let root = run(&dir, &["rev-parse", "HEAD"]);
+        // Side branches, all older than main's commits.
+        run(&dir, &["checkout", "-q", "-b", "deep"]);
+        commit(&dir, "deep", &mut n);
+        run(&dir, &["checkout", "-q", "-b", "old", &root]);
+        commit(&dir, "old", &mut n);
+        let old = run(&dir, &["rev-parse", "HEAD"]);
+        run(&dir, &["checkout", "-q", "main"]);
+        // Not fetched yet: the commit is there but nothing points at it.
+        run(&dir, &["branch", "-q", "-D", "old"]);
+        for i in 0..5 {
+            commit(&dir, &format!("m{i}"), &mut n);
+        }
+
+        // Unmoved refs and a new commit on top still splice.
+        let new = splice_after(&dir, 2, || commit(&dir, "m5", &mut n)).unwrap();
+        assert_eq!(new.len(), 1);
+
+        // Deleting a branch whose commits sit below the page loses them.
+        let delete = || {
+            run(&dir, &["branch", "-q", "-D", "deep"]);
+        };
+        assert_eq!(splice_after(&dir, 2, delete), None);
+
+        // A branch fetched with commits older than the page brings them.
+        let fetch = || {
+            run(&dir, &["update-ref", "refs/remotes/origin/old", &old]);
+        };
+        assert_eq!(splice_after(&dir, 2, fetch), None);
+
+        // So does a new commit on a branch off history not loaded.
+        let deep_work = || {
+            run(&dir, &["checkout", "-q", "-b", "again", &root]);
+            commit(&dir, "again", &mut n);
+        };
+        assert_eq!(splice_after(&dir, 3, deep_work), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

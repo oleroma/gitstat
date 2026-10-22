@@ -20,7 +20,9 @@ pub struct RepoGraph {
     /// HEAD's row: `--date-order` puts newer commits on other branches, or
     /// not yet pulled, above it. `None` while unborn or not loaded yet.
     pub head_row: Option<usize>,
-    /// Extra walk starting points: other worktrees' HEADs.
+    /// Extra walk starting points: other worktrees' HEADs. `--all` has
+    /// walked them too since git 2.16; passing them again costs nothing and
+    /// keeps an older git from losing a worktree's detached commits.
     tips: Vec<String>,
 }
 
@@ -55,15 +57,20 @@ impl RepoGraph {
         let info = repo_info::read(repo, &refs)?;
         let tips = info.worktree_tips(refs.head.as_deref());
         let first = history::first_page(repo, &tips, page)?;
-        let (commits, end) =
-            match prev.and_then(|p| Some((p, history::new_since(&first, &p.commits)?))) {
-                Some((prev, new)) if !prev.commits.is_empty() => {
-                    let mut commits = new;
-                    commits.extend(prev.commits.iter().cloned());
-                    (commits, prev.end)
-                }
-                _ => (first.commits, first.end),
-            };
+        let spliced = prev.and_then(|p| {
+            Some((
+                p,
+                history::new_since(&first, &p.commits, &p.ctx.refs, &refs)?,
+            ))
+        });
+        let (commits, end) = match spliced {
+            Some((prev, new)) if !prev.commits.is_empty() => {
+                let mut commits = new;
+                commits.extend(prev.commits.iter().cloned());
+                (commits, prev.end)
+            }
+            _ => (first.commits, first.end),
+        };
         let ctx = Context {
             default_tip: info.default_tip.clone(),
             unpushed: info.unpushed.clone(),

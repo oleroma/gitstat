@@ -158,8 +158,9 @@ pub struct Layout {
     trunk: HashSet<String>,
     merged: HashSet<String>,
     branch_ids: HashMap<String, usize>,
-    /// Edges waiting for a parent not loaded yet, by edge index.
-    open: HashMap<usize, String>,
+    /// Edges waiting for a parent not loaded yet, by the parent's id, so
+    /// closing one looks only at the edges into that commit.
+    open: HashMap<String, Vec<usize>>,
 }
 
 impl Layout {
@@ -187,7 +188,7 @@ impl Layout {
     /// Edges still waiting for a parent below the last loaded row.
     #[cfg(test)]
     pub fn open_edges(&self) -> impl Iterator<Item = &Edge> {
-        self.open.keys().map(|&i| &self.edges[i])
+        self.open.values().flatten().map(|&i| &self.edges[i])
     }
 
     fn add(&mut self, commit: &Commit, ctx: &Context) {
@@ -206,11 +207,15 @@ impl Layout {
         let inherited = self.lanes[lane]
             .as_ref()
             .and_then(|slot| slot.sources.iter().find(|s| s.first).and_then(|s| s.branch));
+        let mut open = self.open.remove(&commit.id).unwrap_or_default();
         for &i in &waiting {
             let slot = self.lanes[i].take().expect("waiting lane");
             for s in slot.sources {
-                self.close(s.child, i, (row, lane), s.first, &commit.id);
+                self.close(&mut open, s.child, i, (row, lane), s.first);
             }
+        }
+        if !open.is_empty() {
+            self.open.insert(commit.id.clone(), open);
         }
 
         let (class, branch) = self.classify(commit, inherited, ctx);
@@ -253,7 +258,10 @@ impl Layout {
                 branch,
             });
             // Open until the parent is loaded.
-            self.open.insert(self.edges.len(), parent.clone());
+            self.open
+                .entry(parent.clone())
+                .or_default()
+                .push(self.edges.len());
             self.edges.push(Edge {
                 child: (row, lane),
                 via,
@@ -267,21 +275,22 @@ impl Layout {
         self.width = self.width.max(self.lanes.len()).max(lane + 1);
     }
 
-    /// Ends the open edge from `child` through lane `via` at the parent.
+    /// Ends the edge from `child` through lane `via` at the parent, out of
+    /// `open`, the edges still waiting for that parent.
     fn close(
         &mut self,
+        open: &mut Vec<usize>,
         child: (usize, usize),
         via: usize,
         at: (usize, usize),
         first: bool,
-        id: &str,
     ) {
-        let found = self.open.iter().find_map(|(&i, target)| {
+        let found = open.iter().position(|&i| {
             let e = &self.edges[i];
-            (target == id && e.child == child && e.via == via && e.first == first).then_some(i)
+            e.child == child && e.via == via && e.first == first
         });
-        if let Some(i) = found {
-            self.open.remove(&i);
+        if let Some(n) = found {
+            let i = open.swap_remove(n);
             self.edges[i].parent = Some(at);
         }
     }
@@ -316,13 +325,18 @@ impl Layout {
 
         // The first-parent child's branch carries down; a commit nothing
         // carries to takes the branch pointing at it, local before remote.
+        // A local branch also takes over from one carried down, so stacked
+        // branches each keep their own colour, except from HEAD's, which
+        // runs straight down its lane, and from its own remote.
         let refs = ctx.refs.at(id);
-        let own = refs
-            .iter()
-            .find(|r| matches!(r, Ref::Local(_)))
+        let local = refs.iter().find(|r| matches!(r, Ref::Local(_)));
+        let own = local
             .or_else(|| refs.iter().find(|r| matches!(r, Ref::Remote(_))))
             .map(|r| self.branch_id(r.name()));
-        let branch = inherited.or(own);
+        let branch = match (inherited, local) {
+            (Some(b), Some(local)) if self.takes_over(b, local.name(), ctx) => own,
+            _ => inherited.or(own),
+        };
 
         let class = if ctx.unpushed.contains(id) {
             Class::Unpushed
@@ -336,6 +350,15 @@ impl Layout {
             Class::Branch
         };
         (class, branch)
+    }
+
+    /// Whether a local branch `name` on a commit starts a new branch below
+    /// the one carried down, `carried`.
+    fn takes_over(&self, carried: usize, name: &str, ctx: &Context) -> bool {
+        let carried = self.branches[carried].as_str();
+        let own_remote = carried.split_once('/').is_some_and(|(_, n)| n == name)
+            && ctx.refs.tip(&Ref::Remote(carried.to_string())).is_some();
+        carried != name && Some(carried) != ctx.refs.head_branch.as_deref() && !own_remote
     }
 
     fn branch_id(&mut self, name: &str) -> usize {
@@ -398,11 +421,7 @@ mod tests {
         let mut ctx = Context::default();
         ctx.refs.head = Some(head.to_string());
         for (id, r) in refs {
-            ctx.refs
-                .by_commit
-                .entry(id.to_string())
-                .or_default()
-                .push(r.clone());
+            ctx.refs.insert(id, r.clone());
         }
         ctx
     }
@@ -587,6 +606,60 @@ mod tests {
         assert_eq!(branch(3), None);
         // Where topic and main meet, HEAD's lane keeps the commit.
         assert_eq!(branch(5), Some("main"));
+    }
+
+    #[test]
+    fn stacked_branches_keep_their_own_names() {
+        //   b2     topic2, on top of topic1
+        //   b1     topic1, on top of main (HEAD)
+        //   a1
+        //   m      main
+        //   r
+        let commits = [
+            c("b2", &["b1"]),
+            c("b1", &["a1"]),
+            c("a1", &["m"]),
+            c("m", &["r"]),
+            c("r", &[]),
+        ];
+        let mut stacked = ctx(
+            "m",
+            &[
+                ("b2", Ref::Local("topic2".into())),
+                ("b1", Ref::Local("topic1".into())),
+                ("m", Ref::Local("main".into())),
+            ],
+        );
+        stacked.refs.head_branch = Some("main".into());
+        let l = layout(&commits, &stacked);
+        let branch = |row: usize| l.nodes[row].branch.map(|b| l.branches[b].as_str());
+        assert_eq!(branch(0), Some("topic2"));
+        assert_eq!(branch(1), Some("topic1"));
+        assert_eq!(branch(2), Some("topic1"));
+        assert_eq!(branch(3), Some("main"));
+        assert_eq!(branch(4), Some("main"));
+
+        // HEAD's branch runs on down past other branches' tips.
+        let mut on_top = stacked.clone();
+        on_top.refs.head = Some("b2".into());
+        on_top.refs.head_branch = Some("topic2".into());
+        let l = layout(&commits, &on_top);
+        let branch = |row: usize| l.nodes[row].branch.map(|b| l.branches[b].as_str());
+        assert_eq!(branch(1), Some("topic2"));
+        assert_eq!(branch(3), Some("topic2"));
+
+        // A local branch behind its own remote stays the remote's colour.
+        let behind = ctx(
+            "m",
+            &[
+                ("x", Ref::Remote("origin/topic1".into())),
+                ("b1", Ref::Local("topic1".into())),
+            ],
+        );
+        let commits = [c("x", &["b1"]), c("b1", &["m"]), c("m", &[])];
+        let l = layout(&commits, &behind);
+        let branch = |row: usize| l.nodes[row].branch.map(|b| l.branches[b].as_str());
+        assert_eq!(branch(1), Some("origin/topic1"));
     }
 
     #[test]

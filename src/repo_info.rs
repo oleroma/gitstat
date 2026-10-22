@@ -78,7 +78,7 @@ pub fn read(repo: &Path, refs: &Refs) -> Result<Info, String> {
         .map(|t| parse_worktrees(&t))
         .unwrap_or_default();
 
-    let all: Vec<&Ref> = refs.by_commit.values().flatten().collect();
+    let all: Vec<&Ref> = refs.all().collect();
     let local_branches = all.iter().filter(|r| matches!(r, Ref::Local(_))).count();
     let remote_branches = all.iter().filter(|r| matches!(r, Ref::Remote(_))).count();
 
