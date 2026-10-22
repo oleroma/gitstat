@@ -11,12 +11,13 @@ use crate::win;
 use futures::channel::mpsc::UnboundedSender;
 use gpui::{
     AnyElement, App, AppContext, Bounds, Context, Entity, FocusHandle, Global, Hsla, IntoElement,
-    ParentElement, Render, SharedString, Styled, Window, WindowAppearance, WindowBounds,
-    WindowHandle, WindowKind, WindowOptions, div, point, prelude::*, px, rgb, size,
+    ParentElement, Render, ScrollHandle, SharedString, Styled, Window, WindowAppearance,
+    WindowBounds, WindowHandle, WindowKind, WindowOptions, div, point, prelude::*, px, rgb, size,
 };
 use std::path::PathBuf;
 use std::rc::Rc;
 
+/// The window's smallest opening size; big mode grows it to fit columns.
 const WINDOW_SIZE: (f32, f32) = (420.0, 520.0);
 /// Logical px between the window and the work area's bottom-right corner.
 const WINDOW_MARGIN: f32 = 16.0;
@@ -69,10 +70,19 @@ pub fn show_window(cx: &mut App) {
     let Some(state) = cx.try_global::<Ui>().map(|ui| ui.state.clone()) else {
         return;
     };
-    let (width, height) = WINDOW_SIZE;
     let mon = win::primary_monitor();
     let scale = sane_scale(mon.scale);
     let (left, top) = (mon.work.left as f32 / scale, mon.work.top as f32 / scale);
+    let (work_w, work_h) = (
+        mon.work.width() as f32 / scale,
+        mon.work.height() as f32 / scale,
+    );
+    // Big mode: wide enough for every column, up to most of the screen.
+    let repos = state.read(cx).statuses.len().max(1) as f32;
+    let width = (repos * crate::timeline::COLUMN_WIDTH + 2.0)
+        .min(work_w * 0.9)
+        .max(WINDOW_SIZE.0);
+    let height = (work_h * 0.8).max(WINDOW_SIZE.1).min(work_h);
     let x = (mon.work.right as f32 / scale - width - WINDOW_MARGIN).max(left);
     let y = (mon.work.bottom as f32 / scale - height - WINDOW_MARGIN).max(top);
     let bounds = Bounds::new(point(px(x), px(y)), size(px(width), px(height)));
@@ -146,6 +156,8 @@ pub struct StatusView {
     timelines: Option<Entity<Timelines>>,
     mode: Mode,
     show_synced: bool,
+    /// Big mode's table of columns, scrolled sideways.
+    table: ScrollHandle,
     focus: FocusHandle,
     /// The panel has been active once, so a deactivation now means the user
     /// clicked elsewhere rather than the foreground lock refusing us.
@@ -184,6 +196,7 @@ impl StatusView {
             timelines,
             mode,
             show_synced: false,
+            table: ScrollHandle::new(),
             focus,
             seen_active: false,
         }
@@ -302,6 +315,11 @@ impl Render for StatusView {
             (Some(t), Mode::Panel) => Timelines::strip(t, i, s, &p, dark, cx),
             _ => repo_row(i, s, &p, mode),
         };
+        // A strip's label asked big mode for its repo's column.
+        let focus = match (&self.timelines, mode) {
+            (Some(t), Mode::Window) => t.update(cx, |t, _| t.take_focus()),
+            _ => None,
+        };
         let state = self.state.clone();
         let state = state.read(cx);
         let unsynced = state.unsynced();
@@ -408,11 +426,13 @@ impl Render for StatusView {
 
         let mut rows: Vec<AnyElement> = Vec::new();
         match mode {
-            Mode::Window => {
+            // Without timelines (never, once the app is up) a plain list.
+            Mode::Window if timelines.is_none() => {
                 for (i, s) in state.statuses.iter().enumerate() {
                     rows.push(repo_row(i, s, &p, mode));
                 }
             }
+            Mode::Window => {}
             Mode::Panel => {
                 let sorted = state.sorted_for_panel();
                 let (bad, good): (Vec<&RepoStatus>, Vec<&RepoStatus>) =
@@ -465,6 +485,35 @@ impl Render for StatusView {
                 "No git repos in this folder, down to {depth} levels below it. Set \"path\" or \
                  \"depth\" in config.json."
             ),
+        };
+        let table = match (&timelines, mode) {
+            (Some(t), Mode::Window) => {
+                if let Some(i) = focus
+                    .as_deref()
+                    .and_then(|f| crate::timeline::column_index(&state.statuses, f))
+                {
+                    self.table.scroll_to_item(i);
+                }
+                let columns: Vec<AnyElement> = state
+                    .statuses
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| Timelines::column(t, i, s, &p, dark, window, cx))
+                    .collect();
+                Some(
+                    div()
+                        .id("table")
+                        .flex()
+                        .flex_row()
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_x_scroll()
+                        .track_scroll(&self.table)
+                        .bg(p.surface)
+                        .children(columns),
+                )
+            }
+            _ => None,
         };
         let list = div()
             .id("repos")
@@ -537,7 +586,11 @@ impl Render for StatusView {
                         .min_w_0()
                         .truncate()
                         .when_some(capped.clone(), |d, _| d.text_color(p.amber))
-                        .child(capped.unwrap_or_else(|| "Click a repo to open its folder".into())),
+                        .child(capped.unwrap_or_else(|| {
+                            "Click a repo's name to open its folder. Wheel scrolls a column, \
+                             Shift+wheel the table."
+                                .into()
+                        })),
                 )
                 .child(edit_config),
         };
@@ -560,7 +613,10 @@ impl Render for StatusView {
             .bg(p.bg)
             .text_color(p.text)
             .child(header)
-            .child(list)
+            .map(|d| match table {
+                Some(table) if !empty => d.child(table),
+                _ => d.child(list),
+            })
             .child(footer)
             .children(
                 self.timelines

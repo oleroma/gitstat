@@ -309,6 +309,45 @@ pub fn stat(repo: &Path, id: &str) -> Result<Stat, String> {
     Ok(parse_stat(&String::from_utf8_lossy(&out.stdout)))
 }
 
+/// Line stats of several commits in one git call, for a column of rows.
+/// Commits git can't show are left out.
+pub fn stats(repo: &Path, ids: &[String]) -> Result<HashMap<String, Stat>, String> {
+    let mut args = vec![
+        "show",
+        "--no-color",
+        "--shortstat",
+        "--format=%x1e%H",
+        "--diff-merges=first-parent",
+    ];
+    // Only full hashes, so an id can't be read as an option.
+    args.extend(
+        ids.iter()
+            .filter(|t| t.len() >= 40 && t.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(String::as_str),
+    );
+    if args.len() == 5 {
+        return Ok(HashMap::new());
+    }
+    args.push("--");
+    let out = git::git(repo, &args, git::LOCAL_TIMEOUT)?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(parse_stats(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Records of a hash line and its shortstat, each after a `\x1e`.
+fn parse_stats(out: &str) -> HashMap<String, Stat> {
+    out.split(RS)
+        .filter_map(|record| {
+            let record = record.trim_start_matches('\n');
+            let (id, rest) = record.split_once('\n').unwrap_or((record, ""));
+            let id = id.trim();
+            (!id.is_empty()).then(|| (id.to_string(), parse_stat(rest)))
+        })
+        .collect()
+}
+
 /// ` 3 files changed, 10 insertions(+), 2 deletions(-)`; empty for no change.
 fn parse_stat(out: &str) -> Stat {
     let mut stat = Stat::default();
@@ -568,6 +607,16 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn parses_batched_stats() {
+        let out = "\x1eaaa\n\n 2 files changed, 5 insertions(+)\n\x1ebbb\n\x1eccc\n\n 1 file changed, 1 deletion(-)\n";
+        let s = parse_stats(out);
+        assert_eq!(s.len(), 3);
+        assert_eq!(s["aaa"].added, 5);
+        assert_eq!(s["bbb"], Stat::default());
+        assert_eq!(s["ccc"].removed, 1);
+    }
+
+    #[test]
     fn parses_refs() {
         let out = "aaa\x1f\x1frefs/heads/main\n\
                    aaa\x1f\x1frefs/remotes/origin/main\n\
@@ -734,6 +783,10 @@ pub(crate) mod tests {
         let page = first_page(&dir, &[], 10).unwrap();
         assert_eq!(page.commits.len(), 1, "stash commits leaked into the walk");
         let st = stat(&dir, &page.commits[0].id).unwrap();
+        let all = stats(&dir, &[page.commits[0].id.clone(), "--help".into()]).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[&page.commits[0].id], st);
+        assert!(stats(&dir, &[]).unwrap().is_empty());
         assert_eq!((st.files, st.added, st.removed), (1, 1, 0));
         assert!(stat(&dir, "--help").is_err());
         let _ = std::fs::remove_dir_all(&dir);

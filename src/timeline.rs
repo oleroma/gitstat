@@ -9,6 +9,10 @@
 //! canvas that paints only the dots and noodles in view and hit-tests the
 //! mouse against the dots it painted.
 
+mod column;
+
+pub use column::{COLUMN_WIDTH, column_index};
+
 use crate::git::RepoStatus;
 use crate::graph::{self, Class, Seg};
 use crate::history::{self, Ref, Stat};
@@ -130,6 +134,8 @@ pub struct Timelines {
     /// Line stats by commit id, read on first hover.
     stats: HashMap<String, Stat>,
     stats_pending: HashSet<String>,
+    /// A repo whose column big mode should bring into view.
+    focus: Option<PathBuf>,
 }
 
 impl Timelines {
@@ -149,6 +155,7 @@ impl Timelines {
             copied_generation: 0,
             stats: HashMap::new(),
             stats_pending: HashSet::new(),
+            focus: None,
         }
     }
 
@@ -570,6 +577,7 @@ impl Timelines {
         .h_full();
 
         let entity = this.clone();
+        let this_for_label = this.clone();
         let wheel_path = path.clone();
         let open_path = path.clone();
         div()
@@ -616,9 +624,17 @@ impl Timelines {
                     .pr_4()
                     .cursor_pointer()
                     .hover(|s| s.bg(p.hover))
+                    // Big mode, scrolled to this repo's column; the folder
+                    // when the window is turned off.
                     .on_click(move |_, window, cx| {
-                        cx.open_with_system(&open_path);
                         crate::panel::dismiss(window, cx);
+                        let big = this_for_label.read(cx).state.read(cx).config.window;
+                        if big {
+                            this_for_label.update(cx, |t, _| t.focus(&open_path));
+                            crate::view::show_window(cx);
+                        } else {
+                            cx.open_with_system(&open_path);
+                        }
                     })
                     .child(
                         div()
@@ -840,6 +856,8 @@ struct Colors {
     trunk: Hsla,
     head: Hsla,
     stash: Hsla,
+    added: Hsla,
+    removed: Hsla,
     hues: [Hsla; 6],
 }
 
@@ -854,6 +872,8 @@ impl Colors {
                 trunk: c(0x8b949e),
                 head: c(0xe6edf3),
                 stash: p.muted,
+                added: c(0x3fb950),
+                removed: c(0xf85149),
                 // blue, orange, pink, lemon, teal, coral
                 hues: [
                     c(0x4493f8),
@@ -872,6 +892,8 @@ impl Colors {
                 trunk: c(0x656d76),
                 head: c(0x1f2328),
                 stash: p.muted,
+                added: c(0x1a7f37),
+                removed: c(0xcf222e),
                 hues: [
                     c(0x0969da),
                     c(0xbc4c00),
