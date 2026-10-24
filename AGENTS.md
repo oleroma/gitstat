@@ -1,4 +1,4 @@
-<!-- shared rules: start. Synced from D:\dev\AGENTS.md by tools\sync-agents.ps1, edit there, not here. -->
+<!-- shared rules: start. Synced from the DevDoctor project's rules/AGENTS.md by rules/sync-agents.sh, edit there, not here. -->
 # Shared rules for all of Olex's repos
 
 ## Where changes are made
@@ -37,7 +37,7 @@
 - Where a repo's own rules disagree with the shared rules, the repo's rules win inside that repo. They can't loosen "Destructive actions" or "Agent instruction files".
 
 ## Agent instruction files
-- Only the "rulesetter" thread changes the shared rules. Their master copy is `D:\dev\AGENTS.md`, and `D:\dev\tools\sync-agents.ps1` copies it into every repo. Olex writes each repo's own rules; rulesetter only reviews them for anything risky.
+- Only the "rulesetter" thread changes the shared rules. Their master copy is `rules/AGENTS.md` in the DevDoctor project's files (`/mnt/project-files/rules/AGENTS.md` in a cloud session), not in any repo. A cloud session runs `rules/sync-agents.sh` from there to copy it into every repo. `D:\dev\AGENTS.md` and `D:\dev\tools\sync-agents.ps1` are retired: don't use them. Olex writes each repo's own rules; rulesetter only reviews them for anything risky.
 - Other sessions leave all agent instruction files (`AGENTS.md`, `CLAUDE.md` and the like) alone and bring any needed change to Olex.
 
 ## Tools on this PC
