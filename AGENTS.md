@@ -18,7 +18,7 @@
 - GitHub CI doesn't run on every push.
 
 ## When the PC is offline
-- When Olex says the PC is offline, the cloud session pushes and then starts the repo's fallback workflow on GitHub (`gh workflow run fallback.yml --ref <branch>`), which runs the full tests and builds. It waits for the run, downloads the APK or exe from the run's artifacts (`gh run download`), and attaches it to the project thread so Olex can install it from the phone.
+- When Olex says the PC is offline, the cloud session pushes and then starts the repo's fallback workflow on GitHub (`gh workflow run fallback.yml --ref <branch>`), which runs the full tests and builds. It waits for the run, then gives Olex a direct download link to the build in the project thread: `https://github.com/oleroma/<repo>/actions/runs/<run-id>/artifacts/<artifact-id>` (get the artifact id with `gh api repos/oleroma/<repo>/actions/runs/<run-id>/artifacts --jq '.artifacts[].id'`). If the run fails, say why instead.
 - Once the PC is back, builds go back to the PC.
 
 ## After a build
