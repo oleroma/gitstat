@@ -278,13 +278,16 @@ You need [Rust](https://rustup.rs/) and the Visual Studio C++ build tools with
 a Windows SDK. GPUI compiles its shaders with the SDK's `fxc.exe`.
 
 ```
-cargo build --release
+build.cmd
 ```
 
-The executable is `target\release\gitstat.exe`. To run your own build, copy it
-into `builds\` (ignored by git) along with a `config.json` whose `path` points
-at your repos folder, since a new config defaults to the folder above the
-exe's folder.
+It builds the committed `HEAD` (or the commit you pass) in its own git worktree
+and puts the newest `gitstat.exe` in `build\` (ignored by git). The last 4
+builds stay in `build\builds\<version>-<commit>\`, each with the worktree it
+was built from in `src\`. To run it, put a `config.json` next to
+`build\gitstat.exe` whose `path` points at your repos folder, since a new
+config defaults to the folder above the exe's folder. Plain
+`cargo build --release` still works for a quick check.
 
 `cargo test` runs the status detection, file-watching, layout, config and
 folder-icon tests. They also run on Linux (CI runs them there too), where only
