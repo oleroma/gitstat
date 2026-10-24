@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 /// deactivates on the tray's mouse-down, then the click-up arrives, and a
 /// double-click sends two clicks.
 const DEBOUNCE: Duration = Duration::from_millis(400);
-const WIDTH: f32 = 360.0;
+/// Wide enough for a timeline strip next to each repo's name.
+const WIDTH: f32 = 480.0;
 /// Logical px between the panel and the taskbar or the badge.
 const GAP: f32 = 12.0;
 

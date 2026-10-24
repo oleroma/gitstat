@@ -11,13 +11,21 @@ mod git;
 #[cfg(any(windows, test))]
 mod folder_icons;
 #[cfg(any(windows, test))]
+mod graph;
+#[cfg(any(windows, test))]
+mod history;
+#[cfg(any(windows, test))]
 mod icon;
 #[cfg(any(windows, test))]
 mod layout;
 #[cfg(any(windows, test))]
 mod monitor;
 #[cfg(any(windows, test))]
+mod repo_graph;
+#[cfg(any(windows, test))]
 mod repo_icon;
+#[cfg(any(windows, test))]
+mod repo_info;
 #[cfg(any(windows, test))]
 mod state;
 #[cfg(any(windows, test))]
@@ -31,6 +39,8 @@ mod autostart;
 mod overlay;
 #[cfg(windows)]
 mod panel;
+#[cfg(windows)]
+mod timeline;
 #[cfg(windows)]
 mod tray;
 #[cfg(windows)]
