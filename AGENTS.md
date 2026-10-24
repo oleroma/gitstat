@@ -6,11 +6,20 @@
 - To build on the PC, fetch the branch or commit from GitHub and check it out into a worktree inside the repo's `build/` folder (`build/builds/<version>-<commit>/src`), then build there.
 
 ## Builds
-- All builds happen on Olex's PC. GitHub CI runs only lightweight checks (lint, quick tests); it never builds APKs, executables or other release files.
+- All builds happen on Olex's PC. GitHub CI builds only in the fallback below, when the PC is offline.
 - Everything made by building, testing or running the program (build outputs, logs, screenshots, caches, virtual environments, downloads) goes inside the repo's gitignored `build/` folder, and nowhere else in the repo.
 - The newest APK or exe sits directly in `build/`.
 - `build/builds/` keeps the last 4 builds, one folder per build, named after its version and commit. Each folder holds that build's APK or exe and, in `src/`, the git worktree it was built from.
 - When adding a build, delete build folders older than the last 4 (remove their worktrees with `git worktree remove`) and any old `debug-*` files.
+
+## Tests
+- Tests run on the PC, in the `build/` worktree, right before building. If they fail, don't build and say why.
+- Before pushing, a cloud session runs only the tests that are quick there, and says which it ran and which it left to the PC.
+- GitHub CI doesn't run on every push.
+
+## When the PC is offline
+- When Olex says the PC is offline, the cloud session pushes and then starts the repo's fallback workflow on GitHub (`gh workflow run fallback.yml --ref <branch>`). It runs the full tests and builds; for an Android app it publishes the APK as a GitHub pre-release that Olex installs from the phone.
+- Once the PC is back, builds go back to the PC.
 
 ## After a build
 - If Olex's phone is connected over adb (`adb devices` lists it), install the newest APK on it with `adb install -r`, unless there's a good reason not to (for example a downgrade that would wipe app data).
