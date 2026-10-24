@@ -197,7 +197,9 @@ set `"watch": false`) to check on the interval only, as before v0.3.
 ## Install
 
 1. Build `gitstat.exe` yourself, see [Build from source](#build-from-source).
-   CI only runs tests and clippy; it doesn't publish an exe.
+   GitHub CI doesn't run on push. When the PC is offline, the manual
+   `fallback.yml` workflow runs the tests and clippy, builds the exe and
+   uploads it as the `gitstat` artifact.
 2. Put `gitstat.exe` in a folder of its own, e.g. `D:\dev\gitstat\`.
 3. Run it. The first time, it writes `config.json` next to itself.
 4. Right-click the tray icon and tick **Start with Windows** to have it start
@@ -290,8 +292,7 @@ config defaults to the folder above the exe's folder. Plain
 `cargo build --release` still works for a quick check.
 
 `cargo test` runs the status detection, file-watching, layout, config and
-folder-icon tests. They also run on Linux (CI runs them there too), where only
-`--once` is available.
+folder-icon tests. They also run on Linux, where only `--once` is available.
 
 ## How it works
 

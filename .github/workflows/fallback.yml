@@ -1,0 +1,38 @@
+# Builds and tests run on the dev PC (see README). Run this by hand only when
+# the PC is offline:
+#   gh workflow run fallback.yml --ref <branch>
+# It runs the full tests and clippy on Windows, builds the release exe and
+# uploads it as an artifact.
+name: fallback
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fallback
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --locked
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Build
+        run: cargo build --release --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gitstat
+          path: target/release/gitstat.exe
