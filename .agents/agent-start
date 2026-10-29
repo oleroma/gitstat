@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Step 1: make a feature branch from the latest main and open a draft PR into main.
+# Usage: .agents/agent-start [--continue] <feature-name>
+#   --continue  skip the checks for a red main and other agents' draft PRs (Olex said to go on)
+source "$(dirname "$0")/lib.sh"
+cd "$WORKTREE"
+
+skip_check=0
+if [ "${1:-}" = "--continue" ]; then
+  skip_check=1
+  shift
+fi
+name="${1:-}"
+[ -n "$name" ] || die "Usage: agent-start [--continue] <feature-name>"
+git check-ref-format --branch "$name" >/dev/null || die "\"$name\" isn't a valid branch name."
+case "$name" in
+  main) die "Pick a feature name, not $name." ;;
+esac
+[ -z "$(git status --porcelain)" ] || die "There are uncommitted changes. Commit them with agent-commit, or ask Olex."
+
+git fetch origin --prune
+
+if [ "$skip_check" = 0 ]; then
+  red="$(main_red)"
+  if [ -n "$red" ]; then
+    finish main-red "The last checks on main failed: $red"
+  fi
+  drafts="$(gh api "repos/$SLUG/pulls?base=main&state=open&per_page=100" \
+    --jq '.[] | select(.draft) | "#\(.number) \(.head.ref) \(.html_url)"')"
+  if [ -n "$drafts" ]; then
+    finish other-agent "Open draft PRs into main:" "$drafts"
+  fi
+fi
+
+if git show-ref --verify --quiet "refs/heads/$name" ||
+  git ls-remote --exit-code --heads origin "$name" >/dev/null; then
+  die "A branch named $name already exists. Pick another name."
+fi
+
+git switch --no-track -c "$name" origin/main
+# GitHub won't open a PR without a commit, so the branch starts with an empty one.
+git commit --allow-empty -m "Start $name"
+git push -u origin "$name"
+url="$(gh api -X POST "repos/$SLUG/pulls" -f base=main -f head="$name" -f title="$name" \
+  -f body="Work in progress by an agent." -F draft=true --jq .html_url)"
+
+finish done "Branch $name made from main at $(git rev-parse --short origin/main)." "Draft PR: $url"

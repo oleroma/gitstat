@@ -1,38 +1,103 @@
-# Builds and tests run on the dev PC (see README). Run this by hand only when
-# the PC is offline:
-#   gh workflow run fallback.yml --ref <branch>
-# It runs the full tests and clippy on Windows, builds the release exe and
-# uploads it as an artifact.
-name: fallback
+name: Fallback build
 
+# Run by hand on a feature branch when Olex's PC can't be reached (AGENTS.md step 3):
+#   gh workflow run fallback.yml --ref <branch>
+# agent-merge runs it with -f mode=check to run the full checks on the branch before merging.
+# It runs the quick tests, builds, and saves the build file on the run, unzipped.
+# On a push to main (a feature merged after Olex's OK) it runs the full checks only and builds nothing.
+# Both use the repo's hooks in .agents/hooks/, the same ones PC builds run.
+# gitstat.exe builds only on Windows, so builds and branch checks run there; the Linux job
+# checks main and the platform-neutral code.
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "build: quick tests and build files; check: the full checks only (agent-merge)"
+        type: choice
+        options: [build, check]
+        default: build
 
 permissions:
   contents: read
 
+# A newer push to main cancels the older check still running; runs started by hand are never cancelled.
 concurrency:
-  group: fallback
-  cancel-in-progress: false
+  group: fallback-${{ github.ref }}-${{ github.event_name }}-${{ inputs.mode }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 jobs:
+  linux:
+    if: github.event_name == 'push' || inputs.mode == 'check'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # Branch runs save the cache too, so the next run on the branch reuses its work.
+      # Runs on main only read it, so main doesn't fill the repo's cache space.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> build/target"
+          save-if: ${{ github.event_name != 'push' }}
+
+      - name: Full checks
+        run: bash .agents/hooks/full-check
+
   windows:
+    if: github.event_name != 'push'
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Test
-        run: cargo test --locked
-      - name: Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
-      - name: Build
-        run: cargo build --release --locked
-      - uses: actions/upload-artifact@v4
         with:
-          name: gitstat
-          path: target/release/gitstat.exe
+          workspaces: ". -> build/target"
+
+      - name: Quick tests
+        if: inputs.mode != 'check'
+        shell: bash
+        run: bash .agents/hooks/quick-test
+
+      - name: Build
+        id: build
+        if: inputs.mode != 'check'
+        shell: bash
+        run: |
+          set -o pipefail
+          bash .agents/hooks/build | tee "$RUNNER_TEMP/build.out"
+          file="$(sed -n 's/^build-file: \([^ ]*\) .*/\1/p' "$RUNNER_TEMP/build.out" | head -n 1)"
+          echo "file=$file" >> "$GITHUB_OUTPUT"
+          echo "$(basename "$file")  SHA-256 \`$(sha256sum "$file" | cut -d' ' -f1)\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Full checks
+        if: inputs.mode == 'check'
+        shell: bash
+        run: bash .agents/hooks/full-check
+
+      # Saved on the run as the plain file, not a zip, so the download link gives the file itself.
+      - uses: actions/upload-artifact@v7
+        if: inputs.mode != 'check'
+        with:
+          path: ${{ steps.build.outputs.file }}
+          archive: false
+
+  # Marks the commit checked once both jobs pass, so agent-merge can skip a second run.
+  mark-checked:
+    if: inputs.mode == 'check'
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+    steps:
+      - name: Mark the commit checked
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA"
+          -f state=success -f context=full-check -f description="Passed in CI"
+          -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"

@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# Step 5: bring the latest main into the feature branch, then merge the branch into main.
+# Usage: .agents/agent-merge   (run it again after resolving conflicts)
+source "$(dirname "$0")/lib.sh"
+cd "$WORKTREE"
+require_feature_branch
+
+MAX_ATTEMPTS=3
+# Conflict rounds are counted per branch in .git, so nothing is committed or pushed.
+attempts_file="$(git rev-parse --path-format=absolute --git-path "agent-merge-attempts-${BRANCH//\//-}")"
+files_file="$attempts_file.files"
+attempts="$(cat "$attempts_file" 2>/dev/null || echo 0)"
+
+merge_into_main() {
+  if [ "$(git rev-parse HEAD)" != "$(git rev-parse "origin/$BRANCH")" ]; then
+    git push origin "$BRANCH"
+  fi
+  # The full checks main runs after a merge, run on the branch first so main stays green,
+  # unless they already passed on this commit (a PC build or an earlier check run).
+  local checks
+  if checked "$(git rev-parse HEAD)"; then
+    checks="The full checks had already passed on $(git rev-parse --short HEAD)."
+  else
+    run_fallback check || finish checks-failed "The full checks failed on $BRANCH: $RUN_URL" \
+      "Fix it on the branch with agent-commit, then build again (step 3)."
+    checks="Checks passed on the branch: $RUN_URL"
+  fi
+  local n
+  n="$(pr_number "$BRANCH")"
+  [ -n "$n" ] || die "No open PR from $BRANCH into main."
+  pr_ready "$n"
+  gh api -X PUT "repos/$SLUG/pulls/$n/merge" -f merge_method=merge >/dev/null
+  rm -f "$attempts_file" "$files_file"
+  finish done "Merged $BRANCH into main: https://github.com/$SLUG/pull/$n" "The feature branch is kept." \
+    "$checks"
+}
+
+git fetch origin
+
+# A merge is in progress: this is the run after the agent resolved conflicts.
+if [ -f "$(git rev-parse --git-path MERGE_HEAD)" ]; then
+  if [ -f "$files_file" ]; then
+    mapfile -t files <"$files_file"
+  else
+    mapfile -t files < <(git diff --name-only --diff-filter=U)
+  fi
+  left=""
+  for f in "${files[@]}"; do
+    if [ -f "$f" ] && grep -qE '^(<<<<<<<|>>>>>>>)( |$)' "$f"; then left="$left$f"$'\n'; fi
+  done
+  [ -z "$left" ] || finish stuck "Conflict markers are still in:" "${left%$'\n'}"
+  git add -A -- "${files[@]}"
+  unmerged="$(git diff --name-only --diff-filter=U)"
+  [ -z "$unmerged" ] || finish stuck "Still unmerged:" "$unmerged"
+  git commit --no-edit
+  git push origin "$BRANCH"
+  rm -f "$files_file"
+  finish needs-testing "Conflicts resolved, committed and pushed." \
+    "Build again (step 3). Once Olex says it still works, run agent-merge again."
+fi
+
+# main hasn't moved since the branch last took it in.
+if git merge-base --is-ancestor origin/main HEAD; then
+  merge_into_main
+fi
+
+base="$(git merge-base HEAD origin/main)"
+overlap="$(comm -12 \
+  <(git diff --name-only "$base" HEAD | sort) \
+  <(git diff --name-only "$base" origin/main | sort) | grep -v '^$' || true)"
+
+if git merge --no-edit origin/main; then
+  git push origin "$BRANCH"
+  if [ -n "$overlap" ]; then
+    finish needs-testing "Merged the latest main. It changed files this feature also changed:" "$overlap" \
+      "Build again (step 3). Once Olex says it still works, run agent-merge again."
+  fi
+  merge_into_main
+fi
+
+unmerged="$(git diff --name-only --diff-filter=U)"
+[ -n "$unmerged" ] || die "git merge failed without conflicts."
+attempts=$((attempts + 1))
+echo "$attempts" >"$attempts_file"
+printf '%s\n' "$unmerged" >"$files_file"
+if [ "$attempts" -gt "$MAX_ATTEMPTS" ]; then
+  finish stuck "Conflicts again after $MAX_ATTEMPTS attempts, in:" "$unmerged"
+fi
+finish conflicts "Conflicts (attempt $attempts of $MAX_ATTEMPTS) in:" "$unmerged" \
+  "Resolve them, then run agent-merge again."

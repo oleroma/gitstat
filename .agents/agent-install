@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# Installs a build made by agent-build pc, which runs this itself after building.
+# Run it on its own to install without building.
+# Usage: build/src/.agents/agent-install [<version>-<commit>]
+#   no argument: the newest build; otherwise that build from build/builds/
+# Installs each APK on the phone (in place, never a downgrade), then runs the repo's
+# install hook, if it has one, for the other build files and any setup after an install.
+source "$(dirname "$0")/lib.sh"
+cd "$WORKTREE"
+
+HOOKS="$WORKTREE/.agents/hooks"
+INSTALL_NOTE=""
+NOTES=()
+
+[ "$WORKTREE" -ef "$BUILD_DIR/src" ] || die "Run this from the build/src worktree, as in AGENTS.md step 3."
+
+build_id="${1:-}"
+if [ -z "$build_id" ]; then
+  [ -f "$BUILD_DIR/.newest-build" ] || die "No build to install yet: run agent-build pc first."
+  build_id="$(head -n 1 "$BUILD_DIR/.newest-build")"
+fi
+dir="$BUILD_DIR/builds/$build_id"
+[ -d "$dir" ] || die "No build $build_id in build/builds/. Builds there: $(ls -1 "$BUILD_DIR/builds" 2>/dev/null | tr '\n' ' ')"
+paths=()
+for f in "$dir"/*; do
+  if [ -f "$f" ]; then paths+=("$f"); fi
+done
+[ "${#paths[@]}" -gt 0 ] || die "Build $build_id has no build files."
+
+find_adb() { # adb comes from the PATH; prints nothing if it isn't there
+  if command -v adb >/dev/null 2>&1; then echo adb; fi
+  return 0
+}
+
+phone_notify() { # phone_notify <adb> <title> <text>
+  "$1" shell "cmd notification post -t '$2' agent-install '$3'" || true
+}
+
+install_apk() { # install_apk <apk> <name>; sets INSTALL_NOTE
+  local apk="$1" title="${2%.apk}" adb devices out
+  adb="$(find_adb)"
+  if [ -z "$adb" ]; then
+    INSTALL_NOTE="Not installed: adb not found."
+    return
+  fi
+  export MSYS_NO_PATHCONV=1
+
+  devices="$("$adb" devices | awk 'NR > 1 && $2 == "device"' | wc -l | tr -d ' ')"
+  if [ "$devices" = 0 ]; then
+    INSTALL_NOTE="Not installed: no phone connected."
+    return
+  fi
+  if [ "$devices" != 1 ]; then
+    INSTALL_NOTE="Not installed: more than one device connected."
+    return
+  fi
+
+  "$adb" shell cmd vibrator_manager synced oneshot 200 || true
+  phone_notify "$adb" "$title" "Installing now"
+  # -r keeps app data. Without -d, adb refuses a downgrade instead of wiping data.
+  if out="$("$adb" install -r "$apk" 2>&1)" && grep -q Success <<<"$out"; then
+    echo "$out"
+    phone_notify "$adb" "$title" "Install complete"
+    INSTALL_NOTE="Installed on the phone."
+  else
+    echo "$out"
+    phone_notify "$adb" "$title" "Install failed"
+    if grep -q VERSION_DOWNGRADE <<<"$out"; then
+      INSTALL_NOTE="Not installed: it's a downgrade, which would wipe app data."
+    else
+      INSTALL_NOTE="Install failed: $(grep -m 1 -E 'Failure|Error' <<<"$out" || echo "see the log")"
+    fi
+  fi
+}
+
+for f in "${paths[@]}"; do
+  name="$(basename "$f")"
+  case "$name" in
+    *.apk)
+      install_apk "$f" "$name"
+      NOTES+=("$name: $INSTALL_NOTE")
+      ;;
+    *)
+      if [ ! -f "$HOOKS/install" ]; then NOTES+=("$name: not an APK, ask Olex whether to install it."); fi
+      ;;
+  esac
+done
+
+# The repo's install hook gets the build id and the build files; its "note: <text>"
+# lines go into the summary.
+if [ -f "$HOOKS/install" ]; then
+  hook_out="$BUILD_DIR/logs/install-output.txt"
+  if ! bash "$HOOKS/install" "$build_id" "${paths[@]}" >"$hook_out"; then
+    NOTES+=("The install hook failed; see the log.")
+  fi
+  cat "$hook_out"
+  while IFS= read -r line; do
+    case "$line" in "note: "*) NOTES+=("${line#note: }") ;; esac
+  done <"$hook_out"
+fi
+
+finish done "Installed build $build_id:" "${NOTES[@]}"

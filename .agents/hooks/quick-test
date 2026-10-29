@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Quick tests, run by every branch build (PC and fallback) before building.
+set -euo pipefail
+cd "$(dirname "$0")/../.."
+export CARGO_TARGET_DIR=build/target
+
+cargo test --locked
