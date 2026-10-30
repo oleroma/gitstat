@@ -102,8 +102,12 @@ pub fn run(config_file: PathBuf) {
             let _ = icons_tx.unbounded_send(Input::FolderSkips(skips));
         });
 
+        let timelines = cx.new(|cx| crate::timeline::Timelines::new(&state, cx));
+        let marks = cx.new(|cx| crate::repo_marks::RepoMarks::new(&state, cx));
         cx.set_global(Ui {
             state: state.clone(),
+            timelines,
+            marks,
             input: tx,
             refresh: Rc::new(|cx: &mut App| {
                 if let Some(shared) = cx.try_global::<Shared>() {
@@ -147,10 +151,14 @@ async fn input_loop(mut rx: UnboundedReceiver<Input>, cx: &mut gpui::AsyncApp) {
 fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
     let state = cx.global::<Ui>().state.clone();
     let mut changed = false;
+    let mut checked = false;
     let mut icons_stale = false;
     for input in batch {
         match input {
             Input::Monitor(update) => {
+                // A check that changed no status may still have moved refs
+                // the timeline shows; it observes the state for this.
+                checked |= matches!(update, Update::Status(_));
                 let (c, s) = on_update(update, cx);
                 changed |= c;
                 icons_stale |= s;
@@ -194,7 +202,7 @@ fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
             }
         }
     }
-    if changed {
+    if changed || checked {
         state.update(cx, |_, cx| cx.notify());
     }
     // An icon.svg change alone changes nothing on screen.
@@ -233,8 +241,7 @@ fn on_update(update: Update, cx: &mut App) -> (bool, bool) {
         }
         Update::Repos { repos, capped } => state.update(cx, |s, _| {
             let before = s.statuses.len();
-            s.statuses.retain(|st| repos.contains(&st.path));
-            s.in_flight.retain(|p| repos.contains(p));
+            s.retain_repos(|p| repos.iter().any(|r| r == p));
             let removed = s.statuses.len() != before;
             let capped_changed = s.capped != capped;
             s.capped = capped;
@@ -246,6 +253,7 @@ fn on_update(update: Update, cx: &mut App) -> (bool, bool) {
         }
         Update::Status(status) => state.update(cx, |s, _| {
             s.in_flight.remove(&status.path);
+            s.checked(&status.path);
             let changed = s.merge_status(status);
             (changed, changed)
         }),

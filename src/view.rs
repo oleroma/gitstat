@@ -5,17 +5,19 @@ use crate::git::RepoStatus;
 use crate::monitor::WatchMode;
 use crate::panel;
 use crate::state::{AppState, Input};
+use crate::timeline::Timelines;
 use crate::tray::TraySnapshot;
 use crate::win;
 use futures::channel::mpsc::UnboundedSender;
 use gpui::{
     AnyElement, App, AppContext, Bounds, Context, Entity, FocusHandle, Global, Hsla, IntoElement,
-    ParentElement, Render, SharedString, Styled, Window, WindowAppearance, WindowBounds,
-    WindowHandle, WindowKind, WindowOptions, div, point, prelude::*, px, rgb, size,
+    ParentElement, Render, ScrollHandle, SharedString, Styled, Window, WindowAppearance,
+    WindowBounds, WindowHandle, WindowKind, WindowOptions, div, point, prelude::*, px, rgb, size,
 };
 use std::path::PathBuf;
 use std::rc::Rc;
 
+/// The window's smallest opening size; big mode grows it to fit columns.
 const WINDOW_SIZE: (f32, f32) = (420.0, 520.0);
 /// Logical px between the window and the work area's bottom-right corner.
 const WINDOW_MARGIN: f32 = 16.0;
@@ -24,6 +26,10 @@ const WINDOW_MARGIN: f32 = 16.0;
 /// it once with `cx.set_global` before opening any of them.
 pub struct Ui {
     pub state: Entity<AppState>,
+    /// Every repo's loaded history, for the timeline strips.
+    pub timelines: Entity<Timelines>,
+    /// Every repo's own icon, drawn for the windows.
+    pub marks: Entity<crate::repo_marks::RepoMarks>,
     /// The app's one input channel; the overlay posts its clicks here.
     pub input: UnboundedSender<Input>,
     /// Starts a fetch sweep now (the refresh buttons).
@@ -66,10 +72,19 @@ pub fn show_window(cx: &mut App) {
     let Some(state) = cx.try_global::<Ui>().map(|ui| ui.state.clone()) else {
         return;
     };
-    let (width, height) = WINDOW_SIZE;
     let mon = win::primary_monitor();
     let scale = sane_scale(mon.scale);
     let (left, top) = (mon.work.left as f32 / scale, mon.work.top as f32 / scale);
+    let (work_w, work_h) = (
+        mon.work.width() as f32 / scale,
+        mon.work.height() as f32 / scale,
+    );
+    // Big mode: wide enough for every column, up to most of the screen.
+    let repos = state.read(cx).statuses.len().max(1) as f32;
+    let width = (repos * crate::timeline::COLUMN_WIDTH + 2.0)
+        .min(work_w * 0.9)
+        .max(WINDOW_SIZE.0);
+    let height = (work_h * 0.8).max(WINDOW_SIZE.1).min(work_h);
     let x = (mon.work.right as f32 / scale - width - WINDOW_MARGIN).max(left);
     let y = (mon.work.bottom as f32 / scale - height - WINDOW_MARGIN).max(top);
     let bounds = Bounds::new(point(px(x), px(y)), size(px(width), px(height)));
@@ -140,8 +155,11 @@ pub enum Mode {
 
 pub struct StatusView {
     state: Entity<AppState>,
+    timelines: Option<Entity<Timelines>>,
     mode: Mode,
     show_synced: bool,
+    /// Big mode's table of columns, scrolled sideways.
+    table: ScrollHandle,
     focus: FocusHandle,
     /// The panel has been active once, so a deactivation now means the user
     /// clicked elsewhere rather than the foreground lock refusing us.
@@ -156,6 +174,14 @@ impl StatusView {
         cx: &mut Context<Self>,
     ) -> Self {
         cx.observe(&state, |_, _, cx| cx.notify()).detach();
+        let timelines = cx.try_global::<Ui>().map(|ui| ui.timelines.clone());
+        if let Some(t) = &timelines {
+            cx.observe(t, |_, _, cx| cx.notify()).detach();
+        }
+        // Repo icons land as they are drawn.
+        if let Some(marks) = cx.try_global::<Ui>().map(|ui| ui.marks.clone()) {
+            cx.observe(&marks, |_, _, cx| cx.notify()).detach();
+        }
         cx.observe_window_appearance(window, |_, _, cx| cx.notify())
             .detach();
         if mode == Mode::Panel {
@@ -173,8 +199,10 @@ impl StatusView {
         focus.focus(window);
         Self {
             state,
+            timelines,
             mode,
             show_synced: false,
+            table: ScrollHandle::new(),
             focus,
             seen_active: false,
         }
@@ -203,7 +231,7 @@ fn mode_text(mode: &WatchMode) -> String {
     }
 }
 
-fn status_color(s: &RepoStatus, p: &Palette) -> Hsla {
+pub(crate) fn status_color(s: &RepoStatus, p: &Palette) -> Hsla {
     if s.error.is_some() || s.is_diverged() || s.behind > 0 {
         p.red
     } else if !s.is_synced() {
@@ -214,7 +242,7 @@ fn status_color(s: &RepoStatus, p: &Palette) -> Hsla {
 }
 
 /// One repo; a click opens its folder (and closes the panel).
-fn repo_row(index: usize, s: &RepoStatus, p: &Palette, mode: Mode) -> AnyElement {
+fn repo_row(index: usize, s: &RepoStatus, p: &Palette, mode: Mode, cx: &App) -> AnyElement {
     let color = status_color(s, p);
     let path = s.path.clone();
     let (py, gap) = match mode {
@@ -236,7 +264,7 @@ fn repo_row(index: usize, s: &RepoStatus, p: &Palette, mode: Mode) -> AnyElement
                 panel::dismiss(window, cx);
             }
         })
-        .child(div().size_2().rounded_full().bg(color).flex_none())
+        .child(crate::repo_marks::global_mark(s, 16.0, color, cx))
         .child(
             div()
                 .flex_1()
@@ -282,8 +310,26 @@ fn icon_button(
 impl Render for StatusView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::for_appearance(window.appearance());
+        let dark = matches!(
+            window.appearance(),
+            WindowAppearance::Dark | WindowAppearance::VibrantDark
+        );
         let mode = self.mode;
-        let state = self.state.read(cx);
+        let timelines = self.timelines.clone();
+        // Pictures only: the panel's words move into tooltips.
+        let icons_only = mode == Mode::Panel && self.state.read(cx).config.icons_only;
+        // A repo row: a timeline strip in the panel, a plain row elsewhere.
+        let row = |i: usize, s: &RepoStatus, cx: &App| match (&timelines, mode) {
+            (Some(t), Mode::Panel) => Timelines::strip(t, i, s, &p, dark, icons_only, cx),
+            _ => repo_row(i, s, &p, mode, cx),
+        };
+        // A strip's label asked big mode for its repo's column.
+        let focus = match (&self.timelines, mode) {
+            (Some(t), Mode::Window) => t.update(cx, |t, _| t.take_focus()),
+            _ => None,
+        };
+        let state = self.state.clone();
+        let state = state.read(cx);
         let unsynced = state.unsynced();
         let problem = state.problem();
         let sweeping = state.sweeping;
@@ -325,16 +371,37 @@ impl Render for StatusView {
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(headline_color)
                     .truncate()
-                    .child(headline),
+                    .child(headline.clone()),
             )
             .child(
                 div()
                     .text_xs()
                     .text_color(p.muted)
                     .truncate()
-                    .child(subline),
+                    .child(subline.clone()),
             );
 
+        let titles = if icons_only {
+            let mut lines = vec![
+                (headline.to_string(), headline_color),
+                (subline.clone(), p.muted),
+                (mode_text(&state.mode), p.muted),
+            ];
+            if let Some(c) = &state.capped {
+                lines.push((format!("Repo list incomplete: {c}"), p.amber));
+            }
+            div()
+                .id("summary")
+                .flex()
+                .flex_1()
+                .items_center()
+                .h(px(28.))
+                .tooltip(tip(lines, &p))
+                .child(summary_bar(&state.statuses, sweeping, &p))
+                .into_any_element()
+        } else {
+            titles.into_any_element()
+        };
         let header = div()
             .flex()
             .items_center()
@@ -388,20 +455,39 @@ impl Render for StatusView {
 
         let mut rows: Vec<AnyElement> = Vec::new();
         match mode {
-            Mode::Window => {
+            // Without timelines (never, once the app is up) a plain list.
+            Mode::Window if timelines.is_none() => {
                 for (i, s) in state.statuses.iter().enumerate() {
-                    rows.push(repo_row(i, s, &p, mode));
+                    rows.push(repo_row(i, s, &p, mode, cx));
                 }
             }
+            Mode::Window => {}
             Mode::Panel => {
                 let sorted = state.sorted_for_panel();
                 let (bad, good): (Vec<&RepoStatus>, Vec<&RepoStatus>) =
                     sorted.into_iter().partition(|s| !s.is_synced());
                 for (i, s) in bad.iter().enumerate() {
-                    rows.push(repo_row(i, s, &p, mode));
+                    rows.push(row(i, s, cx));
                 }
                 if !good.is_empty() {
                     let open = self.show_synced;
+                    let label =
+                        if icons_only {
+                            // The synced repos' icons in a row, while collapsed.
+                            div()
+                                .flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap_1()
+                                .overflow_hidden()
+                                .when(!open, |d| {
+                                    d.children(good.iter().map(|s| {
+                                        crate::repo_marks::global_mark(s, 16.0, p.green, cx)
+                                    }))
+                                })
+                        } else {
+                            div().flex_1().child(format!("✓ {} synced", good.len()))
+                        };
                     rows.push(
                         div()
                             .id("synced")
@@ -414,7 +500,13 @@ impl Render for StatusView {
                             .hover(|style| style.bg(p.hover))
                             .text_sm()
                             .text_color(p.green)
-                            .child(div().flex_1().child(format!("✓ {} synced", good.len())))
+                            .when(icons_only, |d| {
+                                d.tooltip(tip(
+                                    vec![(format!("{} synced", good.len()), p.green)],
+                                    &p,
+                                ))
+                            })
+                            .child(label)
                             .child(div().flex_none().text_color(p.muted).child(if open {
                                 "▾"
                             } else {
@@ -429,7 +521,7 @@ impl Render for StatusView {
                     if open {
                         let offset = bad.len();
                         for (i, s) in good.iter().enumerate() {
-                            rows.push(repo_row(offset + i, s, &p, mode));
+                            rows.push(row(offset + i, s, cx));
                         }
                     }
                 }
@@ -445,6 +537,35 @@ impl Render for StatusView {
                 "No git repos in this folder, down to {depth} levels below it. Set \"path\" or \
                  \"depth\" in config.json."
             ),
+        };
+        let table = match (&timelines, mode) {
+            (Some(t), Mode::Window) => {
+                if let Some(i) = focus
+                    .as_deref()
+                    .and_then(|f| crate::timeline::column_index(&state.statuses, f))
+                {
+                    self.table.scroll_to_item(i);
+                }
+                let columns: Vec<AnyElement> = state
+                    .statuses
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| Timelines::column(t, i, s, &p, dark, window, cx))
+                    .collect();
+                Some(
+                    div()
+                        .id("table")
+                        .flex()
+                        .flex_row()
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_x_scroll()
+                        .track_scroll(&self.table)
+                        .bg(p.surface)
+                        .children(columns),
+                )
+            }
+            _ => None,
         };
         let list = div()
             .id("repos")
@@ -517,7 +638,11 @@ impl Render for StatusView {
                         .min_w_0()
                         .truncate()
                         .when_some(capped.clone(), |d, _| d.text_color(p.amber))
-                        .child(capped.unwrap_or_else(|| "Click a repo to open its folder".into())),
+                        .child(capped.unwrap_or_else(|| {
+                            "Click a repo's name to open its folder. Wheel scrolls a column, \
+                             Shift+wheel the table."
+                                .into()
+                        })),
                 )
                 .child(edit_config),
         };
@@ -540,8 +665,92 @@ impl Render for StatusView {
             .bg(p.bg)
             .text_color(p.text)
             .child(header)
-            .child(list)
-            .child(footer)
+            .map(|d| match table {
+                Some(table) if !empty => d.child(table),
+                _ => d.child(list),
+            })
+            .when(!icons_only, |d| d.child(footer))
+            .children(
+                self.timelines
+                    .as_ref()
+                    .and_then(|t| t.read(cx).hover_card(&p, dark, cx)),
+            )
+    }
+}
+
+/// A bar of the repos' tones: green synced, amber local work, red needs
+/// action, each as wide as its share; dimmed while a check runs.
+fn summary_bar(statuses: &[RepoStatus], checking: bool, p: &Palette) -> gpui::Div {
+    let mut counts = [0usize; 3];
+    for s in statuses {
+        let i = match crate::icon::FolderState::of(s).tone() {
+            crate::icon::Tone::Synced => 0,
+            crate::icon::Tone::Local => 1,
+            crate::icon::Tone::Attention => 2,
+        };
+        counts[i] += 1;
+    }
+    let total = statuses.len().max(1) as f32;
+    let bar = div()
+        .flex()
+        .flex_1()
+        .h(px(6.))
+        .rounded_full()
+        .overflow_hidden()
+        .bg(p.hover)
+        .when(checking, |b| b.opacity(0.6));
+    [
+        (counts[0], p.green),
+        (counts[1], p.amber),
+        (counts[2], p.red),
+    ]
+    .into_iter()
+    .filter(|&(n, _)| n > 0)
+    .fold(bar, |bar, (n, color)| {
+        bar.child(div().h_full().w(gpui::relative(n as f32 / total)).bg(color))
+    })
+}
+
+/// A tooltip of coloured lines.
+struct Tip {
+    lines: Vec<(SharedString, Hsla)>,
+    bg: Hsla,
+    border: Hsla,
+}
+
+impl Render for Tip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .max_w(px(320.))
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(self.border)
+            .bg(self.bg)
+            .shadow_md()
+            .text_xs()
+            .children(
+                self.lines
+                    .iter()
+                    .filter(|(text, _)| !text.is_empty())
+                    .map(|(text, color)| div().text_color(*color).child(text.clone())),
+            )
+    }
+}
+
+/// A tooltip builder showing `lines`, for icons-only mode.
+pub(crate) fn tip(
+    lines: Vec<(String, Hsla)>,
+    p: &Palette,
+) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView + 'static {
+    let lines: Vec<(SharedString, Hsla)> = lines.into_iter().map(|(t, c)| (t.into(), c)).collect();
+    let (bg, border) = (p.bg, p.border);
+    move |_, cx| {
+        let lines = lines.clone();
+        cx.new(|_| Tip { lines, bg, border }).into()
     }
 }
 

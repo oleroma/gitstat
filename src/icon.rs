@@ -540,7 +540,7 @@ impl FolderState {
 
 /// The three colours a repo's own icon is drawn in: fewer than the status
 /// folders' seven, so it reads at a glance whatever its shape.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Tone {
     /// Nothing to do.
     Synced,

@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 /// deactivates on the tray's mouse-down, then the click-up arrives, and a
 /// double-click sends two clicks.
 const DEBOUNCE: Duration = Duration::from_millis(400);
-const WIDTH: f32 = 360.0;
+/// Wide enough for a timeline strip next to each repo's name.
+const WIDTH: f32 = 480.0;
 /// Logical px between the panel and the taskbar or the badge.
 const GAP: f32 = 12.0;
 
@@ -100,6 +101,12 @@ fn open(anchor: Anchor, cx: &mut App) {
         return;
     };
     let rows = view::panel_rows(state.read(cx));
+    // Icons only: the strips' labels shrink to their icons.
+    let width = if state.read(cx).config.icons_only {
+        WIDTH - (crate::timeline::LABEL_WIDTH - crate::timeline::ICON_LABEL_WIDTH)
+    } else {
+        WIDTH
+    };
     let anchor_rect = match anchor {
         Anchor::Tray(Some(rect)) | Anchor::Overlay { rect, .. } => rect,
         Anchor::Tray(None) => {
@@ -112,7 +119,7 @@ fn open(anchor: Anchor, cx: &mut App) {
     let scale = view::sane_scale(mon.scale);
     let height = layout::panel_height(rows, mon.work.height() as f32 / scale);
     let (w, h, gap) = (
-        (WIDTH * scale).round() as i32,
+        (width * scale).round() as i32,
         (height * scale).round() as i32,
         (GAP * scale).round() as i32,
     );

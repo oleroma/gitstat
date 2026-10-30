@@ -63,6 +63,7 @@ pub enum Setting {
     Watch,
     Panel,
     Window,
+    IconsOnly,
     Overlay,
     OverlayHideSynced,
     OverlayHideFullscreen,
@@ -75,6 +76,7 @@ impl Setting {
             Setting::Watch => cfg.watch,
             Setting::Panel => cfg.panel,
             Setting::Window => cfg.window,
+            Setting::IconsOnly => cfg.icons_only,
             Setting::Overlay => cfg.overlay.enabled,
             Setting::OverlayHideSynced => cfg.overlay.hide_when_synced,
             Setting::OverlayHideFullscreen => cfg.overlay.hide_in_fullscreen,
@@ -87,6 +89,7 @@ impl Setting {
             Setting::Watch => &mut cfg.watch,
             Setting::Panel => &mut cfg.panel,
             Setting::Window => &mut cfg.window,
+            Setting::IconsOnly => &mut cfg.icons_only,
             Setting::Overlay => &mut cfg.overlay.enabled,
             Setting::OverlayHideSynced => &mut cfg.overlay.hide_when_synced,
             Setting::OverlayHideFullscreen => &mut cfg.overlay.hide_in_fullscreen,
@@ -169,6 +172,7 @@ impl Tray {
         };
         let panel = check("Status panel on click", Setting::Panel);
         let window = check("Status window", Setting::Window);
+        let icons_only = check("Icons only (panel and badge)", Setting::IconsOnly);
         let overlay = check("Corner badge", Setting::Overlay);
         let hide_synced = check("Hide badge when all synced", Setting::OverlayHideSynced);
         let hide_fullscreen = check("Hide badge in fullscreen", Setting::OverlayHideFullscreen);
@@ -203,6 +207,7 @@ impl Tray {
             .append_items(&[
                 &panel.0,
                 &window.0,
+                &icons_only.0,
                 &PredefinedMenuItem::separator(),
                 &overlay.0,
                 &corner_menu,
@@ -264,6 +269,7 @@ impl Tray {
             settings: vec![
                 panel,
                 window,
+                icons_only,
                 overlay,
                 hide_synced,
                 hide_fullscreen,
@@ -635,6 +641,7 @@ mod tests {
             Setting::Watch,
             Setting::Panel,
             Setting::Window,
+            Setting::IconsOnly,
             Setting::Overlay,
             Setting::OverlayHideSynced,
             Setting::OverlayHideFullscreen,

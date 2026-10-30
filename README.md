@@ -118,6 +118,9 @@ one keep the status folder. The picture takes one of three colours:
   or no upstream;
 - **red**: needs you: behind, diverged, or an error.
 
+The same picture, in the same colour, sits beside the repo's name in the
+status panel and the window, whatever the folder icon style.
+
 Every fill or stroke that is `currentColor` gets that colour, and every other
 colour stays as drawn. A file that never mentions `currentColor` is drawn as
 a silhouette instead: its shape, all in that colour. For example, this
@@ -219,6 +222,7 @@ from an older version keeps working:
   "watch": true,
   "panel": true,
   "window": true,
+  "icons_only": false,
   "overlay": {
     "enabled": false,
     "corner": "bottom-right",
@@ -240,6 +244,7 @@ from an older version keeps working:
 | `watch` | true | Pick up local changes from file-system events. false checks on the interval only. |
 | `panel` | true | A tray left-click (and a badge click) opens the status panel. |
 | `window` | true | The status window is available from the menu, a double-click and the panel's ⧉ button. |
+| `icons_only` | false | **Display ▸ Icons only**: the panel and the badge show pictures, no words. Each repo is its `.gitstat/icon.svg` (or a status dot) beside its graph, the header a bar of green, amber and red repos, the badge a ring of the same colours around a dot in the most urgent one. Hover any of them for the words. |
 | `overlay.enabled` | false | Show the corner badge. |
 | `overlay.corner` | `bottom-right` | `top-left`, `top-right`, `bottom-left` or `bottom-right`. |
 | `overlay.offset_x`, `overlay.offset_y` | unset | Where the badge was dragged to: px at 100% scale from the left or right, and the top or bottom, edge of the corner. Unset is `margin`. Written by dragging, removed by picking a corner from the menu. |

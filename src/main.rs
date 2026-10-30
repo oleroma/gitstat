@@ -11,13 +11,21 @@ mod git;
 #[cfg(any(windows, test))]
 mod folder_icons;
 #[cfg(any(windows, test))]
+mod graph;
+#[cfg(any(windows, test))]
+mod history;
+#[cfg(any(windows, test))]
 mod icon;
 #[cfg(any(windows, test))]
 mod layout;
 #[cfg(any(windows, test))]
 mod monitor;
 #[cfg(any(windows, test))]
+mod repo_graph;
+#[cfg(any(windows, test))]
 mod repo_icon;
+#[cfg(any(windows, test))]
+mod repo_info;
 #[cfg(any(windows, test))]
 mod state;
 #[cfg(any(windows, test))]
@@ -31,6 +39,10 @@ mod autostart;
 mod overlay;
 #[cfg(windows)]
 mod panel;
+#[cfg(windows)]
+mod repo_marks;
+#[cfg(windows)]
+mod timeline;
 #[cfg(windows)]
 mod tray;
 #[cfg(windows)]
@@ -123,8 +135,47 @@ fn main() {
             .join();
             return;
         }
+        log_panics();
         app::run(args.config_file);
     }
+}
+
+/// Appends every panic to `%LOCALAPPDATA%\gitstat\crash.log` before the
+/// default hook runs. The tray app has no console, and a panic in a GPUI
+/// window callback can't unwind into Windows, so it ends the process with
+/// nothing to say why.
+#[cfg(windows)]
+fn log_panics() {
+    use std::io::Write;
+    /// The log is started afresh past this size.
+    const MAX_LOG: u64 = 256 * 1024;
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let dir = config::data_dir();
+        let file = dir.join("crash.log");
+        let fresh = std::fs::metadata(&file).is_ok_and(|m| m.len() > MAX_LOG);
+        let _ = std::fs::create_dir_all(&dir);
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(!fresh)
+            .truncate(fresh)
+            .open(&file);
+        if let Ok(mut log) = log {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let thread = std::thread::current();
+            let _ = writeln!(
+                log,
+                "--- {} (unix {secs}), thread {}\n{info}\n{}",
+                env!("CARGO_PKG_VERSION"),
+                thread.name().unwrap_or("unnamed"),
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+        default(info);
+    }));
 }
 
 fn run_once(args: &Args) -> i32 {
