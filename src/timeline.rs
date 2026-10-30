@@ -1203,9 +1203,14 @@ fn paint_strip(
                 Some(ink::Dash { on: 2.0, off: 2.0 }),
             );
         }
-        let mut wip = ring(center, r, 1.0, colors.unpushed, colors.bg);
-        wip.border_style = BorderStyle::Dashed;
-        window.paint_quad(wip);
+        let c = (f32::from(center.x), f32::from(center.y));
+        ink::circle(
+            window,
+            c,
+            r,
+            Some(colors.bg),
+            Some((1.0, colors.unpushed, true)),
+        );
     }
 
     for row in lo..hi {
@@ -1221,29 +1226,23 @@ fn paint_strip(
         let id = &g.commits[row].id;
         let head = g.ctx.refs.is_head(id);
         let r = grow.radius(Dot::Commit(row), DOT, DOT_HOVER);
+        let c = (f32::from(center.x), f32::from(center.y));
         if copied == Some(row) {
             // Its id just went to the clipboard.
             let ring = r + 3.0;
-            window.paint_quad(
-                outline(circle(center, ring), colors.head, BorderStyle::Solid)
-                    .corner_radii(px(ring))
-                    .border_widths(px(1.0)),
-            );
+            ink::circle(window, c, ring, None, Some((1.0, colors.head, false)));
         }
         if head {
-            let glow = r + 3.0;
-            window.paint_quad(
-                fill(circle(center, glow), colors.head.opacity(0.22)).corner_radii(px(glow)),
-            );
-            window.paint_quad(fill(circle(center, r), colors.head).corner_radii(px(r)));
+            ink::circle(window, c, r + 3.0, Some(colors.head.opacity(0.22)), None);
+            ink::circle(window, c, r, Some(colors.head), None);
         } else if node.class == Class::Unpulled || node.merge {
             // Merges and not-yet-pulled commits are rings; a merge's is smaller.
             // Filled with the background, so the noodles under it don't
             // show through the ring.
             let r = if node.merge { r - 0.5 } else { r };
-            window.paint_quad(ring(center, r, 1.5, color, colors.bg));
+            ink::circle(window, c, r, Some(colors.bg), Some((1.5, color, false)));
         } else {
-            window.paint_quad(fill(circle(center, r), color).corner_radii(px(r)));
+            ink::circle(window, c, r, Some(color), None);
         }
         if g.ctx.refs.at(id).iter().any(|r| matches!(r, Ref::Tag(_))) {
             diamond(point(center.x, center.y - px(r + 4.0)), 2.5, color, window);
@@ -1281,21 +1280,6 @@ fn stash(base: Point<Pixels>, r: f32, line: Hsla, color: Hsla, window: &mut Wind
         color,
         BorderStyle::Solid,
     ));
-}
-
-/// A ring of `width` px in `color`, filled with `bg`.
-fn ring(center: Point<Pixels>, r: f32, width: f32, color: Hsla, bg: Hsla) -> gpui::PaintQuad {
-    fill(circle(center, r), bg)
-        .border_color(color)
-        .border_widths(px(width))
-        .corner_radii(px(r))
-}
-
-fn circle(center: Point<Pixels>, r: f32) -> Bounds<Pixels> {
-    Bounds::new(
-        point(center.x - px(r), center.y - px(r)),
-        size(px(2.0 * r), px(2.0 * r)),
-    )
 }
 
 fn diamond(c: Point<Pixels>, r: f32, color: Hsla, window: &mut Window) {

@@ -169,31 +169,117 @@ fn stroke(window: &mut Window, pts: &[P], width: f32, color: Hsla, dash: Option<
         .hash(&mut h);
     let key = h.finish();
 
-    let image = KEPT.with(|kept| kept.borrow().get(&key).cloned());
-    let image = match image {
-        Some(image) => image,
-        None => {
-            let Some(image) = draw(&local, w, dash.map(|d| (d.on * s, d.off * s)), rgba, iw, ih)
-            else {
-                return;
-            };
-            KEPT.with(|kept| {
-                let mut kept = kept.borrow_mut();
-                if kept.len() >= MAX_KEPT {
-                    kept.clear();
-                }
-                kept.insert(key, image.clone());
-            });
-            image
-        }
+    let Some(image) = kept(key, || {
+        draw(&local, w, dash.map(|d| (d.on * s, d.off * s)), rgba, iw, ih)
+    }) else {
+        return;
     };
+    paint(window, (ox, oy), (iw, ih), image);
+}
+
+/// The picture kept under `key`, made with `make` the first time.
+fn kept(key: u64, make: impl FnOnce() -> Option<Arc<RenderImage>>) -> Option<Arc<RenderImage>> {
+    if let Some(image) = KEPT.with(|kept| kept.borrow().get(&key).cloned()) {
+        return Some(image);
+    }
+    let image = make()?;
+    KEPT.with(|kept| {
+        let mut kept = kept.borrow_mut();
+        if kept.len() >= MAX_KEPT {
+            kept.clear();
+        }
+        kept.insert(key, image.clone());
+    });
+    Some(image)
+}
+
+/// Paints a picture 1:1 with its corner at device px `at`.
+fn paint(window: &mut Window, at: P, (iw, ih): (u32, u32), image: Arc<RenderImage>) {
+    let s = window.scale_factor();
     let bounds = Bounds::new(
-        point(px(ox / s), px(oy / s)),
+        point(px(at.0 / s), px(at.1 / s)),
         size(px(iw as f32 / s), px(ih as f32 / s)),
     );
     window
         .paint_image(bounds, Default::default(), image, 0, false)
         .ok();
+}
+
+/// A dot of radius `r` around `center`, filled with `fill`, with a ring
+/// `(width, colour, dashed)` just inside its edge. Drawn like the bends:
+/// GPUI's own circles take their coverage at pixel centres, which leaves
+/// a dot a few px wide visibly flat-sided.
+pub fn circle(
+    window: &mut Window,
+    center: P,
+    r: f32,
+    fill: Option<Hsla>,
+    ring: Option<(f32, Hsla, bool)>,
+) {
+    let s = window.scale_factor();
+    let (cx, cy, rd) = (center.0 * s, center.1 * s, r * s);
+    if rd <= 0.0 {
+        return;
+    }
+    let (ox, oy) = ((cx - rd - 1.0).floor(), (cy - rd - 1.0).floor());
+    let (iw, ih) = (
+        ((cx + rd + 1.0).ceil() - ox) as u32,
+        ((cy + rd + 1.0).ceil() - oy) as u32,
+    );
+    let (lx, ly) = (cx - ox, cy - oy);
+    let ring = ring.map(|(w, c, dashed)| (w * s, c.to_rgb(), dashed));
+    let fill = fill.map(|c| c.to_rgb());
+    let q = |v: f32| (v * 8.0).round() as i32;
+    let byte = |c: Rgba| [c.r, c.g, c.b, c.a].map(|v| (v * 255.0).round() as u8);
+    let mut h = DefaultHasher::new();
+    ("circle", q(lx), q(ly), q(rd), iw, ih).hash(&mut h);
+    fill.map(byte).hash(&mut h);
+    ring.map(|(w, c, d)| (q(w), byte(c), d)).hash(&mut h);
+    let Some(image) = kept(h.finish(), || {
+        let mut pixmap = tiny_skia::Pixmap::new(iw, ih)?;
+        let solid = |c: Rgba| {
+            let mut paint = tiny_skia::Paint::default();
+            paint.set_color(tiny_skia::Color::from_rgba(c.r, c.g, c.b, c.a)?);
+            paint.anti_alias = true;
+            Some(paint)
+        };
+        let id = tiny_skia::Transform::identity();
+        if let Some(c) = fill {
+            let path = tiny_skia::PathBuilder::from_circle(lx, ly, rd)?;
+            pixmap.fill_path(&path, &solid(c)?, tiny_skia::FillRule::Winding, id, None);
+        }
+        if let Some((w, c, dashed)) = ring {
+            let rr = (rd - w / 2.0).max(0.1);
+            let path = tiny_skia::PathBuilder::from_circle(lx, ly, rr)?;
+            // Eight dashes around, whatever the size.
+            let arc = std::f32::consts::TAU * rr / 16.0;
+            let stroke = tiny_skia::Stroke {
+                width: w,
+                dash: if dashed {
+                    tiny_skia::StrokeDash::new(vec![arc, arc], 0.0)
+                } else {
+                    None
+                },
+                ..Default::default()
+            };
+            pixmap.stroke_path(&path, &solid(c)?, &stroke, id, None);
+        }
+        to_image(pixmap)
+    }) else {
+        return;
+    };
+    paint(window, (ox, oy), (iw, ih), image);
+}
+
+/// A tiny-skia picture as the straight-alpha BGRA GPUI takes.
+fn to_image(pixmap: tiny_skia::Pixmap) -> Option<Arc<RenderImage>> {
+    let (iw, ih) = (pixmap.width(), pixmap.height());
+    let mut data = pixmap.take_demultiplied();
+    for px in data.as_chunks_mut::<4>().0 {
+        px.swap(0, 2);
+    }
+    let buffer = image::RgbaImage::from_raw(iw, ih, data)?;
+    Some(Arc::new(RenderImage::new([image::Frame::new(buffer)])))
 }
 
 /// The stroke as a straight-alpha BGRA picture, `iw` by `ih` device px.
@@ -233,10 +319,21 @@ fn draw(
         tiny_skia::Transform::identity(),
         None,
     );
-    let mut data = pixmap.take_demultiplied();
-    for px in data.as_chunks_mut::<4>().0 {
-        px.swap(0, 2);
+    to_image(pixmap)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runs_land_on_pixel_edges() {
+        // 2 device px wide: centred between pixels.
+        assert_eq!(pos(1.0, 14.3, 1.75), 14.0);
+        // 3 device px wide at 150%: centred on a pixel's middle.
+        let x = pos(1.5, 14.3, 1.75) * 1.5;
+        assert_eq!(x.fract(), 0.5);
+        // At least one device px, however thin.
+        assert_eq!(device_width(0.2, 1.0), 1.0);
     }
-    let buffer = image::RgbaImage::from_raw(iw, ih, data)?;
-    Some(Arc::new(RenderImage::new([image::Frame::new(buffer)])))
 }

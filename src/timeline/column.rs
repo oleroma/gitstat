@@ -7,7 +7,7 @@
 //! same commit. The column's top rests on the newest row rather than on
 //! HEAD, so commits not yet pulled stay in sight above it.
 
-use super::{Colors, Dot, Grow, STEP, Timelines, circle, ink, ring};
+use super::{Colors, Dot, Grow, STEP, Timelines, ink};
 use crate::git::RepoStatus;
 use crate::graph::{self, Class, Seg};
 use crate::history::{self, Ref};
@@ -15,10 +15,9 @@ use crate::repo_graph::RepoGraph;
 use crate::repo_info::Checkout;
 use crate::view::Palette;
 use gpui::{
-    AnyElement, App, BorderStyle, Bounds, ClipboardItem, ContentMask, Context, DispatchPhase,
-    Entity, HitboxBehavior, Hsla, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ParentElement, Pixels, Point, ScrollWheelEvent, Styled, Window, canvas, div, fill, outline,
-    point, prelude::*, px,
+    AnyElement, App, Bounds, ClipboardItem, ContentMask, Context, DispatchPhase, Entity,
+    HitboxBehavior, Hsla, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement,
+    Pixels, Point, ScrollWheelEvent, Styled, Window, canvas, div, point, prelude::*, px,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -690,9 +689,14 @@ fn paint_column(
                 Some(ink::Dash { on: 2.0, off: 2.0 }),
             );
         }
-        let mut wip = ring(center, r, 1.0, colors.unpushed, colors.bg);
-        wip.border_style = BorderStyle::Dashed;
-        window.paint_quad(wip);
+        let c = (f32::from(center.x), f32::from(center.y));
+        ink::circle(
+            window,
+            c,
+            r,
+            Some(colors.bg),
+            Some((1.0, colors.unpushed, true)),
+        );
     }
 
     for row in lo..hi {
@@ -707,25 +711,19 @@ fn paint_column(
         };
         let head = g.ctx.refs.is_head(&g.commits[row].id);
         let r = grow.radius(Dot::Commit(row), DOT, DOT_HOVER);
+        let c = (f32::from(center.x), f32::from(center.y));
         if copied == Some(row) {
             let ring = r + 3.0;
-            window.paint_quad(
-                outline(circle(center, ring), colors.head, BorderStyle::Solid)
-                    .corner_radii(px(ring))
-                    .border_widths(px(1.0)),
-            );
+            ink::circle(window, c, ring, None, Some((1.0, colors.head, false)));
         }
         if head {
-            let glow = r + 3.5;
-            window.paint_quad(
-                fill(circle(center, glow), colors.head.opacity(0.22)).corner_radii(px(glow)),
-            );
-            window.paint_quad(fill(circle(center, r), colors.head).corner_radii(px(r)));
+            ink::circle(window, c, r + 3.5, Some(colors.head.opacity(0.22)), None);
+            ink::circle(window, c, r, Some(colors.head), None);
         } else if node.class == Class::Unpulled || node.merge {
             let r = if node.merge { r - 0.5 } else { r };
-            window.paint_quad(ring(center, r, 1.75, color, colors.bg));
+            ink::circle(window, c, r, Some(colors.bg), Some((1.75, color, false)));
         } else {
-            window.paint_quad(fill(circle(center, r), color).corner_radii(px(r)));
+            ink::circle(window, c, r, Some(color), None);
         }
     }
     dots
