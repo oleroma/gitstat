@@ -2212,6 +2212,7 @@ dependencies = [
  "ab_glyph",
  "futures",
  "gpui",
+ "image",
  "notify",
  "raw-window-handle",
  "resvg 0.48.1",

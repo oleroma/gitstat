@@ -28,6 +28,8 @@ pub struct Ui {
     pub state: Entity<AppState>,
     /// Every repo's loaded history, for the timeline strips.
     pub timelines: Entity<Timelines>,
+    /// Every repo's own icon, drawn for the windows.
+    pub marks: Entity<crate::repo_marks::RepoMarks>,
     /// The app's one input channel; the overlay posts its clicks here.
     pub input: UnboundedSender<Input>,
     /// Starts a fetch sweep now (the refresh buttons).
@@ -176,6 +178,10 @@ impl StatusView {
         if let Some(t) = &timelines {
             cx.observe(t, |_, _, cx| cx.notify()).detach();
         }
+        // Repo icons land as they are drawn.
+        if let Some(marks) = cx.try_global::<Ui>().map(|ui| ui.marks.clone()) {
+            cx.observe(&marks, |_, _, cx| cx.notify()).detach();
+        }
         cx.observe_window_appearance(window, |_, _, cx| cx.notify())
             .detach();
         if mode == Mode::Panel {
@@ -236,7 +242,7 @@ pub(crate) fn status_color(s: &RepoStatus, p: &Palette) -> Hsla {
 }
 
 /// One repo; a click opens its folder (and closes the panel).
-fn repo_row(index: usize, s: &RepoStatus, p: &Palette, mode: Mode) -> AnyElement {
+fn repo_row(index: usize, s: &RepoStatus, p: &Palette, mode: Mode, cx: &App) -> AnyElement {
     let color = status_color(s, p);
     let path = s.path.clone();
     let (py, gap) = match mode {
@@ -258,7 +264,7 @@ fn repo_row(index: usize, s: &RepoStatus, p: &Palette, mode: Mode) -> AnyElement
                 panel::dismiss(window, cx);
             }
         })
-        .child(div().size_2().rounded_full().bg(color).flex_none())
+        .child(crate::repo_marks::global_mark(s, 16.0, color, cx))
         .child(
             div()
                 .flex_1()
@@ -310,10 +316,12 @@ impl Render for StatusView {
         );
         let mode = self.mode;
         let timelines = self.timelines.clone();
+        // Pictures only: the panel's words move into tooltips.
+        let icons_only = mode == Mode::Panel && self.state.read(cx).config.icons_only;
         // A repo row: a timeline strip in the panel, a plain row elsewhere.
         let row = |i: usize, s: &RepoStatus, cx: &App| match (&timelines, mode) {
-            (Some(t), Mode::Panel) => Timelines::strip(t, i, s, &p, dark, cx),
-            _ => repo_row(i, s, &p, mode),
+            (Some(t), Mode::Panel) => Timelines::strip(t, i, s, &p, dark, icons_only, cx),
+            _ => repo_row(i, s, &p, mode, cx),
         };
         // A strip's label asked big mode for its repo's column.
         let focus = match (&self.timelines, mode) {
@@ -363,16 +371,37 @@ impl Render for StatusView {
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(headline_color)
                     .truncate()
-                    .child(headline),
+                    .child(headline.clone()),
             )
             .child(
                 div()
                     .text_xs()
                     .text_color(p.muted)
                     .truncate()
-                    .child(subline),
+                    .child(subline.clone()),
             );
 
+        let titles = if icons_only {
+            let mut lines = vec![
+                (headline.to_string(), headline_color),
+                (subline.clone(), p.muted),
+                (mode_text(&state.mode), p.muted),
+            ];
+            if let Some(c) = &state.capped {
+                lines.push((format!("Repo list incomplete: {c}"), p.amber));
+            }
+            div()
+                .id("summary")
+                .flex()
+                .flex_1()
+                .items_center()
+                .h(px(28.))
+                .tooltip(tip(lines, &p))
+                .child(summary_bar(&state.statuses, sweeping, &p))
+                .into_any_element()
+        } else {
+            titles.into_any_element()
+        };
         let header = div()
             .flex()
             .items_center()
@@ -429,7 +458,7 @@ impl Render for StatusView {
             // Without timelines (never, once the app is up) a plain list.
             Mode::Window if timelines.is_none() => {
                 for (i, s) in state.statuses.iter().enumerate() {
-                    rows.push(repo_row(i, s, &p, mode));
+                    rows.push(repo_row(i, s, &p, mode, cx));
                 }
             }
             Mode::Window => {}
@@ -442,6 +471,23 @@ impl Render for StatusView {
                 }
                 if !good.is_empty() {
                     let open = self.show_synced;
+                    let label =
+                        if icons_only {
+                            // The synced repos' icons in a row, while collapsed.
+                            div()
+                                .flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap_1()
+                                .overflow_hidden()
+                                .when(!open, |d| {
+                                    d.children(good.iter().map(|s| {
+                                        crate::repo_marks::global_mark(s, 16.0, p.green, cx)
+                                    }))
+                                })
+                        } else {
+                            div().flex_1().child(format!("✓ {} synced", good.len()))
+                        };
                     rows.push(
                         div()
                             .id("synced")
@@ -454,7 +500,13 @@ impl Render for StatusView {
                             .hover(|style| style.bg(p.hover))
                             .text_sm()
                             .text_color(p.green)
-                            .child(div().flex_1().child(format!("✓ {} synced", good.len())))
+                            .when(icons_only, |d| {
+                                d.tooltip(tip(
+                                    vec![(format!("{} synced", good.len()), p.green)],
+                                    &p,
+                                ))
+                            })
+                            .child(label)
                             .child(div().flex_none().text_color(p.muted).child(if open {
                                 "▾"
                             } else {
@@ -617,12 +669,88 @@ impl Render for StatusView {
                 Some(table) if !empty => d.child(table),
                 _ => d.child(list),
             })
-            .child(footer)
+            .when(!icons_only, |d| d.child(footer))
             .children(
                 self.timelines
                     .as_ref()
                     .and_then(|t| t.read(cx).hover_card(&p, dark, cx)),
             )
+    }
+}
+
+/// A bar of the repos' tones: green synced, amber local work, red needs
+/// action, each as wide as its share; dimmed while a check runs.
+fn summary_bar(statuses: &[RepoStatus], checking: bool, p: &Palette) -> gpui::Div {
+    let mut counts = [0usize; 3];
+    for s in statuses {
+        let i = match crate::icon::FolderState::of(s).tone() {
+            crate::icon::Tone::Synced => 0,
+            crate::icon::Tone::Local => 1,
+            crate::icon::Tone::Attention => 2,
+        };
+        counts[i] += 1;
+    }
+    let total = statuses.len().max(1) as f32;
+    let bar = div()
+        .flex()
+        .flex_1()
+        .h(px(6.))
+        .rounded_full()
+        .overflow_hidden()
+        .bg(p.hover)
+        .when(checking, |b| b.opacity(0.6));
+    [
+        (counts[0], p.green),
+        (counts[1], p.amber),
+        (counts[2], p.red),
+    ]
+    .into_iter()
+    .filter(|&(n, _)| n > 0)
+    .fold(bar, |bar, (n, color)| {
+        bar.child(div().h_full().w(gpui::relative(n as f32 / total)).bg(color))
+    })
+}
+
+/// A tooltip of coloured lines.
+struct Tip {
+    lines: Vec<(SharedString, Hsla)>,
+    bg: Hsla,
+    border: Hsla,
+}
+
+impl Render for Tip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .max_w(px(320.))
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(self.border)
+            .bg(self.bg)
+            .shadow_md()
+            .text_xs()
+            .children(
+                self.lines
+                    .iter()
+                    .filter(|(text, _)| !text.is_empty())
+                    .map(|(text, color)| div().text_color(*color).child(text.clone())),
+            )
+    }
+}
+
+/// A tooltip builder showing `lines`, for icons-only mode.
+pub(crate) fn tip(
+    lines: Vec<(String, Hsla)>,
+    p: &Palette,
+) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView + 'static {
+    let lines: Vec<(SharedString, Hsla)> = lines.into_iter().map(|(t, c)| (t.into(), c)).collect();
+    let (bg, border) = (p.bg, p.border);
+    move |_, cx| {
+        let lines = lines.clone();
+        cx.new(|_| Tip { lines, bg, border }).into()
     }
 }
 

@@ -17,8 +17,8 @@ use crate::view::Palette;
 use gpui::{
     AnyElement, App, BorderStyle, Bounds, ClipboardItem, ContentMask, Context, DispatchPhase,
     Entity, HitboxBehavior, Hsla, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ParentElement, Pixels, Point, ScrollWheelEvent, Styled, Window, canvas, div, fill,
-    outline, point, prelude::*, px,
+    ParentElement, Pixels, Point, ScrollWheelEvent, Styled, Window, canvas, div, fill, outline,
+    point, prelude::*, px,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -157,7 +157,15 @@ impl Timelines {
             .map(|g| Geometry::new(g, dirty, top))
             .unwrap_or_default();
 
-        let header = header(index, status, graph.as_deref(), error.as_deref(), p, &path);
+        let header = header(
+            index,
+            status,
+            graph.as_deref(),
+            error.as_deref(),
+            p,
+            &path,
+            cx,
+        );
 
         // The rows' text, for the rows that fit the window; the body clips
         // the rest.
@@ -427,6 +435,7 @@ fn header(
     error: Option<&str>,
     p: &Palette,
     path: &Path,
+    cx: &App,
 ) -> AnyElement {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -496,10 +505,23 @@ fn header(
         .on_click(move |_, _, cx| cx.open_with_system(&open))
         .child(
             div()
-                .truncate()
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(p.text)
-                .child(status.name.clone()),
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(crate::repo_marks::global_mark(
+                    status,
+                    20.0,
+                    crate::view::status_color(status, p),
+                    cx,
+                ))
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(p.text)
+                        .child(status.name.clone()),
+                ),
         )
         .child(
             div()

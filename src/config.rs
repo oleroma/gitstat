@@ -82,6 +82,9 @@ pub struct Config {
     pub panel: bool,
     /// The normal status window is available.
     pub window: bool,
+    /// The panel and the badge show pictures only: repo icons, the graph
+    /// and coloured marks, their words in tooltips.
+    pub icons_only: bool,
     pub overlay: OverlayConfig,
     /// desktop.ini status icons on the repo folders.
     pub folder_icons: bool,
@@ -98,6 +101,7 @@ impl Default for Config {
             watch: true,
             panel: true,
             window: true,
+            icons_only: false,
             overlay: OverlayConfig::default(),
             folder_icons: false,
             folder_icon_mode: FolderIconMode::default(),

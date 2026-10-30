@@ -186,12 +186,15 @@ pub struct Renderer {
     timeout: Duration,
 }
 
+/// Straight RGBA pictures, by size in px.
+pub type Images = Vec<(u32, Vec<u8>)>;
+
 /// A drawing given up on, by repo.
 struct Late {
     /// Its file and tone.
     key: u64,
     /// `None` while it is still going.
-    result: Option<Result<Vec<u8>, String>>,
+    result: Option<Result<Images, String>>,
 }
 
 impl Default for Renderer {
@@ -217,7 +220,20 @@ impl Renderer {
     /// `currentColor` is drawn as a silhouette in that colour instead: its
     /// shape and transparency, none of its colours.
     pub fn render(&self, repo: &str, svg: &[u8], tone: Tone) -> Result<Vec<u8>, Error> {
-        let key = fnv(&[svg, tone.name().as_bytes()]);
+        self.render_rgba(repo, svg, tone, &FOLDER_SIZES)
+            .map(|images| icon::encode_ico(&images))
+    }
+
+    /// Like [`Renderer::render`], as straight RGBA at each of `sizes` px,
+    /// for the app's own windows.
+    pub fn render_rgba(
+        &self,
+        repo: &str,
+        svg: &[u8],
+        tone: Tone,
+        sizes: &[u32],
+    ) -> Result<Images, Error> {
+        let key = late_key(svg, tone, sizes);
         {
             let mut late = lock(&self.late);
             match late.remove(repo) {
@@ -244,14 +260,13 @@ impl Renderer {
         let svg = svg.to_vec();
         let slots = Arc::clone(&self.late);
         let slot = repo.to_string();
+        let sizes = sizes.to_vec();
         std::thread::Builder::new()
             .name("repo-icon".into())
             .stack_size(RENDER_STACK)
             .spawn(move || {
-                let result = std::panic::catch_unwind(|| {
-                    render_all(&svg, tone.color()).map(|images| icon::encode_ico(&images))
-                })
-                .unwrap_or_else(|_| Err(format!("{DIR}/{FILE} couldn't be drawn")));
+                let result = std::panic::catch_unwind(|| render_all(&svg, tone.color(), &sizes))
+                    .unwrap_or_else(|_| Err(format!("{DIR}/{FILE} couldn't be drawn")));
                 // Under the lock, so the caller either receives it or has
                 // left the slot for it.
                 let mut late = lock(&slots);
@@ -286,11 +301,17 @@ impl Renderer {
     }
 }
 
+/// What a drawing given up on drew: its file, tone and sizes.
+fn late_key(svg: &[u8], tone: Tone, sizes: &[u32]) -> u64 {
+    let sizes: Vec<u8> = sizes.iter().flat_map(|s| s.to_le_bytes()).collect();
+    fnv(&[svg, tone.name().as_bytes(), &sizes])
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn render_all(svg: &[u8], color: [u8; 3]) -> Result<Vec<(u32, Vec<u8>)>, String> {
+fn render_all(svg: &[u8], color: [u8; 3], sizes: &[u32]) -> Result<Images, String> {
     if svg.len() as u64 > MAX_BYTES {
         return Err(format!("{DIR}/{FILE} is over {} KiB", MAX_BYTES / 1024));
     }
@@ -316,7 +337,7 @@ fn render_all(svg: &[u8], color: [u8; 3]) -> Result<Vec<(u32, Vec<u8>)>, String>
     check_expansion(&xml)?;
     let tree = usvg::Tree::from_xmltree(&xml, &options(color)).map_err(|e| unusable(&e))?;
     check_complexity(&tree)?;
-    let images = FOLDER_SIZES
+    let images = sizes
         .iter()
         .map(|&size| {
             let rgba = render_at(&tree, size)?;
@@ -817,7 +838,7 @@ mod tests {
     }
 
     fn draw(svg: &str, tone: Tone, size: u32) -> Vec<u8> {
-        let all = render_all(svg.as_bytes(), tone.color()).unwrap();
+        let all = render_all(svg.as_bytes(), tone.color(), &FOLDER_SIZES).unwrap();
         all.into_iter().find(|(s, _)| *s == size).unwrap().1
     }
 
@@ -1374,8 +1395,9 @@ mod tests {
         let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 8 8">
             <rect width="8" height="8" fill="currentColor"/></svg>"#;
         let expected = render_ico(svg.as_bytes(), Tone::Synced).unwrap();
-        let key = fnv(&[svg.as_bytes(), Tone::Synced.name().as_bytes()]);
+        let key = late_key(svg.as_bytes(), Tone::Synced, &FOLDER_SIZES);
         let renderer = Renderer::default();
+        let late = || vec![(16, b"late".to_vec())];
         let going = |repo: &str| {
             let late = Late { key, result: None };
             lock(&renderer.late).insert(repo.into(), late);
@@ -1404,16 +1426,16 @@ mod tests {
         );
         // Once one has finished, its result answers the same file and tone,
         // once; another file is drawn afresh.
-        lock(&renderer.late).get_mut("a").unwrap().result = Some(Ok(b"late".to_vec()));
+        lock(&renderer.late).get_mut("a").unwrap().result = Some(Ok(late()));
         assert_eq!(
             renderer.render("a", svg.as_bytes(), Tone::Synced),
-            Ok(b"late".to_vec())
+            Ok(icon::encode_ico(&late()))
         );
         assert_eq!(
             renderer.render("a", svg.as_bytes(), Tone::Synced),
             Ok(expected.clone())
         );
-        lock(&renderer.late).get_mut("b").unwrap().result = Some(Ok(b"late".to_vec()));
+        lock(&renderer.late).get_mut("b").unwrap().result = Some(Ok(late()));
         assert_eq!(
             renderer
                 .render("b", svg.as_bytes(), Tone::Local)

@@ -55,6 +55,19 @@ pub fn line(window: &mut Window, a: P, b: P, width: f32, color: Hsla, dash: Opti
     polyline(window, &[a, b], width, color, dash);
 }
 
+/// An arc of the circle of radius `r` around `center`, from angle `start`
+/// to `end` in radians, clockwise from the top.
+pub fn arc(window: &mut Window, center: P, r: f32, start: f32, end: f32, width: f32, color: Hsla) {
+    let n = ((end - start).abs() * r / 2.0).ceil().max(2.0) as usize;
+    let pts: Vec<P> = (0..=n)
+        .map(|i| {
+            let a = start + (end - start) * i as f32 / n as f32;
+            (center.0 + r * a.sin(), center.1 - r * a.cos())
+        })
+        .collect();
+    polyline(window, &pts, width, color, None);
+}
+
 fn bezier([p0, p1, p2, p3]: [P; 4], t: f32) -> P {
     let u = 1.0 - t;
     let (a, b, c, d) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
@@ -70,7 +83,10 @@ fn polyline(window: &mut Window, pts: &[P], width: f32, color: Hsla, dash: Optio
     for at in stamps(pts, r, dash) {
         window.paint_quad(
             fill(
-                Bounds::new(point(px(at.0 - r), px(at.1 - r)), size(px(width), px(width))),
+                Bounds::new(
+                    point(px(at.0 - r), px(at.1 - r)),
+                    size(px(width), px(width)),
+                ),
                 color,
             )
             .corner_radii(px(r)),

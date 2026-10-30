@@ -10,7 +10,7 @@
 //! mouse against the dots it painted.
 
 mod column;
-mod ink;
+pub(crate) mod ink;
 
 pub use column::{COLUMN_WIDTH, column_index};
 
@@ -21,11 +21,11 @@ use crate::repo_graph::{More, RepoGraph};
 use crate::state::AppState;
 use crate::view::Palette;
 use gpui::{
-    Animation, AnimationExt, AnyElement, App, AppContext, BorderStyle, Bounds, ClipboardItem, ContentMask, Context, Corner,
-    DispatchPhase, Entity, HitboxBehavior, Hsla, IntoElement, MouseButton, MouseDownEvent,
-    MouseMoveEvent, ParentElement, PathBuilder, Pixels, Point, ScrollWheelEvent, Styled, Window,
-    anchored, canvas, deferred, div, fill, linear_color_stop, linear_gradient, outline, point,
-    prelude::*, px, rgb, size,
+    Animation, AnimationExt, AnyElement, App, AppContext, BorderStyle, Bounds, ClipboardItem,
+    ContentMask, Context, Corner, DispatchPhase, Entity, HitboxBehavior, Hsla, IntoElement,
+    MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, PathBuilder, Pixels, Point,
+    ScrollWheelEvent, Styled, Window, anchored, canvas, deferred, div, fill, linear_color_stop,
+    linear_gradient, outline, point, prelude::*, px, rgb, size,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -36,6 +36,11 @@ use std::time::{Duration, Instant};
 pub const STRIP_HEIGHT: f32 = 36.0;
 /// The label column at the strip's right.
 pub const LABEL_WIDTH: f32 = 168.0;
+/// The label column in icons-only mode: the repo's icon alone.
+pub const ICON_LABEL_WIDTH: f32 = 40.0;
+/// A repo icon beside its name, and alone in icons-only mode; logical px.
+const MARK: f32 = 16.0;
+const ICON_MARK: f32 = 22.0;
 /// Px between commits along a strip.
 const STEP: f32 = 14.0;
 /// Px between lanes across a strip.
@@ -579,6 +584,7 @@ impl Timelines {
         status: &RepoStatus,
         p: &Palette,
         dark: bool,
+        icons_only: bool,
         cx: &App,
     ) -> AnyElement {
         let t = this.read(cx);
@@ -700,6 +706,97 @@ impl Timelines {
         let this_for_label = this.clone();
         let wheel_path = path.clone();
         let open_path = path.clone();
+        let status_text = match &error {
+            Some(_) if status.error.is_none() => "history unreadable".to_string(),
+            _ => status.label(),
+        };
+        let label = div()
+            .id(("label", index))
+            .flex()
+            .items_center()
+            .flex_none()
+            .h_full()
+            .cursor_pointer()
+            .hover(|s| s.bg(p.hover))
+            // Big mode, scrolled to this repo's column; the folder when the
+            // window is turned off.
+            .on_click(move |_, window, cx| {
+                crate::panel::dismiss(window, cx);
+                let big = this_for_label.read(cx).state.read(cx).config.window;
+                if big {
+                    this_for_label.update(cx, |t, _| t.focus(&open_path));
+                    crate::view::show_window(cx);
+                } else {
+                    cx.open_with_system(&open_path);
+                }
+            });
+        let label = if icons_only {
+            // The icon alone; its words in a tooltip.
+            let lines = vec![
+                (status.name.clone(), p.text),
+                (checkout, p.muted),
+                (status_text, status_color),
+            ];
+            label
+                .justify_center()
+                .w(px(ICON_LABEL_WIDTH))
+                .tooltip(crate::view::tip(lines, p))
+                .child(crate::repo_marks::global_mark(
+                    status,
+                    ICON_MARK,
+                    status_color,
+                    cx,
+                ))
+        } else {
+            label
+                .gap_2()
+                .w(px(LABEL_WIDTH))
+                .pl_2()
+                .pr_4()
+                .child(crate::repo_marks::global_mark(
+                    status,
+                    MARK,
+                    status_color,
+                    cx,
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .justify_center()
+                        .flex_1()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .truncate()
+                                .text_sm()
+                                .text_color(p.text)
+                                .child(status.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_1()
+                                .text_xs()
+                                .child(
+                                    div()
+                                        .flex_shrink()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_color(p.muted)
+                                        .child(checkout),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .max_w(px(LABEL_WIDTH * 0.6))
+                                        .truncate()
+                                        .text_color(status_color)
+                                        .child(status_text),
+                                ),
+                        ),
+                )
+        };
         div()
             .id(("strip", index))
             .flex()
@@ -731,66 +828,7 @@ impl Timelines {
                 entity.update(cx, |t, cx| t.scroll(&wheel_path, dx, all, cx));
             })
             .child(painter)
-            .child(
-                div()
-                    .id(("label", index))
-                    .flex()
-                    .flex_col()
-                    .justify_center()
-                    .flex_none()
-                    .w(px(LABEL_WIDTH))
-                    .h_full()
-                    .pl_2()
-                    .pr_4()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(p.hover))
-                    // Big mode, scrolled to this repo's column; the folder
-                    // when the window is turned off.
-                    .on_click(move |_, window, cx| {
-                        crate::panel::dismiss(window, cx);
-                        let big = this_for_label.read(cx).state.read(cx).config.window;
-                        if big {
-                            this_for_label.update(cx, |t, _| t.focus(&open_path));
-                            crate::view::show_window(cx);
-                        } else {
-                            cx.open_with_system(&open_path);
-                        }
-                    })
-                    .child(
-                        div()
-                            .truncate()
-                            .text_sm()
-                            .text_color(p.text)
-                            .child(status.name.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap_1()
-                            .text_xs()
-                            .child(
-                                div()
-                                    .flex_shrink()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_color(p.muted)
-                                    .child(checkout),
-                            )
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .max_w(px(LABEL_WIDTH * 0.6))
-                                    .truncate()
-                                    .text_color(status_color)
-                                    .child(match &error {
-                                        Some(_) if status.error.is_none() => {
-                                            "history unreadable".to_string()
-                                        }
-                                        _ => status.label(),
-                                    }),
-                            ),
-                    ),
-            )
+            .child(label)
             .into_any_element()
     }
 
@@ -1205,7 +1243,13 @@ fn paint_strip(
             diamond(point(center.x, center.y - px(r + 4.0)), 2.5, color, window);
         }
         if g.stashes_at(row).next().is_some() {
-            stash(center, r, ink::over(colors.stash.opacity(0.8), colors.bg), colors.stash, window);
+            stash(
+                center,
+                r,
+                ink::over(colors.stash.opacity(0.8), colors.bg),
+                colors.stash,
+                window,
+            );
         }
     }
     dots
