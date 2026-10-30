@@ -7,7 +7,7 @@
 //! same commit. The column's top rests on the newest row rather than on
 //! HEAD, so commits not yet pulled stay in sight above it.
 
-use super::{Colors, Dot, STEP, Timelines, circle};
+use super::{Colors, Dot, Grow, STEP, Timelines, ink};
 use crate::git::RepoStatus;
 use crate::graph::{self, Class, Seg};
 use crate::history::{self, Ref};
@@ -15,13 +15,13 @@ use crate::repo_graph::RepoGraph;
 use crate::repo_info::Checkout;
 use crate::view::Palette;
 use gpui::{
-    AnyElement, App, BorderStyle, Bounds, ClipboardItem, ContentMask, Context, DispatchPhase,
-    Entity, HitboxBehavior, Hsla, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ParentElement, PathBuilder, Pixels, Point, ScrollWheelEvent, Styled, Window, canvas, div, fill,
-    outline, point, prelude::*, px, size,
+    AnyElement, App, Bounds, ClipboardItem, ContentMask, Context, DispatchPhase, Entity,
+    HitboxBehavior, Hsla, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement,
+    Pixels, Point, ScrollWheelEvent, Styled, Window, canvas, div, point, prelude::*, px,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// A column's width.
 pub const COLUMN_WIDTH: f32 = 380.0;
@@ -50,14 +50,16 @@ impl Timelines {
         self.focus = Some(path.to_path_buf());
     }
 
-    /// The first row a column shows, fractional while between rows. The
-    /// column rests on the newest row; HEAD's row is where the strip rests.
-    fn column_top(&self, path: &Path) -> f32 {
+    /// The first row a column shows at `now`, fractional while between rows
+    /// or gliding, and whether it is gliding. The column rests on the newest
+    /// row; HEAD's row is where the strip rests.
+    fn column_top(&self, path: &Path, now: Instant) -> (f32, bool) {
         let Some(slot) = self.slots.get(path) else {
-            return 0.0;
+            return (0.0, false);
         };
         let home = slot.graph.as_ref().map_or(0.0, |g| g.home());
-        (slot.scroll / STEP - home).max(0.0)
+        let (scroll, gliding) = slot.shown_scroll(now);
+        ((scroll / STEP - home).max(0.0), gliding)
     }
 
     /// Scrolls a column `rows` rows down (negative: up), loading more
@@ -71,8 +73,15 @@ impl Timelines {
         let n = g.commits.len() as f32;
         let home = g.home() * STEP;
         let max = ((n - 1.0) * STEP).max(home);
-        slot.scroll = (slot.scroll.max(home) + rows * STEP).clamp(home, max);
-        let near_end = !g.end && n * STEP - slot.scroll < super::PRELOAD;
+        let to = (slot.scroll.max(home) + rows * STEP).clamp(home, max);
+        let near_end = !g.end && n * STEP - to < super::PRELOAD;
+        // Gliding up from above home would sweep through rows the column
+        // never shows.
+        if slot.scroll < home {
+            slot.scroll = home;
+            slot.glide = None;
+        }
+        slot.glide_to(to, Instant::now());
         if near_end {
             self.load_more(path, cx);
         }
@@ -131,13 +140,11 @@ impl Timelines {
         let slot = t.slots.get(&path);
         let graph = slot.and_then(|s| s.graph.clone());
         let error = slot.and_then(|s| s.error.clone());
-        let top = t.column_top(&path);
+        let now = Instant::now();
+        let (top, gliding) = t.column_top(&path, now);
         let dirty = status.dirty;
-        let hovered = t
-            .hover
-            .as_ref()
-            .filter(|h| h.repo == path && h.dirty == dirty)
-            .map(|h| h.dot);
+        let grow = t.grow(&path, dirty, now);
+        let moving = gliding || grow.going();
         let copied = t
             .copied
             .as_ref()
@@ -149,7 +156,15 @@ impl Timelines {
             .map(|g| Geometry::new(g, dirty, top))
             .unwrap_or_default();
 
-        let header = header(index, status, graph.as_deref(), error.as_deref(), p, &path);
+        let header = header(
+            index,
+            status,
+            graph.as_deref(),
+            error.as_deref(),
+            p,
+            &path,
+            cx,
+        );
 
         // The rows' text, for the rows that fit the window; the body clips
         // the rest.
@@ -189,8 +204,11 @@ impl Timelines {
             },
             move |bounds, hitbox, window, _cx| {
                 let Some(g) = graph else { return };
+                if moving {
+                    window.request_animation_frame();
+                }
                 let dots = window.with_content_mask(Some(ContentMask { bounds }), |window| {
-                    paint_column(bounds, &g, &geo, hovered, copied, &colors, window)
+                    paint_column(bounds, &g, &geo, grow, copied, &colors, window)
                 });
                 let dots = Arc::new(dots);
                 let dots2 = dots.clone();
@@ -416,6 +434,7 @@ fn header(
     error: Option<&str>,
     p: &Palette,
     path: &Path,
+    cx: &App,
 ) -> AnyElement {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -485,10 +504,23 @@ fn header(
         .on_click(move |_, _, cx| cx.open_with_system(&open))
         .child(
             div()
-                .truncate()
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(p.text)
-                .child(status.name.clone()),
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(crate::repo_marks::global_mark(
+                    status,
+                    20.0,
+                    crate::view::status_color(status, p),
+                    cx,
+                ))
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(p.text)
+                        .child(status.name.clone()),
+                ),
         )
         .child(
             div()
@@ -577,12 +609,13 @@ fn paint_column(
     bounds: Bounds<Pixels>,
     g: &RepoGraph,
     geo: &Geometry,
-    hovered: Option<Dot>,
+    grow: Grow,
     copied: Option<usize>,
     colors: &Colors,
     window: &mut Window,
 ) -> Vec<(Point<Pixels>, Dot)> {
     let rows = g.layout.nodes.len();
+    let s = window.scale_factor();
     let (ox, oy) = (f32::from(bounds.left()), f32::from(bounds.top()));
     let at = |row: f32, lane: f32| {
         // Fractional rows only come from segment ends, which are whole.
@@ -591,7 +624,12 @@ fn paint_column(
         } else {
             geo.pos(row as usize)
         };
-        point(px(ox + geo.x(lane.round() as usize)), px(oy + geo.y(pos)))
+        // On the device pixel grid, so runs are crisp and bends meet them
+        // exactly.
+        point(
+            px(ink::pos(s, ox + geo.x(lane.round() as usize), STROKE)),
+            px(ink::pos(s, oy + geo.y(pos), STROKE)),
+        )
     };
     let folded = |lane: f32| lane.round() as usize >= LANES;
     let span = geo.rows_in(bounds.size.height);
@@ -612,63 +650,53 @@ fn paint_column(
                 Seg::Straight(a, b) => (a, b, false),
                 Seg::Curve(a, b) => (a, b, true),
             };
-            let color = if folded(a.lane) || folded(b.lane) {
-                base.opacity(0.35)
+            let alpha = if folded(a.lane) || folded(b.lane) {
+                0.35
             } else {
-                base.opacity(0.85)
+                0.85
             };
+            let color = ink::over(base.opacity(alpha), colors.bg);
             let (pa, pb) = (at(a.row, a.lane), at(b.row, b.lane));
+            let (pa, pb) = (
+                (f32::from(pa.x), f32::from(pa.y)),
+                (f32::from(pb.x), f32::from(pb.y)),
+            );
             if curve {
-                let [_, c1, c2, _] = graph::noodle(
-                    (f32::from(pa.x), f32::from(pa.y)),
-                    (f32::from(pb.x), f32::from(pb.y)),
-                    (0.0, 1.0),
-                );
-                let mut path = PathBuilder::stroke(px(STROKE));
-                path.move_to(pa);
-                path.cubic_bezier_to(pb, point(px(c1.0), px(c1.1)), point(px(c2.0), px(c2.1)));
-                if let Ok(path) = path.build() {
-                    window.paint_path(path, color);
-                }
+                let c = graph::noodle(pa, pb, (0.0, 1.0));
+                ink::cubic(window, c, STROKE, color, None);
             } else {
-                window.paint_quad(fill(
-                    Bounds::new(
-                        point(pa.x - px(STROKE / 2.0), pa.y),
-                        size(px(STROKE), pb.y - pa.y),
-                    ),
-                    color,
-                ));
+                ink::line(window, pa, pb, STROKE, color, None);
             }
         }
     }
 
     if geo.dirty {
-        let center = point(px(ox + geo.x(geo.wip_lane)), px(oy + geo.y(geo.wip_pos)));
-        dots.push((center, Dot::Wip));
-        let r = if hovered == Some(Dot::Wip) {
-            DOT_HOVER
-        } else {
-            DOT
-        };
-        window.paint_quad(
-            outline(circle(center, r), colors.unpushed, BorderStyle::Dashed).corner_radii(px(r)),
+        let center = point(
+            px(ink::pos(s, ox + geo.x(geo.wip_lane), STROKE)),
+            px(ink::pos(s, oy + geo.y(geo.wip_pos), STROKE)),
         );
+        dots.push((center, Dot::Wip));
+        let r = grow.radius(Dot::Wip, DOT, DOT_HOVER);
         if let Some(h) = geo.head {
             let to = at(h as f32, g.layout.nodes[h].lane as f32);
             let from = (f32::from(center.x), f32::from(center.y) + r);
             let to = (f32::from(to.x), f32::from(to.y) - DOT);
-            let [_, c1, c2, _] = graph::noodle(from, to, (0.0, 1.0));
-            let mut path = PathBuilder::stroke(px(1.0)).dash_array(&[px(2.0), px(2.0)]);
-            path.move_to(point(px(from.0), px(from.1)));
-            path.cubic_bezier_to(
-                point(px(to.0), px(to.1)),
-                point(px(c1.0), px(c1.1)),
-                point(px(c2.0), px(c2.1)),
+            ink::cubic(
+                window,
+                graph::noodle(from, to, (0.0, 1.0)),
+                1.0,
+                ink::over(colors.unpushed.opacity(0.8), colors.bg),
+                Some(ink::Dash { on: 2.0, off: 2.0 }),
             );
-            if let Ok(path) = path.build() {
-                window.paint_path(path, colors.unpushed.opacity(0.8));
-            }
         }
+        let c = (f32::from(center.x), f32::from(center.y));
+        ink::circle(
+            window,
+            c,
+            r,
+            Some(colors.bg),
+            Some((1.0, colors.unpushed, true)),
+        );
     }
 
     for row in lo..hi {
@@ -682,34 +710,20 @@ fn paint_column(
             color
         };
         let head = g.ctx.refs.is_head(&g.commits[row].id);
-        let r = if hovered == Some(Dot::Commit(row)) {
-            DOT_HOVER
-        } else {
-            DOT
-        };
+        let r = grow.radius(Dot::Commit(row), DOT, DOT_HOVER);
+        let c = (f32::from(center.x), f32::from(center.y));
         if copied == Some(row) {
             let ring = r + 3.0;
-            window.paint_quad(
-                outline(circle(center, ring), colors.head, BorderStyle::Solid)
-                    .corner_radii(px(ring))
-                    .border_widths(px(1.0)),
-            );
+            ink::circle(window, c, ring, None, Some((1.0, colors.head, false)));
         }
         if head {
-            let glow = r + 3.5;
-            window.paint_quad(
-                fill(circle(center, glow), colors.head.opacity(0.22)).corner_radii(px(glow)),
-            );
-            window.paint_quad(fill(circle(center, r), colors.head).corner_radii(px(r)));
+            ink::circle(window, c, r + 3.5, Some(colors.head.opacity(0.22)), None);
+            ink::circle(window, c, r, Some(colors.head), None);
         } else if node.class == Class::Unpulled || node.merge {
             let r = if node.merge { r - 0.5 } else { r };
-            window.paint_quad(
-                outline(circle(center, r), color, BorderStyle::Solid)
-                    .corner_radii(px(r))
-                    .border_widths(px(1.75)),
-            );
+            ink::circle(window, c, r, Some(colors.bg), Some((1.75, color, false)));
         } else {
-            window.paint_quad(fill(circle(center, r), color).corner_radii(px(r)));
+            ink::circle(window, c, r, Some(color), None);
         }
     }
     dots

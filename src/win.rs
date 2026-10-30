@@ -17,10 +17,18 @@ use windows_sys::Win32::Graphics::Gdi::{
     MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
     SetWindowRgn,
 };
+use windows_sys::Win32::UI::Controls::{
+    ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, TOOLTIPS_CLASSW, TTDT_AUTOPOP,
+    TTF_IDISHWND, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_SETDELAYTIME, TTM_SETMAXTIPWIDTH,
+    TTM_UPDATETIPTEXTW, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW,
+};
 use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, GetSystemMetricsForDpi, MDT_EFFECTIVE_DPI};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON};
 use windows_sys::Win32::UI::Shell::{
     QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    CW_USEDEFAULT, CreateWindowExW, SendMessageW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GWL_EXSTYLE, GetClientRect, GetCursorPos, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
@@ -359,4 +367,74 @@ pub fn confirm_box(text: String) -> std::thread::JoinHandle<bool> {
         };
         answer == IDYES
     })
+}
+
+/// Creates a native tooltip over the whole of `owner`, empty until
+/// [`set_tooltip`]; returns the tooltip's HWND. It subclasses `owner` to
+/// see the mouse, so it works for a window that never takes focus.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn create_tooltip(owner: isize) -> Option<isize> {
+    let hwnd = live(owner)?;
+    unsafe {
+        let icc = INITCOMMONCONTROLSEX {
+            dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
+            dwICC: ICC_WIN95_CLASSES,
+        };
+        InitCommonControlsEx(&icc);
+        let tip = CreateWindowExW(
+            WS_EX_TOPMOST,
+            TOOLTIPS_CLASSW,
+            std::ptr::null(),
+            WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            hwnd,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        );
+        if tip.is_null() {
+            return None;
+        }
+        let mut empty = [0u16];
+        let info = tool_info(hwnd, empty.as_mut_ptr());
+        SendMessageW(tip, TTM_ADDTOOLW, 0, (&raw const info) as isize);
+        // Lines break at `\n` rather than running off the screen.
+        SendMessageW(tip, TTM_SETMAXTIPWIDTH, 0, 480);
+        // Stays up while the mouse rests on the badge.
+        SendMessageW(tip, TTM_SETDELAYTIME, TTDT_AUTOPOP as usize, 30_000);
+        Some(tip as isize)
+    }
+}
+
+/// Sets the text of `owner`'s tooltip; an empty text shows none.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn set_tooltip(tip: isize, owner: isize, text: &str) {
+    let (Some(tip), Some(owner)) = (live(tip), live(owner)) else {
+        return;
+    };
+    let mut text: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+    let info = tool_info(owner, text.as_mut_ptr());
+    unsafe {
+        SendMessageW(tip, TTM_UPDATETIPTEXTW, 0, (&raw const info) as isize);
+    }
+}
+
+/// The tool that is all of `owner`. Sized without `lpReserved`, so it is
+/// accepted by comctl32 5 as well as 6: the app has no manifest asking for 6.
+fn tool_info(owner: HWND, text: *mut u16) -> TTTOOLINFOW {
+    TTTOOLINFOW {
+        cbSize: std::mem::offset_of!(TTTOOLINFOW, lpReserved) as u32,
+        uFlags: TTF_IDISHWND | TTF_SUBCLASS,
+        hwnd: owner,
+        uId: owner as usize,
+        lpszText: text,
+        ..Default::default()
+    }
 }

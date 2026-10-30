@@ -461,7 +461,9 @@ pub type Point = (f32, f32);
 /// tight S. Works for any `flow`, so the curves stay smooth while the graph
 /// turns from the strip to the column.
 pub fn noodle(a: Point, b: Point, flow: Point) -> [Point; 4] {
-    const K: f32 = 0.5;
+    // Long handles, so a bend leaves and joins its lanes gently instead of
+    // kinking where the straight run ends.
+    const K: f32 = 0.75;
     let along = ((b.0 - a.0) * flow.0 + (b.1 - a.1) * flow.1).abs() * K;
     [
         a,
@@ -825,12 +827,12 @@ mod tests {
     fn noodle_controls_follow_the_flow() {
         // Strip: rows run right to left.
         let [_, c1, c2, _] = noodle((100.0, 0.0), (40.0, 10.0), (-1.0, 0.0));
-        assert_eq!(c1, (70.0, 0.0));
-        assert_eq!(c2, (70.0, 10.0));
+        assert_eq!(c1, (55.0, 0.0));
+        assert_eq!(c2, (85.0, 10.0));
         // Column: rows run down.
         let [_, c1, c2, _] = noodle((0.0, 0.0), (10.0, 20.0), (0.0, 1.0));
-        assert_eq!(c1, (0.0, 10.0));
-        assert_eq!(c2, (10.0, 10.0));
+        assert_eq!(c1, (0.0, 15.0));
+        assert_eq!(c2, (10.0, 5.0));
     }
 
     #[test]

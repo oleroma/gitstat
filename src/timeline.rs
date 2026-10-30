@@ -10,6 +10,7 @@
 //! mouse against the dots it painted.
 
 mod column;
+pub(crate) mod ink;
 
 pub use column::{COLUMN_WIDTH, column_index};
 
@@ -20,27 +21,37 @@ use crate::repo_graph::{More, RepoGraph};
 use crate::state::AppState;
 use crate::view::Palette;
 use gpui::{
-    AnyElement, App, AppContext, BorderStyle, Bounds, ClipboardItem, ContentMask, Context, Corner,
-    DispatchPhase, Entity, HitboxBehavior, Hsla, IntoElement, MouseButton, MouseDownEvent,
-    MouseMoveEvent, ParentElement, PathBuilder, Pixels, Point, ScrollWheelEvent, Styled, Window,
-    anchored, canvas, deferred, div, fill, linear_color_stop, linear_gradient, outline, point,
-    prelude::*, px, rgb, size,
+    Animation, AnimationExt, AnyElement, App, AppContext, BorderStyle, Bounds, ClipboardItem,
+    ContentMask, Context, Corner, DispatchPhase, Entity, HitboxBehavior, Hsla, IntoElement,
+    MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, PathBuilder, Pixels, Point,
+    ScrollWheelEvent, Styled, Window, anchored, canvas, deferred, div, fill, linear_color_stop,
+    linear_gradient, outline, point, prelude::*, px, rgb, size,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// A strip's height; the panel's row height in `layout`.
 pub const STRIP_HEIGHT: f32 = 36.0;
 /// The label column at the strip's right.
 pub const LABEL_WIDTH: f32 = 168.0;
+/// The label column in icons-only mode: the repo's icon alone.
+pub const ICON_LABEL_WIDTH: f32 = 40.0;
+/// A repo icon beside its name, and alone in icons-only mode; logical px.
+const MARK: f32 = 16.0;
+const ICON_MARK: f32 = 22.0;
 /// Px between commits along a strip.
 const STEP: f32 = 14.0;
 /// Px between lanes across a strip.
 const LANE: f32 = 5.0;
-/// Lanes a strip shows; the rest fold into a dimmed band at its edge.
-const LANES: usize = 6;
+/// Lanes a strip shows; the rest fold into a dimmed band at its edge. The
+/// outermost sit `2 * LANE` from the centre line, so a hovered dot's glow
+/// and a tag's diamond above it stay inside the strip.
+const LANES: usize = 5;
+/// Px a strip may paint past its top and bottom, into its neighbours'
+/// empty margins, so nothing near its edge is cut flat.
+const BLEED: f32 = 6.0;
 const DOT: f32 = 3.0;
 const DOT_HOVER: f32 = 4.5;
 const STROKE: f32 = 1.5;
@@ -60,6 +71,12 @@ const CARD_DELAY: Duration = Duration::from_millis(150);
 const COPIED_FOR: Duration = Duration::from_millis(900);
 /// Px between a hovered dot and its card.
 const CARD_GAP: f32 = 8.0;
+/// A wheel step glides the strip to its new place over this long.
+const GLIDE: Duration = Duration::from_millis(140);
+/// A dot grows into its hover size, and back, over this long.
+const GROW: Duration = Duration::from_millis(110);
+/// A card fades in over this long.
+const CARD_FADE: Duration = Duration::from_millis(120);
 
 #[derive(Default)]
 struct Slot {
@@ -76,6 +93,66 @@ struct Slot {
     /// Px the strip is scrolled into the past from the newest row; HEAD's
     /// row, `RepoGraph::home`, is where it rests.
     scroll: f32,
+    /// Where the strip was shown when the wheel last moved it, and when:
+    /// it glides from there to `scroll`.
+    glide: Option<(f32, Instant)>,
+}
+
+impl Slot {
+    /// The scroll to draw at `now`, part way along a glide, and whether
+    /// the glide is still going.
+    fn shown_scroll(&self, now: Instant) -> (f32, bool) {
+        match self.glide {
+            Some((from, start)) => {
+                let t = progress(start, now, GLIDE);
+                (from + (self.scroll - from) * t, t < 1.0)
+            }
+            None => (self.scroll, false),
+        }
+    }
+
+    /// Moves the scroll to `to`, gliding from wherever it shows now.
+    fn glide_to(&mut self, to: f32, now: Instant) {
+        let (shown, _) = self.shown_scroll(now);
+        self.glide = Some((shown, now));
+        self.scroll = to;
+    }
+}
+
+/// How far an `over`-long transition begun at `start` is at `now`, eased
+/// out: 0 to 1, fast at first and settling gently.
+fn progress(start: Instant, now: Instant, over: Duration) -> f32 {
+    let t = (now.saturating_duration_since(start).as_secs_f32() / over.as_secs_f32()).min(1.0);
+    1.0 - (1.0 - t).powi(3)
+}
+
+/// How far each dot has grown toward its hover size: the hovered one up,
+/// the one the mouse just left down.
+#[derive(Clone, Copy, Default)]
+struct Grow {
+    hovered: Option<(Dot, f32)>,
+    left: Option<(Dot, f32)>,
+}
+
+impl Grow {
+    /// 0 at rest, 1 at full hover size.
+    fn of(&self, dot: Dot) -> f32 {
+        match (self.hovered, self.left) {
+            (Some((d, k)), _) if d == dot => k,
+            (_, Some((d, k))) if d == dot => k,
+            _ => 0.0,
+        }
+    }
+
+    fn going(&self) -> bool {
+        let moving = |g: Option<(Dot, f32)>| g.is_some_and(|(_, k)| k > 0.0 && k < 1.0);
+        moving(self.hovered) || moving(self.left)
+    }
+
+    /// The radius of a dot between `rest` and `hover`.
+    fn radius(&self, dot: Dot, rest: f32, hover: f32) -> f32 {
+        rest + (hover - rest) * self.of(dot)
+    }
 }
 
 /// A dot on a strip: a commit's row, or the uncommitted changes.
@@ -124,8 +201,15 @@ pub struct Timelines {
     /// can't pass for the new slot's.
     generation: u64,
     hover: Option<Hover>,
+    /// When `hover` began, so its dot grows.
+    hover_since: Instant,
+    /// The dot the mouse last left, and when, so it shrinks back.
+    left: Option<(PathBuf, Dot, Instant)>,
     /// The hover has lasted `CARD_DELAY`, so its card shows.
     card: bool,
+    /// Bumped each time a card comes up, so it fades in once rather than
+    /// on every dot the mouse slides to.
+    card_shown: u64,
     /// Bumped on every hover change, so an older card timer does nothing.
     hover_generation: u64,
     /// The commit whose id was just copied, flashed until its timer ends.
@@ -149,7 +233,10 @@ impl Timelines {
             running: 0,
             generation: 0,
             hover: None,
+            hover_since: Instant::now(),
+            left: None,
             card: false,
+            card_shown: 0,
             hover_generation: 0,
             copied: None,
             copied_generation: 0,
@@ -263,6 +350,7 @@ impl Timelines {
                     None => g.home(),
                 };
                 slot.scroll = row * STEP;
+                slot.glide = None;
                 slot.graph = Some(Arc::new(*g));
                 slot.error = None;
                 if self.hover.as_ref().is_some_and(|h| h.repo == path) {
@@ -310,6 +398,7 @@ impl Timelines {
     /// Scrolls one strip, or every strip with `all`, by `dx` px into the
     /// past (negative: toward HEAD), loading more history near the end.
     fn scroll(&mut self, path: &Path, dx: f32, all: bool, cx: &mut Context<Self>) {
+        let now = Instant::now();
         let mut more = Vec::new();
         for (p, slot) in self.slots.iter_mut() {
             if !all && p != path {
@@ -318,10 +407,11 @@ impl Timelines {
             let Some(g) = &slot.graph else { continue };
             let rows = g.commits.len() as f32;
             let max = ((rows - 1.0) * STEP).max(0.0);
-            slot.scroll = (slot.scroll + dx).clamp(0.0, max);
-            if !g.end && rows * STEP - slot.scroll < PRELOAD {
+            let to = (slot.scroll + dx).clamp(0.0, max);
+            if !g.end && rows * STEP - to < PRELOAD {
                 more.push(p.clone());
             }
+            slot.glide_to(to, now);
         }
         for p in more {
             self.load_more(&p, cx);
@@ -331,6 +421,7 @@ impl Timelines {
     }
 
     fn unhover(&mut self) {
+        self.leave(Instant::now());
         self.hover = None;
         self.card = false;
         self.hover_generation += 1;
@@ -338,8 +429,33 @@ impl Timelines {
 
     fn scroll_home(&mut self, path: &Path, cx: &mut Context<Self>) {
         if let Some(slot) = self.slots.get_mut(path) {
-            slot.scroll = slot.graph.as_ref().map_or(0.0, |g| g.home() * STEP);
+            let home = slot.graph.as_ref().map_or(0.0, |g| g.home() * STEP);
+            slot.glide_to(home, Instant::now());
             cx.notify();
+        }
+    }
+
+    /// The hovered dot, if any, starts shrinking back.
+    fn leave(&mut self, now: Instant) {
+        if let Some(h) = &self.hover {
+            self.left = Some((h.repo.clone(), h.dot, now));
+        }
+    }
+
+    /// How far `path`'s dots have grown into their hover size at `now`.
+    fn grow(&self, path: &Path, dirty: bool, now: Instant) -> Grow {
+        Grow {
+            hovered: self
+                .hover
+                .as_ref()
+                .filter(|h| h.repo == path && h.dirty == dirty)
+                .map(|h| (h.dot, progress(self.hover_since, now, GROW))),
+            left: self
+                .left
+                .as_ref()
+                .filter(|(p, ..)| p == path)
+                .map(|&(_, dot, at)| (dot, 1.0 - progress(at, now, GROW)))
+                .filter(|&(_, k)| k > 0.0),
         }
     }
 
@@ -387,6 +503,9 @@ impl Timelines {
         // Sliding from dot to dot keeps a card already up; a fresh hover
         // waits for the mouse to settle.
         let sliding = self.card && self.hover.is_some() && new.is_some();
+        let now = Instant::now();
+        self.leave(now);
+        self.hover_since = now;
         self.hover = new;
         self.hover_generation += 1;
         self.card = sliding;
@@ -398,6 +517,7 @@ impl Timelines {
                 this.update(cx, |this, cx| {
                     if this.hover_generation == generation {
                         this.card = true;
+                        this.card_shown += 1;
                         cx.notify();
                     }
                 })
@@ -464,20 +584,19 @@ impl Timelines {
         status: &RepoStatus,
         p: &Palette,
         dark: bool,
+        icons_only: bool,
         cx: &App,
     ) -> AnyElement {
         let t = this.read(cx);
         let path = status.path.clone();
         let slot = t.slots.get(&path);
         let graph = slot.and_then(|s| s.graph.clone());
-        let scroll = slot.map_or(0.0, |s| s.scroll);
+        let now = Instant::now();
+        let (scroll, gliding) = slot.map_or((0.0, false), |s| s.shown_scroll(now));
         let error = slot.and_then(|s| s.error.clone());
         let dirty = status.dirty;
-        let hovered = t
-            .hover
-            .as_ref()
-            .filter(|h| h.repo == path && h.dirty == dirty)
-            .map(|h| h.dot);
+        let grow = t.grow(&path, dirty, now);
+        let moving = gliding || grow.going();
         let copied = t
             .copied
             .as_ref()
@@ -511,8 +630,15 @@ impl Timelines {
             },
             move |bounds, hitbox, window, _cx| {
                 let Some(g) = graph else { return };
-                let dots = window.with_content_mask(Some(ContentMask { bounds }), |window| {
-                    paint_strip(bounds, &g, scroll, hovered, copied, dirty, &colors, window)
+                if moving {
+                    window.request_animation_frame();
+                }
+                let mask = Bounds::new(
+                    point(bounds.left(), bounds.top() - px(BLEED)),
+                    size(bounds.size.width, bounds.size.height + px(2.0 * BLEED)),
+                );
+                let dots = window.with_content_mask(Some(ContentMask { bounds: mask }), |window| {
+                    paint_strip(bounds, &g, scroll, grow, copied, dirty, &colors, window)
                 });
                 fade(bounds, surface, window);
 
@@ -580,6 +706,97 @@ impl Timelines {
         let this_for_label = this.clone();
         let wheel_path = path.clone();
         let open_path = path.clone();
+        let status_text = match &error {
+            Some(_) if status.error.is_none() => "history unreadable".to_string(),
+            _ => status.label(),
+        };
+        let label = div()
+            .id(("label", index))
+            .flex()
+            .items_center()
+            .flex_none()
+            .h_full()
+            .cursor_pointer()
+            .hover(|s| s.bg(p.hover))
+            // Big mode, scrolled to this repo's column; the folder when the
+            // window is turned off.
+            .on_click(move |_, window, cx| {
+                crate::panel::dismiss(window, cx);
+                let big = this_for_label.read(cx).state.read(cx).config.window;
+                if big {
+                    this_for_label.update(cx, |t, _| t.focus(&open_path));
+                    crate::view::show_window(cx);
+                } else {
+                    cx.open_with_system(&open_path);
+                }
+            });
+        let label = if icons_only {
+            // The icon alone; its words in a tooltip.
+            let lines = vec![
+                (status.name.clone(), p.text),
+                (checkout, p.muted),
+                (status_text, status_color),
+            ];
+            label
+                .justify_center()
+                .w(px(ICON_LABEL_WIDTH))
+                .tooltip(crate::view::tip(lines, p))
+                .child(crate::repo_marks::global_mark(
+                    status,
+                    ICON_MARK,
+                    status_color,
+                    cx,
+                ))
+        } else {
+            label
+                .gap_2()
+                .w(px(LABEL_WIDTH))
+                .pl_2()
+                .pr_4()
+                .child(crate::repo_marks::global_mark(
+                    status,
+                    MARK,
+                    status_color,
+                    cx,
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .justify_center()
+                        .flex_1()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .truncate()
+                                .text_sm()
+                                .text_color(p.text)
+                                .child(status.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_1()
+                                .text_xs()
+                                .child(
+                                    div()
+                                        .flex_shrink()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_color(p.muted)
+                                        .child(checkout),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .max_w(px(LABEL_WIDTH * 0.6))
+                                        .truncate()
+                                        .text_color(status_color)
+                                        .child(status_text),
+                                ),
+                        ),
+                )
+        };
         div()
             .id(("strip", index))
             .flex()
@@ -611,66 +828,7 @@ impl Timelines {
                 entity.update(cx, |t, cx| t.scroll(&wheel_path, dx, all, cx));
             })
             .child(painter)
-            .child(
-                div()
-                    .id(("label", index))
-                    .flex()
-                    .flex_col()
-                    .justify_center()
-                    .flex_none()
-                    .w(px(LABEL_WIDTH))
-                    .h_full()
-                    .pl_2()
-                    .pr_4()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(p.hover))
-                    // Big mode, scrolled to this repo's column; the folder
-                    // when the window is turned off.
-                    .on_click(move |_, window, cx| {
-                        crate::panel::dismiss(window, cx);
-                        let big = this_for_label.read(cx).state.read(cx).config.window;
-                        if big {
-                            this_for_label.update(cx, |t, _| t.focus(&open_path));
-                            crate::view::show_window(cx);
-                        } else {
-                            cx.open_with_system(&open_path);
-                        }
-                    })
-                    .child(
-                        div()
-                            .truncate()
-                            .text_sm()
-                            .text_color(p.text)
-                            .child(status.name.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap_1()
-                            .text_xs()
-                            .child(
-                                div()
-                                    .flex_shrink()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_color(p.muted)
-                                    .child(checkout),
-                            )
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .max_w(px(LABEL_WIDTH * 0.6))
-                                    .truncate()
-                                    .text_color(status_color)
-                                    .child(match &error {
-                                        Some(_) if status.error.is_none() => {
-                                            "history unreadable".to_string()
-                                        }
-                                        _ => status.label(),
-                                    }),
-                            ),
-                    ),
-            )
+            .child(label)
             .into_any_element()
     }
 
@@ -712,7 +870,12 @@ impl Timelines {
             // The strips under it don't see the mouse, so a click here
             // copies nothing.
             .occlude()
-            .children(card);
+            .children(card)
+            .with_animation(
+                ("card", self.card_shown),
+                Animation::new(CARD_FADE).with_easing(gpui::ease_out_quint()),
+                |card, k| card.opacity(k),
+            );
         let gap = px(DOT_HOVER + CARD_GAP);
         let x = h.at.x - px(12.);
         let (corner, y) = if h.above {
@@ -859,6 +1022,8 @@ struct Colors {
     added: Hsla,
     removed: Hsla,
     hues: [Hsla; 6],
+    /// What the graph is drawn on.
+    bg: Hsla,
 }
 
 impl Colors {
@@ -883,6 +1048,7 @@ impl Colors {
                     c(0x39c5cf),
                     c(0xff7b72),
                 ],
+                bg: p.surface,
             }
         } else {
             Self {
@@ -902,6 +1068,7 @@ impl Colors {
                     c(0x1b7c83),
                     c(0xc4432b),
                 ],
+                bg: p.surface,
             }
         }
     }
@@ -939,7 +1106,7 @@ fn paint_strip(
     bounds: Bounds<Pixels>,
     g: &RepoGraph,
     scroll: f32,
-    hovered: Option<Dot>,
+    grow: Grow,
     copied: Option<usize>,
     dirty: bool,
     colors: &Colors,
@@ -957,8 +1124,14 @@ fn paint_strip(
     // the work-in-progress dot leads it.
     let top_x = right - PAD - if dirty { STEP } else { 0.0 } + scroll;
     let cy = f32::from(bounds.center().y);
-    let x = |row: f32| top_x - row * STEP + if row < gap - 0.5 { STEP } else { 0.0 };
-    let y = |lane: f32| cy + lane_offset(lane.round() as usize);
+    // On the device pixel grid, so runs are crisp and bends meet them
+    // exactly.
+    let s = window.scale_factor();
+    let x = |row: f32| {
+        let x = top_x - row * STEP + if row < gap - 0.5 { STEP } else { 0.0 };
+        ink::pos(s, x, STROKE)
+    };
+    let y = |lane: f32| ink::pos(s, cy + lane_offset(lane.round() as usize), STROKE);
     let at = |pos: graph::Pos| point(px(x(pos.row)), px(y(pos.lane)));
     let folded = |lane: f32| lane.round() as usize >= LANES;
 
@@ -980,40 +1153,25 @@ fn paint_strip(
             }
         };
         for seg in e.segments(rows) {
+            let (a, b) = match seg {
+                Seg::Straight(a, b) | Seg::Curve(a, b) => (a, b),
+            };
+            let alpha = if folded(a.lane) || folded(b.lane) {
+                0.35
+            } else {
+                0.8
+            };
+            let color = ink::over(base.opacity(alpha), colors.bg);
+            let (pa, pb) = (at(a), at(b));
+            let (pa, pb) = (
+                (f32::from(pa.x), f32::from(pa.y)),
+                (f32::from(pb.x), f32::from(pb.y)),
+            );
             match seg {
-                Seg::Straight(a, b) => {
-                    let color = if folded(a.lane) {
-                        base.opacity(0.35)
-                    } else {
-                        base.opacity(0.8)
-                    };
-                    let (x0, x1) = (x(b.row), x(a.row));
-                    window.paint_quad(fill(
-                        Bounds::new(
-                            point(px(x0), px(y(a.lane) - STROKE / 2.0)),
-                            size(px(x1 - x0), px(STROKE)),
-                        ),
-                        color,
-                    ));
-                }
-                Seg::Curve(a, b) => {
-                    let color = if folded(a.lane) || folded(b.lane) {
-                        base.opacity(0.35)
-                    } else {
-                        base.opacity(0.8)
-                    };
-                    let (pa, pb) = (at(a), at(b));
-                    let [_, c1, c2, _] = graph::noodle(
-                        (f32::from(pa.x), f32::from(pa.y)),
-                        (f32::from(pb.x), f32::from(pb.y)),
-                        (-1.0, 0.0),
-                    );
-                    let mut path = PathBuilder::stroke(px(STROKE));
-                    path.move_to(pa);
-                    path.cubic_bezier_to(pb, point(px(c1.0), px(c1.1)), point(px(c2.0), px(c2.1)));
-                    if let Ok(path) = path.build() {
-                        window.paint_path(path, color);
-                    }
+                Seg::Straight(..) => ink::line(window, pa, pb, STROKE, color, None),
+                Seg::Curve(..) => {
+                    let c = graph::noodle(pa, pb, (-1.0, 0.0));
+                    ink::cubic(window, c, STROKE, color, None);
                 }
             }
         }
@@ -1030,31 +1188,29 @@ fn paint_strip(
             ),
             None => (x(0.0), cy, 0),
         };
-        let center = point(px(hx + STEP), px(y(lane as f32)));
+        let center = point(px(ink::pos(s, hx + STEP, STROKE)), px(y(lane as f32)));
         dots.push((center, Dot::Wip));
-        let r = if hovered == Some(Dot::Wip) {
-            DOT_HOVER
-        } else {
-            DOT + 0.5
-        };
-        window.paint_quad(
-            outline(circle(center, r), colors.unpushed, BorderStyle::Dashed).corner_radii(px(r)),
-        );
+        let r = grow.radius(Dot::Wip, DOT + 0.5, DOT_HOVER);
         if head.is_some() {
             // Joined to HEAD by a short dashed noodle.
             let (from, to) = ((hx + DOT, hy), (hx + STEP - r, f32::from(center.y)));
-            let [_, c1, c2, _] = graph::noodle(to, from, (-1.0, 0.0));
-            let mut path = PathBuilder::stroke(px(1.0)).dash_array(&[px(2.0), px(2.0)]);
-            path.move_to(point(px(from.0), px(from.1)));
-            path.cubic_bezier_to(
-                point(px(to.0), px(to.1)),
-                point(px(c2.0), px(c2.1)),
-                point(px(c1.0), px(c1.1)),
+            let [a, c1, c2, b] = graph::noodle(to, from, (-1.0, 0.0));
+            ink::cubic(
+                window,
+                [b, c2, c1, a],
+                1.0,
+                ink::over(colors.unpushed.opacity(0.8), colors.bg),
+                Some(ink::Dash { on: 2.0, off: 2.0 }),
             );
-            if let Ok(path) = path.build() {
-                window.paint_path(path, colors.unpushed.opacity(0.8));
-            }
         }
+        let c = (f32::from(center.x), f32::from(center.y));
+        ink::circle(
+            window,
+            c,
+            r,
+            Some(colors.bg),
+            Some((1.0, colors.unpushed, true)),
+        );
     }
 
     for row in lo..hi {
@@ -1069,42 +1225,36 @@ fn paint_strip(
         };
         let id = &g.commits[row].id;
         let head = g.ctx.refs.is_head(id);
-        let r = if hovered == Some(Dot::Commit(row)) {
-            DOT_HOVER
-        } else {
-            DOT
-        };
+        let r = grow.radius(Dot::Commit(row), DOT, DOT_HOVER);
+        let c = (f32::from(center.x), f32::from(center.y));
         if copied == Some(row) {
             // Its id just went to the clipboard.
             let ring = r + 3.0;
-            window.paint_quad(
-                outline(circle(center, ring), colors.head, BorderStyle::Solid)
-                    .corner_radii(px(ring))
-                    .border_widths(px(1.0)),
-            );
+            ink::circle(window, c, ring, None, Some((1.0, colors.head, false)));
         }
         if head {
-            let glow = r + 3.0;
-            window.paint_quad(
-                fill(circle(center, glow), colors.head.opacity(0.22)).corner_radii(px(glow)),
-            );
-            window.paint_quad(fill(circle(center, r), colors.head).corner_radii(px(r)));
+            ink::circle(window, c, r + 3.0, Some(colors.head.opacity(0.22)), None);
+            ink::circle(window, c, r, Some(colors.head), None);
         } else if node.class == Class::Unpulled || node.merge {
             // Merges and not-yet-pulled commits are rings; a merge's is smaller.
+            // Filled with the background, so the noodles under it don't
+            // show through the ring.
             let r = if node.merge { r - 0.5 } else { r };
-            window.paint_quad(
-                outline(circle(center, r), color, BorderStyle::Solid)
-                    .corner_radii(px(r))
-                    .border_widths(px(1.5)),
-            );
+            ink::circle(window, c, r, Some(colors.bg), Some((1.5, color, false)));
         } else {
-            window.paint_quad(fill(circle(center, r), color).corner_radii(px(r)));
+            ink::circle(window, c, r, Some(color), None);
         }
         if g.ctx.refs.at(id).iter().any(|r| matches!(r, Ref::Tag(_))) {
             diamond(point(center.x, center.y - px(r + 4.0)), 2.5, color, window);
         }
         if g.stashes_at(row).next().is_some() {
-            stash(center, r, colors.stash, window);
+            stash(
+                center,
+                r,
+                ink::over(colors.stash.opacity(0.8), colors.bg),
+                colors.stash,
+                window,
+            );
         }
     }
     dots
@@ -1112,24 +1262,16 @@ fn paint_strip(
 
 /// A hollow square for the stashes made on the commit at `base`, newer than
 /// it so to its right, joined to it by a dotted noodle.
-fn stash(base: Point<Pixels>, r: f32, color: Hsla, window: &mut Window) {
+/// `line` is `color` laid over the background, for the dotted noodle.
+fn stash(base: Point<Pixels>, r: f32, line: Hsla, color: Hsla, window: &mut Window) {
     let s = 2.5;
     let at = point(base.x + px(STEP * 0.6), base.y + px(r + 5.0));
-    let [_, c1, c2, _] = graph::noodle(
+    let c = graph::noodle(
         (f32::from(at.x) - s, f32::from(at.y)),
         (f32::from(base.x), f32::from(base.y) + r),
         (-1.0, 0.0),
     );
-    let mut path = PathBuilder::stroke(px(1.0)).dash_array(&[px(1.0), px(1.5)]);
-    path.move_to(point(at.x - px(s), at.y));
-    path.cubic_bezier_to(
-        point(base.x, base.y + px(r)),
-        point(px(c1.0), px(c1.1)),
-        point(px(c2.0), px(c2.1)),
-    );
-    if let Ok(path) = path.build() {
-        window.paint_path(path, color.opacity(0.8));
-    }
+    ink::cubic(window, c, 1.0, line, Some(ink::Dash { on: 1.0, off: 1.5 }));
     window.paint_quad(outline(
         Bounds::new(
             point(at.x - px(s), at.y - px(s)),
@@ -1138,13 +1280,6 @@ fn stash(base: Point<Pixels>, r: f32, color: Hsla, window: &mut Window) {
         color,
         BorderStyle::Solid,
     ));
-}
-
-fn circle(center: Point<Pixels>, r: f32) -> Bounds<Pixels> {
-    Bounds::new(
-        point(center.x - px(r), center.y - px(r)),
-        size(px(2.0 * r), px(2.0 * r)),
-    )
 }
 
 fn diamond(c: Point<Pixels>, r: f32, color: Hsla, window: &mut Window) {

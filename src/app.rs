@@ -103,9 +103,11 @@ pub fn run(config_file: PathBuf) {
         });
 
         let timelines = cx.new(|cx| crate::timeline::Timelines::new(&state, cx));
+        let marks = cx.new(|cx| crate::repo_marks::RepoMarks::new(&state, cx));
         cx.set_global(Ui {
             state: state.clone(),
             timelines,
+            marks,
             input: tx,
             refresh: Rc::new(|cx: &mut App| {
                 if let Some(shared) = cx.try_global::<Shared>() {
