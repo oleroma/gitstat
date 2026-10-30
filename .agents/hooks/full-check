@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Full checks, run on every push to main and before agent-merge. Not run on branch builds.
+# On Linux they cover the platform-neutral code; PC builds and the fallback's Windows job cover the rest.
+set -euo pipefail
+cd "$(dirname "$0")/../.."
+export CARGO_TARGET_DIR=build/target
+
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings

@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Builds the release gitstat.exe and prints "build-file: <path> <version>", as the pipeline expects.
+# Windows only: the tray app doesn't build anywhere else.
+set -euo pipefail
+cd "$(dirname "$0")/../.."
+# Cargo's output stays in build/, which PC builds reuse so rebuilds are incremental.
+# Relative, so Git Bash never has to convert the path for cargo.
+export CARGO_TARGET_DIR=build/target
+
+cargo build --release --locked
+
+# The package version in Cargo.toml, bumped by hand.
+version="$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -n 1)"
+exe="$CARGO_TARGET_DIR/release/gitstat.exe"
+[ -f "$exe" ] || { echo "No $exe: gitstat.exe builds only on Windows." >&2; exit 1; }
+echo "build-file: $exe $version"

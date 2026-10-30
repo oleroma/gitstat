@@ -197,9 +197,8 @@ set `"watch": false`) to check on the interval only, as before v0.3.
 ## Install
 
 1. Build `gitstat.exe` yourself, see [Build from source](#build-from-source).
-   GitHub CI doesn't run on push. When the PC is offline, the manual
-   `fallback.yml` workflow runs the tests and clippy, builds the exe and
-   uploads it as the `gitstat` artifact.
+   When the PC is offline, the manual `fallback.yml` workflow runs the tests,
+   builds the exe on Windows and saves it on the run.
 2. Put `gitstat.exe` in a folder of its own, e.g. `D:\dev\gitstat\`.
 3. Run it. The first time, it writes `config.json` next to itself.
 4. Right-click the tray icon and tick **Start with Windows** to have it start
@@ -279,17 +278,14 @@ running. gitstat.exe is a windowed app, so run it from PowerShell as
 You need [Rust](https://rustup.rs/) and the Visual Studio C++ build tools with
 a Windows SDK. GPUI compiles its shaders with the SDK's `fxc.exe`.
 
-```
-build.cmd
-```
-
-It builds the committed `HEAD` (or the commit you pass) in its own git worktree
-and puts the newest `gitstat.exe` in `build\` (ignored by git). The last 4
-builds stay in `build\builds\<version>-<commit>\`, each with the worktree it
-was built from in `src\`. To run it, put a `config.json` next to
-`build\gitstat.exe` whose `path` points at your repos folder, since a new
-config defaults to the folder above the exe's folder. Plain
-`cargo build --release` still works for a quick check.
+Agents build it with the shared pipeline (`.agents/agent-build pc`, see
+`AGENTS.md`): it runs the tests, builds the committed branch in the `build/src`
+worktree and puts the newest `gitstat.exe` in `build\` (ignored by git). The
+last 4 builds stay in `build\builds\<version>-<commit>\`. The repo's own steps
+are in `.agents/hooks/` (`quick-test`, `build`, `full-check`). To run a build,
+put a `config.json` next to `build\gitstat.exe` whose `path` points at your
+repos folder, since a new config defaults to the folder above the exe's
+folder. Plain `cargo build --release` still works for a quick check.
 
 `cargo test` runs the status detection, file-watching, layout, config and
 folder-icon tests. They also run on Linux, where only `--once` is available.
