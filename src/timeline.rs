@@ -1124,8 +1124,14 @@ fn paint_strip(
     // the work-in-progress dot leads it.
     let top_x = right - PAD - if dirty { STEP } else { 0.0 } + scroll;
     let cy = f32::from(bounds.center().y);
-    let x = |row: f32| top_x - row * STEP + if row < gap - 0.5 { STEP } else { 0.0 };
-    let y = |lane: f32| cy + lane_offset(lane.round() as usize);
+    // On the device pixel grid, so runs are crisp and bends meet them
+    // exactly.
+    let s = window.scale_factor();
+    let x = |row: f32| {
+        let x = top_x - row * STEP + if row < gap - 0.5 { STEP } else { 0.0 };
+        ink::pos(s, x, STROKE)
+    };
+    let y = |lane: f32| ink::pos(s, cy + lane_offset(lane.round() as usize), STROKE);
     let at = |pos: graph::Pos| point(px(x(pos.row)), px(y(pos.lane)));
     let folded = |lane: f32| lane.round() as usize >= LANES;
 
@@ -1182,7 +1188,7 @@ fn paint_strip(
             ),
             None => (x(0.0), cy, 0),
         };
-        let center = point(px(hx + STEP), px(y(lane as f32)));
+        let center = point(px(ink::pos(s, hx + STEP, STROKE)), px(y(lane as f32)));
         dots.push((center, Dot::Wip));
         let r = grow.radius(Dot::Wip, DOT + 0.5, DOT_HOVER);
         if head.is_some() {

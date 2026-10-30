@@ -1,25 +1,35 @@
-//! Anti-aliased strokes for the graph.
+//! Crisp strokes for the graph.
 //!
 //! GPUI fills paths with 4x MSAA, which leaves a curve one or two px wide
-//! visibly stair-stepped, while its quads, rounded ones included, get exact
-//! anti-aliasing from their distance field. So a curve here is a run of
-//! small round quads, close enough together that their union is the stroke
-//! with round caps, and its edges are as smooth as a dot's.
+//! stair-stepped. So a curve here is drawn by tiny-skia, whose coverage
+//! anti-aliasing is exact, into a picture at the window's own device px,
+//! painted 1:1 on whole device px. The pictures are kept by shape and
+//! colour, and the graph has few distinct shapes (the bends between
+//! neighbouring lanes), so each is drawn once.
 //!
-//! The quads overlap, so a translucent colour would darken where they do:
-//! strokes are opaque, their colour first laid over the background.
+//! Straight runs are quads on whole device px, `width` rounded to whole
+//! device px. Callers place lanes with [`pos`], so a run's edges fall on
+//! pixel edges and a bend starts exactly where its run ends.
 
-use gpui::{Bounds, Hsla, Rgba, Window, fill, point, px, size};
+use gpui::{Bounds, Hsla, RenderImage, Rgba, Window, fill, point, px, size};
+use resvg::tiny_skia;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::Arc;
 
-/// Px between stamp centres along a stroke; small against the thinnest
-/// stroke's radius, so the edge has no scallops.
-const SPACING: f32 = 0.3;
-/// Pieces a curve is cut into to measure it; its stamps follow the pieces.
-const PIECES: usize = 24;
+/// Pictures kept past this many are all let go, so an unusual run of
+/// shapes can't grow the cache for ever.
+const MAX_KEPT: usize = 4096;
 
 type P = (f32, f32);
 
+thread_local! {
+    static KEPT: RefCell<HashMap<u64, Arc<RenderImage>>> = RefCell::new(HashMap::new());
+}
+
 /// `color`, with its alpha, laid over `bg`: the opaque colour it shows as.
+/// Strokes are opaque so a bend's round end over its run doesn't show.
 pub fn over(color: Hsla, bg: Hsla) -> Hsla {
     let (c, b) = (color.to_rgb(), bg.to_rgb());
     let a = c.a;
@@ -40,126 +50,193 @@ pub struct Dash {
     pub off: f32,
 }
 
-/// A cubic Bézier `[from, c1, c2, to]`, `width` px wide, in an opaque
-/// `color` (see [`over`]).
-pub fn cubic(window: &mut Window, c: [P; 4], width: f32, color: Hsla, dash: Option<Dash>) {
-    let mut pts = [(0.0, 0.0); PIECES + 1];
-    for (i, p) in pts.iter_mut().enumerate() {
-        *p = bezier(c, i as f32 / PIECES as f32);
-    }
-    polyline(window, &pts, width, color, dash);
+/// A stroke `width` logical px wide, in whole device px.
+fn device_width(width: f32, scale: f32) -> f32 {
+    (width * scale).round().max(1.0)
 }
 
-/// A straight stroke from `a` to `b` with round caps.
+/// Where to put the centre line of a `width`-px stroke near `v`, so that
+/// its edges fall on device pixel edges: on a pixel's middle for an odd
+/// number of device px, between pixels for an even one.
+/// `s` is the window's scale factor.
+pub fn pos(s: f32, v: f32, width: f32) -> f32 {
+    let w = device_width(width, s);
+    let d = v * s;
+    let d = if w as u32 % 2 == 1 {
+        d.floor() + 0.5
+    } else {
+        d.round()
+    };
+    d / s
+}
+
+/// A straight stroke from `a` to `b`, which share an x or a y. Its ends
+/// are square; a bend's round end covers the joint.
 pub fn line(window: &mut Window, a: P, b: P, width: f32, color: Hsla, dash: Option<Dash>) {
-    polyline(window, &[a, b], width, color, dash);
+    if dash.is_some() || (a.0 != b.0 && a.1 != b.1) {
+        stroke(window, &[a, a, b, b], width, color, dash);
+        return;
+    }
+    let s = window.scale_factor();
+    let w = device_width(width, s);
+    let (x0, x1) = ((a.0.min(b.0) * s).round(), (a.0.max(b.0) * s).round());
+    let (y0, y1) = ((a.1.min(b.1) * s).round(), (a.1.max(b.1) * s).round());
+    let (l, r, t, btm) = if a.0 == b.0 {
+        let l = (a.0 * s - w / 2.0).round();
+        (l, l + w, y0, y1)
+    } else {
+        let t = (a.1 * s - w / 2.0).round();
+        (x0, x1, t, t + w)
+    };
+    window.paint_quad(fill(
+        Bounds::new(
+            point(px(l / s), px(t / s)),
+            size(px((r - l) / s), px((btm - t) / s)),
+        ),
+        color,
+    ));
+}
+
+/// A cubic Bézier `[from, c1, c2, to]`, `width` px wide.
+pub fn cubic(window: &mut Window, c: [P; 4], width: f32, color: Hsla, dash: Option<Dash>) {
+    stroke(window, &c, width, color, dash);
 }
 
 /// An arc of the circle of radius `r` around `center`, from angle `start`
 /// to `end` in radians, clockwise from the top.
 pub fn arc(window: &mut Window, center: P, r: f32, start: f32, end: f32, width: f32, color: Hsla) {
-    let n = ((end - start).abs() * r / 2.0).ceil().max(2.0) as usize;
-    let pts: Vec<P> = (0..=n)
-        .map(|i| {
-            let a = start + (end - start) * i as f32 / n as f32;
-            (center.0 + r * a.sin(), center.1 - r * a.cos())
-        })
-        .collect();
-    polyline(window, &pts, width, color, None);
-}
-
-fn bezier([p0, p1, p2, p3]: [P; 4], t: f32) -> P {
-    let u = 1.0 - t;
-    let (a, b, c, d) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
-    (
-        a * p0.0 + b * p1.0 + c * p2.0 + d * p3.0,
-        a * p0.1 + b * p1.1 + c * p2.1 + d * p3.1,
-    )
-}
-
-/// Stamps round quads at even steps along `pts`.
-fn polyline(window: &mut Window, pts: &[P], width: f32, color: Hsla, dash: Option<Dash>) {
-    let r = width / 2.0;
-    for at in stamps(pts, r, dash) {
-        window.paint_quad(
-            fill(
-                Bounds::new(
-                    point(px(at.0 - r), px(at.1 - r)),
-                    size(px(width), px(width)),
-                ),
-                color,
-            )
-            .corner_radii(px(r)),
-        );
-    }
-}
-
-/// Where the stamps of a stroke of radius `r` along `pts` go. A dash's
-/// stamps stop `2r` short of its end, so its caps keep it `on` px long.
-fn stamps(pts: &[P], r: f32, dash: Option<Dash>) -> Vec<P> {
-    let mut out = Vec::new();
-    let Some(&first) = pts.first() else {
-        return out;
-    };
-    let period = dash.map(|d| d.on + d.off).filter(|&p| p > 0.0);
-    let drawn = |s: f32| match (dash, period) {
-        (Some(d), Some(p)) => s.rem_euclid(p) <= (d.on - 2.0 * r).max(0.0),
-        _ => true,
-    };
-    // Arc length walked so far, and where the next stamp is due.
-    let (mut walked, mut next) = (0.0f32, 0.0f32);
-    let mut prev = first;
-    if drawn(0.0) {
-        out.push(first);
-    }
-    next += SPACING;
-    for &p in &pts[1..] {
-        let len = (p.0 - prev.0).hypot(p.1 - prev.1);
-        while next <= walked + len && len > 0.0 {
-            let t = (next - walked) / len;
-            if drawn(next) {
-                out.push((prev.0 + (p.0 - prev.0) * t, prev.1 + (p.1 - prev.1) * t));
-            }
-            next += SPACING;
+    // Cubics of at most a quarter turn each, which stay within 0.03% of
+    // the circle.
+    let n = ((end - start).abs() / std::f32::consts::FRAC_PI_2)
+        .ceil()
+        .max(1.0) as usize;
+    let step = (end - start) / n as f32;
+    let k = 4.0 / 3.0 * (step / 4.0).tan();
+    let at = |a: f32| (center.0 + r * a.sin(), center.1 - r * a.cos());
+    // The tangent, clockwise from the top.
+    let dir = |a: f32| (a.cos(), a.sin());
+    let mut pts = Vec::with_capacity(3 * n + 1);
+    for i in 0..n {
+        let (a0, a1) = (start + step * i as f32, start + step * (i + 1) as f32);
+        let (p0, p3) = (at(a0), at(a1));
+        let (d0, d1) = (dir(a0), dir(a1));
+        if i == 0 {
+            pts.push(p0);
         }
-        walked += len;
-        prev = p;
+        pts.push((p0.0 + d0.0 * k * r, p0.1 + d0.1 * k * r));
+        pts.push((p3.0 - d1.0 * k * r, p3.1 - d1.1 * k * r));
+        pts.push(p3);
     }
-    // The far end gets its cap even between steps.
-    if drawn(walked) && out.last() != Some(&prev) {
-        out.push(prev);
-    }
-    out
+    stroke(window, &pts, width, color, None);
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Strokes the cubics through `pts` (a start, then three points per
+/// cubic) with round caps, as a picture drawn once per shape.
+fn stroke(window: &mut Window, pts: &[P], width: f32, color: Hsla, dash: Option<Dash>) {
+    if pts.len() < 4 {
+        return;
+    }
+    let s = window.scale_factor();
+    let w = device_width(width, s);
+    let dev: Vec<P> = pts.iter().map(|&(x, y)| (x * s, y * s)).collect();
+    // The picture's corner: whole device px, a stroke's width clear of
+    // every point, so the curve keeps its place within a px.
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for &(x, y) in &dev {
+        (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+    }
+    let pad = w + 1.0;
+    let (ox, oy) = ((x0 - pad).floor(), (y0 - pad).floor());
+    let (iw, ih) = (
+        ((x1 + pad).ceil() - ox) as u32,
+        ((y1 + pad).ceil() - oy) as u32,
+    );
+    if iw == 0 || ih == 0 || iw > 4096 || ih > 4096 {
+        return;
+    }
+    let local: Vec<P> = dev.iter().map(|&(x, y)| (x - ox, y - oy)).collect();
+    let rgba = color.to_rgb();
+    let q = |v: f32| (v * 8.0).round() as i32;
 
-    #[test]
-    fn stamps_cover_the_whole_line_evenly() {
-        let s = stamps(&[(0.0, 0.0), (3.0, 0.0)], 0.75, None);
-        assert_eq!(s.first(), Some(&(0.0, 0.0)));
-        assert_eq!(s.last(), Some(&(3.0, 0.0)));
-        for w in s.windows(2) {
-            let gap = w[1].0 - w[0].0;
-            assert!(gap > 0.0 && gap <= SPACING + 1e-4, "{gap}");
+    let mut h = DefaultHasher::new();
+    for &(x, y) in &local {
+        (q(x), q(y)).hash(&mut h);
+    }
+    (q(w), iw, ih).hash(&mut h);
+    dash.map(|d| (q(d.on * s), q(d.off * s))).hash(&mut h);
+    [rgba.r, rgba.g, rgba.b, rgba.a]
+        .map(|c| (c * 255.0).round() as u8)
+        .hash(&mut h);
+    let key = h.finish();
+
+    let image = KEPT.with(|kept| kept.borrow().get(&key).cloned());
+    let image = match image {
+        Some(image) => image,
+        None => {
+            let Some(image) = draw(&local, w, dash.map(|d| (d.on * s, d.off * s)), rgba, iw, ih)
+            else {
+                return;
+            };
+            KEPT.with(|kept| {
+                let mut kept = kept.borrow_mut();
+                if kept.len() >= MAX_KEPT {
+                    kept.clear();
+                }
+                kept.insert(key, image.clone());
+            });
+            image
         }
-    }
+    };
+    let bounds = Bounds::new(
+        point(px(ox / s), px(oy / s)),
+        size(px(iw as f32 / s), px(ih as f32 / s)),
+    );
+    window
+        .paint_image(bounds, Default::default(), image, 0, false)
+        .ok();
+}
 
-    #[test]
-    fn dashes_leave_gaps() {
-        let d = Some(Dash { on: 2.0, off: 2.0 });
-        let s = stamps(&[(0.0, 0.0), (8.0, 0.0)], 0.5, d);
-        // Stamps cover [0, 1] and [4, 5], so the caps make 2 px dashes.
-        assert!(s.iter().all(|p| p.0.rem_euclid(4.0) <= 1.0 + 1e-4));
-        assert!(s.iter().any(|p| p.0 > 4.0));
+/// The stroke as a straight-alpha BGRA picture, `iw` by `ih` device px.
+fn draw(
+    pts: &[P],
+    width: f32,
+    dash: Option<(f32, f32)>,
+    color: Rgba,
+    iw: u32,
+    ih: u32,
+) -> Option<Arc<RenderImage>> {
+    let mut pixmap = tiny_skia::Pixmap::new(iw, ih)?;
+    let mut path = tiny_skia::PathBuilder::new();
+    path.move_to(pts[0].0, pts[0].1);
+    for c in pts[1..].as_chunks::<3>().0 {
+        path.cubic_to(c[0].0, c[0].1, c[1].0, c[1].1, c[2].0, c[2].1);
     }
-
-    #[test]
-    fn bezier_ends_on_its_ends() {
-        let c = [(0.0, 0.0), (5.0, 0.0), (5.0, 10.0), (10.0, 10.0)];
-        assert_eq!(bezier(c, 0.0), (0.0, 0.0));
-        assert_eq!(bezier(c, 1.0), (10.0, 10.0));
+    let path = path.finish()?;
+    let mut paint = tiny_skia::Paint::default();
+    paint.set_color(tiny_skia::Color::from_rgba(
+        color.r, color.g, color.b, color.a,
+    )?);
+    paint.anti_alias = true;
+    let stroke = tiny_skia::Stroke {
+        width,
+        line_cap: tiny_skia::LineCap::Round,
+        // A dash's round caps add half the width at each end.
+        dash: dash.and_then(|(on, off)| {
+            tiny_skia::StrokeDash::new(vec![(on - width).max(0.01), off + width], 0.0)
+        }),
+        ..Default::default()
+    };
+    pixmap.stroke_path(
+        &path,
+        &paint,
+        &stroke,
+        tiny_skia::Transform::identity(),
+        None,
+    );
+    let mut data = pixmap.take_demultiplied();
+    for px in data.as_chunks_mut::<4>().0 {
+        px.swap(0, 2);
     }
+    let buffer = image::RgbaImage::from_raw(iw, ih, data)?;
+    Some(Arc::new(RenderImage::new([image::Frame::new(buffer)])))
 }

@@ -616,6 +616,7 @@ fn paint_column(
     window: &mut Window,
 ) -> Vec<(Point<Pixels>, Dot)> {
     let rows = g.layout.nodes.len();
+    let s = window.scale_factor();
     let (ox, oy) = (f32::from(bounds.left()), f32::from(bounds.top()));
     let at = |row: f32, lane: f32| {
         // Fractional rows only come from segment ends, which are whole.
@@ -624,7 +625,12 @@ fn paint_column(
         } else {
             geo.pos(row as usize)
         };
-        point(px(ox + geo.x(lane.round() as usize)), px(oy + geo.y(pos)))
+        // On the device pixel grid, so runs are crisp and bends meet them
+        // exactly.
+        point(
+            px(ink::pos(s, ox + geo.x(lane.round() as usize), STROKE)),
+            px(ink::pos(s, oy + geo.y(pos), STROKE)),
+        )
     };
     let folded = |lane: f32| lane.round() as usize >= LANES;
     let span = geo.rows_in(bounds.size.height);
@@ -666,7 +672,10 @@ fn paint_column(
     }
 
     if geo.dirty {
-        let center = point(px(ox + geo.x(geo.wip_lane)), px(oy + geo.y(geo.wip_pos)));
+        let center = point(
+            px(ink::pos(s, ox + geo.x(geo.wip_lane), STROKE)),
+            px(ink::pos(s, oy + geo.y(geo.wip_pos), STROKE)),
+        );
         dots.push((center, Dot::Wip));
         let r = grow.radius(Dot::Wip, DOT, DOT_HOVER);
         if let Some(h) = geo.head {
