@@ -137,6 +137,108 @@ impl RepoGraph {
         }))
     }
 
+    /// A graph of a GitHub repo with no clone here, from its recent history
+    /// as GitHub has it. Every branch is a remote one (`origin/<name>`), the
+    /// default branch stands for HEAD, and there is nothing local: no
+    /// worktrees, stashes, or unpushed commits. History ends where the read
+    /// stopped.
+    pub fn from_remote(h: crate::github::RemoteHistory, web: String) -> RepoGraph {
+        use crate::history::{Ref, Refs};
+        use crate::repo_info::{Branch, Checkout, Merge};
+        let mut refs = Refs::default();
+        for (name, tip) in &h.branches {
+            refs.insert(tip, Ref::Remote(format!("origin/{name}")));
+        }
+        let default_tip = h.default_branch.as_ref().and_then(|d| {
+            h.branches
+                .iter()
+                .find(|(name, _)| name == d)
+                .map(|(_, tip)| tip.clone())
+        });
+        refs.head = default_tip.clone();
+        refs.head_branch = h.default_branch.clone();
+        let by_id: std::collections::HashMap<&str, &Commit> =
+            h.commits.iter().map(|c| (c.id.as_str(), c)).collect();
+        // What the default branch reaches, within what was read.
+        let mut trunk = std::collections::HashSet::new();
+        let mut stack: Vec<&str> = default_tip.iter().map(String::as_str).collect();
+        while let Some(id) = stack.pop() {
+            if trunk.insert(id.to_string())
+                && let Some(c) = by_id.get(id)
+            {
+                stack.extend(c.parents.iter().map(String::as_str));
+            }
+        }
+        // The newest merge down the default branch's first parents.
+        let mut last_merge = None;
+        let mut at = default_tip.as_deref();
+        while let Some(c) = at.and_then(|id| by_id.get(id)) {
+            if c.is_merge() {
+                last_merge = Some(Merge {
+                    id: c.id.clone(),
+                    time: c.time,
+                    subject: c.subject.clone(),
+                });
+                break;
+            }
+            at = c.parents.first().map(String::as_str);
+        }
+        let branches = h
+            .branches
+            .iter()
+            .filter(|(name, _)| Some(name) != h.default_branch.as_ref())
+            .map(|(name, tip)| Branch {
+                name: name.clone(),
+                local: false,
+                remote: true,
+                merged: trunk.contains(tip),
+                time: by_id.get(tip.as_str()).map_or(0, |c| c.time),
+            })
+            .collect();
+        let default_branch = h.default_branch.as_ref().map(|d| format!("origin/{d}"));
+        let info = Info {
+            checkout: match &h.default_branch {
+                Some(b) => Checkout::Branch(b.clone()),
+                None => Checkout::Detached(String::new()),
+            },
+            worktrees: Vec::new(),
+            local_branches: 0,
+            remote_branches: h.branches.len(),
+            default_branch: default_branch.clone(),
+            default_tip: default_tip.clone(),
+            last_merge,
+            branches,
+            unpushed: Default::default(),
+            unpulled: Default::default(),
+            web: Some(web),
+        };
+        let ctx = Context {
+            default_branch,
+            default_tip,
+            unpushed: Default::default(),
+            unpulled: Default::default(),
+            refs,
+        };
+        let commits = h.commits;
+        let mut layout = Layout::new(&ctx);
+        layout.push(&commits, &ctx);
+        let head_row = find_head(&commits, &ctx, 0);
+        RepoGraph {
+            prs: Default::default(),
+            bands: Vec::new(),
+            others: Vec::new(),
+            head_row,
+            commits,
+            layout,
+            ctx,
+            info,
+            stashes: Vec::new(),
+            end: true,
+            tips: Vec::new(),
+            setup: Default::default(),
+        }
+    }
+
     /// Reads the page after what is loaded.
     pub fn more(&self, repo: &Path, page: usize) -> Result<More, String> {
         let Some(last) = self.commits.last() else {
@@ -246,6 +348,46 @@ fn find_head(commits: &[Commit], ctx: &Context, from: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_graph_marks_merged_and_hanging_branches() {
+        let c = |id: &str, time: i64, parents: &[&str]| Commit {
+            id: id.into(),
+            parents: parents.iter().map(|p| p.to_string()).collect(),
+            author: "a".into(),
+            email: "a@x".into(),
+            time,
+            subject: id.into(),
+        };
+        let h = crate::github::RemoteHistory {
+            default_branch: Some("main".into()),
+            branches: vec![
+                ("main".into(), "m2".into()),
+                ("done".into(), "d1".into()),
+                ("wip".into(), "w1".into()),
+            ],
+            commits: vec![
+                c("w1", 5, &["m1"]),
+                c("m2", 4, &["m1", "d1"]),
+                c("d1", 3, &["root"]),
+                c("m1", 2, &["root"]),
+                c("root", 1, &[]),
+            ],
+        };
+        let g = RepoGraph::from_remote(h, "https://github.com/o/r".into());
+        assert_eq!(g.info.default_branch.as_deref(), Some("origin/main"));
+        assert_eq!(g.head_row, Some(1));
+        assert!(g.end);
+        let merged: Vec<(&str, bool)> = g
+            .info
+            .branches
+            .iter()
+            .map(|b| (b.name.as_str(), b.merged))
+            .collect();
+        assert_eq!(merged, [("done", true), ("wip", false)]);
+        assert_eq!(g.info.last_merge.as_ref().unwrap().id, "m2");
+        assert_eq!(g.layout.nodes.len(), 5);
+    }
     use crate::history::tests::{commit, run, temp_repo};
 
     #[test]

@@ -35,7 +35,11 @@ restores the folders.";
 /// What only the input loop touches.
 struct Shared {
     tray: Tray,
-    monitor: Monitor,
+    /// One per folder in the config's `roots()`, in that order.
+    monitors: Vec<Monitor>,
+    /// Where new monitors report.
+    monitor_input: futures::channel::mpsc::UnboundedSender<Input>,
+    config_file: PathBuf,
     icons: folder_icons::Worker,
     /// Reads pull requests from GitHub; never writes anything.
     github: crate::github::Poller,
@@ -46,6 +50,41 @@ struct Shared {
 }
 
 impl Global for Shared {}
+
+impl Shared {
+    fn send_monitors(&self, command: Command) {
+        for m in &self.monitors {
+            m.send(command.clone());
+        }
+    }
+
+    fn start_monitor(&self, slot: usize) -> Monitor {
+        let tx = self.monitor_input.clone();
+        Monitor::start_slot(self.config_file.clone(), slot, move |u| {
+            let _ = tx.unbounded_send(Input::Monitor(slot, u));
+        })
+    }
+}
+
+/// Starts or stops monitors so there is one per folder in `config.roots()`,
+/// and forgets the repos of folders no longer watched.
+fn sync_monitors(cx: &mut App) {
+    let state = cx.global::<Ui>().state.clone();
+    let want = state.read(cx).config.roots().len().max(1);
+    cx.update_global::<Shared, _>(|shared, _| {
+        while shared.monitors.len() < want {
+            let m = shared.start_monitor(shared.monitors.len());
+            shared.monitors.push(m);
+        }
+        // Dropping a monitor shuts it down.
+        shared.monitors.truncate(want);
+    });
+    let removed = state.update(cx, |s, _| s.keep_slots(want));
+    if removed {
+        let repos = state.read(cx).all_repos();
+        cx.global::<Shared>().github.set_repos(repos);
+    }
+}
 
 pub fn run(config_file: PathBuf) {
     Application::new().run(move |cx: &mut App| {
@@ -96,8 +135,8 @@ pub fn run(config_file: PathBuf) {
         };
 
         let monitor_tx = tx.clone();
-        let monitor = Monitor::start(config_file, move |u| {
-            let _ = monitor_tx.unbounded_send(Input::Monitor(u));
+        let monitor = Monitor::start(config_file.clone(), move |u| {
+            let _ = monitor_tx.unbounded_send(Input::Monitor(0, u));
         });
         let icons_tx = tx.clone();
         let icons = folder_icons::Worker::start(config::data_dir(), move |skips| {
@@ -115,10 +154,10 @@ pub fn run(config_file: PathBuf) {
             state: state.clone(),
             timelines,
             marks,
-            input: tx,
+            input: tx.clone(),
             refresh: Rc::new(|cx: &mut App| {
                 if let Some(shared) = cx.try_global::<Shared>() {
-                    shared.monitor.send(Command::RefreshAll);
+                    shared.send_monitors(Command::RefreshAll);
                     shared.github.refresh();
                 }
             }),
@@ -126,7 +165,9 @@ pub fn run(config_file: PathBuf) {
         });
         cx.set_global(Shared {
             tray,
-            monitor,
+            monitors: vec![monitor],
+            monitor_input: tx.clone(),
+            config_file: config_file.clone(),
             icons,
             github,
             save_notice_shown: false,
@@ -167,11 +208,15 @@ fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
     let mut prs_stale = false;
     for input in batch {
         match input {
-            Input::Monitor(update) => {
+            Input::Monitor(slot, update) => {
+                // A monitor being shut down for a folder no longer watched.
+                if slot >= cx.global::<Shared>().monitors.len() {
+                    continue;
+                }
                 // A check that changed no status may still have moved refs
                 // the timeline shows; it observes the state for this.
                 checked |= matches!(update, Update::Status(_));
-                let (c, s) = on_update(update, cx);
+                let (c, s) = on_update(slot, update, cx);
                 changed |= c;
                 icons_stale |= s;
             }
@@ -180,9 +225,19 @@ fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
                 changed = true;
             }
             Input::Github(report) => {
-                // A poll that was under way when the option went off.
-                if state.read(cx).config.github_prs {
-                    state.update(cx, |s, _| s.github_report(report));
+                let c = &state.read(cx).config;
+                if c.github_prs || c.github_repos {
+                    state.update(cx, |s, _| {
+                        let (prs, repos) = (s.config.github_prs, s.config.github_repos);
+                        s.github_report(report);
+                        // A poll that was under way when one option went off.
+                        if !prs {
+                            s.prs.clear();
+                        }
+                        if !repos {
+                            s.set_remote_repos(Vec::new());
+                        }
+                    });
                     prs_stale = true;
                     changed = true;
                 }
@@ -242,7 +297,7 @@ fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
 /// Folds one monitor update into the state. Returns (anything changed,
 /// the folder icons need a sync: statuses changed, or a repo's own icon
 /// may have).
-fn on_update(update: Update, cx: &mut App) -> (bool, bool) {
+fn on_update(slot: usize, update: Update, cx: &mut App) -> (bool, bool) {
     let state = cx.global::<Ui>().state.clone();
     let repo_svgs = {
         let config = &state.read(cx).config;
@@ -263,15 +318,10 @@ fn on_update(update: Update, cx: &mut App) -> (bool, bool) {
             (true, false)
         }
         Update::Repos { repos, capped } => {
-            cx.global::<Shared>().github.set_repos(repos.clone());
-            state.update(cx, |s, _| {
-                let before = s.statuses.len();
-                s.retain_repos(|p| repos.iter().any(|r| r == p));
-                let removed = s.statuses.len() != before;
-                let capped_changed = s.capped != capped;
-                s.capped = capped;
-                (removed || capped_changed, removed)
-            })
+            let result = state.update(cx, |s, _| s.set_slot_repos(slot, repos, capped));
+            let all = state.read(cx).all_repos();
+            cx.global::<Shared>().github.set_repos(all);
+            result
         }
         Update::Started { repo, .. } => {
             state.update(cx, |s, _| s.in_flight.insert(repo));
@@ -284,11 +334,11 @@ fn on_update(update: Update, cx: &mut App) -> (bool, bool) {
             (changed, changed)
         }),
         Update::SweepStarted => {
-            state.update(cx, |s, _| s.sweeping = true);
+            state.update(cx, |s, _| s.set_sweeping(slot, true));
             (true, false)
         }
         Update::SweepDone => state.update(cx, |s, _| {
-            s.sweeping = false;
+            s.set_sweeping(slot, false);
             s.last_checked = Some(local_time());
             // The first result: the folder-icon worker can start now.
             // Every sweep has another look at the repos' own icons, which
@@ -299,7 +349,7 @@ fn on_update(update: Update, cx: &mut App) -> (bool, bool) {
         }),
         Update::RepoIcons => (false, repo_svgs),
         Update::Mode(mode) => {
-            state.update(cx, |s, _| s.mode = mode);
+            state.update(cx, |s, _| s.set_mode(slot, mode));
             (true, false)
         }
     }
@@ -312,13 +362,18 @@ fn update_outputs(sync_icons: bool, cx: &mut App) {
     cx.update_global::<Shared, _>(|shared, cx| {
         let s = state.read(cx);
         let problem = s.problem();
-        shared.tray.update(&TraySnapshot {
-            statuses: &s.statuses,
-            checking: s.sweeping,
-            has_result: s.has_result,
-            problem: problem.as_deref(),
-            incomplete: s.capped.is_some(),
-        });
+        let note = s.badge_note();
+        shared.tray.update(
+            &TraySnapshot {
+                statuses: &s.statuses,
+                checking: s.sweeping,
+                has_result: s.has_result,
+                problem: problem.as_deref(),
+                incomplete: s.capped.is_some(),
+            },
+            s.badge(),
+            note.as_deref(),
+        );
         if sync_icons && s.has_result {
             let config = &s.config;
             shared.icons.sync(
@@ -354,7 +409,7 @@ fn on_action(action: TrayAction, cx: &mut App) -> bool {
             }
         }
         TrayAction::ShowWindow => view::show_window(cx),
-        TrayAction::Refresh => cx.global::<Shared>().monitor.send(Command::RefreshAll),
+        TrayAction::Refresh => cx.global::<Shared>().send_monitors(Command::RefreshAll),
         TrayAction::OpenRepo(path) => view::open_repo(&path, cx),
         TrayAction::EditConfig => {
             let file = cx.global::<Ui>().state.read(cx).config_file.clone();
@@ -373,6 +428,8 @@ fn on_action(action: TrayAction, cx: &mut App) -> bool {
         ),
         TrayAction::SetFolderIconMode(mode) => change_setting(|c| c.folder_icon_mode = mode, cx),
         TrayAction::SetRepoClick(click) => change_setting(|c| c.repo_click = click, cx),
+        TrayAction::SetBadgeNumber(n) => change_setting(|c| c.badge_number = n, cx),
+        TrayAction::SetSort(s) => change_setting(|c| c.sort = s, cx),
         TrayAction::SetAutostart(enabled) => {
             if let Err(e) = crate::autostart::set_enabled(enabled) {
                 crate::error_box(format!("Couldn't change the startup setting: {e}"));
@@ -383,7 +440,7 @@ fn on_action(action: TrayAction, cx: &mut App) -> bool {
         }
         TrayAction::Quit => {
             let shared = cx.global::<Shared>();
-            shared.monitor.send(Command::Shutdown);
+            shared.send_monitors(Command::Shutdown);
             shared.tray.hide();
             cx.quit();
             return false;
@@ -448,8 +505,7 @@ fn change_setting(f: impl FnOnce(&mut Config), cx: &mut App) {
         }
     }
     cx.global::<Shared>()
-        .monitor
-        .send(Command::Apply(new.clone()));
+        .send_monitors(Command::Apply(new.clone()));
     apply_config(&old, new, cx);
 }
 
@@ -484,15 +540,24 @@ fn apply_config(old: &Config, new: Config, cx: &mut App) {
             .icons
             .sync(statuses, new.folder_icons, new.folder_icon_mode);
     }
-    shared.github.settings(new.github_prs, new.interval());
+    let wants = crate::github::Wants {
+        prs: new.github_prs,
+        remote_repos: new.github_repos,
+    };
+    shared.github.settings(wants, new.interval());
     shared.tray.sync_settings(&new);
+    if !new.github_repos {
+        state.update(cx, |s, _| s.set_remote_repos(Vec::new()));
+    }
     if !new.github_prs {
-        state.update(cx, |s, _| {
-            s.prs.clear();
-            s.github_problem = None;
-        });
+        state.update(cx, |s, _| s.prs.clear());
         sync_pr_colors(cx);
     }
+    if !new.github_prs && !new.github_repos {
+        state.update(cx, |s, _| s.github_problem = None);
+    }
+    // A folder added to or removed from `more_paths`.
+    sync_monitors(cx);
 }
 
 /// Hands each listed repo's PRs, merged and closed ones too, to its graph

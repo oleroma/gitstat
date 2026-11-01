@@ -28,7 +28,12 @@ pub enum Badge {
     /// No result yet.
     Checking,
     AllSynced,
+    /// Red, with the configured count (which may be 0 when it counts
+    /// something other than unsynced repos).
     Unsynced(usize),
+    /// Green, with the configured count: every repo is synced, but there
+    /// is something to count, such as open pull requests.
+    Count(usize),
     /// Bad config or a missing folder.
     Problem,
 }
@@ -106,6 +111,10 @@ fn render_with(badge: Badge, size: u32, font: Option<&FontVec>) -> Vec<u8> {
         Badge::Unsynced(count) => {
             draw_text(&mut fg, size, &count_text(count), font);
             RED
+        }
+        Badge::Count(count) => {
+            draw_text(&mut fg, size, &count_text(count), font);
+            GREEN
         }
     };
     compose(&disc, &fg, color)
@@ -748,9 +757,10 @@ pub fn folder_ico(state: FolderState) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    const BADGES: [Badge; 7] = [
+    const BADGES: [Badge; 8] = [
         Badge::Checking,
         Badge::AllSynced,
+        Badge::Count(5),
         Badge::Unsynced(3),
         Badge::Unsynced(42),
         Badge::Unsynced(88),
@@ -804,7 +814,7 @@ mod tests {
                     assert!(rim > 0 && rim < 255, "{ctx}: rim alpha {rim}");
                     // The text or mark is there, with soft edges too.
                     let color = match badge {
-                        Badge::AllSynced => GREEN,
+                        Badge::AllSynced | Badge::Count(_) => GREEN,
                         Badge::Checking => GRAY,
                         _ => RED,
                     };

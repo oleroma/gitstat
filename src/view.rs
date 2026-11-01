@@ -295,12 +295,22 @@ pub fn panel_rows(state: &AppState) -> usize {
     } else {
         usize::from(state.github_problem.is_some())
     };
-    repos + github
+    let remote = match state.remote_statuses.len() {
+        0 => 0,
+        _ if state.remote_folded(false) => 1,
+        n => n + 1,
+    };
+    repos + github + remote
 }
 
 /// Opens a repo the way config's `repo_click` says: its folder, or its
 /// GitHub page (the folder when it has none). Only opens; changes nothing.
 pub fn open_repo(path: &std::path::Path, cx: &mut App) {
+    // A repo with no clone has only its GitHub page.
+    if let Some(slug) = crate::github::remote_slug(path) {
+        cx.open_url(&format!("https://github.com/{slug}"));
+        return;
+    }
     let github = cx
         .try_global::<Ui>()
         .is_some_and(|ui| ui.state.read(cx).config.repo_click == crate::config::RepoClick::Github);
@@ -332,7 +342,9 @@ fn mode_text(mode: &WatchMode) -> String {
 }
 
 pub(crate) fn status_color(s: &RepoStatus, p: &Palette) -> Hsla {
-    if s.error.is_some() || s.is_diverged() || s.behind > 0 {
+    if s.remote_only {
+        p.muted
+    } else if s.error.is_some() || s.is_diverged() || s.behind > 0 {
         p.red
     } else if !s.is_synced() {
         p.amber
@@ -577,6 +589,21 @@ fn pr_rows(
     out
 }
 
+/// Why the GitHub repo list couldn't be read, when the pull requests
+/// aren't already saying it.
+fn remote_problem_row(problem: &str, p: &Palette) -> AnyElement {
+    div()
+        .px_4()
+        .py(px(6.))
+        .border_t_1()
+        .border_color(p.border)
+        .text_xs()
+        .text_color(p.muted)
+        .truncate()
+        .child(format!("GitHub repos: {problem}"))
+        .into_any_element()
+}
+
 /// Big mode's pull request list at its tallest: the heading and about
 /// six rows.
 const WINDOW_PRS_HEIGHT: f32 = 230.;
@@ -649,7 +676,14 @@ impl Render for StatusView {
         } else {
             p.muted
         };
-        let mut subline = state.config.repos_dir().display().to_string();
+        let roots = state.config.roots();
+        let mut subline = roots
+            .first()
+            .map(|r| r.display().to_string())
+            .unwrap_or_default();
+        if roots.len() > 1 {
+            subline.push_str(&format!(" + {} more", roots.len() - 1));
+        }
         if let Some(time) = &state.last_checked {
             subline.push_str(&format!(" · checked {time}"));
         }
@@ -762,6 +796,25 @@ impl Render for StatusView {
                 })
             })
         };
+        let fold_remote = |big: bool| -> OnClick {
+            let state = self.state.clone();
+            Box::new(move |_, _, cx| {
+                state.update(cx, |s, cx| {
+                    s.fold_remote(big);
+                    cx.notify();
+                })
+            })
+        };
+        let pr_problem = state
+            .github_problem
+            .as_deref()
+            .filter(|_| state.config.github_prs);
+        // The pull requests show a GitHub problem; without them, this does.
+        let remote_problem = if state.config.github_prs || !state.config.github_repos {
+            None
+        } else {
+            state.github_problem.as_deref()
+        };
         let mut rows: Vec<AnyElement> = Vec::new();
         match mode {
             // Without timelines (never, once the app is up) a plain list.
@@ -834,9 +887,68 @@ impl Render for StatusView {
                         }
                     }
                 }
+                // The GitHub repos with no clone, last, folded like the
+                // synced ones.
+                let remote = state.sorted(&state.remote_statuses);
+                if !remote.is_empty() {
+                    let open = !state.remote_folded(false);
+                    let label =
+                        if icons_only {
+                            div()
+                                .flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap_1()
+                                .overflow_hidden()
+                                .when(!open, |d| {
+                                    d.children(remote.iter().map(|s| {
+                                        crate::repo_marks::global_mark(s, 16.0, p.muted, cx)
+                                    }))
+                                })
+                        } else {
+                            div()
+                                .flex_1()
+                                .child(format!("◌ {} on GitHub only", remote.len()))
+                        };
+                    rows.push(
+                        div()
+                            .id("remote")
+                            .flex()
+                            .items_center()
+                            .gap(px(10.))
+                            .px_4()
+                            .py(px(6.))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(p.hover))
+                            .text_sm()
+                            .text_color(p.muted)
+                            .tooltip(tip(
+                                vec![
+                                    (
+                                        format!("{} GitHub repos not cloned here", remote.len()),
+                                        p.text,
+                                    ),
+                                    ("Their trees come from GitHub".to_string(), p.muted),
+                                ],
+                                &p,
+                            ))
+                            .child(label)
+                            .child(div().flex_none().child(if open { "▾" } else { "▸" }))
+                            .on_click(fold_remote(false))
+                            .into_any_element(),
+                    );
+                    if open {
+                        let offset = bad.len() + good.len();
+                        for (i, s) in remote.iter().enumerate() {
+                            rows.push(row(offset + i, s, cx));
+                        }
+                    }
+                } else if let Some(problem) = remote_problem {
+                    rows.push(remote_problem_row(problem, &p));
+                }
                 rows.extend(pr_rows(
                     &open_prs,
-                    state.github_problem.as_deref(),
+                    pr_problem,
                     &p,
                     mode,
                     icons_only,
@@ -858,15 +970,21 @@ impl Render for StatusView {
         };
         let table = match (&timelines, mode) {
             (Some(t), Mode::Window) => {
+                // In the configured order; the GitHub repos with no clone
+                // come after the cloned ones.
+                let order: Vec<&RepoStatus> = state
+                    .sorted(&state.statuses)
+                    .into_iter()
+                    .chain(state.sorted(&state.remote_statuses))
+                    .collect();
                 if let Some(i) = focus
                     .as_deref()
-                    .and_then(|f| crate::timeline::column_index(&state.statuses, f))
+                    .and_then(|f| crate::timeline::column_index(&order, f))
                 {
                     self.table.scroll_to_item(i);
                 }
-                let columns: Vec<AnyElement> = state
-                    .statuses
-                    .iter()
+                let columns: Vec<AnyElement> = order
+                    .into_iter()
                     .enumerate()
                     .map(|(i, s)| Timelines::column(t, i, s, &p, dark, window, cx))
                     .collect();
@@ -910,15 +1028,21 @@ impl Render for StatusView {
         // high, scrolling when there are more.
         let window_prs = (mode == Mode::Window)
             .then(|| {
-                pr_rows(
+                let mut rows = pr_rows(
                     &open_prs,
-                    state.github_problem.as_deref(),
+                    pr_problem,
                     &p,
                     mode,
                     false,
                     Some((state.prs_folded(true), fold_prs(true))),
                     cx,
-                )
+                );
+                if state.remote_statuses.is_empty()
+                    && let Some(problem) = remote_problem
+                {
+                    rows.push(remote_problem_row(problem, &p));
+                }
+                rows
             })
             .filter(|rows| !rows.is_empty())
             .map(|rows| {

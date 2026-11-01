@@ -224,6 +224,9 @@ pub struct Timelines {
     focus: Option<PathBuf>,
     /// Each repo's GitHub PRs by branch, given to its graph as it lands.
     prs: HashMap<PathBuf, Arc<PrColors>>,
+    /// Big mode columns whose header shows its details, not just the
+    /// one-line summary. Kept while gitstat runs.
+    expanded: HashSet<PathBuf>,
 }
 
 impl Timelines {
@@ -248,7 +251,20 @@ impl Timelines {
             stats_pending: HashSet::new(),
             focus: None,
             prs: HashMap::new(),
+            expanded: HashSet::new(),
         }
+    }
+
+    /// Whether `path`'s column header shows its details.
+    pub fn header_open(&self, path: &Path) -> bool {
+        self.expanded.contains(path)
+    }
+
+    pub fn toggle_header(&mut self, path: &Path, cx: &mut Context<Self>) {
+        if !self.expanded.remove(path) {
+            self.expanded.insert(path.to_path_buf());
+        }
+        cx.notify();
     }
 
     /// The repo's GitHub page, once its graph has loaded.
@@ -275,10 +291,11 @@ impl Timelines {
     /// Forgets the repos gone from the list. Checks need nothing here: the
     /// state change redraws the panel, and drawing reloads stale strips.
     fn sync(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
-        let listed: HashSet<&Path> = state
-            .read(cx)
+        let s = state.read(cx);
+        let listed: HashSet<&Path> = s
             .statuses
             .iter()
+            .chain(&s.remote_statuses)
             .map(|s| s.path.as_path())
             .collect();
         self.slots.retain(|p, _| listed.contains(p.as_path()));
@@ -328,6 +345,17 @@ impl Timelines {
             let prev = slot.graph.clone();
             let repo = path.clone();
             let task = match (load, prev) {
+                // A GitHub repo with no clone: its history comes from GitHub,
+                // all of it at once.
+                (Load::Reload, _) if crate::github::remote_slug(&repo).is_some() => cx
+                    .background_spawn(async move {
+                        let slug = crate::github::remote_slug(&repo).unwrap_or_default();
+                        let h = crate::github::remote_history(slug)?;
+                        let web = format!("https://github.com/{slug}");
+                        Ok(Loaded::Graph(Some(Box::new(RepoGraph::from_remote(
+                            h, web,
+                        )))))
+                    }),
                 (Load::Reload, prev) => cx.background_spawn(async move {
                     RepoGraph::load(&repo, prev.as_deref(), history::PAGE_SIZE)
                         .map(|g| Loaded::Graph(g.map(Box::new)))

@@ -188,16 +188,27 @@ fn run_once(args: &Args) -> i32 {
             return 2;
         }
     };
-    let dir = config.repos_dir();
-    let found = git::find_repos(&dir, config.depth());
-    if let Some(capped) = &found.capped {
-        eprintln!("The repo list is incomplete: {capped}.");
+    let roots = config.roots();
+    let mut statuses = Vec::new();
+    for dir in &roots {
+        let found = git::find_repos(dir, config.depth());
+        if let Some(capped) = &found.capped {
+            eprintln!(
+                "The repo list of {} is incomplete: {capped}.",
+                dir.display()
+            );
+        }
+        statuses.extend(git::check_all(
+            &config.name_base(dir),
+            &found.repos,
+            args.fetch,
+        ));
     }
-    let statuses = git::check_all(&dir, &found.repos, args.fetch);
     if statuses.is_empty() {
+        let dirs: Vec<String> = roots.iter().map(|d| d.display().to_string()).collect();
         println!(
             "No git repos found in {} (depth {})",
-            dir.display(),
+            dirs.join(", "),
             config.depth()
         );
     }

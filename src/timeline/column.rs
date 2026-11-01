@@ -93,6 +93,10 @@ impl Timelines {
 
     /// Reads the line stats of the rows in view that haven't been read.
     fn want_stats(&mut self, path: &Path, rows: std::ops::Range<usize>, cx: &mut Context<Self>) {
+        // No clone to ask git; GitHub's line counts aren't read.
+        if crate::github::remote_slug(path).is_some() {
+            return;
+        }
         let Some(g) = self.slots.get(path).and_then(|s| s.graph.as_ref()) else {
             return;
         };
@@ -164,7 +168,9 @@ impl Timelines {
             graph.as_deref(),
             error.as_deref(),
             p,
+            &colors,
             &path,
+            (t.header_open(&path), this.clone()),
             cx,
         );
 
@@ -431,20 +437,23 @@ fn pill(text: String, color: Hsla) -> AnyElement {
         .into_any_element()
 }
 
-/// The column's header: name, checkout and status, worktrees and branches,
-/// and the last merge. A click opens the repo's folder.
+/// The column's header: name, checkout and status, then the repo at a
+/// glance: its branches by fate (merged, in review, hanging), worktrees and
+/// last merge. Folded, that is one row of coloured counts; open, a bar,
+/// a legend and the names behind the counts. A click on the name opens the
+/// repo, a click on the counts folds or opens the details.
+#[allow(clippy::too_many_arguments)]
 fn header(
     index: usize,
     status: &RepoStatus,
     g: Option<&RepoGraph>,
     error: Option<&str>,
     p: &Palette,
+    colors: &Colors,
     path: &Path,
+    (open, timelines): (bool, Entity<Timelines>),
     cx: &App,
 ) -> AnyElement {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64);
     let checkout = match g.map(|g| &g.info.checkout) {
         Some(Checkout::Branch(b)) => b.clone(),
         Some(Checkout::Unborn(b)) => format!("{b} (no commits)"),
@@ -455,59 +464,14 @@ fn header(
         Some(_) if status.error.is_none() => "history unreadable".to_string(),
         _ => status.label(),
     };
-    let stats = g.map(|g| {
-        let i = &g.info;
-        let wt = i.worktrees.len().max(1);
-        format!(
-            "{wt} worktree{} · {} local · {} remote branch{}",
-            if wt == 1 { "" } else { "s" },
-            i.local_branches,
-            i.remote_branches,
-            if i.remote_branches == 1 { "" } else { "es" }
-        )
-    });
-    let merge = g.map(|g| match (&g.info.last_merge, &g.info.default_branch) {
-        (Some(m), Some(b)) => format!(
-            "last merge into {b} {} ago: {}",
-            history::ago(now, m.time),
-            m.subject
-        ),
-        (None, Some(b)) => format!("no merges into {b}"),
-        _ => "no default branch".to_string(),
-    });
-    let worktrees: Vec<String> = g
-        .map(|g| {
-            g.info
-                .worktrees
-                .iter()
-                .skip(1)
-                .map(|w| {
-                    let name = w.path.file_name().map_or_else(
-                        || w.path.display().to_string(),
-                        |n| n.to_string_lossy().into(),
-                    );
-                    match &w.branch {
-                        Some(b) => format!("↳ {name} on {b}"),
-                        None => format!("↳ {name}, detached"),
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let open = path.to_path_buf();
-    div()
-        .id(("column-header", index))
+    let repo = path.to_path_buf();
+    let title = div()
+        .id(("column-title", index))
         .flex()
         .flex_col()
-        .flex_none()
         .gap(px(2.))
-        .px_3()
-        .py_2()
-        .border_b_1()
-        .border_color(p.border)
         .cursor_pointer()
-        .hover(|s| s.bg(p.hover))
-        .on_click(move |_, _, cx| crate::view::open_repo(&open, cx))
+        .on_click(move |_, _, cx| crate::view::open_repo(&repo, cx))
         .child(
             div()
                 .flex()
@@ -546,15 +510,313 @@ fn header(
                         .text_color(crate::view::status_color(status, p))
                         .child(label),
                 ),
-        )
-        .children(stats.map(|s| div().truncate().text_xs().text_color(p.muted).child(s)))
-        .children(
-            worktrees
-                .into_iter()
-                .map(|w| div().truncate().text_xs().text_color(p.muted).child(w)),
-        )
-        .children(merge.map(|m| div().truncate().text_xs().text_color(p.muted).child(m)))
+        );
+    let head = div()
+        .flex()
+        .flex_col()
+        .flex_none()
+        .gap(px(6.))
+        .px_3()
+        .py_2()
+        .border_b_1()
+        .border_color(p.border)
+        .child(title);
+    let Some(g) = g else {
+        return head.into_any_element();
+    };
+    let glance = Glance::new(g);
+    let toggle_path = path.to_path_buf();
+    let summary = glance
+        .summary_row(index, open, p, colors)
+        .cursor_pointer()
+        .rounded_sm()
+        .hover(|s| s.bg(p.hover))
+        .on_click(move |_, _, cx| {
+            timelines.update(cx, |t, cx| t.toggle_header(&toggle_path, cx));
+        });
+    head.child(summary)
+        .when(open, |d| d.child(glance.details(p, colors)))
         .into_any_element()
+}
+
+/// What a column header shows about a repo beyond its status.
+struct Glance {
+    branches: crate::repo_info::BranchSummary,
+    /// The default branch's short name, for the words: `main`.
+    trunk: String,
+    local: usize,
+    remote: usize,
+    /// Other worktrees than the main one, as their lines.
+    worktrees: Vec<String>,
+    /// How long ago the last merge into the default branch was, and its line.
+    merge: Option<(String, String)>,
+    /// The PR state per branch, for the names in the details.
+    prs: Arc<graph::PrColors>,
+}
+
+impl Glance {
+    fn new(g: &RepoGraph) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        let i = &g.info;
+        let trunk = i
+            .default_branch
+            .as_deref()
+            .map(|d| d.split_once('/').map_or(d, |(_, n)| n).to_string())
+            .unwrap_or_else(|| "the default branch".to_string());
+        let worktrees = i
+            .worktrees
+            .iter()
+            .skip(1)
+            .map(|w| {
+                let name = w.path.file_name().map_or_else(
+                    || w.path.display().to_string(),
+                    |n| n.to_string_lossy().into(),
+                );
+                match &w.branch {
+                    Some(b) => format!("{name} on {b}"),
+                    None => format!("{name}, detached"),
+                }
+            })
+            .collect();
+        let merge = match (&i.last_merge, &i.default_branch) {
+            (Some(m), Some(b)) => {
+                let ago = history::ago(now, m.time);
+                Some((
+                    ago.clone(),
+                    format!("Last merge into {b}, {ago} ago: {}", m.subject),
+                ))
+            }
+            _ => None,
+        };
+        Self {
+            branches: crate::repo_info::summarize(&i.branches, |name| g.prs.of(name)),
+            trunk,
+            local: i.local_branches,
+            remote: i.remote_branches,
+            worktrees,
+            merge,
+            prs: g.prs.clone(),
+        }
+    }
+
+    /// (count, colour, words) for merged, in review and hanging.
+    fn fates(&self, colors: &Colors) -> [(usize, Hsla, String); 3] {
+        let b = &self.branches;
+        [
+            (
+                b.merged.len(),
+                colors.merged,
+                format!("merged into {}", self.trunk),
+            ),
+            (
+                b.in_review.len(),
+                colors.pr_open,
+                "in open pull requests".to_string(),
+            ),
+            (
+                b.hanging.len(),
+                colors.unpushed,
+                "hanging: not merged, no open PR".to_string(),
+            ),
+        ]
+    }
+
+    /// The folded view: a small bar of the fates, the branch count, each
+    /// fate's count, worktrees and the last merge's age, as icons with
+    /// numbers that never wrap. Each part says what it is on hover.
+    fn summary_row(
+        &self,
+        index: usize,
+        open: bool,
+        p: &Palette,
+        colors: &Colors,
+    ) -> gpui::Stateful<gpui::Div> {
+        let total = self.branches.total();
+        let fates = self.fates(colors);
+        let mut tip_lines = vec![(
+            format!(
+                "{total} branch{} besides {} ({} local, {} remote)",
+                if total == 1 { "" } else { "es" },
+                self.trunk,
+                self.local,
+                self.remote
+            ),
+            p.text,
+        )];
+        tip_lines.extend(
+            fates
+                .iter()
+                .map(|(n, c, words)| (format!("{n} {words}"), *c)),
+        );
+        if !self.worktrees.is_empty() {
+            tip_lines.push((
+                format!("{} more worktree(s)", self.worktrees.len()),
+                p.muted,
+            ));
+        }
+        if let Some((_, line)) = &self.merge {
+            tip_lines.push((line.clone(), p.muted));
+        }
+        tip_lines.push((
+            if open {
+                "Click to fold"
+            } else {
+                "Click for details"
+            }
+            .to_string(),
+            p.muted,
+        ));
+        let count = |glyph: &'static str, n: String, c: Hsla, dim: bool| {
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(px(3.))
+                .when(dim, |d| d.opacity(0.45))
+                .child(div().text_color(c).child(glyph))
+                .child(div().text_color(p.text).child(n))
+        };
+        div()
+            .id(("column-glance", index))
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .px_1()
+            .py(px(2.))
+            .overflow_hidden()
+            .text_xs()
+            .tooltip(crate::view::tip(tip_lines, p))
+            .child(fate_bar(&fates, total, px(36.).into(), p).flex_none())
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(p.muted)
+                    .child(format!("{total}")),
+            )
+            .children(
+                fates
+                    .iter()
+                    .map(|(n, c, _)| count("●", n.to_string(), *c, *n == 0)),
+            )
+            .when(!self.worktrees.is_empty(), |d| {
+                d.child(count(
+                    "⧉",
+                    (self.worktrees.len() + 1).to_string(),
+                    p.muted,
+                    false,
+                ))
+            })
+            .when_some(self.merge.as_ref(), |d, (ago, _)| {
+                d.child(count("◷", ago.clone(), p.muted, false))
+            })
+            .child(div().flex_1())
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(p.muted)
+                    .child(if open { "▾" } else { "▸" }),
+            )
+    }
+
+    /// The open view: a full-width bar, a legend line per fate with the
+    /// branch names behind it, then worktrees and the last merge.
+    fn details(&self, p: &Palette, colors: &Colors) -> gpui::Div {
+        /// Names listed under a fate before "and N more".
+        const NAMES: usize = 5;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        let total = self.branches.total();
+        let fates = self.fates(colors);
+        let lists = [
+            &self.branches.merged,
+            &self.branches.in_review,
+            &self.branches.hanging,
+        ];
+        let line = |text: String, c: Hsla| div().truncate().text_color(c).child(text);
+        let mut out = div()
+            .flex()
+            .flex_col()
+            .gap(px(3.))
+            .px_1()
+            .text_xs()
+            .child(fate_bar(&fates, total, gpui::relative(1.), p).mb_1());
+        for (i, ((n, c, words), list)) in fates.iter().zip(lists).enumerate() {
+            out = out.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_none().size(px(8.)).rounded_full().bg(*c))
+                    .child(line(format!("{n} {words}"), p.text)),
+            );
+            // Merged ones (the first) are done with: their names matter least.
+            let shown = if i == 0 { 0 } else { NAMES };
+            for b in list.iter().take(shown) {
+                let mut text = format!("{} · {}", b.name, history::ago(now, b.time));
+                match (b.local, b.remote) {
+                    (true, false) => text.push_str(" · local only"),
+                    (false, true) => text.push_str(" · remote only"),
+                    _ => {}
+                }
+                if let Some(pr) = self.prs.of(&b.name) {
+                    text.push_str(&format!(" · {}", pr.label()));
+                }
+                out = out.child(div().pl(px(16.)).child(line(text, p.muted)));
+            }
+            if shown > 0 && list.len() > shown {
+                out = out.child(
+                    div()
+                        .pl(px(16.))
+                        .child(line(format!("and {} more", list.len() - shown), p.muted)),
+                );
+            }
+        }
+        out = out.child(line(
+            format!(
+                "{} local · {} remote branch{}",
+                self.local,
+                self.remote,
+                if self.remote == 1 { "" } else { "es" }
+            ),
+            p.muted,
+        ));
+        for w in &self.worktrees {
+            out = out.child(line(format!("↳ worktree {w}"), p.muted));
+        }
+        out.child(line(
+            match &self.merge {
+                Some((_, l)) => l.clone(),
+                None => format!("No merges into {}", self.trunk),
+            },
+            p.muted,
+        ))
+    }
+}
+
+/// A rounded bar cut into the fates, each part as long as its share; an
+/// empty track when there are no branches.
+fn fate_bar(
+    fates: &[(usize, Hsla, String); 3],
+    total: usize,
+    width: gpui::DefiniteLength,
+    p: &Palette,
+) -> gpui::Div {
+    div()
+        .flex()
+        .w(width)
+        .h(px(6.))
+        .rounded_full()
+        .overflow_hidden()
+        .bg(p.border)
+        .children(fates.iter().filter(|(n, _, _)| *n > 0).map(|(n, c, _)| {
+            div()
+                .h_full()
+                .w(gpui::relative(*n as f32 / total.max(1) as f32))
+                .bg(*c)
+        }))
 }
 
 /// Where a column's rows and lanes sit. Rows are counted in "positions":
@@ -756,6 +1018,6 @@ fn paint_column(
 }
 
 /// The repos in the table's order, for `ScrollHandle::scroll_to_item`.
-pub fn column_index(statuses: &[RepoStatus], path: &Path) -> Option<usize> {
+pub fn column_index(statuses: &[&RepoStatus], path: &Path) -> Option<usize> {
     statuses.iter().position(|s| s.path == path)
 }

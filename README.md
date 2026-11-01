@@ -19,6 +19,22 @@ whether they're in sync with their remotes. It's built with
 - **Red with a number**: that many repos are unsynced.
 - **Gray …**: the first check is still running.
 
+**Display ▸ Number on the icon** picks what the number counts: unsynced repos
+(the default), repos with uncommitted changes, repos to push, repos to pull,
+open pull requests, pull requests needing you (a review asked of you, failing
+checks, conflicts or requested changes), or reviews asked of you. The colour
+still follows sync: red while any repo is unsynced, green with the number
+once all are current, and the ✓ when that number is 0 too. The tooltip says
+what the number counts.
+
+**Display ▸ Sort repos by** sets the order of the repos, the same in the
+panel and the big view: name (the default), status (worst first), last
+commit on any branch, last worked on (where HEAD last moved, from the
+reflog), last pull request activity, most open pull requests (the ones
+needing you count first), or most hanging branches. The panel keeps the
+unsynced repos above the synced ones and sorts within each group; the
+GitHub-only repos stay at the end, sorted the same way.
+
 The icon is drawn at the exact size the notification area uses at your
 display scale, with smooth edges and Segoe UI digits, so it stays crisp at
 125%, 150% and 200%. Above 99 it shows `99+`.
@@ -40,6 +56,18 @@ icon again.
 
 **Double-click** the tray icon to open the **status window**, a normal window
 with every repo in name order and a **Refresh now** button.
+
+In the window each repo is a column. Its header shows the name and checkout,
+then one row that sums the repo up: a small bar and coloured counts of its
+branches (local and remote copies of a branch count once, the default branch
+not at all), its worktrees and how long ago the last merge was. Purple
+branches are **merged** into the default branch, by git or through a merged
+GitHub pull request, which also catches squash merges. Green ones are **in
+review**, with an open or draft pull request. Amber ones are **hanging**: not
+merged and with no open pull request, so work that didn't make it or hasn't
+yet. Click the row to open the details, which list the hanging and in-review
+branches by name with their age, the worktrees and the last merge; click
+again to fold them.
 
 A repo's name is its path below `path`, such as `dev\gitstat`, and lists
 everywhere sort by it.
@@ -164,6 +192,23 @@ token. It asks again every `interval_minutes` and on the refresh button, in
 one GraphQL query per 20 repos. Like everything in gitstat this only reads:
 nothing on GitHub or in the repos is ever changed.
 
+### GitHub repos not cloned here
+
+**Display ▸ GitHub repos not cloned here** (`"github_repos": true`, on by
+default) adds every repo of the account `gh` is signed in to, and of its
+organisations, that has no clone under the watched folders (archived repos are
+left out; a clone counts when its `origin` points at the repo). They come
+after the cloned repos: in the panel behind a "◌ N on GitHub only" row that
+folds like the synced one, in the window as the last columns. Their trees
+come from GitHub: the 30 most recently committed branches, 100 commits back
+from each, read again when the repo is pushed to. Being remote only, they
+have no dirty, unpushed or worktree marks, and never count as unsynced.
+Clicking one opens it on GitHub.
+
+The list is one more read-only GraphQL query per 100 repos every
+`interval_minutes`, plus one per repo for its tree when it is first shown or
+pushed to. gitstat never clones anything.
+
 ## Which repos
 
 gitstat looks in `path` and up to `depth` folder levels below it (3 by
@@ -224,6 +269,14 @@ set `"watch": false`) to check on the interval only, as before v0.3.
 
 git must be on your `PATH` (Git for Windows puts it there).
 
+## Install
+
+Each build on the PC installs itself to `%LOCALAPPDATA%\Programs\gitstat`
+with a **gitstat** shortcut in the Start menu, stops a running gitstat and
+starts the new one. `config.json` there is kept between installs; the first
+install copies `build\config.json`. If **Start with Windows** is on, it is
+pointed at the installed exe.
+
 ## Configure
 
 `config.json` lives next to `gitstat.exe`. Every key is optional, and a file
@@ -232,6 +285,7 @@ from an older version keeps working:
 ```json
 {
   "path": "D:/dev",
+  "more_paths": [],
   "depth": 3,
   "interval_minutes": 5.0,
   "watch": true,
@@ -249,13 +303,17 @@ from an older version keeps working:
   "folder_icons": false,
   "folder_icon_mode": "status",
   "github_prs": true,
-  "repo_click": "folder"
+  "github_repos": true,
+  "repo_click": "folder",
+  "badge_number": "unsynced",
+  "sort": "name"
 }
 ```
 
 | key | default | meaning |
 |---|---|---|
 | `path` | the folder above gitstat's own | The folder your repos are in, at any level down to `depth`; a whole drive such as `D:/` works. `~` and variables like `%USERPROFILE%` are expanded. Use forward slashes or doubled backslashes. |
+| `more_paths` | `[]` | More folders to watch besides `path`, each down to `depth`, such as `["E:/work", "~/src"]`. A folder inside or around one already listed is skipped. With more than one folder, repo names start with their folder's name (`dev\gitstat`, `work\api`). |
 | `depth` | 3 | How many folder levels below `path` to look for repos, 1 to 8. 1 is only `path`'s direct subfolders, which is all earlier versions looked at: set it to keep an older config's repo list as it was, with two exceptions. A `path` that is itself a repo now shows only that repo, not the repos inside it, and a link to a repo that is listed anyway is dropped. See [Which repos](#which-repos). |
 | `interval_minutes` | 5 | How often to fetch, 1 to 1440. |
 | `watch` | true | Pick up local changes from file-system events. false checks on the interval only. |
@@ -272,6 +330,9 @@ from an older version keeps working:
 | `folder_icons` | false | Status icons on the repo folders, see above. Setting it by hand skips the confirmation. |
 | `folder_icon_mode` | `status` | `status` for the status folders, `repo-svg` for each repo's own `.gitstat/icon.svg` where it has one, see [Repo icons](#repo-icons). Only matters while `folder_icons` is on. |
 | `github_prs` | true | **Display ▸ GitHub pull requests**: open pull requests in the panel and big mode, read through `gh`, see [GitHub pull requests](#github-pull-requests). |
+| `github_repos` | true | **Display ▸ GitHub repos not cloned here**: the signed-in account's GitHub repos with no clone under `path`, read through `gh`, see [GitHub repos not cloned here](#github-repos-not-cloned-here). |
+| `badge_number` | `unsynced` | **Display ▸ Number on the icon**: what the number on the tray icon and the badge counts. `unsynced`, `dirty`, `ahead`, `behind`, `pull-requests`, `pull-requests-for-you` or `review-requests`. |
+| `sort` | `name` | **Display ▸ Sort repos by**: the order of the repos in the panel and the big view. `name`, `status`, `last-commit`, `last-worked`, `last-pull-request`, `open-pull-requests` or `hanging-branches`. |
 | `repo_click` | `folder` | **Display ▸ Repo click opens**: what a click on a repo (its name in big mode, or in the menu) opens. `folder` for its folder, `github` for its GitHub page; a repo whose `origin` isn't on GitHub opens its folder either way. |
 
 Edits apply within about a second, without a restart. **Edit config.json** in
