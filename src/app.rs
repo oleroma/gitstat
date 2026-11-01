@@ -235,7 +235,7 @@ fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
                             s.prs.clear();
                         }
                         if !repos {
-                            s.remote_repos.clear();
+                            s.set_remote_repos(Vec::new());
                         }
                     });
                     prs_stale = true;
@@ -546,7 +546,7 @@ fn apply_config(old: &Config, new: Config, cx: &mut App) {
     shared.github.settings(wants, new.interval());
     shared.tray.sync_settings(&new);
     if !new.github_repos {
-        state.update(cx, |s, _| s.remote_repos.clear());
+        state.update(cx, |s, _| s.set_remote_repos(Vec::new()));
     }
     if !new.github_prs {
         state.update(cx, |s, _| s.prs.clear());

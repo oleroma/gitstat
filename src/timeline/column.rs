@@ -93,6 +93,10 @@ impl Timelines {
 
     /// Reads the line stats of the rows in view that haven't been read.
     fn want_stats(&mut self, path: &Path, rows: std::ops::Range<usize>, cx: &mut Context<Self>) {
+        // No clone to ask git; GitHub's line counts aren't read.
+        if crate::github::remote_slug(path).is_some() {
+            return;
+        }
         let Some(g) = self.slots.get(path).and_then(|s| s.graph.as_ref()) else {
             return;
         };

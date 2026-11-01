@@ -369,6 +369,168 @@ fn parse_repo(n: &Value) -> Option<RemoteRepo> {
     })
 }
 
+/// A path that stands for a GitHub repo with no clone here, so the
+/// timeline can key it like a cloned one: `github:owner/name`.
+pub fn remote_path(slug: &str) -> PathBuf {
+    PathBuf::from(format!("{REMOTE_PREFIX}{slug}"))
+}
+
+/// The `owner/name` a [`remote_path`] stands for; `None` for a real folder.
+pub fn remote_slug(path: &Path) -> Option<&str> {
+    path.to_str()?.strip_prefix(REMOTE_PREFIX)
+}
+
+const REMOTE_PREFIX: &str = "github:";
+/// Branches read per uncloned repo, most recently committed to first.
+const REMOTE_BRANCHES: usize = 30;
+/// Commits read back from each of those branches' tips.
+const REMOTE_DEPTH: usize = 100;
+
+/// An uncloned repo's recent history as GitHub has it: its default branch,
+/// each branch's tip, and the commits reachable within `REMOTE_DEPTH` of
+/// those tips, each once.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RemoteHistory {
+    pub default_branch: Option<String>,
+    /// (branch, tip commit id).
+    pub branches: Vec<(String, String)>,
+    pub commits: Vec<crate::history::Commit>,
+}
+
+/// Reads `slug`'s branches and recent commits: one read-only `query`.
+pub fn remote_history(slug: &str) -> Result<RemoteHistory, String> {
+    let (owner, name) = slug.split_once('/').ok_or("not owner/name")?;
+    let plain = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    };
+    if !plain(owner) || !plain(name) {
+        return Err(format!("odd repo name {slug}"));
+    }
+    let json = gh_graphql(&history_query(owner, name))?;
+    parse_history(&json).ok_or_else(|| format!("GitHub has no repo {slug}"))
+}
+
+fn history_query(owner: &str, name: &str) -> String {
+    format!(
+        "query{{repository(owner:\"{owner}\",name:\"{name}\"){{defaultBranchRef{{name}} \
+         refs(refPrefix:\"refs/heads/\",first:{REMOTE_BRANCHES},\
+         orderBy:{{field:TAG_COMMIT_DATE,direction:DESC}}){{nodes{{name \
+         target{{...on Commit{{oid history(first:{REMOTE_DEPTH}){{nodes{{oid \
+         committedDate messageHeadline author{{name email}} \
+         parents(first:3){{nodes{{oid}}}}}}}}}}}}}}}}}}}}"
+    )
+}
+
+fn parse_history(json: &Value) -> Option<RemoteHistory> {
+    let repo = &json["data"]["repository"];
+    if !repo.is_object() {
+        return None;
+    }
+    let mut out = RemoteHistory {
+        default_branch: repo["defaultBranchRef"]["name"]
+            .as_str()
+            .map(str::to_string),
+        ..Default::default()
+    };
+    let mut seen = std::collections::HashSet::new();
+    for r in repo["refs"]["nodes"].as_array().into_iter().flatten() {
+        let (Some(branch), Some(tip)) = (r["name"].as_str(), r["target"]["oid"].as_str()) else {
+            continue;
+        };
+        out.branches.push((branch.to_string(), tip.to_string()));
+        for c in r["target"]["history"]["nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            let Some(id) = c["oid"].as_str() else {
+                continue;
+            };
+            if !seen.insert(id.to_string()) {
+                continue;
+            }
+            out.commits.push(crate::history::Commit {
+                id: id.to_string(),
+                parents: c["parents"]["nodes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|p| p["oid"].as_str().map(str::to_string))
+                    .collect(),
+                author: c["author"]["name"].as_str().unwrap_or("").to_string(),
+                email: c["author"]["email"].as_str().unwrap_or("").to_string(),
+                time: c["committedDate"].as_str().and_then(unix_time).unwrap_or(0),
+                subject: c["messageHeadline"].as_str().unwrap_or("").to_string(),
+            });
+        }
+    }
+    out.commits = date_order(out.commits);
+    Some(out)
+}
+
+/// Seconds since 1970 for an ISO 8601 UTC time as GitHub writes it:
+/// `2026-11-01T14:05:00Z`.
+fn unix_time(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() < 19 {
+        return None;
+    }
+    let n = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
+    let (y, m, d) = (n(0..4)?, n(5..7)?, n(8..10)?);
+    let (hh, mm, ss) = (n(11..13)?, n(14..16)?, n(17..19)?);
+    // Days from 1970-01-01 to y-m-d, by the civil-from-days algorithm.
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + hh * 3_600 + mm * 60 + ss)
+}
+
+/// Newest first, with every commit after all of its children (what the
+/// graph layout needs, as `git log --date-order` gives): of the commits
+/// whose children are all placed, the newest goes next.
+fn date_order(commits: Vec<crate::history::Commit>) -> Vec<crate::history::Commit> {
+    use std::collections::{BinaryHeap, HashMap};
+    let index: HashMap<&str, usize> = commits
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.id.as_str(), i))
+        .collect();
+    let mut children = vec![0usize; commits.len()];
+    for c in &commits {
+        for p in &c.parents {
+            if let Some(&i) = index.get(p.as_str()) {
+                children[i] += 1;
+            }
+        }
+    }
+    let mut ready: BinaryHeap<(i64, std::cmp::Reverse<usize>)> = children
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| **n == 0)
+        .map(|(i, _)| (commits[i].time, std::cmp::Reverse(i)))
+        .collect();
+    let mut order = Vec::with_capacity(commits.len());
+    while let Some((_, std::cmp::Reverse(i))) = ready.pop() {
+        order.push(i);
+        for p in &commits[i].parents {
+            if let Some(&j) = index.get(p.as_str()) {
+                children[j] -= 1;
+                if children[j] == 0 {
+                    ready.push((commits[j].time, std::cmp::Reverse(j)));
+                }
+            }
+        }
+    }
+    let mut slots: Vec<Option<crate::history::Commit>> = commits.into_iter().map(Some).collect();
+    order.into_iter().filter_map(|i| slots[i].take()).collect()
+}
+
 fn checks(state: Option<&str>) -> Checks {
     match state {
         Some("SUCCESS") => Checks::Passing,
@@ -694,6 +856,60 @@ mod tests {
             .map(|r| r.slug)
             .collect();
         assert_eq!(left, ["o/new", "o/Old"]);
+    }
+
+    #[test]
+    fn remote_paths_round_trip() {
+        let p = remote_path("o/r");
+        assert_eq!(remote_slug(&p), Some("o/r"));
+        assert_eq!(remote_slug(Path::new("/dev/r")), None);
+    }
+
+    #[test]
+    fn history_query_is_read_only() {
+        let q = history_query("o", "r");
+        assert!(q.starts_with("query{"));
+        assert!(!q.to_lowercase().contains("mutation"));
+        assert_eq!(q.matches('{').count(), q.matches('}').count());
+        assert!(remote_history("o/r\"x").is_err());
+    }
+
+    #[test]
+    fn reads_iso_times() {
+        assert_eq!(unix_time("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(unix_time("2026-11-01T14:05:00Z"), Some(1_793_541_900));
+        assert_eq!(unix_time("2000-02-29T12:00:00Z"), Some(951_825_600));
+        assert_eq!(unix_time("nope"), None);
+    }
+
+    #[test]
+    fn parses_history_once_per_commit_children_first() {
+        let c = |id: &str, t: &str, parents: &[&str]| {
+            json!({"oid": id, "committedDate": t, "messageHeadline": id,
+                   "author": {"name": "a", "email": "a@x"},
+                   "parents": {"nodes": parents.iter().map(|p| json!({"oid": p})).collect::<Vec<_>>()}})
+        };
+        // main: m2 <- m1 <- root; feat: f1 <- root, with a clock that puts
+        // the child f1 before its parent root, which must still come after.
+        let json = json!({"data": {"repository": {
+            "defaultBranchRef": {"name": "main"},
+            "refs": {"nodes": [
+                {"name": "main", "target": {"oid": "m2", "history": {"nodes": [
+                    c("m2", "2026-01-03T00:00:00Z", &["m1"]),
+                    c("m1", "2026-01-02T00:00:00Z", &["root"]),
+                    c("root", "2026-01-05T00:00:00Z", &[])]}}},
+                {"name": "feat", "target": {"oid": "f1", "history": {"nodes": [
+                    c("f1", "2026-01-04T00:00:00Z", &["root", "gone"]),
+                    c("root", "2026-01-05T00:00:00Z", &[])]}}}
+            ]}
+        }}});
+        let h = parse_history(&json).unwrap();
+        assert_eq!(h.default_branch.as_deref(), Some("main"));
+        assert_eq!(h.branches.len(), 2);
+        let ids: Vec<&str> = h.commits.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["f1", "m2", "m1", "root"]);
+        assert_eq!(h.commits[0].parents, ["root", "gone"]);
+        assert!(parse_history(&json!({"data": {"repository": null}})).is_none());
     }
 
     #[test]

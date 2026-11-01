@@ -187,16 +187,19 @@ nothing on GitHub or in the repos is ever changed.
 ### GitHub repos not cloned here
 
 **Display ▸ GitHub repos not cloned here** (`"github_repos": true`, on by
-default) lists, under the pull requests, every repo of the account `gh` is
-signed in to, and of its organisations, that has no clone under `path`
-(archived repos are left out). A clone counts when its `origin` points at
-the repo on GitHub. The list starts folded; each row shows the repo's name,
-its last push, the checks on its default branch, its open pull requests and
-whether it is private or a fork. Click to open it in the browser.
+default) adds every repo of the account `gh` is signed in to, and of its
+organisations, that has no clone under the watched folders (archived repos are
+left out; a clone counts when its `origin` points at the repo). They come
+after the cloned repos: in the panel behind a "◌ N on GitHub only" row that
+folds like the synced one, in the window as the last columns. Their trees
+come from GitHub: the 30 most recently committed branches, 100 commits back
+from each, read again when the repo is pushed to. Being remote only, they
+have no dirty, unpushed or worktree marks, and never count as unsynced.
+Clicking one opens it on GitHub.
 
-It is read through `gh` like the pull requests, in one more read-only GraphQL
-query per 100 repos, every `interval_minutes` and on the refresh button.
-gitstat never clones anything.
+The list is one more read-only GraphQL query per 100 repos every
+`interval_minutes`, plus one per repo for its tree when it is first shown or
+pushed to. gitstat never clones anything.
 
 ## Which repos
 

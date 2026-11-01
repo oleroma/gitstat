@@ -45,6 +45,9 @@ pub struct AppState {
     /// The GitHub account's repos with no clone here, most recently pushed
     /// first.
     pub remote_repos: Vec<crate::github::RemoteRepo>,
+    /// The same repos as statuses, by name, so the timeline can list them
+    /// after the cloned ones. Never counted as unsynced.
+    pub remote_statuses: Vec<RepoStatus>,
     /// The list of those is folded: in the panel, in big mode. Folded at
     /// first, since an account can have many.
     remote_folded: [bool; 2],
@@ -79,6 +82,7 @@ impl AppState {
             prs: HashMap::new(),
             github_problem: None,
             remote_repos: Vec::new(),
+            remote_statuses: Vec::new(),
             remote_folded: [true; 2],
             prs_folded: [false; 2],
         }
@@ -286,9 +290,40 @@ impl AppState {
             self.prs.extend(report.prs);
         }
         if let Some(remote) = report.remote_only {
-            self.remote_repos = remote;
+            self.set_remote_repos(remote);
         }
         self.github_problem = report.problem;
+    }
+
+    /// Takes in the uncloned repos. One pushed to since the last list
+    /// counts as checked, so its tree is read again.
+    pub fn set_remote_repos(&mut self, remote: Vec<crate::github::RemoteRepo>) {
+        for r in &remote {
+            let pushed_before = self
+                .remote_repos
+                .iter()
+                .find(|o| o.slug == r.slug)
+                .map(|o| o.pushed_at.as_str());
+            if pushed_before.is_some_and(|p| p != r.pushed_at) {
+                self.checked(&crate::github::remote_path(&r.slug));
+            }
+        }
+        let mut statuses: Vec<RepoStatus> = remote
+            .iter()
+            .map(|r| RepoStatus {
+                name: r.slug.clone(),
+                path: crate::github::remote_path(&r.slug),
+                has_upstream: true,
+                remote_only: true,
+                ..Default::default()
+            })
+            .collect();
+        statuses.sort_by_cached_key(|s| s.name.to_lowercase());
+        let listed: HashSet<PathBuf> = statuses.iter().map(|s| s.path.clone()).collect();
+        self.checks
+            .retain(|p, _| crate::github::remote_slug(p).is_none() || listed.contains(p));
+        self.remote_statuses = statuses;
+        self.remote_repos = remote;
     }
 
     /// Whether the not-cloned repo list is folded, in big mode or the panel.

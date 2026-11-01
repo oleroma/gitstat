@@ -291,10 +291,11 @@ impl Timelines {
     /// Forgets the repos gone from the list. Checks need nothing here: the
     /// state change redraws the panel, and drawing reloads stale strips.
     fn sync(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
-        let listed: HashSet<&Path> = state
-            .read(cx)
+        let s = state.read(cx);
+        let listed: HashSet<&Path> = s
             .statuses
             .iter()
+            .chain(&s.remote_statuses)
             .map(|s| s.path.as_path())
             .collect();
         self.slots.retain(|p, _| listed.contains(p.as_path()));
@@ -344,6 +345,17 @@ impl Timelines {
             let prev = slot.graph.clone();
             let repo = path.clone();
             let task = match (load, prev) {
+                // A GitHub repo with no clone: its history comes from GitHub,
+                // all of it at once.
+                (Load::Reload, _) if crate::github::remote_slug(&repo).is_some() => cx
+                    .background_spawn(async move {
+                        let slug = crate::github::remote_slug(&repo).unwrap_or_default();
+                        let h = crate::github::remote_history(slug)?;
+                        let web = format!("https://github.com/{slug}");
+                        Ok(Loaded::Graph(Some(Box::new(RepoGraph::from_remote(
+                            h, web,
+                        )))))
+                    }),
                 (Load::Reload, prev) => cx.background_spawn(async move {
                     RepoGraph::load(&repo, prev.as_deref(), history::PAGE_SIZE)
                         .map(|g| Loaded::Graph(g.map(Box::new)))

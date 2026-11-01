@@ -29,6 +29,9 @@ pub struct RepoStatus {
     /// `fetch_failed` is false). Drives the retry backoff, and lets a later
     /// local-only recheck keep the fetch error.
     pub fetch_errored: bool,
+    /// A GitHub repo with no clone here, listed after the cloned ones: no
+    /// local state, and `path` is `github::remote_path`.
+    pub remote_only: bool,
 }
 
 impl RepoStatus {
@@ -46,6 +49,9 @@ impl RepoStatus {
 
     /// Short status text such as `⬆2 ⬇1 diverged dirty` or `✓ current`.
     pub fn label(&self) -> String {
+        if self.remote_only {
+            return "on GitHub only".to_string();
+        }
         if let Some(error) = &self.error {
             return format!("error: {error}");
         }
