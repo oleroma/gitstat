@@ -41,6 +41,29 @@ pub enum RepoClick {
     Github,
 }
 
+/// What the number on the tray icon and the corner badge counts. Their
+/// colour always follows sync: red while any repo is unsynced, else green.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BadgeNumber {
+    /// Repos not in sync: dirty, ahead, behind, no upstream or erroring.
+    #[default]
+    Unsynced,
+    /// Repos with uncommitted changes.
+    Dirty,
+    /// Repos with commits to push.
+    Ahead,
+    /// Repos with commits to pull.
+    Behind,
+    /// Open pull requests, in the cloned repos and the GitHub-only ones.
+    PullRequests,
+    /// Open pull requests that need something from you: a review asked of
+    /// you, failing checks, conflicts or requested changes.
+    PullRequestsForYou,
+    /// Open pull requests whose review is asked of you.
+    ReviewRequests,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OverlayConfig {
@@ -109,6 +132,8 @@ pub struct Config {
     pub github_repos: bool,
     /// What clicking a repo opens: its folder or its GitHub page.
     pub repo_click: RepoClick,
+    /// What the number on the tray icon and the corner badge counts.
+    pub badge_number: BadgeNumber,
 }
 
 impl Default for Config {
@@ -127,6 +152,7 @@ impl Default for Config {
             github_prs: true,
             github_repos: true,
             repo_click: RepoClick::default(),
+            badge_number: BadgeNumber::default(),
         }
     }
 }
@@ -414,6 +440,15 @@ mod tests {
             assert_eq!(serde_json::from_str::<Corner>(text).unwrap(), corner);
         }
         assert!(serde_json::from_str::<Corner>("\"BottomRight\"").is_err());
+    }
+
+    #[test]
+    fn badge_number_defaults_to_unsynced() {
+        let parse = |text: &str| serde_json::from_str::<Config>(text);
+        assert_eq!(parse("{}").unwrap().badge_number, BadgeNumber::Unsynced);
+        let n = parse(r#"{ "badge_number": "pull-requests-for-you" }"#).unwrap();
+        assert_eq!(n.badge_number, BadgeNumber::PullRequestsForYou);
+        assert!(parse(r#"{ "badge_number": "prs" }"#).is_err());
     }
 
     #[test]

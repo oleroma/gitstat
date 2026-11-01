@@ -322,13 +322,18 @@ fn update_outputs(sync_icons: bool, cx: &mut App) {
     cx.update_global::<Shared, _>(|shared, cx| {
         let s = state.read(cx);
         let problem = s.problem();
-        shared.tray.update(&TraySnapshot {
-            statuses: &s.statuses,
-            checking: s.sweeping,
-            has_result: s.has_result,
-            problem: problem.as_deref(),
-            incomplete: s.capped.is_some(),
-        });
+        let note = s.badge_note();
+        shared.tray.update(
+            &TraySnapshot {
+                statuses: &s.statuses,
+                checking: s.sweeping,
+                has_result: s.has_result,
+                problem: problem.as_deref(),
+                incomplete: s.capped.is_some(),
+            },
+            s.badge(),
+            note.as_deref(),
+        );
         if sync_icons && s.has_result {
             let config = &s.config;
             shared.icons.sync(
@@ -383,6 +388,7 @@ fn on_action(action: TrayAction, cx: &mut App) -> bool {
         ),
         TrayAction::SetFolderIconMode(mode) => change_setting(|c| c.folder_icon_mode = mode, cx),
         TrayAction::SetRepoClick(click) => change_setting(|c| c.repo_click = click, cx),
+        TrayAction::SetBadgeNumber(n) => change_setting(|c| c.badge_number = n, cx),
         TrayAction::SetAutostart(enabled) => {
             if let Err(e) = crate::autostart::set_enabled(enabled) {
                 crate::error_box(format!("Couldn't change the startup setting: {e}"));

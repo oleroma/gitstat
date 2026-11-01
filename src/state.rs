@@ -1,6 +1,6 @@
 //! The app's shared state and the one input type the UI loop consumes.
 
-use crate::config::Config;
+use crate::config::{BadgeNumber, Config};
 use crate::git::RepoStatus;
 use crate::icon::Badge;
 use crate::monitor::WatchMode;
@@ -90,17 +90,68 @@ impl AppState {
         None
     }
 
+    /// Red with the configured count while any repo is unsynced; green
+    /// with it, or a tick when it is 0, once all are synced.
     pub fn badge(&self) -> Badge {
         if !self.has_result {
             Badge::Checking
         } else if self.problem().is_some() {
             Badge::Problem
         } else {
-            match self.unsynced() {
-                0 => Badge::AllSynced,
-                n => Badge::Unsynced(n),
+            match (self.unsynced(), self.badge_count()) {
+                (0, 0) => Badge::AllSynced,
+                (0, n) => Badge::Count(n),
+                (_, n) => Badge::Unsynced(n),
             }
         }
+    }
+
+    /// What the badge's number counts, per config's `badge_number`.
+    pub fn badge_count(&self) -> usize {
+        let repos = |f: fn(&RepoStatus) -> bool| self.statuses.iter().filter(|s| f(s)).count();
+        let prs = |f: fn(&crate::github::Pr) -> bool| {
+            self.open_prs().into_iter().filter(|(_, p)| f(p)).count()
+        };
+        match self.config.badge_number {
+            BadgeNumber::Unsynced => self.unsynced(),
+            BadgeNumber::Dirty => repos(|s| s.dirty),
+            BadgeNumber::Ahead => repos(|s| s.ahead > 0),
+            BadgeNumber::Behind => repos(|s| s.behind > 0),
+            BadgeNumber::PullRequests => {
+                let remote: u64 = self.remote_repos.iter().map(|r| r.open_prs).sum();
+                prs(|_| true) + remote as usize
+            }
+            BadgeNumber::PullRequestsForYou => prs(crate::github::Pr::needs_attention),
+            BadgeNumber::ReviewRequests => prs(|p| p.review_requested),
+        }
+    }
+
+    /// The badge's number in words, when it counts something other than
+    /// unsynced repos (which the summary already says).
+    pub fn badge_note(&self) -> Option<String> {
+        let n = self.badge_count();
+        let plural = |one: &str, many: &str| {
+            if n == 1 {
+                one.to_string()
+            } else {
+                many.to_string()
+            }
+        };
+        let what = match self.config.badge_number {
+            BadgeNumber::Unsynced => return None,
+            BadgeNumber::Dirty => plural(
+                "repo with uncommitted changes",
+                "repos with uncommitted changes",
+            ),
+            BadgeNumber::Ahead => plural("repo to push", "repos to push"),
+            BadgeNumber::Behind => plural("repo to pull", "repos to pull"),
+            BadgeNumber::PullRequests => plural("open pull request", "open pull requests"),
+            BadgeNumber::PullRequestsForYou => {
+                plural("pull request needs you", "pull requests need you")
+            }
+            BadgeNumber::ReviewRequests => plural("review asked of you", "reviews asked of you"),
+        };
+        Some(format!("{n} {what}"))
     }
 
     /// Replaces the status with the same path, or inserts it in name order
@@ -267,6 +318,62 @@ mod tests {
         state.statuses = statuses;
         state.has_result = true;
         state
+    }
+
+    #[test]
+    fn badge_counts_what_config_says_and_colours_by_sync() {
+        use crate::config::BadgeNumber;
+        let mut dirty = repo("dirty");
+        dirty.dirty = true;
+        let mut ahead = repo("ahead");
+        ahead.ahead = 2;
+        let mut both = repo("both");
+        both.ahead = 1;
+        both.behind = 1;
+        let mut s = state(vec![dirty, ahead, both, repo("synced")]);
+        s.has_result = true;
+        let count = |s: &mut AppState, n: BadgeNumber| {
+            s.config.badge_number = n;
+            (s.badge_count(), s.badge())
+        };
+        assert_eq!(
+            count(&mut s, BadgeNumber::Unsynced),
+            (3, Badge::Unsynced(3))
+        );
+        assert_eq!(count(&mut s, BadgeNumber::Dirty), (1, Badge::Unsynced(1)));
+        assert_eq!(count(&mut s, BadgeNumber::Ahead), (2, Badge::Unsynced(2)));
+        assert_eq!(count(&mut s, BadgeNumber::Behind), (1, Badge::Unsynced(1)));
+        // No PRs read: still red, since repos are unsynced.
+        assert_eq!(
+            count(&mut s, BadgeNumber::PullRequests),
+            (0, Badge::Unsynced(0))
+        );
+        assert_eq!(s.badge_note().as_deref(), Some("0 open pull requests"));
+        s.config.badge_number = BadgeNumber::Unsynced;
+        assert_eq!(s.badge_note(), None);
+
+        // All synced: green with a count, or the tick at 0.
+        let mut s = state(vec![repo("a")]);
+        s.has_result = true;
+        s.remote_repos.push(crate::github::RemoteRepo {
+            slug: "o/r".into(),
+            url: String::new(),
+            private: false,
+            fork: false,
+            pushed_at: String::new(),
+            default_branch: String::new(),
+            checks: crate::github::Checks::None,
+            open_prs: 3,
+        });
+        assert_eq!(
+            count(&mut s, BadgeNumber::PullRequests),
+            (3, Badge::Count(3))
+        );
+        assert_eq!(
+            count(&mut s, BadgeNumber::ReviewRequests),
+            (0, Badge::AllSynced)
+        );
+        assert_eq!(count(&mut s, BadgeNumber::Unsynced), (0, Badge::AllSynced));
     }
 
     #[test]

@@ -19,6 +19,14 @@ whether they're in sync with their remotes. It's built with
 - **Red with a number**: that many repos are unsynced.
 - **Gray …**: the first check is still running.
 
+**Display ▸ Number on the icon** picks what the number counts: unsynced repos
+(the default), repos with uncommitted changes, repos to push, repos to pull,
+open pull requests, pull requests needing you (a review asked of you, failing
+checks, conflicts or requested changes), or reviews asked of you. The colour
+still follows sync: red while any repo is unsynced, green with the number
+once all are current, and the ✓ when that number is 0 too. The tooltip says
+what the number counts.
+
 The icon is drawn at the exact size the notification area uses at your
 display scale, with smooth edges and Segoe UI digits, so it stays crisp at
 125%, 150% and 200%. Above 99 it shows `99+`.
@@ -40,6 +48,18 @@ icon again.
 
 **Double-click** the tray icon to open the **status window**, a normal window
 with every repo in name order and a **Refresh now** button.
+
+In the window each repo is a column. Its header shows the name and checkout,
+then one row that sums the repo up: a small bar and coloured counts of its
+branches (local and remote copies of a branch count once, the default branch
+not at all), its worktrees and how long ago the last merge was. Purple
+branches are **merged** into the default branch, by git or through a merged
+GitHub pull request, which also catches squash merges. Green ones are **in
+review**, with an open or draft pull request. Amber ones are **hanging**: not
+merged and with no open pull request, so work that didn't make it or hasn't
+yet. Click the row to open the details, which list the hanging and in-review
+branches by name with their age, the worktrees and the last merge; click
+again to fold them.
 
 A repo's name is its path below `path`, such as `dev\gitstat`, and lists
 everywhere sort by it.
@@ -264,7 +284,8 @@ from an older version keeps working:
   "folder_icon_mode": "status",
   "github_prs": true,
   "github_repos": true,
-  "repo_click": "folder"
+  "repo_click": "folder",
+  "badge_number": "unsynced"
 }
 ```
 
@@ -288,6 +309,7 @@ from an older version keeps working:
 | `folder_icon_mode` | `status` | `status` for the status folders, `repo-svg` for each repo's own `.gitstat/icon.svg` where it has one, see [Repo icons](#repo-icons). Only matters while `folder_icons` is on. |
 | `github_prs` | true | **Display ▸ GitHub pull requests**: open pull requests in the panel and big mode, read through `gh`, see [GitHub pull requests](#github-pull-requests). |
 | `github_repos` | true | **Display ▸ GitHub repos not cloned here**: the signed-in account's GitHub repos with no clone under `path`, read through `gh`, see [GitHub repos not cloned here](#github-repos-not-cloned-here). |
+| `badge_number` | `unsynced` | **Display ▸ Number on the icon**: what the number on the tray icon and the badge counts. `unsynced`, `dirty`, `ahead`, `behind`, `pull-requests`, `pull-requests-for-you` or `review-requests`. |
 | `repo_click` | `folder` | **Display ▸ Repo click opens**: what a click on a repo (its name in big mode, or in the menu) opens. `folder` for its folder, `github` for its GitHub page; a repo whose `origin` isn't on GitHub opens its folder either way. |
 
 Edits apply within about a second, without a restart. **Edit config.json** in

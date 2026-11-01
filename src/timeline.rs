@@ -224,6 +224,9 @@ pub struct Timelines {
     focus: Option<PathBuf>,
     /// Each repo's GitHub PRs by branch, given to its graph as it lands.
     prs: HashMap<PathBuf, Arc<PrColors>>,
+    /// Big mode columns whose header shows its details, not just the
+    /// one-line summary. Kept while gitstat runs.
+    expanded: HashSet<PathBuf>,
 }
 
 impl Timelines {
@@ -248,7 +251,20 @@ impl Timelines {
             stats_pending: HashSet::new(),
             focus: None,
             prs: HashMap::new(),
+            expanded: HashSet::new(),
         }
+    }
+
+    /// Whether `path`'s column header shows its details.
+    pub fn header_open(&self, path: &Path) -> bool {
+        self.expanded.contains(path)
+    }
+
+    pub fn toggle_header(&mut self, path: &Path, cx: &mut Context<Self>) {
+        if !self.expanded.remove(path) {
+            self.expanded.insert(path.to_path_buf());
+        }
+        cx.notify();
     }
 
     /// The repo's GitHub page, once its graph has loaded.

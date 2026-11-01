@@ -38,6 +38,73 @@ pub struct Merge {
     pub subject: String,
 }
 
+/// A branch by name: a local branch and its remote-tracking copies
+/// (`feat` and `origin/feat`) count as one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Branch {
+    /// Without the remote: `feat`.
+    pub name: String,
+    pub local: bool,
+    pub remote: bool,
+    /// Every copy's commits are in the default branch.
+    pub merged: bool,
+    /// The newest copy's commit time, Unix seconds.
+    pub time: i64,
+}
+
+/// Where a branch stands against the default branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Fate {
+    /// Its commits are in the default branch, or its GitHub PR was merged
+    /// (which catches squash and rebase merges).
+    Merged,
+    /// Not merged, with an open or a draft PR.
+    InReview,
+    /// Not merged and no open PR: work that didn't make it, or hasn't yet.
+    Hanging,
+}
+
+/// The branches other than the default one, sorted into their fates.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BranchSummary {
+    pub merged: Vec<Branch>,
+    pub in_review: Vec<Branch>,
+    /// Oldest first: the likeliest to be forgotten.
+    pub hanging: Vec<Branch>,
+}
+
+impl BranchSummary {
+    pub fn total(&self) -> usize {
+        self.merged.len() + self.in_review.len() + self.hanging.len()
+    }
+}
+
+/// Sorts `branches` by fate, with `pr` giving each branch name's PR state.
+pub fn summarize(
+    branches: &[Branch],
+    pr: impl Fn(&str) -> Option<crate::graph::PrState>,
+) -> BranchSummary {
+    use crate::graph::PrState;
+    let mut s = BranchSummary::default();
+    for b in branches {
+        let fate = match pr(&b.name) {
+            _ if b.merged => Fate::Merged,
+            Some(PrState::Merged) => Fate::Merged,
+            Some(PrState::Open | PrState::Draft) => Fate::InReview,
+            Some(PrState::Closed) | None => Fate::Hanging,
+        };
+        match fate {
+            Fate::Merged => s.merged.push(b.clone()),
+            Fate::InReview => s.in_review.push(b.clone()),
+            Fate::Hanging => s.hanging.push(b.clone()),
+        }
+    }
+    s.hanging.sort_by_key(|b| b.time);
+    s.in_review.sort_by_key(|b| std::cmp::Reverse(b.time));
+    s.merged.sort_by_key(|b| std::cmp::Reverse(b.time));
+    s
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Info {
     pub checkout: Checkout,
@@ -48,6 +115,8 @@ pub struct Info {
     pub default_branch: Option<String>,
     pub default_tip: Option<String>,
     pub last_merge: Option<Merge>,
+    /// Every branch but the default one, local and remote merged by name.
+    pub branches: Vec<Branch>,
     pub unpushed: HashSet<String>,
     pub unpulled: HashSet<String>,
     /// `https://github.com/owner/repo` for a GitHub `origin`.
@@ -111,6 +180,7 @@ pub fn read(repo: &Path, refs: &Refs, setup: &Setup) -> Result<Info, String> {
         refs.tip(&r).map(str::to_string)
     });
     let last_merge = default_tip.as_deref().and_then(|tip| last_merge(repo, tip));
+    let branches = branches(repo, default_tip.as_deref(), default_branch.as_deref());
 
     let (unpushed, unpulled) = if refs.head.is_some() {
         sync_sets(repo, remote_branches > 0)
@@ -129,9 +199,79 @@ pub fn read(repo: &Path, refs: &Refs, setup: &Setup) -> Result<Info, String> {
         default_branch,
         default_tip,
         last_merge,
+        branches,
         unpushed,
         unpulled,
     })
+}
+
+/// The repo's branches by name, with which are merged into `tip` (the
+/// default branch's commit). Two read-only `for-each-ref` calls.
+fn branches(repo: &Path, tip: Option<&str>, default: Option<&str>) -> Vec<Branch> {
+    const FORMAT: &str = "--format=%(refname)%1f%(committerdate:unix)";
+    let Some(all) = text(
+        repo,
+        &["for-each-ref", FORMAT, "refs/heads", "refs/remotes"],
+    ) else {
+        return Vec::new();
+    };
+    let merged = tip
+        .filter(|t| t.bytes().all(|b| b.is_ascii_hexdigit()))
+        .and_then(|t| {
+            let arg = format!("--merged={t}");
+            text(
+                repo,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    &arg,
+                    "refs/heads",
+                    "refs/remotes",
+                ],
+            )
+        })
+        .unwrap_or_default();
+    parse_branches(&all, &merged, default)
+}
+
+/// `all` is `refname\x1ftime` lines, `merged` the merged refnames. The
+/// default branch (`origin/main` or `main`) is left out by its short name.
+pub(crate) fn parse_branches(all: &str, merged: &str, default: Option<&str>) -> Vec<Branch> {
+    let merged: HashSet<&str> = merged.lines().map(str::trim).collect();
+    let default = default.map(|d| d.split_once('/').map_or(d, |(_, n)| n));
+    let mut by_name: std::collections::BTreeMap<String, Branch> = Default::default();
+    for line in all.lines() {
+        let Some((refname, time)) = line.split_once('\x1f') else {
+            continue;
+        };
+        let (name, local) = if let Some(n) = refname.strip_prefix("refs/heads/") {
+            (n, true)
+        } else if let Some(n) = refname.strip_prefix("refs/remotes/") {
+            match n.split_once('/') {
+                Some((_, "HEAD")) | None => continue,
+                Some((_, n)) => (n, false),
+            }
+        } else {
+            continue;
+        };
+        if Some(name) == default {
+            continue;
+        }
+        let time = time.trim().parse().unwrap_or(0);
+        let is_merged = merged.contains(refname);
+        let b = by_name.entry(name.to_string()).or_insert(Branch {
+            name: name.to_string(),
+            local: false,
+            remote: false,
+            merged: true,
+            time,
+        });
+        b.local |= local;
+        b.remote |= !local;
+        b.merged &= is_merged;
+        b.time = b.time.max(time);
+    }
+    by_name.into_values().collect()
 }
 
 fn text(repo: &Path, args: &[&str]) -> Option<String> {
@@ -347,6 +487,9 @@ mod tests {
             &remote,
             &["merge", "-q", "--no-ff", "-m", "Merge feature", "feature"],
         );
+        run(&remote, &["checkout", "-q", "-b", "spike"]);
+        commit(&remote, "spike", &mut n);
+        run(&remote, &["checkout", "-q", "main"]);
 
         let dir = std::env::temp_dir().join(format!("gitstat-info-clone-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -379,8 +522,14 @@ mod tests {
         assert_eq!(info.checkout, Checkout::Branch("main".into()));
         assert_eq!(info.worktrees.len(), 2);
         assert_eq!(info.local_branches, 1);
-        // origin/main and origin/feature; origin/HEAD isn't counted.
-        assert_eq!(info.remote_branches, 2);
+        // origin/main, origin/feature and origin/spike; origin/HEAD isn't counted.
+        assert_eq!(info.remote_branches, 3);
+        let fates: Vec<(&str, bool, bool)> = info
+            .branches
+            .iter()
+            .map(|b| (b.name.as_str(), b.remote && !b.local, b.merged))
+            .collect();
+        assert_eq!(fates, [("feature", true, true), ("spike", true, false)]);
         assert_eq!(info.default_branch.as_deref(), Some("origin/main"));
         let merge = info.last_merge.as_ref().unwrap();
         assert_eq!(merge.subject, "Merge feature");
@@ -393,6 +542,69 @@ mod tests {
         for d in [&remote, &dir, &wt] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+
+    #[test]
+    fn parses_branches_merging_copies_by_name() {
+        let all = "refs/heads/feat\x1f100\n\
+                   refs/remotes/origin/feat\x1f200\n\
+                   refs/remotes/origin/HEAD\x1f300\n\
+                   refs/remotes/origin/main\x1f300\n\
+                   refs/heads/main\x1f290\n\
+                   refs/heads/done\x1f50\n\
+                   refs/remotes/upstream/team/x\x1f70\n\
+                   garbage\n";
+        // Only the local feat is merged; origin/feat has more, so the
+        // branch isn't.
+        let merged = "refs/heads/feat\nrefs/heads/done\n";
+        let b = parse_branches(all, merged, Some("origin/main"));
+        let names: Vec<&str> = b.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, ["done", "feat", "team/x"]);
+        assert!(b[0].merged && b[0].local && !b[0].remote);
+        assert!(!b[1].merged && b[1].local && b[1].remote);
+        assert_eq!(b[1].time, 200);
+        assert!(!b[2].merged && b[2].remote);
+        // A repo with no remote names its default branch plainly.
+        let local = parse_branches(
+            "refs/heads/main\x1f1\nrefs/heads/x\x1f2\n",
+            "",
+            Some("main"),
+        );
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0].name, "x");
+    }
+
+    #[test]
+    fn summarize_sorts_branches_by_fate() {
+        use crate::graph::PrState;
+        let b = |name: &str, merged: bool, time: i64| Branch {
+            name: name.into(),
+            local: true,
+            remote: false,
+            merged,
+            time,
+        };
+        let branches = [
+            b("merged", true, 5),
+            b("squashed", false, 4),
+            b("review", false, 3),
+            b("draft", false, 2),
+            b("closed", false, 1),
+            b("old", false, 0),
+            b("new", false, 9),
+        ];
+        let s = summarize(&branches, |name| match name {
+            "squashed" => Some(PrState::Merged),
+            "review" | "merged" => Some(PrState::Open),
+            "draft" => Some(PrState::Draft),
+            "closed" => Some(PrState::Closed),
+            _ => None,
+        });
+        let names = |v: &[Branch]| v.iter().map(|b| b.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&s.merged), ["merged", "squashed"]);
+        assert_eq!(names(&s.in_review), ["review", "draft"]);
+        assert_eq!(names(&s.hanging), ["old", "closed", "new"]);
+        assert_eq!(s.total(), 7);
     }
 
     #[test]
