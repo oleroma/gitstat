@@ -30,6 +30,17 @@ pub enum FolderIconMode {
     RepoSvg,
 }
 
+/// What clicking a repo opens.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RepoClick {
+    /// Its folder in Explorer.
+    #[default]
+    Folder,
+    /// Its GitHub page in the browser; the folder for a repo not on GitHub.
+    Github,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OverlayConfig {
@@ -90,6 +101,11 @@ pub struct Config {
     pub folder_icons: bool,
     /// What those icons are drawn from; only matters with `folder_icons`.
     pub folder_icon_mode: FolderIconMode,
+    /// Open pull requests from GitHub in the panel, read through the `gh`
+    /// CLI every interval.
+    pub github_prs: bool,
+    /// What clicking a repo opens: its folder or its GitHub page.
+    pub repo_click: RepoClick,
 }
 
 impl Default for Config {
@@ -105,6 +121,8 @@ impl Default for Config {
             overlay: OverlayConfig::default(),
             folder_icons: false,
             folder_icon_mode: FolderIconMode::default(),
+            github_prs: true,
+            repo_click: RepoClick::default(),
         }
     }
 }
@@ -392,6 +410,16 @@ mod tests {
             assert_eq!(serde_json::from_str::<Corner>(text).unwrap(), corner);
         }
         assert!(serde_json::from_str::<Corner>("\"BottomRight\"").is_err());
+    }
+
+    #[test]
+    fn repo_click_defaults_to_folder() {
+        let parse = |text: &str| serde_json::from_str::<Config>(text);
+        assert_eq!(Config::default().repo_click, RepoClick::Folder);
+        assert_eq!(parse("{}").unwrap().repo_click, RepoClick::Folder);
+        let gh = parse(r#"{ "repo_click": "github" }"#).unwrap();
+        assert_eq!(gh.repo_click, RepoClick::Github);
+        assert!(parse(r#"{ "repo_click": "web" }"#).is_err());
     }
 
     #[test]

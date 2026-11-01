@@ -149,6 +149,21 @@ If the file can't be used, the folder shows the status icon and the panel
 counts it as skipped until the file changes. If it can't be read, or takes
 more than 10 seconds to draw, gitstat tries again on a later check.
 
+### GitHub pull requests
+
+**Display ▸ GitHub pull requests** (`"github_prs": true`, on by default)
+lists the open pull requests of every repo whose `origin` is on GitHub at the
+bottom of the panel: review requests for you first, then ones with failing
+checks, conflicts or requested changes, then the rest. Each row shows the
+repo's icon, the number and title, and its checks, review and merge state;
+hover for the branch and author, click to open it in the browser.
+
+gitstat reads them through the [GitHub CLI](https://cli.github.com/), so
+`gh` must be on the `PATH` and signed in (`gh auth login`); gitstat stores no
+token. It asks again every `interval_minutes` and on the refresh button, in
+one GraphQL query per 20 repos. Like everything in gitstat this only reads:
+nothing on GitHub or in the repos is ever changed.
+
 ## Which repos
 
 gitstat looks in `path` and up to `depth` folder levels below it (3 by
@@ -232,7 +247,9 @@ from an older version keeps working:
     "hide_in_fullscreen": true
   },
   "folder_icons": false,
-  "folder_icon_mode": "status"
+  "folder_icon_mode": "status",
+  "github_prs": true,
+  "repo_click": "folder"
 }
 ```
 
@@ -254,6 +271,8 @@ from an older version keeps working:
 | `overlay.hide_in_fullscreen` | true | Hide the badge while a fullscreen app or a presentation runs. |
 | `folder_icons` | false | Status icons on the repo folders, see above. Setting it by hand skips the confirmation. |
 | `folder_icon_mode` | `status` | `status` for the status folders, `repo-svg` for each repo's own `.gitstat/icon.svg` where it has one, see [Repo icons](#repo-icons). Only matters while `folder_icons` is on. |
+| `github_prs` | true | **Display ▸ GitHub pull requests**: open pull requests in the panel and big mode, read through `gh`, see [GitHub pull requests](#github-pull-requests). |
+| `repo_click` | `folder` | **Display ▸ Repo click opens**: what a click on a repo (its name in big mode, or in the menu) opens. `folder` for its folder, `github` for its GitHub page; a repo whose `origin` isn't on GitHub opens its folder either way. |
 
 Edits apply within about a second, without a restart. **Edit config.json** in
 the menu or the panel opens the file. The menu's toggles write the file too;

@@ -246,6 +246,39 @@ impl Layout {
         (0..).find(|l| !used.contains(l)).unwrap_or(0)
     }
 
+    /// How far down its own lane the line of development at `row` runs:
+    /// its first parents while they stay in that lane, the commits a branch
+    /// has of its own before it bends into the line it forked from. Returns
+    /// the last such row, and whether the line runs on past the loaded rows.
+    /// Lane 0 is HEAD's line, so a commit in it has nothing of its own
+    /// beyond the checkout: its run is the row alone.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn lane_run(&self, row: usize) -> (usize, bool) {
+        let Some(node) = self.nodes.get(row) else {
+            return (row, false);
+        };
+        let lane = node.lane;
+        if lane == 0 {
+            return (row, false);
+        }
+        let mut at = row;
+        loop {
+            let from = self.edges.partition_point(|e| e.child.0 < at);
+            let first = self.edges[from..]
+                .iter()
+                .take_while(|e| e.child.0 == at)
+                .find(|e| e.first);
+            match first {
+                Some(e) if e.via == lane => match e.parent {
+                    Some((r, l)) if l == lane => at = r,
+                    Some(_) => return (at, false),
+                    None => return (at, true),
+                },
+                _ => return (at, false),
+            }
+        }
+    }
+
     /// Edges still waiting for a parent below the last loaded row.
     #[cfg(test)]
     pub fn open_edges(&self) -> impl Iterator<Item = &Edge> {
@@ -452,6 +485,90 @@ pub fn hue(name: &str, n: usize) -> usize {
     (h as usize) % n.max(1)
 }
 
+/// A GitHub pull request's state, for colouring the branch it is from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PrState {
+    Open,
+    Draft,
+    Merged,
+    Closed,
+}
+
+impl PrState {
+    /// Which state a branch with several PRs shows: the live one first.
+    fn rank(self) -> u8 {
+        match self {
+            PrState::Open => 0,
+            PrState::Draft => 1,
+            PrState::Merged => 2,
+            PrState::Closed => 3,
+        }
+    }
+
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn label(self) -> &'static str {
+        match self {
+            PrState::Open => "PR open",
+            PrState::Draft => "PR draft",
+            PrState::Merged => "PR merged",
+            PrState::Closed => "PR closed",
+        }
+    }
+}
+
+/// The PR state of each branch that has a PR, by the PR's head branch.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PrColors {
+    by_branch: HashMap<String, PrState>,
+}
+
+impl PrColors {
+    /// From each PR's head branch name and state. A branch with several
+    /// PRs shows open over draft over merged over closed.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn from_prs<'a>(prs: impl IntoIterator<Item = (&'a str, PrState)>) -> Self {
+        let mut by_branch: HashMap<String, PrState> = HashMap::new();
+        for (branch, state) in prs {
+            by_branch
+                .entry(branch.to_string())
+                .and_modify(|s| {
+                    if state.rank() < s.rank() {
+                        *s = state;
+                    }
+                })
+                .or_insert(state);
+        }
+        Self { by_branch }
+    }
+
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn is_empty(&self) -> bool {
+        self.by_branch.is_empty()
+    }
+
+    /// The PR state for a layout branch: a local `feature` or the
+    /// remote-tracking `origin/feature`.
+    pub fn of(&self, branch: &str) -> Option<PrState> {
+        if self.by_branch.is_empty() {
+            return None;
+        }
+        let name = branch.strip_prefix("origin/").unwrap_or(branch);
+        self.by_branch.get(name).copied()
+    }
+
+    /// The PR state that colours `node`, if any. Unpushed, unpulled,
+    /// trunk and merged commits keep their own colour: a PR only colours
+    /// the commits that are still just on its branch.
+    pub fn of_node(&self, node: &Node, branches: &[String]) -> Option<PrState> {
+        if node.class != Class::Branch {
+            return None;
+        }
+        node.branch
+            .and_then(|b| branches.get(b))
+            .and_then(|name| self.of(name))
+    }
+}
+
 /// A point in the view, in pixels.
 pub type Point = (f32, f32);
 
@@ -523,6 +640,35 @@ mod tests {
         assert_eq!(l.edges.len(), 2);
         assert!(l.edges.iter().all(|e| e.via == 0 && e.first));
         assert_eq!(l.open_edges().count(), 0);
+    }
+
+    #[test]
+    fn lane_run_follows_a_branch_to_its_fork() {
+        //   f2      row 0  lane 1
+        //   f1      row 1  lane 1
+        //   c |     row 2  lane 0  HEAD
+        //   |/
+        //   b       row 3  lane 0
+        //   a       row 4  lane 0
+        let commits = [
+            c("f2", &["f1"]),
+            c("f1", &["b"]),
+            c("c", &["b"]),
+            c("b", &["a"]),
+            c("a", &[]),
+        ];
+        let cx = ctx("c", &[]);
+        let l = layout(&commits, &cx);
+        assert_eq!(lanes(&l), [1, 1, 0, 0, 0]);
+        assert_eq!(l.lane_run(0), (1, false));
+        assert_eq!(l.lane_run(1), (1, false));
+        // HEAD's own line has nothing of its own.
+        assert_eq!(l.lane_run(3), (3, false));
+        assert_eq!(l.lane_run(9), (9, false));
+
+        // With the fork not loaded yet, the run goes on past the last row.
+        let l = layout(&commits[..2], &cx);
+        assert_eq!(l.lane_run(0), (1, true));
     }
 
     #[test]
@@ -680,6 +826,29 @@ mod tests {
         assert_eq!(branch(3), None);
         // Where topic and main meet, HEAD's lane keeps the commit.
         assert_eq!(branch(5), Some("main"));
+
+        // A PR on topic colours only topic's own commit.
+        let prs = PrColors::from_prs([("topic", PrState::Draft), ("main", PrState::Open)]);
+        assert_eq!(prs.of_node(&l.nodes[0], &l.branches), Some(PrState::Draft));
+        for row in 1..6 {
+            assert_eq!(prs.of_node(&l.nodes[row], &l.branches), None, "row {row}");
+        }
+    }
+
+    #[test]
+    fn pr_colors_pick_the_live_pr_and_match_remotes() {
+        let prs = PrColors::from_prs([
+            ("feature", PrState::Closed),
+            ("feature", PrState::Open),
+            ("feature", PrState::Merged),
+            ("old", PrState::Closed),
+            ("old", PrState::Merged),
+        ]);
+        assert_eq!(prs.of("feature"), Some(PrState::Open));
+        assert_eq!(prs.of("origin/feature"), Some(PrState::Open));
+        assert_eq!(prs.of("old"), Some(PrState::Merged));
+        assert_eq!(prs.of("other"), None);
+        assert!(PrColors::default().of("feature").is_none());
     }
 
     #[test]

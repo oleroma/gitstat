@@ -15,7 +15,7 @@ pub(crate) mod ink;
 pub use column::{COLUMN_WIDTH, column_index};
 
 use crate::git::RepoStatus;
-use crate::graph::{self, Class, Seg};
+use crate::graph::{self, Class, PrColors, PrState, Seg};
 use crate::history::{self, Ref, Stat};
 use crate::repo_graph::{More, RepoGraph};
 use crate::state::AppState;
@@ -55,6 +55,8 @@ const BLEED: f32 = 6.0;
 const DOT: f32 = 3.0;
 const DOT_HOVER: f32 = 4.5;
 const STROKE: f32 = 1.5;
+/// How wide the band under another worktree's line is.
+const BAND: f32 = 7.0;
 /// Px from the strip's right edge to HEAD.
 const PAD: f32 = 12.0;
 /// The tail fades out over this many px at the left edge.
@@ -220,6 +222,8 @@ pub struct Timelines {
     stats_pending: HashSet<String>,
     /// A repo whose column big mode should bring into view.
     focus: Option<PathBuf>,
+    /// Each repo's GitHub PRs by branch, given to its graph as it lands.
+    prs: HashMap<PathBuf, Arc<PrColors>>,
 }
 
 impl Timelines {
@@ -243,6 +247,28 @@ impl Timelines {
             stats: HashMap::new(),
             stats_pending: HashSet::new(),
             focus: None,
+            prs: HashMap::new(),
+        }
+    }
+
+    /// The repo's GitHub page, once its graph has loaded.
+    pub fn web(&self, path: &Path) -> Option<String> {
+        self.slots.get(path)?.graph.as_ref()?.info.web.clone()
+    }
+
+    /// Sets the PR states `path`'s graph colours its branches by. Cheap
+    /// when nothing changed, so it can be called on every PR refresh.
+    pub fn set_prs(&mut self, path: &Path, prs: PrColors, cx: &mut Context<Self>) {
+        if self.prs.get(path).map(|p| p.as_ref()) == Some(&prs)
+            || (prs.is_empty() && !self.prs.contains_key(path))
+        {
+            return;
+        }
+        let prs = Arc::new(prs);
+        self.prs.insert(path.to_path_buf(), prs.clone());
+        if let Some(g) = self.slots.get_mut(path).and_then(|s| s.graph.as_mut()) {
+            Arc::make_mut(g).prs = prs;
+            cx.notify();
         }
     }
 
@@ -256,6 +282,7 @@ impl Timelines {
             .map(|s| s.path.as_path())
             .collect();
         self.slots.retain(|p, _| listed.contains(p.as_path()));
+        self.prs.retain(|p, _| listed.contains(p.as_path()));
         self.queue.retain(|(p, _)| listed.contains(p.as_path()));
     }
 
@@ -351,7 +378,11 @@ impl Timelines {
                 };
                 slot.scroll = row * STEP;
                 slot.glide = None;
-                slot.graph = Some(Arc::new(*g));
+                let mut g = *g;
+                if let Some(prs) = self.prs.get(&path) {
+                    g.prs = prs.clone();
+                }
+                slot.graph = Some(Arc::new(g));
                 slot.error = None;
                 if self.hover.as_ref().is_some_and(|h| h.repo == path) {
                     self.unhover();
@@ -727,7 +758,7 @@ impl Timelines {
                     this_for_label.update(cx, |t, _| t.focus(&open_path));
                     crate::view::show_window(cx);
                 } else {
-                    cx.open_with_system(&open_path);
+                    crate::view::open_repo(&open_path, cx);
                 }
             });
         let label = if icons_only {
@@ -939,7 +970,10 @@ impl Timelines {
             Class::Unpulled => "not pulled",
             Class::Trunk => "on the default branch",
             Class::Merged => "merged",
-            Class::Branch => "",
+            Class::Branch => g
+                .prs
+                .of_node(node, &g.layout.branches)
+                .map_or("", PrState::label),
         };
         let copied = self
             .copied
@@ -988,6 +1022,25 @@ impl Timelines {
                     .into_any_element(),
             );
         }
+        for b in g.bands_at(row) {
+            let what = match &b.branch {
+                Some(branch) => format!("Checked out in worktree {} on {branch}", b.name),
+                None => format!("Checked out in worktree {}, detached", b.name),
+            };
+            lines.push(
+                div()
+                    .text_color(colors.node(g, row))
+                    .child(what)
+                    .into_any_element(),
+            );
+            lines.push(
+                div()
+                    .text_color(p.muted)
+                    .truncate()
+                    .child(b.path.display().to_string())
+                    .into_any_element(),
+            );
+        }
         Some(lines)
     }
 }
@@ -1021,6 +1074,10 @@ struct Colors {
     stash: Hsla,
     added: Hsla,
     removed: Hsla,
+    /// Branches with an open or a draft PR; closed PRs use `removed`,
+    /// merged ones `merged`.
+    pr_open: Hsla,
+    pr_draft: Hsla,
     hues: [Hsla; 6],
     /// What the graph is drawn on.
     bg: Hsla,
@@ -1039,6 +1096,9 @@ impl Colors {
                 stash: p.muted,
                 added: c(0x3fb950),
                 removed: c(0xf85149),
+                pr_open: c(0x3fb950),
+                // Darker than the trunk's grey, so the two stay apart.
+                pr_draft: c(0x6e7681),
                 // blue, orange, pink, lemon, teal, coral
                 hues: [
                     c(0x4493f8),
@@ -1060,6 +1120,9 @@ impl Colors {
                 stash: p.muted,
                 added: c(0x1a7f37),
                 removed: c(0xcf222e),
+                pr_open: c(0x1a7f37),
+                // Lighter than the trunk's grey, so the two stay apart.
+                pr_draft: c(0xafb8c1),
                 hues: [
                     c(0x0969da),
                     c(0xbc4c00),
@@ -1073,8 +1136,23 @@ impl Colors {
         }
     }
 
+    /// The band under a worktree's line: its tip's colour, faint.
+    /// `folded` when the lane is past the ones shown, so dimmed.
+    fn band(&self, g: &RepoGraph, b: &crate::repo_graph::Band, folded: bool) -> Hsla {
+        let alpha = if folded { 0.12 } else { 0.24 };
+        ink::over(self.node(g, b.top).opacity(alpha), self.bg)
+    }
+
     fn node(&self, g: &RepoGraph, row: usize) -> Hsla {
         let node = &g.layout.nodes[row];
+        if let Some(pr) = g.prs.of_node(node, &g.layout.branches) {
+            return match pr {
+                PrState::Open => self.pr_open,
+                PrState::Draft => self.pr_draft,
+                PrState::Merged => self.merged,
+                PrState::Closed => self.removed,
+            };
+        }
         match node.class {
             Class::Unpushed => self.unpushed,
             Class::Unpulled => self.unpulled,
@@ -1140,6 +1218,21 @@ fn paint_strip(
     let hi = ((((top_x - left) / STEP).ceil() + 1.0).max(0.0) as usize).min(rows);
     if lo >= hi && rows > 0 && lo >= rows {
         return Vec::new();
+    }
+
+    // Under everything, a soft band along each other worktree's line.
+    for b in g.bands.iter().filter(|b| b.top < hi && b.bottom + 1 >= lo) {
+        let color = colors.band(g, b, b.lane >= LANES);
+        let yb = y(b.lane as f32);
+        let r = BAND / 2.0;
+        let x0 = x(b.top as f32);
+        let x1 = if b.open { left - r } else { x(b.bottom as f32) };
+        let x1 = x1.max(left - r);
+        ink::line(window, (x1, yb), (x0, yb), BAND, color, None);
+        ink::circle(window, (x0, yb), r, Some(color), None);
+        if !b.open {
+            ink::circle(window, (x1, yb), r, Some(color), None);
+        }
     }
 
     let mut dots = Vec::with_capacity(hi.saturating_sub(lo) + 1);

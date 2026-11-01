@@ -2,6 +2,7 @@
 //! the normal window itself (`show_window`, `close_window`).
 
 use crate::git::RepoStatus;
+use crate::github::{Checks, Mergeable, Pr, PrState, Review};
 use crate::monitor::WatchMode;
 use crate::panel;
 use crate::state::{AppState, Input};
@@ -72,22 +73,11 @@ pub fn show_window(cx: &mut App) {
     let Some(state) = cx.try_global::<Ui>().map(|ui| ui.state.clone()) else {
         return;
     };
-    let mon = win::primary_monitor();
-    let scale = sane_scale(mon.scale);
-    let (left, top) = (mon.work.left as f32 / scale, mon.work.top as f32 / scale);
-    let (work_w, work_h) = (
-        mon.work.width() as f32 / scale,
-        mon.work.height() as f32 / scale,
-    );
-    // Big mode: wide enough for every column, up to most of the screen.
-    let repos = state.read(cx).statuses.len().max(1) as f32;
-    let width = (repos * crate::timeline::COLUMN_WIDTH + 2.0)
-        .min(work_w * 0.9)
-        .max(WINDOW_SIZE.0);
-    let height = (work_h * 0.8).max(WINDOW_SIZE.1).min(work_h);
-    let x = (mon.work.right as f32 / scale - width - WINDOW_MARGIN).max(left);
-    let y = (mon.work.bottom as f32 / scale - height - WINDOW_MARGIN).max(top);
-    let bounds = Bounds::new(point(px(x), px(y)), size(px(width), px(height)));
+    let (repos, known) = {
+        let s = state.read(cx);
+        (s.statuses.len(), s.has_result)
+    };
+    let (bounds, _) = window_place(repos);
     let handle = cx
         .open_window(
             WindowOptions {
@@ -103,11 +93,42 @@ pub fn show_window(cx: &mut App) {
             |window, cx| {
                 // Safe: opened with show: true, so there is no parked placement.
                 window.activate_window();
-                cx.new(|cx| StatusView::new(state, Mode::Window, window, cx))
+                cx.new(|cx| {
+                    let mut view = StatusView::new(state, Mode::Window, window, cx);
+                    // Opened before the first check found the repos: fit
+                    // the columns once it has.
+                    if !known {
+                        view.fit = Some(window.bounds());
+                    }
+                    view
+                })
             },
         )
         .ok();
     cx.default_global::<WindowSlot>().handle = handle;
+}
+
+/// Where the window goes for `repos` columns, in logical px, at the
+/// bottom-right of the primary work area, and that monitor's scale.
+fn window_place(repos: usize) -> (Bounds<gpui::Pixels>, f32) {
+    let mon = win::primary_monitor();
+    let scale = sane_scale(mon.scale);
+    let (left, top) = (mon.work.left as f32 / scale, mon.work.top as f32 / scale);
+    let (work_w, work_h) = (
+        mon.work.width() as f32 / scale,
+        mon.work.height() as f32 / scale,
+    );
+    // Big mode: wide enough for every column, up to most of the screen.
+    let width = (repos.max(1) as f32 * crate::timeline::COLUMN_WIDTH + 2.0)
+        .min(work_w * 0.9)
+        .max(WINDOW_SIZE.0);
+    let height = (work_h * 0.8).max(WINDOW_SIZE.1).min(work_h);
+    let x = (mon.work.right as f32 / scale - width - WINDOW_MARGIN).max(left);
+    let y = (mon.work.bottom as f32 / scale - height - WINDOW_MARGIN).max(top);
+    (
+        Bounds::new(point(px(x), px(y)), size(px(width), px(height))),
+        scale,
+    )
 }
 
 /// Closes the normal window, if it is open (`window` turned off).
@@ -164,6 +185,10 @@ pub struct StatusView {
     /// The panel has been active once, so a deactivation now means the user
     /// clicked elsewhere rather than the foreground lock refusing us.
     seen_active: bool,
+    /// The window opened before the first check, at these bounds: once the
+    /// check is done it grows to fit the columns, unless the user has moved
+    /// or resized it meanwhile.
+    fit: Option<Bounds<gpui::Pixels>>,
 }
 
 impl StatusView {
@@ -174,6 +199,12 @@ impl StatusView {
         cx: &mut Context<Self>,
     ) -> Self {
         cx.observe(&state, |_, _, cx| cx.notify()).detach();
+        if mode == Mode::Window {
+            cx.observe_in(&state, window, |this: &mut Self, state, window, cx| {
+                this.fit_to_repos(&state, window, cx)
+            })
+            .detach();
+        }
         let timelines = cx.try_global::<Ui>().map(|ui| ui.timelines.clone());
         if let Some(t) = &timelines {
             cx.observe(t, |_, _, cx| cx.notify()).detach();
@@ -205,16 +236,85 @@ impl StatusView {
             table: ScrollHandle::new(),
             focus,
             seen_active: false,
+            fit: None,
         }
+    }
+
+    /// Fits the window to the repos' columns once the first check has
+    /// found them, if it opened before that.
+    fn fit_to_repos(
+        &mut self,
+        state: &Entity<AppState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(opened) = self.fit else {
+            return;
+        };
+        let s = state.read(cx);
+        if !s.has_result {
+            return;
+        }
+        self.fit = None;
+        let near = |a: gpui::Pixels, b: gpui::Pixels| (f32::from(a) - f32::from(b)).abs() < 2.0;
+        let now = window.bounds();
+        let untouched = near(now.origin.x, opened.origin.x)
+            && near(now.origin.y, opened.origin.y)
+            && near(now.size.width, opened.size.width)
+            && near(now.size.height, opened.size.height);
+        let (want, scale) = window_place(s.statuses.len());
+        if !untouched || near(want.size.width, opened.size.width) {
+            return;
+        }
+        let Some(h) = win::hwnd(window) else {
+            return;
+        };
+        let at = |v: gpui::Pixels| (f32::from(v) * scale).round() as i32;
+        let r = crate::layout::Rect::new(
+            at(want.origin.x),
+            at(want.origin.y),
+            at(want.origin.x + want.size.width),
+            at(want.origin.y + want.size.height),
+        );
+        cx.spawn(async move |_, _| unsafe { win::place_window(h, r) })
+            .detach();
     }
 }
 
-/// How many rows the panel shows before "N synced" is expanded: the
-/// unsynced repos, the collapsed synced row, or the one empty-state line.
+/// How many rows the panel opens with, for its first size before it is
+/// measured: the unsynced repos, the collapsed "N synced" row, or the one
+/// empty-state line; then the pull requests unless folded.
 pub fn panel_rows(state: &AppState) -> usize {
     let unsynced = state.unsynced();
     let synced = state.statuses.len() - unsynced;
-    (unsynced + usize::from(synced > 0)).max(1)
+    let repos = (unsynced + usize::from(synced > 0)).max(1);
+    // The pull requests' heading and rows, or the one GitHub problem line.
+    let prs = state.open_prs().len();
+    let github = if prs > 0 {
+        if state.prs_folded(false) { 1 } else { prs + 1 }
+    } else {
+        usize::from(state.github_problem.is_some())
+    };
+    repos + github
+}
+
+/// Opens a repo the way config's `repo_click` says: its folder, or its
+/// GitHub page (the folder when it has none). Only opens; changes nothing.
+pub fn open_repo(path: &std::path::Path, cx: &mut App) {
+    let github = cx
+        .try_global::<Ui>()
+        .is_some_and(|ui| ui.state.read(cx).config.repo_click == crate::config::RepoClick::Github);
+    if github {
+        let web = cx
+            .try_global::<Ui>()
+            .and_then(|ui| ui.timelines.read(cx).web(path))
+            .or_else(|| crate::repo_info::origin_web(path));
+        if let Some(web) = web {
+            cx.open_url(&web);
+            return;
+        }
+    }
+    cx.open_with_system(path);
 }
 
 fn refresh(cx: &mut App) {
@@ -259,7 +359,7 @@ fn repo_row(index: usize, s: &RepoStatus, p: &Palette, mode: Mode, cx: &App) -> 
         .cursor_pointer()
         .hover(|style| style.bg(p.hover))
         .on_click(move |_, window, cx| {
-            cx.open_with_system(&path);
+            open_repo(&path, cx);
             if mode == Mode::Panel {
                 panel::dismiss(window, cx);
             }
@@ -285,6 +385,201 @@ fn repo_row(index: usize, s: &RepoStatus, p: &Palette, mode: Mode, cx: &App) -> 
         )
         .into_any_element()
 }
+
+/// A draft PR's mark in icons-only mode, drawn rather than typed.
+const DRAFT_GLYPH: &str = "◌";
+
+/// What a pull request's row says on its right, most pressing first:
+/// (glyph for icons-only mode, words, colour).
+fn pr_marks(pr: &Pr, p: &Palette) -> Vec<(&'static str, &'static str, Hsla)> {
+    let mut marks = Vec::new();
+    if pr.review_requested {
+        marks.push(("◉", "review requested", p.amber));
+    }
+    match pr.checks {
+        Checks::Failing => marks.push(("✗", "checks failing", p.red)),
+        Checks::Pending => marks.push(("●", "checks running", p.amber)),
+        Checks::Passing => marks.push(("✓", "checks pass", p.green)),
+        Checks::None => {}
+    }
+    if pr.mergeable == Mergeable::Conflicts {
+        marks.push(("⚠", "conflicts", p.red));
+    }
+    match pr.review {
+        Review::ChangesRequested => marks.push(("✎", "changes requested", p.red)),
+        Review::Approved => marks.push(("★", "approved", p.green)),
+        Review::Required if !pr.review_requested => marks.push(("…", "awaiting review", p.muted)),
+        _ => {}
+    }
+    if pr.state == PrState::Draft {
+        marks.push((DRAFT_GLYPH, "draft", p.muted));
+    }
+    marks
+}
+
+/// One open pull request; a click opens it on GitHub (and closes the
+/// panel, not the window). Only a browser link: nothing is changed on GitHub.
+fn pr_row(
+    index: usize,
+    s: &RepoStatus,
+    pr: &Pr,
+    p: &Palette,
+    mode: Mode,
+    icons_only: bool,
+    cx: &App,
+) -> AnyElement {
+    let marks = pr_marks(pr, p);
+    let url = pr.url.clone();
+    let tone = if pr.needs_attention() {
+        p.amber
+    } else if pr.state == PrState::Draft {
+        p.muted
+    } else {
+        p.green
+    };
+    let mut lines = vec![
+        (format!("{} #{}", s.name, pr.number), p.text),
+        (pr.title.clone(), p.text),
+        (format!("{} by {}", pr.head_branch, pr.author), p.muted),
+    ];
+    lines.extend(marks.iter().map(|&(_, words, c)| (words.to_string(), c)));
+    let right = div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap_2()
+        .text_sm()
+        .children(
+            marks
+                .iter()
+                .take(if icons_only { 5 } else { 2 })
+                .map(|&(glyph, words, c)| match (icons_only, glyph) {
+                    // The font's dotted circle comes out jagged at this
+                    // size; a dashed ring is drawn smooth.
+                    (true, DRAFT_GLYPH) => div()
+                        .flex_none()
+                        .size(px(11.))
+                        .rounded_full()
+                        .border_1()
+                        .border_dashed()
+                        .border_color(c),
+                    _ => div()
+                        .text_color(c)
+                        .child(if icons_only { glyph } else { words }),
+                }),
+        );
+    div()
+        .id(("pr", index))
+        .flex()
+        .items_center()
+        .gap(px(10.))
+        .px_4()
+        .py(px(6.))
+        .cursor_pointer()
+        .hover(|style| style.bg(p.hover))
+        .tooltip(tip(lines, p))
+        .on_click(move |_, window, cx| {
+            cx.open_url(&url);
+            if mode == Mode::Panel {
+                panel::dismiss(window, cx);
+            }
+        })
+        .child(crate::repo_marks::global_mark(s, 16.0, tone, cx))
+        .child(
+            div()
+                .flex_none()
+                .text_sm()
+                .text_color(p.muted)
+                .child(format!("#{}", pr.number)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_color(p.text)
+                .when(!icons_only, |d| d.child(pr.title.clone())),
+        )
+        .child(right)
+        .into_any_element()
+}
+
+/// A click handler, boxed.
+type OnClick = Box<dyn Fn(&gpui::ClickEvent, &mut Window, &mut App)>;
+
+/// The pull requests' heading and rows, or the one GitHub problem line.
+fn pr_rows(
+    open_prs: &[(&RepoStatus, &Pr)],
+    problem: Option<&str>,
+    p: &Palette,
+    mode: Mode,
+    icons_only: bool,
+    // Big mode: whether the list is folded, and what folds or unfolds it.
+    fold: Option<(bool, OnClick)>,
+    cx: &App,
+) -> Vec<AnyElement> {
+    let mut out = Vec::new();
+    let folded = fold.as_ref().is_some_and(|(f, _)| *f);
+    if !open_prs.is_empty() {
+        let asked = open_prs
+            .iter()
+            .filter(|(_, pr)| pr.review_requested)
+            .count();
+        let mut heading = format!("Pull requests · {} open", open_prs.len());
+        if asked > 0 {
+            heading.push_str(&format!(" · {asked} for your review"));
+        }
+        let head = div()
+            .id("prs-heading")
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_4()
+            .pt_3()
+            .pb_1()
+            .border_t_1()
+            .border_color(p.border)
+            .text_xs()
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .text_color(if asked > 0 { p.amber } else { p.muted })
+            .child(div().flex_1().min_w_0().truncate().child(heading));
+        let head = match fold {
+            Some((folded, toggle)) => head
+                .when(folded, |d| d.pb_3())
+                .cursor_pointer()
+                .hover(|style| style.bg(p.hover))
+                .child(div().flex_none().text_color(p.muted).child(if folded {
+                    "▸"
+                } else {
+                    "▾"
+                }))
+                .on_click(toggle),
+            None => head,
+        };
+        out.push(head.into_any_element());
+        for (i, (s, pr)) in open_prs.iter().enumerate().filter(|_| !folded) {
+            out.push(pr_row(i, s, pr, p, mode, icons_only, cx));
+        }
+    } else if let Some(problem) = problem {
+        out.push(
+            div()
+                .px_4()
+                .py(px(6.))
+                .border_t_1()
+                .border_color(p.border)
+                .text_xs()
+                .text_color(p.muted)
+                .truncate()
+                .child(format!("Pull requests: {problem}"))
+                .into_any_element(),
+        );
+    }
+    out
+}
+
+/// Big mode's pull request list at its tallest: the heading and about
+/// six rows.
+const WINDOW_PRS_HEIGHT: f32 = 230.;
 
 /// A small square glyph button for the panel header.
 fn icon_button(
@@ -315,6 +610,9 @@ impl Render for StatusView {
             WindowAppearance::Dark | WindowAppearance::VibrantDark
         );
         let mode = self.mode;
+        // The panel's rows measured as laid out, so the panel can be made
+        // exactly as tall as what it shows.
+        let content_h = Rc::new(std::cell::Cell::new(0.0f32));
         let timelines = self.timelines.clone();
         // Pictures only: the panel's words move into tooltips.
         let icons_only = mode == Mode::Panel && self.state.read(cx).config.icons_only;
@@ -358,6 +656,7 @@ impl Render for StatusView {
         if sweeping {
             subline.push_str(" · checking…");
         }
+        let open_prs = state.open_prs();
 
         let titles = div()
             .flex()
@@ -453,6 +752,16 @@ impl Render for StatusView {
             ),
         };
 
+        // Folds or unfolds the pull request list of the panel, or of big mode.
+        let fold_prs = |big: bool| -> OnClick {
+            let state = self.state.clone();
+            Box::new(move |_, _, cx| {
+                state.update(cx, |s, cx| {
+                    s.fold_prs(big);
+                    cx.notify();
+                })
+            })
+        };
         let mut rows: Vec<AnyElement> = Vec::new();
         match mode {
             // Without timelines (never, once the app is up) a plain list.
@@ -525,6 +834,15 @@ impl Render for StatusView {
                         }
                     }
                 }
+                rows.extend(pr_rows(
+                    &open_prs,
+                    state.github_problem.as_deref(),
+                    &p,
+                    mode,
+                    icons_only,
+                    Some((state.prs_folded(false), fold_prs(false))),
+                    cx,
+                ));
             }
         }
 
@@ -567,7 +885,15 @@ impl Render for StatusView {
             }
             _ => None,
         };
+        let list_h = content_h.clone();
         let list = div()
+            .on_children_prepainted(move |rows, _, _| {
+                let h = match (rows.first(), rows.last()) {
+                    (Some(first), Some(last)) => f32::from(last.bottom()) - f32::from(first.top()),
+                    _ => 0.0,
+                };
+                list_h.set(h);
+            })
             .id("repos")
             .flex()
             .flex_col()
@@ -578,6 +904,33 @@ impl Render for StatusView {
             .children(rows)
             .when(empty, |list| {
                 list.child(div().p_4().text_sm().text_color(p.muted).child(empty_text))
+            });
+
+        // Big mode lists the pull requests under the columns, a few rows
+        // high, scrolling when there are more.
+        let window_prs = (mode == Mode::Window)
+            .then(|| {
+                pr_rows(
+                    &open_prs,
+                    state.github_problem.as_deref(),
+                    &p,
+                    mode,
+                    false,
+                    Some((state.prs_folded(true), fold_prs(true))),
+                    cx,
+                )
+            })
+            .filter(|rows| !rows.is_empty())
+            .map(|rows| {
+                div()
+                    .id("prs")
+                    .flex()
+                    .flex_col()
+                    .flex_none()
+                    .max_h(px(WINDOW_PRS_HEIGHT))
+                    .overflow_y_scroll()
+                    .bg(p.surface)
+                    .children(rows)
             });
 
         let config_file: PathBuf = state.config_file.clone();
@@ -639,15 +992,37 @@ impl Render for StatusView {
                         .truncate()
                         .when_some(capped.clone(), |d, _| d.text_color(p.amber))
                         .child(capped.unwrap_or_else(|| {
-                            "Click a repo's name to open its folder. Wheel scrolls a column, \
-                             Shift+wheel the table."
-                                .into()
+                            match state.config.repo_click {
+                                crate::config::RepoClick::Folder => {
+                                    "Click a repo's name to open its folder. Wheel scrolls a \
+                                     column, Shift+wheel the table."
+                                }
+                                crate::config::RepoClick::Github => {
+                                    "Click a repo's name to open it on GitHub. Wheel scrolls a \
+                                     column, Shift+wheel the table."
+                                }
+                            }
+                            .into()
                         })),
                 )
                 .child(edit_config),
         };
 
         div()
+            .when(mode == Mode::Panel, |d| {
+                // Header, rows, footer: grow or shrink the panel to them
+                // whenever they change (a section folded, repos or pull
+                // requests come or go), with no empty space below.
+                d.on_children_prepainted(move |parts, _, cx| {
+                    let header = parts.first().map_or(0.0, |b| f32::from(b.size.height));
+                    let footer = if icons_only {
+                        0.0
+                    } else {
+                        parts.get(2).map_or(0.0, |b| f32::from(b.size.height))
+                    };
+                    panel::fit(header + content_h.get() + footer, cx);
+                })
+            })
             .id("root")
             .track_focus(&self.focus)
             .key_context("StatusView")
@@ -669,6 +1044,7 @@ impl Render for StatusView {
                 Some(table) if !empty => d.child(table),
                 _ => d.child(list),
             })
+            .children(window_prs)
             .when(!icons_only, |d| d.child(footer))
             .children(
                 self.timelines
@@ -712,6 +1088,10 @@ fn summary_bar(statuses: &[RepoStatus], checking: bool, p: &Palette) -> gpui::Di
 }
 
 /// A tooltip of coloured lines.
+/// The tooltip's widest, and the characters of `text_xs` that fit in it.
+const TIP_WIDTH: f32 = 320.;
+const TIP_LINE_CHARS: usize = 44;
+
 struct Tip {
     lines: Vec<(SharedString, Hsla)>,
     bg: Hsla,
@@ -720,10 +1100,17 @@ struct Tip {
 
 impl Render for Tip {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        // A line that wraps needs a definite width: under only a max width
+        // its height is measured as one line and the next line overlaps it.
+        let wraps = self
+            .lines
+            .iter()
+            .any(|(text, _)| text.chars().count() > TIP_LINE_CHARS);
         div()
             .flex()
             .flex_col()
-            .max_w(px(320.))
+            .max_w(px(TIP_WIDTH))
+            .when(wraps, |d| d.w(px(TIP_WIDTH)))
             .px_2()
             .py_1()
             .rounded_md()

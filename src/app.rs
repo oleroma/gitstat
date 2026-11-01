@@ -37,6 +37,8 @@ struct Shared {
     tray: Tray,
     monitor: Monitor,
     icons: folder_icons::Worker,
+    /// Reads pull requests from GitHub; never writes anything.
+    github: crate::github::Poller,
     /// The "couldn't save config.json" notice was shown this session.
     save_notice_shown: bool,
     /// The folder-icon consent box is open.
@@ -102,6 +104,11 @@ pub fn run(config_file: PathBuf) {
             let _ = icons_tx.unbounded_send(Input::FolderSkips(skips));
         });
 
+        let github_tx = tx.clone();
+        let github = crate::github::Poller::start(move |report| {
+            let _ = github_tx.unbounded_send(Input::Github(report));
+        });
+
         let timelines = cx.new(|cx| crate::timeline::Timelines::new(&state, cx));
         let marks = cx.new(|cx| crate::repo_marks::RepoMarks::new(&state, cx));
         cx.set_global(Ui {
@@ -112,6 +119,7 @@ pub fn run(config_file: PathBuf) {
             refresh: Rc::new(|cx: &mut App| {
                 if let Some(shared) = cx.try_global::<Shared>() {
                     shared.monitor.send(Command::RefreshAll);
+                    shared.github.refresh();
                 }
             }),
             keepalive,
@@ -120,6 +128,7 @@ pub fn run(config_file: PathBuf) {
             tray,
             monitor,
             icons,
+            github,
             save_notice_shown: false,
             consent_pending: false,
         });
@@ -153,6 +162,9 @@ fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
     let mut changed = false;
     let mut checked = false;
     let mut icons_stale = false;
+    // A repo listed after the poll that read its PRs needs them too.
+    let listed = state.read(cx).statuses.len();
+    let mut prs_stale = false;
     for input in batch {
         match input {
             Input::Monitor(update) => {
@@ -166,6 +178,14 @@ fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
             Input::FolderSkips(skips) => {
                 state.update(cx, |s, _| s.folder_skips = skips);
                 changed = true;
+            }
+            Input::Github(report) => {
+                // A poll that was under way when the option went off.
+                if state.read(cx).config.github_prs {
+                    state.update(cx, |s, _| s.github_report(report));
+                    prs_stale = true;
+                    changed = true;
+                }
             }
             Input::Overlay => {
                 let click = state.read(cx).config.overlay_click();
@@ -201,6 +221,9 @@ fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
                 changed = true;
             }
         }
+    }
+    if prs_stale || state.read(cx).statuses.len() != listed {
+        sync_pr_colors(cx);
     }
     if changed || checked {
         state.update(cx, |_, cx| cx.notify());
@@ -239,14 +262,17 @@ fn on_update(update: Update, cx: &mut App) -> (bool, bool) {
             state.update(cx, |s, _| s.config_error = Some(config_problem(&e)));
             (true, false)
         }
-        Update::Repos { repos, capped } => state.update(cx, |s, _| {
-            let before = s.statuses.len();
-            s.retain_repos(|p| repos.iter().any(|r| r == p));
-            let removed = s.statuses.len() != before;
-            let capped_changed = s.capped != capped;
-            s.capped = capped;
-            (removed || capped_changed, removed)
-        }),
+        Update::Repos { repos, capped } => {
+            cx.global::<Shared>().github.set_repos(repos.clone());
+            state.update(cx, |s, _| {
+                let before = s.statuses.len();
+                s.retain_repos(|p| repos.iter().any(|r| r == p));
+                let removed = s.statuses.len() != before;
+                let capped_changed = s.capped != capped;
+                s.capped = capped;
+                (removed || capped_changed, removed)
+            })
+        }
         Update::Started { repo, .. } => {
             state.update(cx, |s, _| s.in_flight.insert(repo));
             (false, false)
@@ -329,7 +355,7 @@ fn on_action(action: TrayAction, cx: &mut App) -> bool {
         }
         TrayAction::ShowWindow => view::show_window(cx),
         TrayAction::Refresh => cx.global::<Shared>().monitor.send(Command::RefreshAll),
-        TrayAction::OpenRepo(path) => cx.open_with_system(&path),
+        TrayAction::OpenRepo(path) => view::open_repo(&path, cx),
         TrayAction::EditConfig => {
             let file = cx.global::<Ui>().state.read(cx).config_file.clone();
             cx.open_with_system(&file);
@@ -346,6 +372,7 @@ fn on_action(action: TrayAction, cx: &mut App) -> bool {
             cx,
         ),
         TrayAction::SetFolderIconMode(mode) => change_setting(|c| c.folder_icon_mode = mode, cx),
+        TrayAction::SetRepoClick(click) => change_setting(|c| c.repo_click = click, cx),
         TrayAction::SetAutostart(enabled) => {
             if let Err(e) = crate::autostart::set_enabled(enabled) {
                 crate::error_box(format!("Couldn't change the startup setting: {e}"));
@@ -457,7 +484,42 @@ fn apply_config(old: &Config, new: Config, cx: &mut App) {
             .icons
             .sync(statuses, new.folder_icons, new.folder_icon_mode);
     }
+    shared.github.settings(new.github_prs, new.interval());
     shared.tray.sync_settings(&new);
+    if !new.github_prs {
+        state.update(cx, |s, _| {
+            s.prs.clear();
+            s.github_problem = None;
+        });
+        sync_pr_colors(cx);
+    }
+}
+
+/// Hands each listed repo's PRs, merged and closed ones too, to its graph
+/// so its branches take their PR's colour.
+fn sync_pr_colors(cx: &mut App) {
+    let Some(ui) = cx.try_global::<Ui>() else {
+        return;
+    };
+    let (state, timelines) = (ui.state.clone(), ui.timelines.clone());
+    let colors: Vec<_> = {
+        let s = state.read(cx);
+        s.statuses
+            .iter()
+            .map(|r| {
+                let prs = s.prs.get(&r.path).map(Vec::as_slice).unwrap_or_default();
+                let colors = crate::graph::PrColors::from_prs(
+                    prs.iter().map(|p| (p.head_branch.as_str(), p.state)),
+                );
+                (r.path.clone(), colors)
+            })
+            .collect()
+    };
+    timelines.update(cx, |t, cx| {
+        for (path, colors) in colors {
+            t.set_prs(&path, colors, cx);
+        }
+    });
 }
 
 fn config_problem(e: &str) -> String {

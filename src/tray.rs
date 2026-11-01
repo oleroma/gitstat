@@ -1,6 +1,6 @@
 //! The notification-area icon and its right-click menu.
 
-use crate::config::{ClickAction, Config, Corner, FolderIconMode};
+use crate::config::{ClickAction, Config, Corner, FolderIconMode, RepoClick};
 use crate::git::RepoStatus;
 use crate::icon::{self, Badge};
 use crate::layout;
@@ -53,6 +53,7 @@ pub enum TrayAction {
     Toggle(Setting),
     SetCorner(Corner),
     SetFolderIconMode(FolderIconMode),
+    SetRepoClick(RepoClick),
     SetAutostart(bool),
     Quit,
 }
@@ -68,6 +69,7 @@ pub enum Setting {
     OverlayHideSynced,
     OverlayHideFullscreen,
     FolderIcons,
+    GithubPrs,
 }
 
 impl Setting {
@@ -81,6 +83,7 @@ impl Setting {
             Setting::OverlayHideSynced => cfg.overlay.hide_when_synced,
             Setting::OverlayHideFullscreen => cfg.overlay.hide_in_fullscreen,
             Setting::FolderIcons => cfg.folder_icons,
+            Setting::GithubPrs => cfg.github_prs,
         }
     }
 
@@ -94,6 +97,7 @@ impl Setting {
             Setting::OverlayHideSynced => &mut cfg.overlay.hide_when_synced,
             Setting::OverlayHideFullscreen => &mut cfg.overlay.hide_in_fullscreen,
             Setting::FolderIcons => &mut cfg.folder_icons,
+            Setting::GithubPrs => &mut cfg.github_prs,
         };
         *field = !*field;
     }
@@ -104,6 +108,11 @@ const CORNERS: [(Corner, &str); 4] = [
     (Corner::TopRight, "Top right"),
     (Corner::BottomLeft, "Bottom left"),
     (Corner::BottomRight, "Bottom right"),
+];
+
+const REPO_CLICKS: [(RepoClick, &str); 2] = [
+    (RepoClick::Folder, "Folder"),
+    (RepoClick::Github, "GitHub page"),
 ];
 
 const FOLDER_ICON_MODES: [(FolderIconMode, &str); 2] = [
@@ -136,6 +145,7 @@ pub struct Tray {
     corners: Vec<(CheckMenuItem, Corner)>,
     folder_icon_menu: Submenu,
     folder_icon_modes: Vec<(CheckMenuItem, FolderIconMode)>,
+    repo_clicks: Vec<(CheckMenuItem, RepoClick)>,
     autostart: CheckMenuItem,
     edit_config: MenuItem,
     quit: MenuItem,
@@ -178,6 +188,7 @@ impl Tray {
         let hide_fullscreen = check("Hide badge in fullscreen", Setting::OverlayHideFullscreen);
         let folder_icons = check("Folder icons in Explorer", Setting::FolderIcons);
         let watch = check("Watch for changes", Setting::Watch);
+        let github_prs = check("GitHub pull requests (via gh)", Setting::GithubPrs);
 
         let corner_menu = Submenu::new("Badge corner", defaults.overlay.enabled);
         let corners: Vec<(CheckMenuItem, Corner)> = CORNERS
@@ -202,12 +213,26 @@ impl Tray {
             folder_icon_menu.append(item).map_err(|e| e.to_string())?;
         }
 
+        let repo_click_menu = Submenu::new("Repo click opens", true);
+        let repo_clicks: Vec<(CheckMenuItem, RepoClick)> = REPO_CLICKS
+            .iter()
+            .map(|&(click, label)| {
+                let on = click == defaults.repo_click;
+                (CheckMenuItem::new(label, true, on, None), click)
+            })
+            .collect();
+        for (item, _) in &repo_clicks {
+            repo_click_menu.append(item).map_err(|e| e.to_string())?;
+        }
+
         let display = Submenu::new("Display", true);
         display
             .append_items(&[
                 &panel.0,
                 &window.0,
                 &icons_only.0,
+                &github_prs.0,
+                &repo_click_menu,
                 &PredefinedMenuItem::separator(),
                 &overlay.0,
                 &corner_menu,
@@ -275,11 +300,13 @@ impl Tray {
                 hide_fullscreen,
                 folder_icons,
                 watch,
+                github_prs,
             ],
             corner_menu,
             corners,
             folder_icon_menu,
             folder_icon_modes,
+            repo_clicks,
             autostart,
             edit_config,
             quit,
@@ -421,6 +448,11 @@ impl Tray {
             // Like the corners: exactly one stays checked.
             self.check_folder_icon_mode(*mode);
             Some(TrayAction::SetFolderIconMode(*mode))
+        } else if let Some((_, click)) = self.repo_clicks.iter().find(|(item, _)| item.id() == id) {
+            for (item, c) in &self.repo_clicks {
+                set_checked(item, c == click);
+            }
+            Some(TrayAction::SetRepoClick(*click))
         } else {
             self.repos
                 .iter()
@@ -455,6 +487,9 @@ impl Tray {
         }
         self.check_corner(cfg.overlay.corner);
         self.check_folder_icon_mode(cfg.folder_icon_mode);
+        for (item, c) in &self.repo_clicks {
+            set_checked(item, *c == cfg.repo_click);
+        }
         self.folder_icon_menu.set_enabled(cfg.folder_icons);
 
         let badge = cfg.overlay.enabled;
@@ -646,6 +681,7 @@ mod tests {
             Setting::OverlayHideSynced,
             Setting::OverlayHideFullscreen,
             Setting::FolderIcons,
+            Setting::GithubPrs,
         ];
         for setting in all {
             let before = Config::default();

@@ -672,7 +672,14 @@ fn run_git(repo: Option<&Path>, args: &[&str], timeout: Duration) -> Result<Outp
         .args(args)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GCM_INTERACTIVE", "never")
+        .env("GCM_INTERACTIVE", "never");
+    run_quiet(command, timeout)
+}
+
+/// Runs `command` with no console window and no stdin, killing it and
+/// everything it started if it runs past `timeout`. Also runs `gh`.
+pub(crate) fn run_quiet(mut command: Command, timeout: Duration) -> Result<Output, String> {
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -683,8 +690,9 @@ fn run_git(repo: Option<&Path>, args: &[&str], timeout: Duration) -> Result<Outp
         command.creation_flags(CREATE_NO_WINDOW);
     }
 
+    let program = command.get_program().to_string_lossy().into_owned();
     let mut child = command.spawn().map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => "git not found on PATH".to_string(),
+        std::io::ErrorKind::NotFound => format!("{program} not found on PATH"),
         _ => e.to_string(),
     })?;
     #[cfg(windows)]

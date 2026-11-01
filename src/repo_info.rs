@@ -210,6 +210,15 @@ fn sync_sets(repo: &Path, has_remotes: bool) -> (HashSet<String>, HashSet<String
     (unpushed, HashSet::new())
 }
 
+/// The GitHub page of `repo`'s `origin`, read without changing anything.
+pub fn origin_web(repo: &Path) -> Option<String> {
+    let out = git::git(repo, &["remote", "get-url", "origin"], git::LOCAL_TIMEOUT).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    github_web(String::from_utf8_lossy(&out.stdout).trim())
+}
+
 /// The GitHub page of a remote URL, from its https, ssh or scp form.
 pub fn github_web(url: &str) -> Option<String> {
     let path = url
