@@ -35,7 +35,7 @@
       - To install without building (for example once the phone is connected), run only `bash build/src/.agents/agent-install`, which installs the newest build, or `agent-install <version>-<commit>` for an older one from `build/builds/`.
    - `ci`: runs the fallback workflow on the branch and waits, then prints a direct download link per build file and downloads them. Post the links in the project thread first, then upload the files. Nothing is installed.
 4. **Check.** Wait for Olex. If he asks for changes, go back to 2. When he says the feature works, go to 5.
-5. **Merge.** Run `bash .agents/agent-merge`. It merges the latest `main` into the feature branch and pushes, runs the full checks on the branch in GitHub CI and waits for them (a few minutes) unless they already passed on that commit, then marks the PR ready and merges it into `main`, keeping the feature branch.
+5. **Merge.** Run `bash .agents/agent-merge`. It merges the latest `main` into the feature branch and pushes, runs the full checks on the branch in GitHub CI and waits for them (a few minutes) unless they already passed on that commit (or on the feature's last commit, when main only brought in the shared rules and scripts outside `.agents/hooks/`, Markdown files at the repo root, or `docs/`), then marks the PR ready and merges it into `main`, keeping the feature branch.
    - `conflicts`: resolve them, then run it again; it commits the resolution.
    - `needs-testing`: go back to 3. Once Olex says it still works, run it again.
    - `checks-failed`: read the run, fix the cause on the branch (step 2), build again (step 3), and tell Olex what changed.

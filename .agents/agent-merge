@@ -24,6 +24,9 @@ merge_into_main() {
     title=(-f "commit_title=Merge $BRANCH (insights only) [skip ci]")
   elif checked "$(git rev-parse HEAD)"; then
     checks="The full checks had already passed on $(git rev-parse --short HEAD)."
+  elif reuse_check; then
+    mark_checked "$(git rev-parse HEAD)" "Passed on $(git rev-parse --short HEAD^1); main only brought in rules or docs"
+    checks="The full checks had passed on $(git rev-parse --short HEAD^1), and main only brought in rules or docs."
   else
     run_fallback check || finish checks-failed "The full checks failed on $BRANCH: $RUN_URL" \
       "Fix it on the branch with agent-commit, then build again (step 3)."

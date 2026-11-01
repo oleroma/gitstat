@@ -107,6 +107,15 @@ mark_checked() {
   gh api -X POST "repos/$SLUG/statuses/$1" -f state=success -f context=full-check -f description="$2" >/dev/null
 }
 
+# reuse_check: true if HEAD merges main into a feature head that passed the full checks, and the
+# merge brought in only files that can't change the build or the checks: the shared rules and
+# scripts (not .agents/hooks/), Markdown files at the repo root, and docs/.
+reuse_check() {
+  git rev-parse -q --verify HEAD^2 >/dev/null || return 1
+  checked "$(git rev-parse HEAD^1)" || return 1
+  ! git diff --name-only HEAD^1 HEAD | grep -vE '^([^/]+\.md|docs/.*|\.agents/[^/]+)$' | grep -q .
+}
+
 # main_red: prints the link of the latest finished fallback run on main if it failed, else nothing.
 main_red() {
   gh api "repos/$SLUG/actions/workflows/fallback.yml/runs?branch=main&event=push&status=completed&per_page=1" \
