@@ -55,6 +55,8 @@ const BLEED: f32 = 6.0;
 const DOT: f32 = 3.0;
 const DOT_HOVER: f32 = 4.5;
 const STROKE: f32 = 1.5;
+/// How wide the band under another worktree's line is.
+const BAND: f32 = 7.0;
 /// Px from the strip's right edge to HEAD.
 const PAD: f32 = 12.0;
 /// The tail fades out over this many px at the left edge.
@@ -1017,6 +1019,25 @@ impl Timelines {
                     .into_any_element(),
             );
         }
+        for b in g.bands_at(row) {
+            let what = match &b.branch {
+                Some(branch) => format!("Checked out in worktree {} on {branch}", b.name),
+                None => format!("Checked out in worktree {}, detached", b.name),
+            };
+            lines.push(
+                div()
+                    .text_color(colors.node(g, row))
+                    .child(what)
+                    .into_any_element(),
+            );
+            lines.push(
+                div()
+                    .text_color(p.muted)
+                    .truncate()
+                    .child(b.path.display().to_string())
+                    .into_any_element(),
+            );
+        }
         Some(lines)
     }
 }
@@ -1112,6 +1133,13 @@ impl Colors {
         }
     }
 
+    /// The band under a worktree's line: its tip's colour, faint.
+    /// `folded` when the lane is past the ones shown, so dimmed.
+    fn band(&self, g: &RepoGraph, b: &crate::repo_graph::Band, folded: bool) -> Hsla {
+        let alpha = if folded { 0.12 } else { 0.24 };
+        ink::over(self.node(g, b.top).opacity(alpha), self.bg)
+    }
+
     fn node(&self, g: &RepoGraph, row: usize) -> Hsla {
         let node = &g.layout.nodes[row];
         if let Some(pr) = g.prs.of_node(node, &g.layout.branches) {
@@ -1187,6 +1215,21 @@ fn paint_strip(
     let hi = ((((top_x - left) / STEP).ceil() + 1.0).max(0.0) as usize).min(rows);
     if lo >= hi && rows > 0 && lo >= rows {
         return Vec::new();
+    }
+
+    // Under everything, a soft band along each other worktree's line.
+    for b in g.bands.iter().filter(|b| b.top < hi && b.bottom + 1 >= lo) {
+        let color = colors.band(g, b, b.lane >= LANES);
+        let yb = y(b.lane as f32);
+        let r = BAND / 2.0;
+        let x0 = x(b.top as f32);
+        let x1 = if b.open { left - r } else { x(b.bottom as f32) };
+        let x1 = x1.max(left - r);
+        ink::line(window, (x1, yb), (x0, yb), BAND, color, None);
+        ink::circle(window, (x0, yb), r, Some(color), None);
+        if !b.open {
+            ink::circle(window, (x1, yb), r, Some(color), None);
+        }
     }
 
     let mut dots = Vec::with_capacity(hi.saturating_sub(lo) + 1);

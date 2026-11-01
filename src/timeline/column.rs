@@ -34,6 +34,8 @@ const LANES: usize = 8;
 const DOT: f32 = 4.0;
 const DOT_HOVER: f32 = 5.5;
 const STROKE: f32 = 1.75;
+/// How wide the band under another worktree's line is.
+const BAND: f32 = 10.0;
 /// Px from the column's left edge to lane 0.
 const PAD: f32 = 14.0;
 /// Commits whose stats one git call reads.
@@ -345,6 +347,10 @@ impl Timelines {
                 Ref::Remote(n) => (n.clone(), p.muted),
             })
             .chain(g.stashes_at(row).map(|s| (s.name.clone(), colors.stash)))
+            .chain(
+                g.bands_at(row)
+                    .map(|b| (format!("⌂ {}", b.name), colors.node(g, row))),
+            )
             .map(|(text, color)| pill(text, color))
             .collect::<Vec<_>>();
         let stat = self.stats.get(&c.id);
@@ -634,6 +640,26 @@ fn paint_column(
     let folded = |lane: f32| lane.round() as usize >= LANES;
     let span = geo.rows_in(bounds.size.height);
     let (lo, hi) = (span.start.saturating_sub(1), (span.end + 1).min(rows));
+
+    // Under everything, a soft band along each other worktree's line.
+    let bottom = oy + f32::from(bounds.size.height);
+    for b in g.bands.iter().filter(|b| b.top < hi && b.bottom + 1 >= lo) {
+        let color = colors.band(g, b, b.lane >= LANES);
+        let r = BAND / 2.0;
+        let top = at(b.top as f32, b.lane as f32);
+        let (xb, y0) = (f32::from(top.x), f32::from(top.y));
+        let y1 = if b.open {
+            bottom + r
+        } else {
+            f32::from(at(b.bottom as f32, b.lane as f32).y)
+        };
+        let y1 = y1.min(bottom + r);
+        ink::line(window, (xb, y0), (xb, y1), BAND, color, None);
+        ink::circle(window, (xb, y0), r, Some(color), None);
+        if !b.open {
+            ink::circle(window, (xb, y1), r, Some(color), None);
+        }
+    }
 
     let mut dots = Vec::new();
     for e in g.layout.visible_edges(lo, hi) {

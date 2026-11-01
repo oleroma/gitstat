@@ -4,7 +4,7 @@
 use crate::graph::{Context, Layout, PrColors};
 use crate::history::{self, Commit, PageError, Stash};
 use crate::repo_info::{self, Info};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 // Only the Windows UI reads some fields; Linux builds this for its tests.
@@ -30,6 +30,29 @@ pub struct RepoGraph {
     tips: Vec<String>,
     /// What `info` was read from besides the refs.
     setup: repo_info::Setup,
+    /// The lines checked out in the repo's other worktrees, for the band
+    /// drawn under their lanes.
+    pub bands: Vec<Band>,
+    /// The worktrees besides this repo's folder, whose HEADs `bands` marks:
+    /// this one's checkout is HEAD, which has a mark of its own.
+    others: Vec<repo_info::Worktree>,
+}
+
+/// Another worktree's checkout on the graph: its HEAD's row and the rows
+/// down its lane that its branch has of its own, rows `top..=bottom`.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Band {
+    /// The worktree's folder name.
+    pub name: String,
+    pub path: PathBuf,
+    /// `None` when detached.
+    pub branch: Option<String>,
+    pub lane: usize,
+    pub top: usize,
+    pub bottom: usize,
+    /// The line runs on past the loaded rows.
+    pub open: bool,
 }
 
 /// What `more` found.
@@ -96,8 +119,12 @@ impl RepoGraph {
         let mut layout = Layout::new(&ctx);
         layout.push(&commits, &ctx);
         let head_row = find_head(&commits, &ctx, 0);
+        let others = other_worktrees(&info, repo, ctx.refs.head.as_deref());
+        let bands = bands(&others, &commits, &layout);
         Ok(Some(RepoGraph {
             prs: prev.map(|p| p.prs.clone()).unwrap_or_default(),
+            bands,
+            others,
             head_row,
             commits,
             layout,
@@ -130,6 +157,14 @@ impl RepoGraph {
         if self.head_row.is_none() {
             self.head_row = find_head(&self.commits, &self.ctx, from);
         }
+        // A band may reach into the new rows, or its HEAD only now be loaded.
+        self.bands = bands(&self.others, &self.commits, &self.layout);
+    }
+
+    /// The other worktrees whose HEAD is the commit at `row`.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn bands_at(&self, row: usize) -> impl Iterator<Item = &Band> {
+        self.bands.iter().filter(move |b| b.top == row)
     }
 
     /// The row a strip rests on: HEAD's, or the newest without one.
@@ -161,6 +196,46 @@ impl RepoGraph {
             .iter()
             .filter(move |s| Some(s.base.as_str()) == id)
     }
+}
+
+/// The repo's worktrees other than `repo` itself that have a commit
+/// checked out. When `repo` can't be resolved, the worktree on HEAD's own
+/// commit stands for it.
+fn other_worktrees(info: &Info, repo: &Path, head: Option<&str>) -> Vec<repo_info::Worktree> {
+    let here = std::fs::canonicalize(repo).ok();
+    info.worktrees
+        .iter()
+        .filter(|w| !w.bare && !w.prunable && w.head.is_some())
+        .filter(|w| match &here {
+            Some(here) => std::fs::canonicalize(&w.path).map_or(true, |p| &p != here),
+            None => w.head.as_deref() != head,
+        })
+        .cloned()
+        .collect()
+}
+
+/// The bands of the worktrees whose HEAD is loaded.
+fn bands(others: &[repo_info::Worktree], commits: &[Commit], layout: &Layout) -> Vec<Band> {
+    others
+        .iter()
+        .filter_map(|w| {
+            let id = w.head.as_deref()?;
+            let top = commits.iter().position(|c| c.id == id)?;
+            let (bottom, open) = layout.lane_run(top);
+            Some(Band {
+                name: w.path.file_name().map_or_else(
+                    || w.path.display().to_string(),
+                    |n| n.to_string_lossy().into_owned(),
+                ),
+                path: w.path.clone(),
+                branch: w.branch.clone(),
+                lane: layout.nodes[top].lane,
+                top,
+                bottom,
+                open,
+            })
+        })
+        .collect()
 }
 
 fn find_head(commits: &[Commit], ctx: &Context, from: usize) -> Option<usize> {
@@ -255,6 +330,60 @@ mod tests {
         );
         let g5 = RepoGraph::load(&dir, Some(&g4), 10).unwrap().unwrap();
         assert_eq!(g5.info.default_branch.as_deref(), Some("origin/dev"));
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bands_mark_other_worktrees_lines() {
+        let dir = temp_repo("repo-graph-bands");
+        let mut n = 0;
+        for i in 0..3 {
+            commit(&dir, &format!("c{i}"), &mut n);
+        }
+        let wt = std::env::temp_dir().join(format!("gitstat-rg-band-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&wt);
+        run(
+            &dir,
+            &["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()],
+        );
+        commit(&wt, "f1", &mut n);
+        commit(&wt, "f2", &mut n);
+        commit(&dir, "c3", &mut n);
+
+        let g = RepoGraph::load(&dir, None, 10).unwrap().unwrap();
+        let subject = |row: usize| g.commits[row].subject.as_str();
+        // Only the other worktree: this one's checkout is HEAD.
+        assert_eq!(g.bands.len(), 1);
+        let b = &g.bands[0];
+        assert_eq!(b.branch.as_deref(), Some("feat"));
+        assert_eq!(subject(b.top), "f2");
+        assert_eq!(subject(b.bottom), "f1");
+        assert!(!b.open);
+        assert_ne!(b.lane, 0);
+        assert_eq!(g.bands_at(b.top).count(), 1);
+
+        // Seen from the worktree, the main folder's line is the band.
+        let g = RepoGraph::load(&wt, None, 10).unwrap().unwrap();
+        assert_eq!(g.bands.len(), 1);
+        assert_eq!(g.bands[0].branch.as_deref(), Some("main"));
+        assert_eq!(g.commits[g.bands[0].top].subject, "c3");
+
+        // Loaded a page at a time, the band reaches on as rows come.
+        let mut g = RepoGraph::load(&dir, None, 2).unwrap().unwrap();
+        let b = g.bands[0].clone();
+        assert!(b.open && b.bottom == b.top);
+        match g.more(&dir, 10).unwrap() {
+            More::Page(c, end) => g.append(c, end),
+            More::Reload => panic!("history didn't move"),
+        }
+        assert_eq!(g.commits[g.bands[0].bottom].subject, "f1");
+        assert!(!g.bands[0].open);
+
+        run(
+            &dir,
+            &["worktree", "remove", "--force", wt.to_str().unwrap()],
+        );
         let _ = std::fs::remove_dir_all(&wt);
         let _ = std::fs::remove_dir_all(&dir);
     }

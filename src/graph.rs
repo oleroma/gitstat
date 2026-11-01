@@ -246,6 +246,39 @@ impl Layout {
         (0..).find(|l| !used.contains(l)).unwrap_or(0)
     }
 
+    /// How far down its own lane the line of development at `row` runs:
+    /// its first parents while they stay in that lane, the commits a branch
+    /// has of its own before it bends into the line it forked from. Returns
+    /// the last such row, and whether the line runs on past the loaded rows.
+    /// Lane 0 is HEAD's line, so a commit in it has nothing of its own
+    /// beyond the checkout: its run is the row alone.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn lane_run(&self, row: usize) -> (usize, bool) {
+        let Some(node) = self.nodes.get(row) else {
+            return (row, false);
+        };
+        let lane = node.lane;
+        if lane == 0 {
+            return (row, false);
+        }
+        let mut at = row;
+        loop {
+            let from = self.edges.partition_point(|e| e.child.0 < at);
+            let first = self.edges[from..]
+                .iter()
+                .take_while(|e| e.child.0 == at)
+                .find(|e| e.first);
+            match first {
+                Some(e) if e.via == lane => match e.parent {
+                    Some((r, l)) if l == lane => at = r,
+                    Some(_) => return (at, false),
+                    None => return (at, true),
+                },
+                _ => return (at, false),
+            }
+        }
+    }
+
     /// Edges still waiting for a parent below the last loaded row.
     #[cfg(test)]
     pub fn open_edges(&self) -> impl Iterator<Item = &Edge> {
@@ -610,6 +643,35 @@ mod tests {
         assert_eq!(l.edges.len(), 2);
         assert!(l.edges.iter().all(|e| e.via == 0 && e.first));
         assert_eq!(l.open_edges().count(), 0);
+    }
+
+    #[test]
+    fn lane_run_follows_a_branch_to_its_fork() {
+        //   f2      row 0  lane 1
+        //   f1      row 1  lane 1
+        //   c |     row 2  lane 0  HEAD
+        //   |/
+        //   b       row 3  lane 0
+        //   a       row 4  lane 0
+        let commits = [
+            c("f2", &["f1"]),
+            c("f1", &["b"]),
+            c("c", &["b"]),
+            c("b", &["a"]),
+            c("a", &[]),
+        ];
+        let cx = ctx("c", &[]);
+        let l = layout(&commits, &cx);
+        assert_eq!(lanes(&l), [1, 1, 0, 0, 0]);
+        assert_eq!(l.lane_run(0), (1, false));
+        assert_eq!(l.lane_run(1), (1, false));
+        // HEAD's own line has nothing of its own.
+        assert_eq!(l.lane_run(3), (3, false));
+        assert_eq!(l.lane_run(9), (9, false));
+
+        // With the fork not loaded yet, the run goes on past the last row.
+        let l = layout(&commits[..2], &cx);
+        assert_eq!(l.lane_run(0), (1, true));
     }
 
     #[test]
