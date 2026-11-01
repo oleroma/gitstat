@@ -119,6 +119,17 @@ pub struct Monitor {
 
 impl Monitor {
     pub fn start(config_file: PathBuf, sink: impl Fn(Update) + Send + 'static) -> Monitor {
+        Self::start_slot(config_file, 0, sink)
+    }
+
+    /// A monitor for the folder at `slot` in the config's
+    /// [`Config::roots`]. Every monitor reads the config file itself; only
+    /// slot 0 reports it. A slot past the list watches nothing.
+    pub fn start_slot(
+        config_file: PathBuf,
+        slot: usize,
+        sink: impl Fn(Update) + Send + 'static,
+    ) -> Monitor {
         let (tx, rx) = mpsc::channel();
         // Event paths come back in the form the watch was given; make it absolute
         // so they compare equal to the config file.
@@ -126,7 +137,7 @@ impl Monitor {
         let scheduler_tx = tx.clone();
         let thread = thread::Builder::new()
             .name("gitstat-monitor".into())
-            .spawn(move || Scheduler::new(config_file, Box::new(sink), scheduler_tx).run(rx))
+            .spawn(move || Scheduler::new(config_file, slot, Box::new(sink), scheduler_tx).run(rx))
             .ok();
         Monitor { tx, thread }
     }
@@ -160,6 +171,10 @@ struct Retry {
 
 struct Scheduler {
     config_file: PathBuf,
+    /// Which of the config's folders this one watches.
+    slot: usize,
+    /// What repo names are relative to (see `Config::name_base`).
+    name_base: PathBuf,
     sink: Box<dyn Fn(Update) + Send>,
     tx: mpsc::Sender<Msg>,
     config: Config,
@@ -221,14 +236,22 @@ struct Scheduler {
 }
 
 impl Scheduler {
-    fn new(config_file: PathBuf, sink: Box<dyn Fn(Update) + Send>, tx: mpsc::Sender<Msg>) -> Self {
+    fn new(
+        config_file: PathBuf,
+        slot: usize,
+        sink: Box<dyn Fn(Update) + Send>,
+        tx: mpsc::Sender<Msg>,
+    ) -> Self {
         let loaded = Config::load_or_create(&config_file);
         let config = loaded.clone().unwrap_or_default();
-        let root = config.repos_dir();
+        let root = config.root(slot).unwrap_or_default();
+        let name_base = config.name_base(&root);
         let depth = config.depth();
         Self {
             router: Router::new(root.clone(), depth, config_file.clone()),
             config_file,
+            slot,
+            name_base,
             sink,
             tx,
             config,
@@ -270,7 +293,9 @@ impl Scheduler {
 
     fn run(mut self, rx: mpsc::Receiver<Msg>) {
         let now = Instant::now();
-        (self.sink)(Update::Config(self.loaded.clone()));
+        if self.slot == 0 {
+            (self.sink)(Update::Config(self.loaded.clone()));
+        }
         // Here, not on the walk thread: there is nothing to do without it.
         self.walk_here(true, now);
         self.setup_watch(now);
@@ -424,7 +449,7 @@ impl Scheduler {
             let tx = self.tx.clone();
             let generation = self.generation;
             let worker_repo = repo.clone();
-            let root = self.root.clone();
+            let root = self.name_base.clone();
             let spawned = thread::Builder::new()
                 .name("gitstat-check".into())
                 .spawn(move || {
@@ -454,7 +479,7 @@ impl Scheduler {
                 self.on_done(
                     Done {
                         generation,
-                        status: git::failed(&self.root, &repo, &e.to_string()),
+                        status: git::failed(&self.name_base, &repo, &e.to_string()),
                         repo,
                         need,
                         ignored: Vec::new(),
@@ -737,7 +762,9 @@ impl Scheduler {
 
     fn apply_loaded(&mut self, loaded: Result<Config, String>, now: Instant) {
         self.loaded = loaded.clone();
-        self.emit(Update::Config(loaded.clone()));
+        if self.slot == 0 {
+            self.emit(Update::Config(loaded.clone()));
+        }
         // A broken file keeps the last good config running.
         if let Ok(config) = loaded
             && config != self.config
@@ -748,11 +775,15 @@ impl Scheduler {
 
     fn apply_config(&mut self, config: Config, now: Instant) {
         let old = std::mem::replace(&mut self.config, config);
-        let root = self.config.repos_dir();
+        let root = self.config.root(self.slot).unwrap_or_default();
+        let name_base = self.config.name_base(&root);
         let depth = self.config.depth();
-        if !same_root(&root, &self.root) || depth != self.depth {
+        // New names (a folder added or removed elsewhere) need every status
+        // again, as a new root does.
+        if !same_root(&root, &self.root) || depth != self.depth || name_base != self.name_base {
             self.generation += 1;
             self.root = root;
+            self.name_base = name_base;
             self.depth = depth;
             self.router = Router::new(self.root.clone(), depth, self.config_file.clone());
             // Checks still running for the old root keep their repos busy.

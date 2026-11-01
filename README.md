@@ -258,6 +258,14 @@ set `"watch": false`) to check on the interval only, as before v0.3.
 
 git must be on your `PATH` (Git for Windows puts it there).
 
+## Install
+
+Each build on the PC installs itself to `%LOCALAPPDATA%\Programs\gitstat`
+with a **gitstat** shortcut in the Start menu, stops a running gitstat and
+starts the new one. `config.json` there is kept between installs; the first
+install copies `build\config.json`. If **Start with Windows** is on, it is
+pointed at the installed exe.
+
 ## Configure
 
 `config.json` lives next to `gitstat.exe`. Every key is optional, and a file
@@ -266,6 +274,7 @@ from an older version keeps working:
 ```json
 {
   "path": "D:/dev",
+  "more_paths": [],
   "depth": 3,
   "interval_minutes": 5.0,
   "watch": true,
@@ -292,6 +301,7 @@ from an older version keeps working:
 | key | default | meaning |
 |---|---|---|
 | `path` | the folder above gitstat's own | The folder your repos are in, at any level down to `depth`; a whole drive such as `D:/` works. `~` and variables like `%USERPROFILE%` are expanded. Use forward slashes or doubled backslashes. |
+| `more_paths` | `[]` | More folders to watch besides `path`, each down to `depth`, such as `["E:/work", "~/src"]`. A folder inside or around one already listed is skipped. With more than one folder, repo names start with their folder's name (`dev\gitstat`, `work\api`). |
 | `depth` | 3 | How many folder levels below `path` to look for repos, 1 to 8. 1 is only `path`'s direct subfolders, which is all earlier versions looked at: set it to keep an older config's repo list as it was, with two exceptions. A `path` that is itself a repo now shows only that repo, not the repos inside it, and a link to a repo that is listed anyway is dropped. See [Which repos](#which-repos). |
 | `interval_minutes` | 5 | How often to fetch, 1 to 1440. |
 | `watch` | true | Pick up local changes from file-system events. false checks on the interval only. |

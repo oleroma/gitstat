@@ -18,6 +18,13 @@ pub struct AppState {
     pub statuses: Vec<RepoStatus>,
     /// Why the repo list may be incomplete: a discovery cap was hit.
     pub capped: Option<String>,
+    /// Each watched folder's repos and cap message, by its slot in
+    /// `config.roots()`; `statuses` holds the repos of all of them.
+    slots: Vec<(Vec<PathBuf>, Option<String>)>,
+    /// Folders whose fetch sweep is running.
+    sweeping_slots: HashSet<usize>,
+    /// Each folder's watch mode; `mode` shows the worst.
+    modes: Vec<WatchMode>,
     pub has_result: bool,
     /// A fetch sweep is running.
     pub sweeping: bool,
@@ -59,6 +66,9 @@ impl AppState {
             config_error,
             statuses: Vec::new(),
             capped: None,
+            slots: Vec::new(),
+            sweeping_slots: HashSet::new(),
+            modes: Vec::new(),
             has_result: false,
             sweeping: false,
             in_flight: HashSet::new(),
@@ -83,11 +93,14 @@ impl AppState {
         if let Some(e) = &self.config_error {
             return Some(e.clone());
         }
-        let dir = self.config.repos_dir();
-        if self.has_result && !dir.is_dir() {
-            return Some(format!("folder not found: {}", dir.display()));
+        if !self.has_result {
+            return None;
         }
-        None
+        self.config
+            .roots()
+            .into_iter()
+            .find(|dir| !dir.is_dir())
+            .map(|dir| format!("folder not found: {}", dir.display()))
     }
 
     /// Red with the configured count while any repo is unsynced; green
@@ -189,6 +202,72 @@ impl AppState {
         self.checks.get(path).copied().unwrap_or(0)
     }
 
+    /// Takes in one folder's repo list. Returns (anything changed, a repo
+    /// was dropped).
+    pub fn set_slot_repos(
+        &mut self,
+        slot: usize,
+        repos: Vec<PathBuf>,
+        capped: Option<String>,
+    ) -> (bool, bool) {
+        if self.slots.len() <= slot {
+            self.slots.resize_with(slot + 1, Default::default);
+        }
+        self.slots[slot] = (repos, capped);
+        self.refresh_slots()
+    }
+
+    /// Forgets the folders from `count` on. Returns whether repos went.
+    pub fn keep_slots(&mut self, count: usize) -> bool {
+        self.sweeping_slots.retain(|&s| s < count);
+        self.sweeping = !self.sweeping_slots.is_empty();
+        self.modes.truncate(count);
+        self.mode = worst_mode(&self.modes).unwrap_or_else(|| self.mode.clone());
+        if self.slots.len() <= count {
+            return false;
+        }
+        self.slots.truncate(count);
+        self.refresh_slots().1
+    }
+
+    /// The repos of every watched folder.
+    pub fn all_repos(&self) -> Vec<PathBuf> {
+        self.slots
+            .iter()
+            .flat_map(|(r, _)| r.iter().cloned())
+            .collect()
+    }
+
+    fn refresh_slots(&mut self) -> (bool, bool) {
+        let all: HashSet<PathBuf> = self.all_repos().into_iter().collect();
+        let before = self.statuses.len();
+        self.retain_repos(|p| all.contains(p));
+        let removed = self.statuses.len() != before;
+        let capped = self.slots.iter().find_map(|(_, c)| c.clone());
+        let capped_changed = self.capped != capped;
+        self.capped = capped;
+        (removed || capped_changed, removed)
+    }
+
+    /// A folder's sweep started or ended; `sweeping` is any folder's.
+    pub fn set_sweeping(&mut self, slot: usize, on: bool) {
+        if on {
+            self.sweeping_slots.insert(slot);
+        } else {
+            self.sweeping_slots.remove(&slot);
+        }
+        self.sweeping = !self.sweeping_slots.is_empty();
+    }
+
+    /// A folder's watch mode; `mode` becomes the worst of them.
+    pub fn set_mode(&mut self, slot: usize, mode: WatchMode) {
+        if self.modes.len() <= slot {
+            self.modes.resize(slot + 1, mode.clone());
+        }
+        self.modes[slot] = mode;
+        self.mode = worst_mode(&self.modes).unwrap_or(WatchMode::Off);
+    }
+
     /// Forgets repos no longer in the list.
     pub fn retain_repos(&mut self, keep: impl Fn(&Path) -> bool) {
         self.statuses.retain(|s| keep(&s.path));
@@ -261,6 +340,16 @@ impl AppState {
     }
 }
 
+/// Polling (watching failed somewhere) over interval only over events.
+fn worst_mode(modes: &[WatchMode]) -> Option<WatchMode> {
+    let rank = |m: &WatchMode| match m {
+        WatchMode::Polling { .. } => 0,
+        WatchMode::Off => 1,
+        WatchMode::Events => 2,
+    };
+    modes.iter().min_by_key(|m| rank(m)).cloned()
+}
+
 /// 0 is worst: error, diverged, behind, ahead, dirty, no upstream, synced.
 fn severity(s: &RepoStatus) -> u8 {
     if s.error.is_some() {
@@ -285,7 +374,8 @@ fn severity(s: &RepoStatus) -> u8 {
 pub enum Input {
     Tray(tray_icon::TrayIconEvent),
     Menu(tray_icon::menu::MenuEvent),
-    Monitor(crate::monitor::Update),
+    /// A monitor's update, with the slot of the folder it watches.
+    Monitor(usize, crate::monitor::Update),
     /// A click on the badge.
     Overlay,
     /// The badge was dragged and dropped with its disc here (physical px).
@@ -318,6 +408,45 @@ mod tests {
         state.statuses = statuses;
         state.has_result = true;
         state
+    }
+
+    #[test]
+    fn folders_combine_their_repos_sweeps_and_modes() {
+        let mut s = state(vec![repo("a"), repo("b"), repo("c")]);
+        let (a, b, c) = (PathBuf::from("a"), PathBuf::from("b"), PathBuf::from("c"));
+        assert_eq!(
+            s.set_slot_repos(0, vec![a.clone(), b.clone()], None),
+            (true, true)
+        );
+        assert_eq!(s.statuses.len(), 2, "c belongs to no folder yet");
+        s.merge_status(repo("c"));
+        assert_eq!(
+            s.set_slot_repos(1, vec![c.clone()], Some("cap".into())),
+            (true, false)
+        );
+        assert_eq!(s.capped.as_deref(), Some("cap"));
+        assert_eq!(s.all_repos(), [a, b, c]);
+        // Folder 0 losing b drops it; folder 1's c stays.
+        assert_eq!(
+            s.set_slot_repos(0, vec![PathBuf::from("a")], None),
+            (true, true)
+        );
+        assert_eq!(s.statuses.len(), 2);
+
+        s.set_sweeping(0, true);
+        s.set_sweeping(1, true);
+        s.set_sweeping(0, false);
+        assert!(s.sweeping);
+        s.set_mode(0, WatchMode::Events);
+        s.set_mode(1, WatchMode::Polling { reason: "x".into() });
+        assert!(matches!(s.mode, WatchMode::Polling { .. }));
+
+        // Folder 1 removed: its repo, sweep and mode go with it.
+        assert!(s.keep_slots(1));
+        assert_eq!(s.statuses.len(), 1);
+        assert!(!s.sweeping && s.capped.is_none());
+        assert_eq!(s.mode, WatchMode::Events);
+        assert!(!s.keep_slots(1));
     }
 
     #[test]

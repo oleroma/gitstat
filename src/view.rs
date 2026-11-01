@@ -821,7 +821,14 @@ impl Render for StatusView {
         } else {
             p.muted
         };
-        let mut subline = state.config.repos_dir().display().to_string();
+        let roots = state.config.roots();
+        let mut subline = roots
+            .first()
+            .map(|r| r.display().to_string())
+            .unwrap_or_default();
+        if roots.len() > 1 {
+            subline.push_str(&format!(" + {} more", roots.len() - 1));
+        }
         if let Some(time) = &state.last_checked {
             subline.push_str(&format!(" · checked {time}"));
         }

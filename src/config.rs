@@ -106,6 +106,8 @@ impl Default for OverlayConfig {
 pub struct Config {
     /// The folder to look for repos in.
     pub path: String,
+    /// More folders to look for repos in, each down to `depth` like `path`.
+    pub more_paths: Vec<String>,
     /// How many folder levels below `path` to look for repos; 1 is its
     /// direct subfolders. See [`Config::depth`].
     pub depth: i64,
@@ -140,6 +142,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             path: "~/dev".into(),
+            more_paths: Vec::new(),
             depth: DEFAULT_DEPTH as i64,
             interval_minutes: 5.0,
             watch: true,
@@ -190,6 +193,56 @@ impl Config {
     /// `path` with `~` and `%VAR%` / `$VAR` expanded.
     pub fn repos_dir(&self) -> PathBuf {
         PathBuf::from(expand(&self.path))
+    }
+
+    /// Every folder to look for repos in: `path`, then `more_paths`, each
+    /// expanded. Blank entries are dropped, and so is a folder that is the
+    /// same as, inside, or around one already listed, so no repo is listed
+    /// twice.
+    pub fn roots(&self) -> Vec<PathBuf> {
+        let mut roots: Vec<PathBuf> = Vec::new();
+        let mut keys: Vec<String> = Vec::new();
+        let candidates =
+            std::iter::once(self.path.as_str()).chain(self.more_paths.iter().map(String::as_str));
+        for (i, raw) in candidates.enumerate() {
+            // `path` always counts, even blank, as it always has.
+            if i > 0 && raw.trim().is_empty() {
+                continue;
+            }
+            let dir = if i == 0 {
+                self.repos_dir()
+            } else {
+                PathBuf::from(expand(raw.trim()))
+            };
+            let key = path_key(&dir);
+            let overlaps = keys.iter().any(|k| {
+                k == &key || key.starts_with(&format!("{k}/")) || k.starts_with(&format!("{key}/"))
+            });
+            if !overlaps {
+                keys.push(key);
+                roots.push(dir);
+            }
+        }
+        roots
+    }
+
+    /// The folder at `slot` in [`Config::roots`].
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn root(&self, slot: usize) -> Option<PathBuf> {
+        self.roots().into_iter().nth(slot)
+    }
+
+    /// What repo names under `root` are relative to: `root` itself when it
+    /// is the only folder, else the folder above it, so names start with
+    /// their folder (`dev\gitstat`, `work\api`) and can't clash.
+    pub fn name_base(&self, root: &Path) -> PathBuf {
+        if self.roots().len() > 1
+            && let Some(parent) = root.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            return parent.to_path_buf();
+        }
+        root.to_path_buf()
     }
 
     /// `depth`, 1 to [`MAX_DEPTH`].
@@ -324,6 +377,18 @@ fn home() -> Option<String> {
         .ok()
 }
 
+/// A folder's spelling for comparing: forward slashes, no trailing slash,
+/// and case-folded on Windows, where paths ignore case.
+fn path_key(dir: &Path) -> String {
+    let key = dir.to_string_lossy().replace('\\', "/");
+    let key = key.trim_end_matches('/').to_string();
+    if cfg!(windows) {
+        key.to_lowercase()
+    } else {
+        key
+    }
+}
+
 fn expand(path: &str) -> String {
     let mut out = String::new();
     let mut rest = path;
@@ -440,6 +505,47 @@ mod tests {
             assert_eq!(serde_json::from_str::<Corner>(text).unwrap(), corner);
         }
         assert!(serde_json::from_str::<Corner>("\"BottomRight\"").is_err());
+    }
+
+    #[test]
+    fn roots_drop_blanks_duplicates_and_overlaps() {
+        let config = Config {
+            path: "/dev".into(),
+            more_paths: vec![
+                "/work".into(),
+                " ".into(),
+                "/dev/".into(),
+                "/dev/inner".into(),
+                "/".into(),
+                "/work2".into(),
+            ],
+            ..Default::default()
+        };
+        let roots: Vec<PathBuf> = config.roots();
+        assert_eq!(
+            roots,
+            [
+                PathBuf::from("/dev"),
+                PathBuf::from("/work"),
+                PathBuf::from("/work2")
+            ]
+        );
+        assert_eq!(config.root(1), Some(PathBuf::from("/work")));
+        assert_eq!(config.root(3), None);
+        // Several folders: names start with the folder.
+        assert_eq!(config.name_base(Path::new("/work")), PathBuf::from("/"));
+        let single = Config {
+            path: "/dev".into(),
+            ..Default::default()
+        };
+        assert_eq!(single.roots(), [PathBuf::from("/dev")]);
+        assert_eq!(single.name_base(Path::new("/dev")), PathBuf::from("/dev"));
+        assert!(
+            serde_json::from_str::<Config>("{}")
+                .unwrap()
+                .more_paths
+                .is_empty()
+        );
     }
 
     #[test]

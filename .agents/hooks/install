@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Installs a build on the PC, run by agent-install with the build id and the build files.
+# gitstat.exe goes to %LOCALAPPDATA%\Programs\gitstat, alongside other per-user apps, with
+# a Start menu shortcut. A running gitstat is stopped first and the new one started after.
+# config.json there is kept; the first install takes build\config.json, so settings carry
+# over. A "Start with Windows" entry is pointed at the installed exe.
+# Prints "note: <text>" lines for the build summary.
+set -euo pipefail
+
+build_id="$1"
+shift
+exe=""
+for f in "$@"; do
+  case "$(basename "$f")" in gitstat.exe) exe="$f" ;; esac
+done
+[ -n "$exe" ] || { echo "note: no gitstat.exe in build $build_id, nothing installed."; exit 0; }
+
+[ -n "${LOCALAPPDATA:-}" ] && [ -n "${APPDATA:-}" ] || {
+  echo "note: not installed: LOCALAPPDATA or APPDATA isn't set (not Windows?)."
+  exit 0
+}
+export MSYS_NO_PATHCONV=1
+dest="$(cygpath -u "$LOCALAPPDATA")/Programs/gitstat"
+dest_win="$(cygpath -w "$dest")"
+# This hook sits in build/src/.agents/hooks; the repo's build folder is three levels up.
+build_dir="$(cd "$(dirname "$0")/../../.." && pwd)"
+
+ps() { powershell.exe -NoProfile -NonInteractive -Command "$1"; }
+
+mkdir -p "$dest"
+
+# Every gitstat, wherever it runs from: the installed one, or an older one from build\.
+stopped="$(ps "\$p = Get-Process gitstat -ErrorAction SilentlyContinue; \$p | Stop-Process -Force; \$p | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue; @(\$p).Count")"
+stopped="$(tr -d '\r' <<<"$stopped")"
+
+cp -f "$exe" "$dest/gitstat.exe"
+
+if [ ! -f "$dest/config.json" ]; then
+  if [ -f "$build_dir/config.json" ]; then
+    cp "$build_dir/config.json" "$dest/config.json"
+    echo "note: config.json copied from build\\config.json on first install."
+  else
+    echo "note: no config.json yet; gitstat creates one in $dest_win on start. Check its \"path\"."
+  fi
+fi
+
+# Start menu shortcut, per user.
+lnk_win="$(cygpath -w "$(cygpath -u "$APPDATA")/Microsoft/Windows/Start Menu/Programs/gitstat.lnk")"
+ps "\$s = (New-Object -ComObject WScript.Shell).CreateShortcut('$lnk_win'); \$s.TargetPath = '$dest_win\\gitstat.exe'; \$s.WorkingDirectory = '$dest_win'; \$s.Description = 'Git repo status in the tray'; \$s.Save()"
+
+# "Start with Windows" follows the installed exe, if it is on.
+run_key='HKCU\Software\Microsoft\Windows\CurrentVersion\Run'
+if reg query "$run_key" /v gitstat >/dev/null 2>&1; then
+  reg add "$run_key" /v gitstat /t REG_SZ /d "\"$dest_win\\gitstat.exe\"" /f >/dev/null
+  echo "note: Start with Windows now points at the installed exe."
+fi
+
+ps "Start-Process -FilePath '$dest_win\\gitstat.exe' -WorkingDirectory '$dest_win'"
+
+echo "note: installed to $dest_win with a Start menu shortcut; stopped ${stopped:-0} running gitstat, started the new one."
