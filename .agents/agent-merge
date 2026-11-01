@@ -19,16 +19,15 @@ merge_into_main() {
   n="$(pr_number "$BRANCH")"
   [ -n "$n" ] || die "No open PR from $BRANCH into main."
   pr_ready "$n"
-  gh api -X PUT "repos/$SLUG/pulls/$n/merge" -f merge_method=merge >/dev/null
+  gh api -X PUT "repos/$SLUG/pulls/$n/merge" -f merge_method=merge >/dev/null ||
+    die "GitHub refused to merge PR #$n, most likely because main moved meanwhile. Run agent-merge again."
   rm -f "$attempts_file" "$files_file"
   finish done "Merged $BRANCH into main: https://github.com/$SLUG/pull/$n" "The feature branch is kept."
 }
 
 # built: true if the branch's last commit passed a build's full checks (on the PC or in CI).
 # A merge of main that changed nothing this feature changed counts as its feature commit.
-# A branch that changes only insights.md needs no build.
 built() {
-  [ "$(git diff --name-only origin/main...HEAD)" = "insights.md" ] && return 0
   checked "$(git rev-parse HEAD)" && return 0
   git rev-parse -q --verify HEAD^2 >/dev/null &&
     git merge-base --is-ancestor HEAD^2 origin/main &&

@@ -131,15 +131,12 @@ build_pc() {
   # The full checks, after the install so the phone gets the build first. A CI build of this
   # commit already ran them. When they pass, the commit is marked checked for agent-merge.
   if [ "$built_here" = 1 ]; then
-    local head
-    head="$(git rev-parse HEAD)"
     if ! bash "$HOOKS/full-check"; then
-      summary+=("Full checks failed at $commit (see the log). Fix them before Olex tests.")
-    elif mark_checked "$head" "Passed on the PC"; then
-      summary+=("Full checks passed.")
-    else
-      summary+=("Full checks passed, but marking $commit checked on GitHub failed, so agent-merge will stop on it. Build again.")
+      finish checks-failed "${summary[@]}" "Full checks failed at $commit (see the log). Fix them before Olex tests."
     fi
+    mark_checked "$(git rev-parse HEAD)" "Passed on the PC" ||
+      die "${summary[@]}" "Full checks passed, but marking $commit checked on GitHub failed."
+    summary+=("Full checks passed.")
   fi
 
   finish done "${summary[@]}"

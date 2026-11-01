@@ -3,7 +3,7 @@ name: Fallback build
 # The fallback for a PC build (AGENTS.md step 3), started by agent-build ci on a feature branch:
 #   gh workflow run fallback.yml --ref <branch>
 # It does what a PC build does, with the same hooks in .agents/hooks/: quick tests, build,
-# full checks. When the full checks pass it marks the commit checked, as PC builds do.
+# full checks. When they all pass it marks the commit checked, as PC builds do.
 # Each build file is saved on the run unzipped. It never runs on a push.
 # gitstat.exe builds only on Windows, so everything runs there.
 on:
@@ -20,6 +20,7 @@ concurrency:
 jobs:
   windows:
     runs-on: windows-latest
+    timeout-minutes: 30
     defaults:
       run:
         shell: bash
