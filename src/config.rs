@@ -90,6 +90,9 @@ pub struct Config {
     pub folder_icons: bool,
     /// What those icons are drawn from; only matters with `folder_icons`.
     pub folder_icon_mode: FolderIconMode,
+    /// Open pull requests from GitHub in the panel, read through the `gh`
+    /// CLI every interval.
+    pub github_prs: bool,
 }
 
 impl Default for Config {
@@ -105,6 +108,7 @@ impl Default for Config {
             overlay: OverlayConfig::default(),
             folder_icons: false,
             folder_icon_mode: FolderIconMode::default(),
+            github_prs: true,
         }
     }
 }

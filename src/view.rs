@@ -2,6 +2,7 @@
 //! the normal window itself (`show_window`, `close_window`).
 
 use crate::git::RepoStatus;
+use crate::github::{Checks, Mergeable, Pr, PrState, Review};
 use crate::monitor::WatchMode;
 use crate::panel;
 use crate::state::{AppState, Input};
@@ -214,7 +215,15 @@ impl StatusView {
 pub fn panel_rows(state: &AppState) -> usize {
     let unsynced = state.unsynced();
     let synced = state.statuses.len() - unsynced;
-    (unsynced + usize::from(synced > 0)).max(1)
+    let repos = (unsynced + usize::from(synced > 0)).max(1);
+    // The pull requests' heading and rows, or the one GitHub problem line.
+    let prs = state.open_prs().len();
+    let github = if prs > 0 {
+        prs + 1
+    } else {
+        usize::from(state.github_problem.is_some())
+    };
+    repos + github
 }
 
 fn refresh(cx: &mut App) {
@@ -283,6 +292,103 @@ fn repo_row(index: usize, s: &RepoStatus, p: &Palette, mode: Mode, cx: &App) -> 
                 .text_color(color)
                 .child(s.label()),
         )
+        .into_any_element()
+}
+
+/// What a pull request's row says on its right, most pressing first:
+/// (glyph for icons-only mode, words, colour).
+fn pr_marks(pr: &Pr, p: &Palette) -> Vec<(&'static str, &'static str, Hsla)> {
+    let mut marks = Vec::new();
+    if pr.review_requested {
+        marks.push(("◉", "review requested", p.amber));
+    }
+    match pr.checks {
+        Checks::Failing => marks.push(("✗", "checks failing", p.red)),
+        Checks::Pending => marks.push(("●", "checks running", p.amber)),
+        Checks::Passing => marks.push(("✓", "checks pass", p.green)),
+        Checks::None => {}
+    }
+    if pr.mergeable == Mergeable::Conflicts {
+        marks.push(("⚠", "conflicts", p.red));
+    }
+    match pr.review {
+        Review::ChangesRequested => marks.push(("✎", "changes requested", p.red)),
+        Review::Approved => marks.push(("★", "approved", p.green)),
+        Review::Required if !pr.review_requested => marks.push(("…", "awaiting review", p.muted)),
+        _ => {}
+    }
+    if pr.state == PrState::Draft {
+        marks.push(("◌", "draft", p.muted));
+    }
+    marks
+}
+
+/// One open pull request; a click opens it on GitHub (and closes the
+/// panel). Only a browser link: nothing is changed on GitHub.
+fn pr_row(
+    index: usize,
+    s: &RepoStatus,
+    pr: &Pr,
+    p: &Palette,
+    icons_only: bool,
+    cx: &App,
+) -> AnyElement {
+    let marks = pr_marks(pr, p);
+    let url = pr.url.clone();
+    let tone = if pr.needs_attention() {
+        p.amber
+    } else if pr.state == PrState::Draft {
+        p.muted
+    } else {
+        p.green
+    };
+    let mut lines = vec![
+        (format!("{} #{}", s.name, pr.number), p.text),
+        (pr.title.clone(), p.text),
+        (format!("{} by {}", pr.head_branch, pr.author), p.muted),
+    ];
+    lines.extend(marks.iter().map(|&(_, words, c)| (words.to_string(), c)));
+    let right = div().flex().flex_none().gap_2().text_sm().children(
+        marks
+            .iter()
+            .take(if icons_only { 5 } else { 2 })
+            .map(|&(glyph, words, c)| {
+                div()
+                    .text_color(c)
+                    .child(if icons_only { glyph } else { words })
+            }),
+    );
+    div()
+        .id(("pr", index))
+        .flex()
+        .items_center()
+        .gap(px(10.))
+        .px_4()
+        .py(px(6.))
+        .cursor_pointer()
+        .hover(|style| style.bg(p.hover))
+        .tooltip(tip(lines, p))
+        .on_click(move |_, window, cx| {
+            cx.open_url(&url);
+            panel::dismiss(window, cx);
+        })
+        .child(crate::repo_marks::global_mark(s, 16.0, tone, cx))
+        .child(
+            div()
+                .flex_none()
+                .text_sm()
+                .text_color(p.muted)
+                .child(format!("#{}", pr.number)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_color(p.text)
+                .when(!icons_only, |d| d.child(pr.title.clone())),
+        )
+        .child(right)
         .into_any_element()
 }
 
@@ -358,6 +464,11 @@ impl Render for StatusView {
         if sweeping {
             subline.push_str(" · checking…");
         }
+        let open_prs = if mode == Mode::Panel {
+            state.open_prs()
+        } else {
+            Vec::new()
+        };
 
         let titles = div()
             .flex()
@@ -524,6 +635,46 @@ impl Render for StatusView {
                             rows.push(row(offset + i, s, cx));
                         }
                     }
+                }
+                if !open_prs.is_empty() {
+                    let asked = open_prs
+                        .iter()
+                        .filter(|(_, pr)| pr.review_requested)
+                        .count();
+                    let mut heading = format!("Pull requests · {} open", open_prs.len());
+                    if asked > 0 {
+                        heading.push_str(&format!(" · {asked} for your review"));
+                    }
+                    rows.push(
+                        div()
+                            .px_4()
+                            .pt_3()
+                            .pb_1()
+                            .border_t_1()
+                            .border_color(p.border)
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(if asked > 0 { p.amber } else { p.muted })
+                            .truncate()
+                            .child(heading)
+                            .into_any_element(),
+                    );
+                    for (i, (s, pr)) in open_prs.iter().enumerate() {
+                        rows.push(pr_row(i, s, pr, &p, icons_only, cx));
+                    }
+                } else if let Some(problem) = &state.github_problem {
+                    rows.push(
+                        div()
+                            .px_4()
+                            .py(px(6.))
+                            .border_t_1()
+                            .border_color(p.border)
+                            .text_xs()
+                            .text_color(p.muted)
+                            .truncate()
+                            .child(format!("Pull requests: {problem}"))
+                            .into_any_element(),
+                    );
                 }
             }
         }

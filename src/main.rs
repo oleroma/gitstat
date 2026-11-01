@@ -11,6 +11,8 @@ mod git;
 #[cfg(any(windows, test))]
 mod folder_icons;
 #[cfg(any(windows, test))]
+mod github;
+#[cfg(any(windows, test))]
 mod graph;
 #[cfg(any(windows, test))]
 mod history;
