@@ -35,6 +35,7 @@
   - `quick-test`: the quick tests, run before the build.
   - `full-check`: the slower checks, run after the build. Every repo has one, and it doesn't repeat the quick tests.
   - `build`: builds the repo and prints `build-file: <path> <version>` per build file (path relative to the repo). Several build files share one version, made from `BUILD_NUMBER`.
+  - A repo made of separate parts (such as an app and its companion) tests, builds and checks only the parts the branch changed since `main`, so the others aren't rebuilt or reinstalled. A change outside every part builds them all. The hooks decide this; a part that isn't built has no build file.
   - Optionally `install`: run on the PC after a build with the build id and file paths. It installs the build files that aren't APKs and prints `note: <text>` lines for the summary. It never starts or restarts an app; a running app updates itself from `<exe>.new`.
 - `.github/workflows/fallback.yml` is the PC build's fallback: run by hand on a branch, never on a push. It runs the same hooks (each on the runner it needs), claims the build number, uploads each build file unzipped, and marks the commit checked only when every job passed. Every job has a `timeout-minutes`. Keep its actions on the Node 24 runtime.
 
