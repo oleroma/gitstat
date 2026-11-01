@@ -281,12 +281,14 @@ impl StatusView {
     }
 }
 
-/// How many rows the panel shows before "N synced" is expanded: the
-/// unsynced repos, the collapsed synced row, or the one empty-state line.
-pub fn panel_rows(state: &AppState) -> usize {
+/// How many rows the panel shows: the unsynced repos, the "N synced" row
+/// and, with `show_synced`, the synced repos under it, or the one
+/// empty-state line; then the pull requests unless folded.
+pub fn panel_rows(state: &AppState, show_synced: bool) -> usize {
     let unsynced = state.unsynced();
     let synced = state.statuses.len() - unsynced;
-    let repos = (unsynced + usize::from(synced > 0)).max(1);
+    let shown = if show_synced { synced } else { 0 };
+    let repos = (unsynced + usize::from(synced > 0) + shown).max(1);
     // The pull requests' heading and rows, or the one GitHub problem line.
     let prs = state.open_prs().len();
     let github = if prs > 0 {
@@ -590,6 +592,12 @@ impl Render for StatusView {
             WindowAppearance::Dark | WindowAppearance::VibrantDark
         );
         let mode = self.mode;
+        if mode == Mode::Panel {
+            // Grow or shrink the panel to what it now shows: a section
+            // folded or unfolded, repos or pull requests come or go.
+            let rows = panel_rows(self.state.read(cx), self.show_synced);
+            panel::refit(rows, cx);
+        }
         let timelines = self.timelines.clone();
         // Pictures only: the panel's words move into tooltips.
         let icons_only = mode == Mode::Panel && self.state.read(cx).config.icons_only;

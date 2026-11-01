@@ -37,6 +37,9 @@ pub struct PanelSlot {
     /// The open panel's HWND, so the badge can stay below it.
     hwnd: Option<isize>,
     toggled_at: Option<Instant>,
+    /// Where the open panel hangs from, and the rows it is sized for.
+    anchor: Option<Anchor>,
+    rows: usize,
 }
 
 impl Global for PanelSlot {}
@@ -100,47 +103,17 @@ fn open(anchor: Anchor, cx: &mut App) {
     let Some(state) = cx.try_global::<Ui>().map(|ui| ui.state.clone()) else {
         return;
     };
-    let rows = view::panel_rows(state.read(cx));
-    // Icons only: the strips' labels shrink to their icons.
-    let width = if state.read(cx).config.icons_only {
-        WIDTH - (crate::timeline::LABEL_WIDTH - crate::timeline::ICON_LABEL_WIDTH)
-    } else {
-        WIDTH
-    };
-    let anchor_rect = match anchor {
-        Anchor::Tray(Some(rect)) | Anchor::Overlay { rect, .. } => rect,
+    // Without the tray icon's rect, the cursor stands in for it, kept so
+    // a refit doesn't follow the mouse.
+    let anchor = match anchor {
         Anchor::Tray(None) => {
             let (x, y) = win::cursor_pos();
-            Rect::new(x, y, x + 1, y + 1)
+            Anchor::Tray(Some(Rect::new(x, y, x + 1, y + 1)))
         }
+        a => a,
     };
-    let (ax, ay) = anchor_rect.centre();
-    let mon = win::monitor_at(ax, ay);
-    let scale = view::sane_scale(mon.scale);
-    let height = layout::panel_height(rows, mon.work.height() as f32 / scale);
-    let (w, h, gap) = (
-        (width * scale).round() as i32,
-        (height * scale).round() as i32,
-        (GAP * scale).round() as i32,
-    );
-    let r = match anchor {
-        Anchor::Overlay { rect, corner } => {
-            layout::flyout_from_corner(rect, corner, mon.work, w, h, gap)
-        }
-        Anchor::Tray(_) => {
-            let edge = layout::taskbar_edge(mon.rect, mon.work, anchor_rect);
-            layout::flyout(anchor_rect, mon.work, edge, w, h, gap)
-        }
-    };
-    // GPUI converts window_bounds with the primary monitor's scale (the
-    // window is created at CW_USEDEFAULT), and the tray and the badge live
-    // on the primary monitor.
-    let primary = view::sane_scale(win::primary_monitor().scale);
-    let logical = |v: i32| px(v as f32 / primary);
-    let bounds = Bounds::new(
-        point(logical(r.left), logical(r.top)),
-        size(logical(r.width()), logical(r.height())),
-    );
+    let rows = view::panel_rows(state.read(cx), false);
+    let bounds = logical(place(anchor, rows, cx));
     let mut hwnd = None;
     let handle = cx
         .open_window(
@@ -172,4 +145,76 @@ fn open(anchor: Anchor, cx: &mut App) {
     slot.handle = handle;
     slot.hwnd = handle.and(hwnd);
     slot.toggled_at = Some(Instant::now());
+    slot.anchor = Some(anchor);
+    slot.rows = rows;
+}
+
+/// Resizes the open panel for `rows`, keeping it on its anchor, when that
+/// differs from what it is sized for. Safe to call while drawing it.
+pub fn refit(rows: usize, cx: &mut App) {
+    if !is_open(cx) {
+        return;
+    }
+    let slot = cx.default_global::<PanelSlot>();
+    let (Some(anchor), Some(h)) = (slot.anchor, slot.hwnd) else {
+        return;
+    };
+    if slot.rows == rows {
+        return;
+    }
+    slot.rows = rows;
+    let r = place(anchor, rows, cx);
+    // Native window calls must run outside this update.
+    cx.spawn(async move |_| unsafe { win::place_window(h, r) })
+        .detach();
+}
+
+/// The panel's rect in physical px, `rows` high, next to `anchor`.
+fn place(anchor: Anchor, rows: usize, cx: &App) -> Rect {
+    // Icons only: the strips' labels shrink to their icons.
+    let icons_only = cx
+        .try_global::<Ui>()
+        .is_some_and(|ui| ui.state.read(cx).config.icons_only);
+    let width = if icons_only {
+        WIDTH - (crate::timeline::LABEL_WIDTH - crate::timeline::ICON_LABEL_WIDTH)
+    } else {
+        WIDTH
+    };
+    let anchor_rect = match anchor {
+        Anchor::Tray(Some(rect)) | Anchor::Overlay { rect, .. } => rect,
+        Anchor::Tray(None) => {
+            let (x, y) = win::cursor_pos();
+            Rect::new(x, y, x + 1, y + 1)
+        }
+    };
+    let (ax, ay) = anchor_rect.centre();
+    let mon = win::monitor_at(ax, ay);
+    let scale = view::sane_scale(mon.scale);
+    let height = layout::panel_height(rows, mon.work.height() as f32 / scale);
+    let (w, h, gap) = (
+        (width * scale).round() as i32,
+        (height * scale).round() as i32,
+        (GAP * scale).round() as i32,
+    );
+    match anchor {
+        Anchor::Overlay { rect, corner } => {
+            layout::flyout_from_corner(rect, corner, mon.work, w, h, gap)
+        }
+        Anchor::Tray(_) => {
+            let edge = layout::taskbar_edge(mon.rect, mon.work, anchor_rect);
+            layout::flyout(anchor_rect, mon.work, edge, w, h, gap)
+        }
+    }
+}
+
+/// A physical rect as GPUI's window bounds. GPUI converts window_bounds
+/// with the primary monitor's scale (the window is created at
+/// CW_USEDEFAULT), and the tray and the badge live on the primary monitor.
+fn logical(r: Rect) -> Bounds<gpui::Pixels> {
+    let primary = view::sane_scale(win::primary_monitor().scale);
+    let at = |v: i32| px(v as f32 / primary);
+    Bounds::new(
+        point(at(r.left), at(r.top)),
+        size(at(r.width()), at(r.height())),
+    )
 }
