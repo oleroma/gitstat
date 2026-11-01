@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Step 1: make a feature branch from the latest main and open a draft PR into main.
 # Usage: .agents/agent-start [--continue] <feature-name>
-#   --continue  skip the checks for a red main and other agents' draft PRs (Olex said to go on)
+#   --continue  skip the check for other agents' draft PRs (Olex said to go on)
 source "$(dirname "$0")/lib.sh"
 cd "$WORKTREE"
 
@@ -21,10 +21,6 @@ esac
 git fetch origin --prune
 
 if [ "$skip_check" = 0 ]; then
-  red="$(main_red)"
-  if [ -n "$red" ]; then
-    finish main-red "The last checks on main failed: $red"
-  fi
   drafts="$(gh api "repos/$SLUG/pulls?base=main&state=open&per_page=100" \
     --jq '.[] | select(.draft) | "#\(.number) \(.head.ref) \(.html_url)"')"
   if [ -n "$drafts" ]; then

@@ -6,7 +6,6 @@ Diagram of the steps in the shared rules at the top of `AGENTS.md`. The rules ar
 graph TD
     A[LLM: pick feature name] --> B[Script: agent-start]
     B -->|failed| ERR[LLM: read log, explain to Olex]
-    B -->|main-red| ASK
     B -->|other-agent| ASK{Olex: wait or continue?}
     ASK -->|Wait| WAIT[Wait until it finishes]
     WAIT --> B
@@ -22,7 +21,7 @@ graph TD
     RC -->|Reached| FETCH[PC session: fetch branch, check out origin/branch in build/src]
     FETCH --> PC[Script: build/src/.agents/agent-build pc]
     RC -->|Can't reach| CI[Script: agent-build ci]
-    PC --> PCS[CI build of this commit? download it; else quick-test hook, build-number, build hook; copy, keep last 4]
+    PC --> PCS[CI build of this commit? download it; else quick-test, build-number, build; copy, keep last 4]
     PCS -->|failed| ERR
     PCS --> INSTALL[Script: build/src/.agents/agent-install]
     INSTALL --> APK{Script: APK?}
@@ -31,22 +30,22 @@ graph TD
     PH -->|No| WHY[LLM: say why not installed]
     PH -->|Yes| INST[Script: vibrate, notifications, adb install -r]
     INST -->|Failed or downgrade| WHY
-    CI --> CIS[Run fallback.yml: build-number, build; wait, artifact id, link, download]
+    CI --> CIS[Run fallback.yml: quick-test, build-number, build, full-check, mark checked; wait, link, download]
     CIS -->|failed| ERR
     CIS --> UP[LLM: post direct link, upload file]
-    ASKI --> OK
-    WHY --> OK
-    INST -->|Installed| OK
+    ASKI --> FC
+    WHY --> FC
+    FC[Script: full-check unless CI ran it; mark commit checked] -->|failed| EDIT
+    FC --> OK
+    INST -->|Installed| FC
     UP --> OK
     OK{Olex: feature works?} -->|Not yet| EDIT
-    OK -->|Yes| M[Script: agent-merge: merge main in, full checks on the branch in CI]
+    OK -->|Yes| M[Script: agent-merge: last commit built and checked? merge main in, merge PR; no checks]
     M -->|done| DONE[Merged into main, branch kept]
     M -->|conflicts| FIX[LLM: resolve conflicts]
     FIX --> M
     M -->|needs-testing| RC
-    M -->|checks-failed| EDIT
+    M -->|not-built| RC
     M -->|stuck| STUCK[LLM: show files, ask Olex]
     M -->|failed| ERR
-    DONE --> FULL[fallback.yml on main: full-check hook, no build]
-    FULL -->|Fails| REP[Next agent-start: main-red, report to Olex]
 ```
