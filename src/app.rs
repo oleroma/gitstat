@@ -37,6 +37,8 @@ struct Shared {
     tray: Tray,
     monitor: Monitor,
     icons: folder_icons::Worker,
+    /// Reads pull requests from GitHub; never writes anything.
+    github: crate::github::Poller,
     /// The "couldn't save config.json" notice was shown this session.
     save_notice_shown: bool,
     /// The folder-icon consent box is open.
@@ -102,6 +104,11 @@ pub fn run(config_file: PathBuf) {
             let _ = icons_tx.unbounded_send(Input::FolderSkips(skips));
         });
 
+        let github_tx = tx.clone();
+        let github = crate::github::Poller::start(move |report| {
+            let _ = github_tx.unbounded_send(Input::Github(report));
+        });
+
         let timelines = cx.new(|cx| crate::timeline::Timelines::new(&state, cx));
         let marks = cx.new(|cx| crate::repo_marks::RepoMarks::new(&state, cx));
         cx.set_global(Ui {
@@ -112,6 +119,7 @@ pub fn run(config_file: PathBuf) {
             refresh: Rc::new(|cx: &mut App| {
                 if let Some(shared) = cx.try_global::<Shared>() {
                     shared.monitor.send(Command::RefreshAll);
+                    shared.github.refresh();
                 }
             }),
             keepalive,
@@ -120,6 +128,7 @@ pub fn run(config_file: PathBuf) {
             tray,
             monitor,
             icons,
+            github,
             save_notice_shown: false,
             consent_pending: false,
         });
@@ -166,6 +175,13 @@ fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
             Input::FolderSkips(skips) => {
                 state.update(cx, |s, _| s.folder_skips = skips);
                 changed = true;
+            }
+            Input::Github(report) => {
+                // A poll that was under way when the option went off.
+                if state.read(cx).config.github_prs {
+                    state.update(cx, |s, _| s.github_report(report));
+                    changed = true;
+                }
             }
             Input::Overlay => {
                 let click = state.read(cx).config.overlay_click();
@@ -239,14 +255,17 @@ fn on_update(update: Update, cx: &mut App) -> (bool, bool) {
             state.update(cx, |s, _| s.config_error = Some(config_problem(&e)));
             (true, false)
         }
-        Update::Repos { repos, capped } => state.update(cx, |s, _| {
-            let before = s.statuses.len();
-            s.retain_repos(|p| repos.iter().any(|r| r == p));
-            let removed = s.statuses.len() != before;
-            let capped_changed = s.capped != capped;
-            s.capped = capped;
-            (removed || capped_changed, removed)
-        }),
+        Update::Repos { repos, capped } => {
+            cx.global::<Shared>().github.set_repos(repos.clone());
+            state.update(cx, |s, _| {
+                let before = s.statuses.len();
+                s.retain_repos(|p| repos.iter().any(|r| r == p));
+                let removed = s.statuses.len() != before;
+                let capped_changed = s.capped != capped;
+                s.capped = capped;
+                (removed || capped_changed, removed)
+            })
+        }
         Update::Started { repo, .. } => {
             state.update(cx, |s, _| s.in_flight.insert(repo));
             (false, false)
@@ -457,7 +476,14 @@ fn apply_config(old: &Config, new: Config, cx: &mut App) {
             .icons
             .sync(statuses, new.folder_icons, new.folder_icon_mode);
     }
+    shared.github.settings(new.github_prs, new.interval());
     shared.tray.sync_settings(&new);
+    if !new.github_prs {
+        state.update(cx, |s, _| {
+            s.prs.clear();
+            s.github_problem = None;
+        });
+    }
 }
 
 fn config_problem(e: &str) -> String {

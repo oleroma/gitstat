@@ -68,6 +68,7 @@ pub enum Setting {
     OverlayHideSynced,
     OverlayHideFullscreen,
     FolderIcons,
+    GithubPrs,
 }
 
 impl Setting {
@@ -81,6 +82,7 @@ impl Setting {
             Setting::OverlayHideSynced => cfg.overlay.hide_when_synced,
             Setting::OverlayHideFullscreen => cfg.overlay.hide_in_fullscreen,
             Setting::FolderIcons => cfg.folder_icons,
+            Setting::GithubPrs => cfg.github_prs,
         }
     }
 
@@ -94,6 +96,7 @@ impl Setting {
             Setting::OverlayHideSynced => &mut cfg.overlay.hide_when_synced,
             Setting::OverlayHideFullscreen => &mut cfg.overlay.hide_in_fullscreen,
             Setting::FolderIcons => &mut cfg.folder_icons,
+            Setting::GithubPrs => &mut cfg.github_prs,
         };
         *field = !*field;
     }
@@ -178,6 +181,7 @@ impl Tray {
         let hide_fullscreen = check("Hide badge in fullscreen", Setting::OverlayHideFullscreen);
         let folder_icons = check("Folder icons in Explorer", Setting::FolderIcons);
         let watch = check("Watch for changes", Setting::Watch);
+        let github_prs = check("GitHub pull requests (via gh)", Setting::GithubPrs);
 
         let corner_menu = Submenu::new("Badge corner", defaults.overlay.enabled);
         let corners: Vec<(CheckMenuItem, Corner)> = CORNERS
@@ -208,6 +212,7 @@ impl Tray {
                 &panel.0,
                 &window.0,
                 &icons_only.0,
+                &github_prs.0,
                 &PredefinedMenuItem::separator(),
                 &overlay.0,
                 &corner_menu,
@@ -275,6 +280,7 @@ impl Tray {
                 hide_fullscreen,
                 folder_icons,
                 watch,
+                github_prs,
             ],
             corner_menu,
             corners,
@@ -646,6 +652,7 @@ mod tests {
             Setting::OverlayHideSynced,
             Setting::OverlayHideFullscreen,
             Setting::FolderIcons,
+            Setting::GithubPrs,
         ];
         for setting in all {
             let before = Config::default();

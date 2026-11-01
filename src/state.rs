@@ -30,6 +30,11 @@ pub struct AppState {
     pub mode: WatchMode,
     /// Folders the folder-icon worker skipped, with the reason.
     pub folder_skips: Vec<(PathBuf, String)>,
+    /// Each GitHub repo's pull requests from the last poll that could read
+    /// it: open ones first, then recently merged and closed.
+    pub prs: HashMap<PathBuf, Vec<crate::github::Pr>>,
+    /// Why the last GitHub poll read nothing.
+    pub github_problem: Option<String>,
 }
 
 impl AppState {
@@ -52,6 +57,8 @@ impl AppState {
             last_checked: None,
             mode,
             folder_skips: Vec::new(),
+            prs: HashMap::new(),
+            github_problem: None,
         }
     }
 
@@ -124,6 +131,36 @@ impl AppState {
         self.statuses.retain(|s| keep(&s.path));
         self.in_flight.retain(|p| keep(p));
         self.checks.retain(|p, _| keep(p));
+        self.prs.retain(|p, _| keep(p));
+    }
+
+    /// Folds in a GitHub poll. A failed poll keeps what the last good one
+    /// read, so a network blip doesn't empty the list.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn github_report(&mut self, report: crate::github::Report) {
+        if report.problem.is_none() {
+            self.prs = report.prs;
+        } else {
+            self.prs.extend(report.prs);
+        }
+        self.github_problem = report.problem;
+    }
+
+    /// The listed repos' open pull requests, most pressing first.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn open_prs(&self) -> Vec<(&RepoStatus, &crate::github::Pr)> {
+        let order = crate::github::panel_order(
+            self.prs
+                .iter()
+                .flat_map(|(path, prs)| prs.iter().map(move |p| (path.as_path(), p))),
+        );
+        order
+            .into_iter()
+            .filter_map(|(path, pr)| {
+                let status = self.statuses.iter().find(|s| s.path == path)?;
+                Some((status, pr))
+            })
+            .collect()
     }
 
     /// Worst first, then by name.
@@ -165,6 +202,8 @@ pub enum Input {
     OverlayMoved(crate::layout::Rect),
     /// The folder-icon worker's report: skipped folders and why.
     FolderSkips(Vec<(PathBuf, String)>),
+    /// A GitHub pull request poll.
+    Github(crate::github::Report),
 }
 
 #[cfg(test)]
