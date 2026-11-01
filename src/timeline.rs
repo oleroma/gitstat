@@ -253,8 +253,6 @@ impl Timelines {
 
     /// Sets the PR states `path`'s graph colours its branches by. Cheap
     /// when nothing changed, so it can be called on every PR refresh.
-    // Called by the GitHub PR polling once it lands.
-    #[allow(dead_code)]
     pub fn set_prs(&mut self, path: &Path, prs: PrColors, cx: &mut Context<Self>) {
         if self.prs.get(path).map(|p| p.as_ref()) == Some(&prs)
             || (prs.is_empty() && !self.prs.contains_key(path))

@@ -32,13 +32,8 @@ const GH_TIMEOUT: Duration = Duration::from_secs(45);
 /// A new repo list waits this long for more changes before a poll.
 const SETTLE: Duration = Duration::from_secs(3);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum PrState {
-    Open,
-    Draft,
-    Merged,
-    Closed,
-}
+/// The graph colours branches by the same states.
+pub use crate::graph::PrState;
 
 /// The head commit's combined checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

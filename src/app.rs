@@ -162,6 +162,9 @@ fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
     let mut changed = false;
     let mut checked = false;
     let mut icons_stale = false;
+    // A repo listed after the poll that read its PRs needs them too.
+    let listed = state.read(cx).statuses.len();
+    let mut prs_stale = false;
     for input in batch {
         match input {
             Input::Monitor(update) => {
@@ -180,6 +183,7 @@ fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
                 // A poll that was under way when the option went off.
                 if state.read(cx).config.github_prs {
                     state.update(cx, |s, _| s.github_report(report));
+                    prs_stale = true;
                     changed = true;
                 }
             }
@@ -217,6 +221,9 @@ fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
                 changed = true;
             }
         }
+    }
+    if prs_stale || state.read(cx).statuses.len() != listed {
+        sync_pr_colors(cx);
     }
     if changed || checked {
         state.update(cx, |_, cx| cx.notify());
@@ -483,7 +490,35 @@ fn apply_config(old: &Config, new: Config, cx: &mut App) {
             s.prs.clear();
             s.github_problem = None;
         });
+        sync_pr_colors(cx);
     }
+}
+
+/// Hands each listed repo's PRs, merged and closed ones too, to its graph
+/// so its branches take their PR's colour.
+fn sync_pr_colors(cx: &mut App) {
+    let Some(ui) = cx.try_global::<Ui>() else {
+        return;
+    };
+    let (state, timelines) = (ui.state.clone(), ui.timelines.clone());
+    let colors: Vec<_> = {
+        let s = state.read(cx);
+        s.statuses
+            .iter()
+            .map(|r| {
+                let prs = s.prs.get(&r.path).map(Vec::as_slice).unwrap_or_default();
+                let colors = crate::graph::PrColors::from_prs(
+                    prs.iter().map(|p| (p.head_branch.as_str(), p.state)),
+                );
+                (r.path.clone(), colors)
+            })
+            .collect()
+    };
+    timelines.update(cx, |t, cx| {
+        for (path, colors) in colors {
+            t.set_prs(&path, colors, cx);
+        }
+    });
 }
 
 fn config_problem(e: &str) -> String {

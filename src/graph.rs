@@ -487,8 +487,6 @@ pub fn hue(name: &str, n: usize) -> usize {
 
 /// A GitHub pull request's state, for colouring the branch it is from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-// Built by the GitHub PR polling once it lands.
-#[allow(dead_code)]
 pub enum PrState {
     Open,
     Draft,
@@ -527,8 +525,7 @@ pub struct PrColors {
 impl PrColors {
     /// From each PR's head branch name and state. A branch with several
     /// PRs shows open over draft over merged over closed.
-    // Called by the GitHub PR polling once it lands.
-    #[allow(dead_code)]
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn from_prs<'a>(prs: impl IntoIterator<Item = (&'a str, PrState)>) -> Self {
         let mut by_branch: HashMap<String, PrState> = HashMap::new();
         for (branch, state) in prs {
