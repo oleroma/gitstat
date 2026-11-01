@@ -1,10 +1,11 @@
 //! Everything the timeline draws for one repo, loaded in one go off the UI
 //! thread: refs, header info, stashes, and the history pages laid out.
 
-use crate::graph::{Context, Layout};
+use crate::graph::{Context, Layout, PrColors};
 use crate::history::{self, Commit, PageError, Stash};
 use crate::repo_info::{self, Info};
 use std::path::Path;
+use std::sync::Arc;
 
 // Only the Windows UI reads some fields; Linux builds this for its tests.
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -20,6 +21,9 @@ pub struct RepoGraph {
     /// HEAD's row: `--date-order` puts newer commits on other branches, or
     /// not yet pulled, above it. `None` while unborn or not loaded yet.
     pub head_row: Option<usize>,
+    /// The repo's GitHub PRs by branch, which colour their branches. Set
+    /// by the timeline, not read from git, so a reload carries it over.
+    pub prs: Arc<PrColors>,
     /// Extra walk starting points: other worktrees' HEADs. `--all` has
     /// walked them too since git 2.16; passing them again costs nothing and
     /// keeps an older git from losing a worktree's detached commits.
@@ -93,6 +97,7 @@ impl RepoGraph {
         layout.push(&commits, &ctx);
         let head_row = find_head(&commits, &ctx, 0);
         Ok(Some(RepoGraph {
+            prs: prev.map(|p| p.prs.clone()).unwrap_or_default(),
             head_row,
             commits,
             layout,

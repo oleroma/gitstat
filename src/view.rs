@@ -72,22 +72,11 @@ pub fn show_window(cx: &mut App) {
     let Some(state) = cx.try_global::<Ui>().map(|ui| ui.state.clone()) else {
         return;
     };
-    let mon = win::primary_monitor();
-    let scale = sane_scale(mon.scale);
-    let (left, top) = (mon.work.left as f32 / scale, mon.work.top as f32 / scale);
-    let (work_w, work_h) = (
-        mon.work.width() as f32 / scale,
-        mon.work.height() as f32 / scale,
-    );
-    // Big mode: wide enough for every column, up to most of the screen.
-    let repos = state.read(cx).statuses.len().max(1) as f32;
-    let width = (repos * crate::timeline::COLUMN_WIDTH + 2.0)
-        .min(work_w * 0.9)
-        .max(WINDOW_SIZE.0);
-    let height = (work_h * 0.8).max(WINDOW_SIZE.1).min(work_h);
-    let x = (mon.work.right as f32 / scale - width - WINDOW_MARGIN).max(left);
-    let y = (mon.work.bottom as f32 / scale - height - WINDOW_MARGIN).max(top);
-    let bounds = Bounds::new(point(px(x), px(y)), size(px(width), px(height)));
+    let (repos, known) = {
+        let s = state.read(cx);
+        (s.statuses.len(), s.has_result)
+    };
+    let (bounds, _) = window_place(repos);
     let handle = cx
         .open_window(
             WindowOptions {
@@ -103,11 +92,42 @@ pub fn show_window(cx: &mut App) {
             |window, cx| {
                 // Safe: opened with show: true, so there is no parked placement.
                 window.activate_window();
-                cx.new(|cx| StatusView::new(state, Mode::Window, window, cx))
+                cx.new(|cx| {
+                    let mut view = StatusView::new(state, Mode::Window, window, cx);
+                    // Opened before the first check found the repos: fit
+                    // the columns once it has.
+                    if !known {
+                        view.fit = Some(window.bounds());
+                    }
+                    view
+                })
             },
         )
         .ok();
     cx.default_global::<WindowSlot>().handle = handle;
+}
+
+/// Where the window goes for `repos` columns, in logical px, at the
+/// bottom-right of the primary work area, and that monitor's scale.
+fn window_place(repos: usize) -> (Bounds<gpui::Pixels>, f32) {
+    let mon = win::primary_monitor();
+    let scale = sane_scale(mon.scale);
+    let (left, top) = (mon.work.left as f32 / scale, mon.work.top as f32 / scale);
+    let (work_w, work_h) = (
+        mon.work.width() as f32 / scale,
+        mon.work.height() as f32 / scale,
+    );
+    // Big mode: wide enough for every column, up to most of the screen.
+    let width = (repos.max(1) as f32 * crate::timeline::COLUMN_WIDTH + 2.0)
+        .min(work_w * 0.9)
+        .max(WINDOW_SIZE.0);
+    let height = (work_h * 0.8).max(WINDOW_SIZE.1).min(work_h);
+    let x = (mon.work.right as f32 / scale - width - WINDOW_MARGIN).max(left);
+    let y = (mon.work.bottom as f32 / scale - height - WINDOW_MARGIN).max(top);
+    (
+        Bounds::new(point(px(x), px(y)), size(px(width), px(height))),
+        scale,
+    )
 }
 
 /// Closes the normal window, if it is open (`window` turned off).
@@ -164,6 +184,10 @@ pub struct StatusView {
     /// The panel has been active once, so a deactivation now means the user
     /// clicked elsewhere rather than the foreground lock refusing us.
     seen_active: bool,
+    /// The window opened before the first check, at these bounds: once the
+    /// check is done it grows to fit the columns, unless the user has moved
+    /// or resized it meanwhile.
+    fit: Option<Bounds<gpui::Pixels>>,
 }
 
 impl StatusView {
@@ -174,6 +198,12 @@ impl StatusView {
         cx: &mut Context<Self>,
     ) -> Self {
         cx.observe(&state, |_, _, cx| cx.notify()).detach();
+        if mode == Mode::Window {
+            cx.observe_in(&state, window, |this: &mut Self, state, window, cx| {
+                this.fit_to_repos(&state, window, cx)
+            })
+            .detach();
+        }
         let timelines = cx.try_global::<Ui>().map(|ui| ui.timelines.clone());
         if let Some(t) = &timelines {
             cx.observe(t, |_, _, cx| cx.notify()).detach();
@@ -205,7 +235,48 @@ impl StatusView {
             table: ScrollHandle::new(),
             focus,
             seen_active: false,
+            fit: None,
         }
+    }
+
+    /// Fits the window to the repos' columns once the first check has
+    /// found them, if it opened before that.
+    fn fit_to_repos(
+        &mut self,
+        state: &Entity<AppState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(opened) = self.fit else {
+            return;
+        };
+        let s = state.read(cx);
+        if !s.has_result {
+            return;
+        }
+        self.fit = None;
+        let near = |a: gpui::Pixels, b: gpui::Pixels| (f32::from(a) - f32::from(b)).abs() < 2.0;
+        let now = window.bounds();
+        let untouched = near(now.origin.x, opened.origin.x)
+            && near(now.origin.y, opened.origin.y)
+            && near(now.size.width, opened.size.width)
+            && near(now.size.height, opened.size.height);
+        let (want, scale) = window_place(s.statuses.len());
+        if !untouched || near(want.size.width, opened.size.width) {
+            return;
+        }
+        let Some(h) = win::hwnd(window) else {
+            return;
+        };
+        let at = |v: gpui::Pixels| (f32::from(v) * scale).round() as i32;
+        let r = crate::layout::Rect::new(
+            at(want.origin.x),
+            at(want.origin.y),
+            at(want.origin.x + want.size.width),
+            at(want.origin.y + want.size.height),
+        );
+        cx.spawn(async move |_, _| unsafe { win::place_window(h, r) })
+            .detach();
     }
 }
 
