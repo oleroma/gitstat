@@ -73,13 +73,13 @@ pr_ready() {
   gh api -X POST "repos/$SLUG/pulls/$1/ccr/ready_for_review" >/dev/null || gh pr ready "$1" -R "$SLUG"
 }
 
-# run_fallback <mode>: runs fallback.yml on BRANCH in mode build or check and waits for it.
-# Sets RUN (the run id) and RUN_URL. Returns 1 if the run failed; stops if it can't be found.
+# run_fallback: runs fallback.yml on BRANCH (the same tests and build as a PC build) and waits
+# for it. Sets RUN (the run id) and RUN_URL. Returns 1 if the run failed; stops if it can't be found.
 run_fallback() {
-  local mode="$1" sha since i
+  local sha since i
   sha="$(git -C "$WORKTREE" rev-parse HEAD)"
   since="$(date -u -d '1 minute ago' +%Y-%m-%dT%H:%M:%SZ)"
-  gh workflow run fallback.yml -R "$SLUG" --ref "$BRANCH" -f mode="$mode"
+  gh workflow run fallback.yml -R "$SLUG" --ref "$BRANCH"
   RUN=""
   for i in $(seq 1 30); do
     sleep 4
@@ -88,13 +88,13 @@ run_fallback() {
       --jq "[.[] | select(.headSha == \"$sha\" and .createdAt >= \"$since\")][0].databaseId // empty")"
     if [ -n "$RUN" ]; then break; fi
   done
-  [ -n "$RUN" ] || die "Started the fallback workflow ($mode) but couldn't find its run."
+  [ -n "$RUN" ] || die "Started the fallback workflow but couldn't find its run."
   RUN_URL="https://github.com/$SLUG/actions/runs/$RUN"
   gh run watch -R "$SLUG" "$RUN" --exit-status --interval 15
 }
 
-# The full checks that passed on a commit are recorded on it as a GitHub commit status named
-# full-check, by PC builds and by fallback.yml's check mode, so agent-merge can skip them.
+# Every build, on the PC or in CI, runs the full checks once. When they pass, the commit gets a
+# GitHub commit status named full-check, so nothing runs them again on that commit.
 
 # checked <sha>: true if the full checks already passed on <sha>.
 checked() {
@@ -105,12 +105,6 @@ checked() {
 # mark_checked <sha> <description>: records that the full checks passed on <sha>.
 mark_checked() {
   gh api -X POST "repos/$SLUG/statuses/$1" -f state=success -f context=full-check -f description="$2" >/dev/null
-}
-
-# main_red: prints the link of the latest finished fallback run on main if it failed, else nothing.
-main_red() {
-  gh api "repos/$SLUG/actions/workflows/fallback.yml/runs?branch=main&event=push&status=completed&per_page=1" \
-    --jq '.workflow_runs[0] | select(.conclusion == "failure") | .html_url'
 }
 
 # Sets BRANCH to the current branch, or stops if it isn't a feature branch.

@@ -128,20 +128,17 @@ build_pc() {
   fi
   echo "$out"
 
-  # The full checks, after the install so the phone gets the build first. When they pass, the
-  # commit is marked checked and agent-merge won't run them again in CI.
-  # A CI build skips them: agent-merge runs them in CI.
-  if [ "$built_here" = 1 ] && [ -f "$HOOKS/full-check" ]; then
+  # The full checks, after the install so the phone gets the build first. A CI build of this
+  # commit already ran them. When they pass, the commit is marked checked for agent-merge.
+  if [ "$built_here" = 1 ]; then
     local head
     head="$(git rev-parse HEAD)"
-    if bash "$HOOKS/full-check"; then
-      if mark_checked "$head" "Passed on the PC"; then
-        summary+=("Full checks passed; agent-merge won't run them again for $commit.")
-      else
-        summary+=("Full checks passed, but marking $commit as checked on GitHub failed; agent-merge will run them in CI.")
-      fi
+    if ! bash "$HOOKS/full-check"; then
+      summary+=("Full checks failed at $commit (see the log). Fix them before Olex tests.")
+    elif mark_checked "$head" "Passed on the PC"; then
+      summary+=("Full checks passed.")
     else
-      summary+=("Full checks failed at $commit (see the log). Fix them before merging; agent-merge would stop on them.")
+      summary+=("Full checks passed, but marking $commit checked on GitHub failed, so agent-merge will stop on it. Build again.")
     fi
   fi
 
@@ -155,11 +152,12 @@ build_ci() {
     die "HEAD isn't what's pushed on origin/$BRANCH. Run agent-commit first."
 
   local slug="$SLUG" run url
-  run_fallback build || die "The fallback run failed: $RUN_URL"
+  # The run does what a PC build does: quick tests, build, full checks.
+  run_fallback || die "The fallback run failed (tests, build or full checks): $RUN_URL"
   run="$RUN"
   url="$RUN_URL"
 
-  local arts art id name dest="$BUILD_DIR/ci/$run" summary=("Built on GitHub: $url")
+  local arts art id name dest="$BUILD_DIR/ci/$run" summary=("Built on GitHub, full checks passed: $url")
   arts="$(gh api "repos/$slug/actions/runs/$run/artifacts" --jq '.artifacts[] | "\(.id) \(.name)"')"
   [ -n "$arts" ] || die "The fallback run saved no build file: $url"
   mkdir -p "$dest"
