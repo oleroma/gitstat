@@ -35,6 +35,9 @@ pub struct AppState {
     pub prs: HashMap<PathBuf, Vec<crate::github::Pr>>,
     /// Why the last GitHub poll read nothing.
     pub github_problem: Option<String>,
+    /// The pull request list is folded to its heading: in the panel, in
+    /// big mode. Kept while gitstat runs, so the panel reopens the same.
+    prs_folded: [bool; 2],
 }
 
 impl AppState {
@@ -59,6 +62,7 @@ impl AppState {
             folder_skips: Vec::new(),
             prs: HashMap::new(),
             github_problem: None,
+            prs_folded: [false; 2],
         }
     }
 
@@ -144,6 +148,18 @@ impl AppState {
             self.prs.extend(report.prs);
         }
         self.github_problem = report.problem;
+    }
+
+    /// Whether the pull request list is folded, in big mode or the panel.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn prs_folded(&self, big: bool) -> bool {
+        self.prs_folded[usize::from(big)]
+    }
+
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn fold_prs(&mut self, big: bool) {
+        let f = &mut self.prs_folded[usize::from(big)];
+        *f = !*f;
     }
 
     /// The listed repos' open pull requests, most pressing first.

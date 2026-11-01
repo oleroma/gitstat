@@ -290,7 +290,7 @@ pub fn panel_rows(state: &AppState) -> usize {
     // The pull requests' heading and rows, or the one GitHub problem line.
     let prs = state.open_prs().len();
     let github = if prs > 0 {
-        prs + 1
+        if state.prs_folded(false) { 1 } else { prs + 1 }
     } else {
         usize::from(state.github_problem.is_some())
     };
@@ -366,6 +366,9 @@ fn repo_row(index: usize, s: &RepoStatus, p: &Palette, mode: Mode, cx: &App) -> 
         .into_any_element()
 }
 
+/// A draft PR's mark in icons-only mode, drawn rather than typed.
+const DRAFT_GLYPH: &str = "◌";
+
 /// What a pull request's row says on its right, most pressing first:
 /// (glyph for icons-only mode, words, colour).
 fn pr_marks(pr: &Pr, p: &Palette) -> Vec<(&'static str, &'static str, Hsla)> {
@@ -389,7 +392,7 @@ fn pr_marks(pr: &Pr, p: &Palette) -> Vec<(&'static str, &'static str, Hsla)> {
         _ => {}
     }
     if pr.state == PrState::Draft {
-        marks.push(("◌", "draft", p.muted));
+        marks.push((DRAFT_GLYPH, "draft", p.muted));
     }
     marks
 }
@@ -420,16 +423,31 @@ fn pr_row(
         (format!("{} by {}", pr.head_branch, pr.author), p.muted),
     ];
     lines.extend(marks.iter().map(|&(_, words, c)| (words.to_string(), c)));
-    let right = div().flex().flex_none().gap_2().text_sm().children(
-        marks
-            .iter()
-            .take(if icons_only { 5 } else { 2 })
-            .map(|&(glyph, words, c)| {
-                div()
-                    .text_color(c)
-                    .child(if icons_only { glyph } else { words })
-            }),
-    );
+    let right = div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap_2()
+        .text_sm()
+        .children(
+            marks
+                .iter()
+                .take(if icons_only { 5 } else { 2 })
+                .map(|&(glyph, words, c)| match (icons_only, glyph) {
+                    // The font's dotted circle comes out jagged at this
+                    // size; a dashed ring is drawn smooth.
+                    (true, DRAFT_GLYPH) => div()
+                        .flex_none()
+                        .size(px(11.))
+                        .rounded_full()
+                        .border_1()
+                        .border_dashed()
+                        .border_color(c),
+                    _ => div()
+                        .text_color(c)
+                        .child(if icons_only { glyph } else { words }),
+                }),
+        );
     div()
         .id(("pr", index))
         .flex()
@@ -466,6 +484,9 @@ fn pr_row(
         .into_any_element()
 }
 
+/// A click handler, boxed.
+type OnClick = Box<dyn Fn(&gpui::ClickEvent, &mut Window, &mut App)>;
+
 /// The pull requests' heading and rows, or the one GitHub problem line.
 fn pr_rows(
     open_prs: &[(&RepoStatus, &Pr)],
@@ -473,9 +494,12 @@ fn pr_rows(
     p: &Palette,
     mode: Mode,
     icons_only: bool,
+    // Big mode: whether the list is folded, and what folds or unfolds it.
+    fold: Option<(bool, OnClick)>,
     cx: &App,
 ) -> Vec<AnyElement> {
     let mut out = Vec::new();
+    let folded = fold.as_ref().is_some_and(|(f, _)| *f);
     if !open_prs.is_empty() {
         let asked = open_prs
             .iter()
@@ -485,21 +509,35 @@ fn pr_rows(
         if asked > 0 {
             heading.push_str(&format!(" · {asked} for your review"));
         }
-        out.push(
-            div()
-                .px_4()
-                .pt_3()
-                .pb_1()
-                .border_t_1()
-                .border_color(p.border)
-                .text_xs()
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(if asked > 0 { p.amber } else { p.muted })
-                .truncate()
-                .child(heading)
-                .into_any_element(),
-        );
-        for (i, (s, pr)) in open_prs.iter().enumerate() {
+        let head = div()
+            .id("prs-heading")
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_4()
+            .pt_3()
+            .pb_1()
+            .border_t_1()
+            .border_color(p.border)
+            .text_xs()
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .text_color(if asked > 0 { p.amber } else { p.muted })
+            .child(div().flex_1().min_w_0().truncate().child(heading));
+        let head = match fold {
+            Some((folded, toggle)) => head
+                .when(folded, |d| d.pb_3())
+                .cursor_pointer()
+                .hover(|style| style.bg(p.hover))
+                .child(div().flex_none().text_color(p.muted).child(if folded {
+                    "▸"
+                } else {
+                    "▾"
+                }))
+                .on_click(toggle),
+            None => head,
+        };
+        out.push(head.into_any_element());
+        for (i, (s, pr)) in open_prs.iter().enumerate().filter(|_| !folded) {
             out.push(pr_row(i, s, pr, p, mode, icons_only, cx));
         }
     } else if let Some(problem) = problem {
@@ -691,6 +729,16 @@ impl Render for StatusView {
             ),
         };
 
+        // Folds or unfolds the pull request list of the panel, or of big mode.
+        let fold_prs = |big: bool| -> OnClick {
+            let state = self.state.clone();
+            Box::new(move |_, _, cx| {
+                state.update(cx, |s, cx| {
+                    s.fold_prs(big);
+                    cx.notify();
+                })
+            })
+        };
         let mut rows: Vec<AnyElement> = Vec::new();
         match mode {
             // Without timelines (never, once the app is up) a plain list.
@@ -769,6 +817,7 @@ impl Render for StatusView {
                     &p,
                     mode,
                     icons_only,
+                    Some((state.prs_folded(false), fold_prs(false))),
                     cx,
                 ));
             }
@@ -836,6 +885,7 @@ impl Render for StatusView {
                     &p,
                     mode,
                     false,
+                    Some((state.prs_folded(true), fold_prs(true))),
                     cx,
                 )
             })
