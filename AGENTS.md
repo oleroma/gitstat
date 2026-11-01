@@ -2,95 +2,61 @@
 # Shared rules for all of Olex's repos
 
 ## How agents work
-- `main` is the only long-lived branch. Agents always work on a feature branch made from `main`.
-- Agents may work in a cloud session or locally on the PC; the cloud is preferred. Work in the cloud unless:
-  - Olex asks for local work: work locally.
-  - No cloud session is available: work locally.
-  - The cloud session lacks something it really needs: ask Olex what to do; if he doesn't answer within 2 minutes, work locally.
-- Local work follows the same steps; say that you're working locally and why. Olex can work and change anything anywhere.
-- Scripts in `.agents/` run the pipeline: branching, committing, pushing, building, installing and merging. The agent does only what needs judgment: writing code and commit messages, resolving conflicts, trying the PC before the fallback build, posting in the project thread, and talking to Olex.
-- Never do by hand what a script does. If a script is missing something or seems wrong, tell Olex instead of working around it.
-- Run the scripts with `bash`, as in the steps below. Each script ends with one line, `result: <word>`, followed by a short summary, and writes its full log to `build/logs/`. Read the log only when the result is `failed`.
+- `main` is the only long-lived branch. Agents always work on a feature branch made from `main`, and change `main` only through `agent-merge`, after Olex says the feature works.
+- Work in a cloud session unless Olex asks for local work or no cloud session is available. If the cloud session lacks something it needs, ask Olex whether to work locally. Local work follows the same steps; say that you're working locally and why.
+- Scripts in `.agents/` do the branching, committing, pushing, building, installing and merging. The agent does what needs judgment: code, commit messages, conflicts, and talking to Olex. Never do by hand what a script does; if a script is missing something or seems wrong, tell Olex.
+- Run the scripts with `bash`. Each ends with `result: <word>` and a short summary, and logs to `build/logs/`. Read the log only when the result is `failed`.
 
 ## Results
-| Result | Script | Meaning | Agent does |
-|---|---|---|---|
-| `done` | all | Finished | Next step |
-| `failed` | all | Something unexpected went wrong | Read the log, explain to Olex, stop |
-| `other-agent` | `agent-start` | Another agent's draft PR is open | Tell Olex which one, ask whether to wait |
-| `conflicts` | `agent-merge` | Conflicts (attempt 1 to 3) | Resolve them, run `agent-merge` again |
-| `needs-testing` | `agent-merge` | The merge touched this feature | Go back to step 3 |
-| `not-built` | `agent-merge` | The branch's last commit has no build whose checks passed | Go back to step 3 |
-| `stuck` | `agent-merge` | Conflicts left after 3 attempts, or conflict markers left in files | Show Olex the files, ask what to do, stop |
+| Result | Script | Agent does |
+|---|---|---|
+| `done` | all | Next step |
+| `failed` | all | Read the log, explain to Olex, stop |
+| `other-agent` | `agent-start` | Tell Olex which draft PR is open, ask whether to wait |
+| `checks-failed` | `agent-build` | Fix it, go back to step 2. Olex doesn't test this build |
+| `conflicts` | `agent-merge` | Resolve them, run `agent-merge` again |
+| `needs-testing` | `agent-merge` | The merge touched this feature: go back to step 3 |
+| `not-built` | `agent-merge` | Something was committed after the last build: go back to step 3 |
+| `stuck` | `agent-merge` | Show Olex the files, ask what to do, stop |
 
 ## Steps
-1. **Start.** Run `bash .agents/agent-start <feature-name>`. It makes a branch named after the feature from the latest `main`, pushes, and opens a draft PR into `main` so other agents can see the work.
-   - `other-agent`: tell Olex which draft PR is open and ask whether to wait.
-   - If he says to go on, run `bash .agents/agent-start --continue <feature-name>`, which skips that check.
-2. **Edit.** Write the code, then run `bash .agents/agent-commit "<message>"` with a commit message; the script commits and pushes.
-3. **Build.** Every build, on the PC or in CI, runs the same checks once: the `quick-test` hook, then the `build` hook, then the `full-check` hook. When the full checks pass, the commit is marked checked on GitHub (a `full-check` commit status). Nothing runs them again later. If they fail, fix them before Olex tests. Try to reach Olex's PC through Remote Control and run the `pc` build there. Don't decide from the cloud session's own tools whether the PC is there: actually try. If the PC can't be reached (offline, no access, no answer), run `bash .agents/agent-build ci` in the cloud instead.
-   - `pc`: on the PC, in `D:\dev\<repo>`, fetch the branch and check it out in `build/src` (`git fetch origin <branch>`, then `git -C build/src checkout --detach origin/<branch>`, or `git worktree add --detach build/src origin/<branch>` the first time). Then run `bash build/src/.agents/agent-build pc`, so the script always comes from the branch being built. It builds in `build/src`, stores the build files, then installs them with `agent-install`. If CI already built that commit (an `agent-build ci` run while the PC was away), it downloads that build and installs it instead of building and checking it again. Installing goes: each APK on the phone when one is connected and it isn't a downgrade, then the repo's `install` hook if it has one. A failed install doesn't fail the build. The summary says what was installed and why not. If it says a build file isn't installed because it isn't an APK, ask Olex whether to install it. Last it runs the full checks, after the install so the phone gets the build first.
-      - To install without building (for example once the phone is connected), run only `bash build/src/.agents/agent-install`, which installs the newest build, or `agent-install <version>-<commit>` for an older one from `build/builds/`.
-   - `ci`: runs the fallback workflow on the branch, which does what a PC build does, and waits, then prints a direct download link per build file and downloads them. Post the links in the project thread first, then upload the files. Nothing is installed.
+1. **Start.** `bash .agents/agent-start <feature-name>` makes the branch and a draft PR. If Olex says to go on despite `other-agent`, run it with `--continue`.
+2. **Edit.** Write the code, then `bash .agents/agent-commit "<message>"`.
+3. **Build.** Every build runs the `quick-test`, `build` and `full-check` hooks once and marks the commit checked; nothing runs them again. Try the PC first through Remote Control (actually try, don't guess):
+   - `pc`: in `D:\dev\<repo>`, run `git fetch origin <branch>`, then `git -C build/src checkout --detach origin/<branch>` (the first time: `git worktree add --detach build/src origin/<branch>`), then `bash build/src/.agents/agent-build pc`. Report its summary. If it says a build file wasn't installed because it isn't an APK, ask Olex whether to install it. To install again without building, run `bash build/src/.agents/agent-install [<version>-<commit>]`.
+   - `ci`, only when the PC can't be reached: `bash .agents/agent-build ci`. Post the download links in the project thread first, then upload the files.
+   - If checks fail in code this feature didn't change, tell Olex instead of fixing it in the feature.
 4. **Check.** Wait for Olex. If he asks for changes, go back to 2. When he says the feature works, go to 5.
-5. **Merge.** Run `bash .agents/agent-merge`. It first makes sure the branch's last commit was built and passed its checks, then merges the latest `main` into the feature branch and pushes, then marks the PR ready and merges it into `main`, keeping the feature branch. It runs no checks itself.
-   - `conflicts`: resolve them, then run it again; it commits the resolution.
-   - `needs-testing`: go back to 3. Once Olex says it still works, run it again.
-   - `not-built`: something was committed after the last build. Build it (step 3); once Olex says it still works, run it again.
-   - `stuck`: show Olex the files and ask what to do.
-
-## After merging into main
-- Agents change `main` only through `agent-merge`, after Olex says the feature works. Never commit or push to `main` directly.
-- A merge into `main` builds and checks nothing: the build Olex tested already did.
+5. **Merge.** `bash .agents/agent-merge`. It merges the latest `main` into the branch, then the branch into `main`, keeping the branch.
 
 ## Scripts and hooks
-- The scripts in `.agents/` (and `.agents/pipeline.md`, the diagram of these steps) are shared: the same in every repo, synced with these rules, and changed only by the "rulesetter" thread. Agents never edit them.
-- Each repo has hooks in `.agents/hooks/`, the only repo-specific part of the pipeline. They are part of the repo's code: an agent may change them when its task changes how the repo builds or tests, and says so in its summary.
+- The scripts in `.agents/` are the same in every repo, synced with these rules, and changed only by the "rulesetter" thread. Agents never edit them.
+- Each repo's hooks in `.agents/hooks/` are its only repo-specific part of the pipeline, and part of its code: an agent may change them when its task changes how the repo builds or tests, and says so in its summary.
   - `quick-test`: the quick tests, run before the build.
-  - `full-check`: the slower checks, run after the build. Every repo has one.
-  - `build`: builds the repo and prints one line `build-file: <path> <version>` per build file, with the path relative to the repo. A repo may have several build files (for example an app and a desktop companion); they share one version. The version comes from `BUILD_NUMBER` (see Builds), never from a commit count.
-    - Optionally `install`: run on the PC by `agent-install`, with the build id (`<version>-<commit>`) and the paths of the build files. It installs the build files that aren't APKs and does any setup after an install. Its `note: <text>` lines go into the build summary. It never starts or restarts an app: for an app that's running, it puts the new exe next to the installed one as `<exe>.new`, and the running app swaps it in and restarts itself (the app's own code does this). An app that isn't running starts with the new build the next time Olex or Windows starts it.
-- `.github/workflows/fallback.yml` is the PC build's fallback and runs the same hooks: `quick-test`, then `build` with a build number claimed by `.agents/build-number` (so it needs `contents: write`), then `full-check`, and marks the commit checked when they pass (so it needs `statuses: write`). Each hook runs on the runner it needs (Linux, or Windows for code that builds only there). It uploads each build file unzipped (`archive: false`), one artifact per file. It runs only when started by hand on a branch (`agent-build ci`), never on a push.
-- `fallback.yml` uses actions on the Node 24 runtime: `actions/checkout@v7`, `actions/setup-java@v6`, `actions/setup-dotnet@v6`, `android-actions/setup-android@v4`, `gradle/actions/setup-gradle@v6` (with `cache-provider: basic`), `actions/cache@v6`, `actions/upload-artifact@v7`. Bump them when GitHub warns about a runtime.
+  - `full-check`: the slower checks, run after the build. Every repo has one, and it doesn't repeat the quick tests.
+  - `build`: builds the repo and prints `build-file: <path> <version>` per build file (path relative to the repo). Several build files share one version, made from `BUILD_NUMBER`.
+  - Optionally `install`: run on the PC after a build with the build id and file paths. It installs the build files that aren't APKs and prints `note: <text>` lines for the summary. It never starts or restarts an app; a running app updates itself from `<exe>.new`.
+- `.github/workflows/fallback.yml` is the PC build's fallback: run by hand on a branch, never on a push. It runs the same hooks (each on the runner it needs), claims the build number, uploads each build file unzipped, and marks the commit checked only when every job passed. Every job has a `timeout-minutes`. Keep its actions on the Node 24 runtime.
 
 ## Builds
-- Everything an agent or its scripts make by building, testing or running the program (build outputs, logs, screenshots, caches, virtual environments, downloads) goes inside the repo's gitignored `build/` folder, and nowhere else in the repo.
-- Files other tools keep in the repo (such as `.delta/` and `.gitstat/`) aren't covered by this rule: leave them alone.
-- Each repo has one build worktree, `build/src`, reused by every PC build so builds stay incremental. Only one build runs in it at a time; nothing is ever edited in it.
-- Every build gets the repo's next build number, one more than the last, whatever branch it comes from. `.agents/build-number` hands it out by pushing a `build/<n>` tag on the built commit; `agent-build pc` and `fallback.yml` run it just before the `build` hook and pass the number as `BUILD_NUMBER`. A failed build leaves a gap in the numbers; that's fine.
-  - The version is the hand-bumped version name plus the build number, `<name>-<n>` (a repo whose name already holds the number, like `0.1.<n>`, uses that). Android's `versionCode` is the build number, so each build installs over the last one.
-  - Each repo has its own count. It starts at the number in `.agents/hooks/first-build-number`, if the repo has one, set above its highest earlier version so nothing already installed counts as newer. Never push, move or delete `build/` tags by hand.
-- The newest build files sit directly in `build/`. `build/builds/` keeps the last 4 builds, one folder per build named `<version>-<commit>` holding its build files.
-- Builds are set up to be as fast as possible:
-  - The build tool's caches are on, and its output and caches are never cleaned between builds.
-  - PC builds keep the build tool's background processes running between builds.
-  - Branch builds may use quicker build settings than a final build, as long as the build file still runs the same way.
-  - `fallback.yml` restores and saves the build tool's cache on every run.
+- Everything made by building, testing or running the program (outputs, logs, screenshots, caches, downloads) goes in the repo's gitignored `build/` folder, nowhere else in the repo. Leave files other tools keep in the repo (such as `.delta/` and `.gitstat/`) alone.
+- `build/src` is the one PC build worktree, reused so builds stay incremental. Nothing is ever edited in it.
+- Every build gets the repo's next build number, pushed as a `build/<n>` tag by `.agents/build-number`; never push, move or delete those tags by hand. The version is the hand-bumped version name plus the number, `<name>-<n>` (or `0.1.<n>` where the name holds it), and Android's `versionCode` is the number. A repo may start its count at the number in `.agents/hooks/first-build-number`.
+- Keep builds fast: build caches on and never cleaned, build daemons kept running on the PC, quicker settings for branch builds as long as the build file runs the same way.
 
 ## Destructive actions
-- Destructive actions are allowed only inside the repo's gitignored `build/` folder, and only what the task needs there, such as the scripts' build cleanup. Never wipe `build/` or remove anything in it the task doesn't need gone.
-- Everywhere else (the rest of the repo, other repos, the rest of the PC, the phone), never do anything that loses data git can't bring back: no deleting files or folders, `git reset --hard`, `git clean`, `git checkout`/`git restore` over uncommitted changes, `git stash drop`, force pushes, deleting branches or tags, rewriting pushed history, or uninstalling apps. If one is needed, ask Olex first.
-- Normal edits to files, as part of the task, are not destructive.
+- Destructive actions are allowed only inside the repo's `build/` folder, and only what the task needs. Never wipe `build/`.
+- Everywhere else (the rest of the repo, other repos, the PC, the phone), never do anything that loses data git can't bring back: no deleting files or folders, `git reset --hard`, `git clean`, `git checkout`/`git restore` over uncommitted changes, `git stash drop`, force pushes, deleting branches or tags, rewriting pushed history, or uninstalling apps. If one is needed, ask Olex first. Normal edits as part of the task are fine.
 
 ## Agent instruction files
-- These shared rules sit at the top of every repo's `AGENTS.md`, between the "shared rules" marker lines, and are the same in every repo. Only the "rulesetter" thread changes them. Their master copy is `rules/AGENTS.md` in the DevDoctor project's files (`/mnt/project-files/rules/AGENTS.md` in a cloud session), with the shared scripts next to it in `rules/.agents/`; a cloud session runs `rules/sync-agents.sh` from there to copy both into every repo. `D:\dev\AGENTS.md` and `D:\dev\tools\sync-agents.ps1` are retired: don't use them.
-- Rules that apply to one repo go below the end marker, without repeating the shared rules. Where a repo rule disagrees with a shared rule, the repo rule wins inside that repo. Olex writes them, or an agent when Olex asks; rulesetter only reviews them for anything risky.
-- Other sessions leave all agent instruction files (`AGENTS.md`, `CLAUDE.md` and the like) alone and bring any needed change to Olex, except the repo rules below the end marker when Olex asks for a change there. `insights.md` isn't an instruction file.
+- These shared rules sit at the top of every repo's `AGENTS.md`, between the "shared rules" markers. Their master copy is `rules/AGENTS.md` in the DevDoctor project's files, and only the "rulesetter" thread changes them. When Olex asks a repo thread for a shared-rule change, pass his message to the rulesetter thread.
+- Rules for one repo go below the end marker, written by Olex or by an agent when Olex asks. Where they disagree with a shared rule, the repo rule wins in that repo. Otherwise leave all agent instruction files (`AGENTS.md`, `CLAUDE.md` and the like) alone and bring any needed change to Olex.
 
-## Insights
-- A repo may keep `insights.md` at its root: notes from this repo's thread telling the rulesetter what the shared rules or shared scripts need. It isn't a rule file; agents don't follow it, and `CLAUDE.md` doesn't import it. Lessons for this repo alone go in its own rules below the end marker instead.
-- Add an entry only when Olex asks, in his words where possible. The first entry creates the file. Entries go at the end, numbered `<repo>-<n>` with the next free number:
-  - `## <repo>-<n>: <title>`, then the lines `Added: <date>. Status: open`, `What happened: …` and `Proposed rule: …`.
-- Never edit, remove or renumber an entry, and never change its status: the sync sets it to `applied <date>` or `declined <date>: <why>` once the rulesetter has handled it. Handled entries stay as a record.
-- Commit the entry on the current feature branch with `agent-commit`. With no feature under way, run `agent-start insights-<topic>`, commit only `insights.md`, and leave the PR open: run `agent-merge` only when Olex says to merge it. The change needs no build or test: `agent-merge` lets a branch that changes only `insights.md` through unbuilt (take a `needs-testing` result as tested).
-- When Olex asks, the rulesetter harvests the open entries from every repo, proposes the rule changes to him, and applies the ones he approves through the next sync.
-
-## Tools on this PC
-- Build tools (JDKs, SDKs and the like) are used through the `PATH` and their standard environment variables (such as `JAVA_HOME` and `ANDROID_HOME`), never by a hardcoded path in scripts or hooks. A tool installed by hand goes in `D:\tools` (one folder each, a portable copy where possible) and is added to the user `PATH`; never inside `D:\dev` or a repo.
-- Java 17: `D:\tools\jdk17`, on the user `PATH`, with `JAVA_HOME` set. Android SDK: `%LOCALAPPDATA%\Android\Sdk`, with `ANDROID_HOME` set. adb: on the `PATH`.
+## On the PC
+- Build tools are used through the `PATH` and their standard variables (such as `JAVA_HOME`, `ANDROID_HOME`), never by a hardcoded path. A tool installed by hand goes in `D:\tools` (one folder each) and on the user `PATH`, never inside `D:\dev` or a repo. Java 17 is in `D:\tools\jdk17`; the Android SDK is in `%LOCALAPPDATA%\Android\Sdk`; adb is on the `PATH`.
 - In Git Bash, set `MSYS_NO_PATHCONV=1` for adb paths like `/sdcard`.
-- Agents never put anything in AppData (`%LOCALAPPDATA%`, `%APPDATA%`): no builds, worktrees, downloads, caches or settings of their own. They go in the repo's `build/` folder. The one exception is an `install` hook, which installs a program into `%LOCALAPPDATA%\Programs\<app>` with its Start menu shortcut and start-with-Windows entry. What programs and build tools keep in AppData on their own (their settings, caches, the Android SDK) is left alone.
-- Agents never start the repo's apps on the PC; Olex tests everything that can't be checked in the background. Claude desktop is a packaged Windows app: what it starts runs in its sandbox, and Windows quietly sends that program's AppData writes to a copy in `%LOCALAPPDATA%\Packages\Claude_…`, so its settings split from the real ones.
+- Agents never put anything of their own in AppData; an `install` hook may install a program into `%LOCALAPPDATA%\Programs\<app>` with its shortcuts.
+- Agents never start the repo's apps on the PC; Olex tests everything that can't be checked in the background.
 
 ## Phone
 - The phone is Olex's daily phone. Never inject test touches (`adb input`) on it, and don't use an emulator.
