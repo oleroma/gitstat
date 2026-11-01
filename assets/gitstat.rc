@@ -1,1 +1,22 @@
 1 ICON "gitstat.ico"
+
+// .agents/hooks/install reads Comments to tell whether the installed exe
+// updates itself from gitstat.exe.new (src/self_update.rs). Keep the text.
+1 VERSIONINFO
+FILEVERSION 0,0,0,0
+PRODUCTVERSION 0,0,0,0
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "FileDescription", "gitstat"
+      VALUE "ProductName", "gitstat"
+      VALUE "Comments", "Updates itself from gitstat.exe.new"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END

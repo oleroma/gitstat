@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # Installs a build on the PC, run by agent-install with the build id and the build files.
 # gitstat.exe goes to %LOCALAPPDATA%\Programs\gitstat, alongside other per-user apps, with
-# a Start menu shortcut. A running gitstat is stopped first and the new one started after.
+# a Start menu shortcut. It never stops or starts gitstat: the new exe goes next to the
+# installed one as gitstat.exe.new, and gitstat swaps it in and restarts itself if it's
+# running, or at its next start (src/self_update.rs). An installed exe from before
+# self-update is renamed to gitstat.exe.old instead (Windows allows that while it runs)
+# and the new one put in its place, to run from the next start.
 # config.json there is kept; the first install takes build\config.json, so settings carry
 # over. A "Start with Windows" entry is pointed at the installed exe.
 # Prints "note: <text>" lines for the build summary.
@@ -29,11 +33,35 @@ ps() { powershell.exe -NoProfile -NonInteractive -Command "$1"; }
 
 mkdir -p "$dest"
 
-# Every gitstat, wherever it runs from: the installed one, or an older one from build\.
-stopped="$(ps "\$p = Get-Process gitstat -ErrorAction SilentlyContinue; \$p | Stop-Process -Force; \$p | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue; @(\$p).Count")"
-stopped="$(tr -d '\r' <<<"$stopped")"
+installed="$dest/gitstat.exe"
+# The installed gitstat, running or quitting (an update renames its exe to .old).
+running="$(ps "@(Get-Process gitstat -ErrorAction SilentlyContinue | Where-Object { \$_.Path -like '$dest_win\\gitstat.exe*' }).Count")"
+running="$(tr -d '\r' <<<"$running")"
+self_updating=""
+if [ -f "$installed" ]; then
+  # Set by assets/gitstat.rc in builds that update themselves.
+  comments="$(ps "(Get-Item -LiteralPath '$dest_win\\gitstat.exe').VersionInfo.Comments")"
+  case "$comments" in *gitstat.exe.new*) self_updating=1 ;; esac
+fi
 
-cp -f "$exe" "$dest/gitstat.exe"
+if [ -z "$self_updating" ] && [ -f "$installed" ] && [ "${running:-0}" != 0 ]; then
+  # A running gitstat from before self-update: it never looks for gitstat.exe.new.
+  mv -f "$installed" "$dest/gitstat.exe.old"
+  cp -f "$exe" "$installed"
+  outcome="the running gitstat predates self-update and keeps running; quit it and start gitstat to use the new build (needed this once)"
+elif [ -n "$self_updating" ]; then
+  # Copied under another name first, so gitstat never sees half a file.
+  cp -f "$exe" "$dest/gitstat.exe.new.tmp"
+  mv -f "$dest/gitstat.exe.new.tmp" "$dest/gitstat.exe.new"
+  if [ "${running:-0}" != 0 ]; then
+    outcome="left as gitstat.exe.new; the running gitstat switches to it within a few seconds"
+  else
+    outcome="left as gitstat.exe.new; gitstat isn't running and switches to it at its next start"
+  fi
+else
+  cp -f "$exe" "$installed"
+  outcome="gitstat isn't running; the new build runs from its next start"
+fi
 
 if [ ! -f "$dest/config.json" ]; then
   if [ -f "$build_dir/config.json" ]; then
@@ -55,6 +83,4 @@ if reg query "$run_key" /v gitstat >/dev/null 2>&1; then
   echo "note: Start with Windows now points at the installed exe."
 fi
 
-ps "Start-Process -FilePath '$dest_win\\gitstat.exe' -WorkingDirectory '$dest_win'"
-
-echo "note: installed to $dest_win with a Start menu shortcut; stopped ${stopped:-0} running gitstat, started the new one."
+echo "note: installed to $dest_win with a Start menu shortcut; $outcome."
