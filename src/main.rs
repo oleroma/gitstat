@@ -29,6 +29,8 @@ mod repo_icon;
 #[cfg(any(windows, test))]
 mod repo_info;
 #[cfg(any(windows, test))]
+mod self_update;
+#[cfg(any(windows, test))]
 mod state;
 #[cfg(any(windows, test))]
 mod watch;
@@ -72,6 +74,8 @@ struct Args {
     remove_folder_icons: bool,
     fetch: bool,
     config_file: PathBuf,
+    /// Started by a gitstat that just swapped in a new build (self_update.rs).
+    after_update: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -80,6 +84,7 @@ fn parse_args() -> Result<Args, String> {
         remove_folder_icons: false,
         fetch: true,
         config_file: config::default_file(),
+        after_update: false,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -87,6 +92,7 @@ fn parse_args() -> Result<Args, String> {
             "--once" => args.once = true,
             "--no-fetch" => args.fetch = false,
             "--remove-folder-icons" => args.remove_folder_icons = true,
+            "--after-update" => args.after_update = true,
             "--config" => args.config_file = iter.next().ok_or("--config needs a file")?.into(),
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument: {other}")),
@@ -130,7 +136,19 @@ fn main() {
 
     #[cfg(windows)]
     {
-        if !single_instance() {
+        // A build an install left while gitstat wasn't running.
+        if let Ok(exe) = std::env::current_exe()
+            && self_update::swap(&exe).unwrap_or(false)
+            && self_update::restart(&exe).is_ok()
+        {
+            return;
+        }
+        let first = if args.after_update {
+            wait_for_single_instance(self_update::HANDOVER)
+        } else {
+            single_instance()
+        };
+        if !first {
             let _ = error_box(
                 "gitstat is already running. Look for its icon in the notification area.".into(),
             )
@@ -281,14 +299,39 @@ fn attach_parent_console() {
 /// gitstat already holds it.
 #[cfg(windows)]
 fn single_instance() -> bool {
-    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError};
     use windows_sys::Win32::System::Threading::CreateMutexW;
     let name: Vec<u16> = "Local\\gitstat-tray"
         .encode_utf16()
         .chain(Some(0))
         .collect();
     let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
-    !handle.is_null() && unsafe { GetLastError() } != ERROR_ALREADY_EXISTS
+    if handle.is_null() {
+        return false;
+    }
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        // Not ours to keep: an open handle would keep the mutex alive after
+        // the other gitstat quits, so a retry could never get it.
+        unsafe { CloseHandle(handle) };
+        return false;
+    }
+    true
+}
+
+/// `single_instance`, retried until the gitstat that started this one after
+/// an update has quit, or `timeout` passes.
+#[cfg(windows)]
+fn wait_for_single_instance(timeout: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if single_instance() {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
 }
 
 /// Shows a warning on its own thread. A message box on the main thread would

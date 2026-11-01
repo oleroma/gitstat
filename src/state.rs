@@ -485,6 +485,8 @@ pub enum Input {
     FolderSkips(Vec<(PathBuf, String)>),
     /// A GitHub pull request poll.
     Github(crate::github::Report),
+    /// An install left a new build next to the exe (self_update.rs).
+    NewBuild,
 }
 
 #[cfg(test)]

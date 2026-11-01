@@ -47,6 +47,8 @@ struct Shared {
     save_notice_shown: bool,
     /// The folder-icon consent box is open.
     consent_pending: bool,
+    /// A self-update failed and said so; later tries stay quiet.
+    update_error_shown: bool,
 }
 
 impl Global for Shared {}
@@ -172,9 +174,17 @@ pub fn run(config_file: PathBuf) {
             github,
             save_notice_shown: false,
             consent_pending: false,
+            update_error_shown: false,
         });
         apply_config(&Config::default(), cfg, cx);
         update_outputs(false, cx);
+
+        if let Ok(exe) = std::env::current_exe() {
+            let update_tx = tx.clone();
+            crate::self_update::watch(exe, move || {
+                let _ = update_tx.unbounded_send(Input::NewBuild);
+            });
+        }
 
         cx.spawn(async move |cx| input_loop(rx, cx).await).detach();
     });
@@ -265,6 +275,11 @@ fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
                 );
                 overlay::drop_saved(cx);
                 changed = true;
+            }
+            Input::NewBuild => {
+                if update_and_restart(cx) {
+                    return false;
+                }
             }
             input @ (Input::Tray(_) | Input::Menu(_)) => {
                 let Some(action) = cx.global::<Shared>().tray.map(&input) else {
@@ -439,14 +454,55 @@ fn on_action(action: TrayAction, cx: &mut App) -> bool {
                 .set_autostart_checked(crate::autostart::is_enabled());
         }
         TrayAction::Quit => {
-            let shared = cx.global::<Shared>();
-            shared.send_monitors(Command::Shutdown);
-            shared.tray.hide();
-            cx.quit();
+            quit(cx);
             return false;
         }
     }
     true
+}
+
+fn quit(cx: &mut App) {
+    let shared = cx.global::<Shared>();
+    shared.send_monitors(Command::Shutdown);
+    shared.tray.hide();
+    cx.quit();
+}
+
+/// Swaps in the build an install left next to the exe, starts it and quits.
+/// Returns true when quitting. A failed swap leaves this gitstat running and
+/// is tried again on the next poll.
+fn update_and_restart(cx: &mut App) -> bool {
+    use crate::self_update;
+    let result = std::env::current_exe().and_then(|exe| {
+        if !self_update::swap(&exe)? {
+            return Ok(false);
+        }
+        if let Err(e) = self_update::restart(&exe) {
+            // Back to the build that is running, so the next start isn't a surprise.
+            let _ = std::fs::rename(&exe, self_update::new_build(&exe));
+            let _ = std::fs::rename(self_update::old_build(&exe), &exe);
+            return Err(e);
+        }
+        Ok(true)
+    });
+    match result {
+        Ok(true) => {
+            quit(cx);
+            true
+        }
+        Ok(false) => false,
+        Err(e) => {
+            let shared = cx.global_mut::<Shared>();
+            if !shared.update_error_shown {
+                shared.update_error_shown = true;
+                crate::error_box(format!(
+                    "A new gitstat build is waiting, but gitstat couldn't switch to it: {e}\n\n\
+                     It will keep trying. Quitting and starting gitstat also picks it up."
+                ));
+            }
+            false
+        }
+    }
 }
 
 /// Folder icons change the user's repo folders, so turning them on from the

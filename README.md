@@ -272,10 +272,14 @@ git must be on your `PATH` (Git for Windows puts it there).
 ## Install
 
 Each build on the PC installs itself to `%LOCALAPPDATA%\Programs\gitstat`
-with a **gitstat** shortcut in the Start menu, stops a running gitstat and
-starts the new one. `config.json` there is kept between installs; the first
-install copies `build\config.json`. If **Start with Windows** is on, it is
-pointed at the installed exe.
+with a **gitstat** shortcut in the Start menu. The install never stops or
+starts gitstat: it leaves the new build next to the installed one as
+`gitstat.exe.new`. A running gitstat notices it within a few seconds, swaps
+it in and restarts itself; one that isn't running switches at its next start.
+The replaced exe is kept as `gitstat.exe.old` until the new gitstat removes
+it. `config.json` there is kept between installs; the first install copies
+`build\config.json`. If **Start with Windows** is on, it is pointed at the
+installed exe.
 
 ## Configure
 
