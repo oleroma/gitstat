@@ -37,9 +37,10 @@ pub struct PanelSlot {
     /// The open panel's HWND, so the badge can stay below it.
     hwnd: Option<isize>,
     toggled_at: Option<Instant>,
-    /// Where the open panel hangs from, and the rows it is sized for.
+    /// Where the open panel hangs from, and the content height in logical
+    /// px it was last fitted to.
     anchor: Option<Anchor>,
-    rows: usize,
+    height: f32,
 }
 
 impl Global for PanelSlot {}
@@ -112,8 +113,8 @@ fn open(anchor: Anchor, cx: &mut App) {
         }
         a => a,
     };
-    let rows = view::panel_rows(state.read(cx), false);
-    let bounds = logical(place(anchor, rows, cx));
+    let rows = view::panel_rows(state.read(cx));
+    let bounds = logical(place(anchor, Height::Rows(rows), cx));
     let mut hwnd = None;
     let handle = cx
         .open_window(
@@ -146,31 +147,39 @@ fn open(anchor: Anchor, cx: &mut App) {
     slot.hwnd = handle.and(hwnd);
     slot.toggled_at = Some(Instant::now());
     slot.anchor = Some(anchor);
-    slot.rows = rows;
+    slot.height = 0.0;
 }
 
-/// Resizes the open panel for `rows`, keeping it on its anchor, when that
-/// differs from what it is sized for. Safe to call while drawing it.
-pub fn refit(rows: usize, cx: &mut App) {
-    if !is_open(cx) {
+/// Resizes the open panel to `height` logical px of content, keeping it on
+/// its anchor, when that differs from its size. Safe to call while drawing.
+pub fn fit(height: f32, cx: &mut App) {
+    if !is_open(cx) || !height.is_finite() {
         return;
     }
     let slot = cx.default_global::<PanelSlot>();
     let (Some(anchor), Some(h)) = (slot.anchor, slot.hwnd) else {
         return;
     };
-    if slot.rows == rows {
+    if (slot.height - height).abs() < 1.0 {
         return;
     }
-    slot.rows = rows;
-    let r = place(anchor, rows, cx);
+    slot.height = height;
+    let r = place(anchor, Height::Fit(height), cx);
     // Native window calls must run outside this update.
     cx.spawn(async move |_| unsafe { win::place_window(h, r) })
         .detach();
 }
 
-/// The panel's rect in physical px, `rows` high, next to `anchor`.
-fn place(anchor: Anchor, rows: usize, cx: &App) -> Rect {
+/// How tall the panel is to be.
+enum Height {
+    /// Estimated from the row count, before it is laid out.
+    Rows(usize),
+    /// Measured, in logical px.
+    Fit(f32),
+}
+
+/// The panel's rect in physical px, `height` high, next to `anchor`.
+fn place(anchor: Anchor, height: Height, cx: &App) -> Rect {
     // Icons only: the strips' labels shrink to their icons.
     let icons_only = cx
         .try_global::<Ui>()
@@ -190,7 +199,11 @@ fn place(anchor: Anchor, rows: usize, cx: &App) -> Rect {
     let (ax, ay) = anchor_rect.centre();
     let mon = win::monitor_at(ax, ay);
     let scale = view::sane_scale(mon.scale);
-    let height = layout::panel_height(rows, mon.work.height() as f32 / scale);
+    let work_h = mon.work.height() as f32 / scale;
+    let height = match height {
+        Height::Rows(rows) => layout::panel_height(rows, work_h),
+        Height::Fit(h) => layout::fit_panel_height(h, work_h),
+    };
     let (w, h, gap) = (
         (width * scale).round() as i32,
         (height * scale).round() as i32,

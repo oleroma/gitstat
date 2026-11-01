@@ -281,14 +281,13 @@ impl StatusView {
     }
 }
 
-/// How many rows the panel shows: the unsynced repos, the "N synced" row
-/// and, with `show_synced`, the synced repos under it, or the one
+/// How many rows the panel opens with, for its first size before it is
+/// measured: the unsynced repos, the collapsed "N synced" row, or the one
 /// empty-state line; then the pull requests unless folded.
-pub fn panel_rows(state: &AppState, show_synced: bool) -> usize {
+pub fn panel_rows(state: &AppState) -> usize {
     let unsynced = state.unsynced();
     let synced = state.statuses.len() - unsynced;
-    let shown = if show_synced { synced } else { 0 };
-    let repos = (unsynced + usize::from(synced > 0) + shown).max(1);
+    let repos = (unsynced + usize::from(synced > 0)).max(1);
     // The pull requests' heading and rows, or the one GitHub problem line.
     let prs = state.open_prs().len();
     let github = if prs > 0 {
@@ -611,12 +610,9 @@ impl Render for StatusView {
             WindowAppearance::Dark | WindowAppearance::VibrantDark
         );
         let mode = self.mode;
-        if mode == Mode::Panel {
-            // Grow or shrink the panel to what it now shows: a section
-            // folded or unfolded, repos or pull requests come or go.
-            let rows = panel_rows(self.state.read(cx), self.show_synced);
-            panel::refit(rows, cx);
-        }
+        // The panel's rows measured as laid out, so the panel can be made
+        // exactly as tall as what it shows.
+        let content_h = Rc::new(std::cell::Cell::new(0.0f32));
         let timelines = self.timelines.clone();
         // Pictures only: the panel's words move into tooltips.
         let icons_only = mode == Mode::Panel && self.state.read(cx).config.icons_only;
@@ -889,7 +885,15 @@ impl Render for StatusView {
             }
             _ => None,
         };
+        let list_h = content_h.clone();
         let list = div()
+            .on_children_prepainted(move |rows, _, _| {
+                let h = match (rows.first(), rows.last()) {
+                    (Some(first), Some(last)) => f32::from(last.bottom()) - f32::from(first.top()),
+                    _ => 0.0,
+                };
+                list_h.set(h);
+            })
             .id("repos")
             .flex()
             .flex_col()
@@ -1005,6 +1009,20 @@ impl Render for StatusView {
         };
 
         div()
+            .when(mode == Mode::Panel, |d| {
+                // Header, rows, footer: grow or shrink the panel to them
+                // whenever they change (a section folded, repos or pull
+                // requests come or go), with no empty space below.
+                d.on_children_prepainted(move |parts, _, cx| {
+                    let header = parts.first().map_or(0.0, |b| f32::from(b.size.height));
+                    let footer = if icons_only {
+                        0.0
+                    } else {
+                        parts.get(2).map_or(0.0, |b| f32::from(b.size.height))
+                    };
+                    panel::fit(header + content_h.get() + footer, cx);
+                })
+            })
             .id("root")
             .track_focus(&self.focus)
             .key_context("StatusView")

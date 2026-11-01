@@ -284,6 +284,15 @@ const FOOTER: f32 = 48.0;
 const MIN_PANEL: f32 = 200.0;
 const MAX_SHARE: f32 = 0.6;
 
+/// A measured panel height in logical px, kept on the screen: at most 60%
+/// of the work area, like `panel_height`, but with no minimum, so the panel
+/// is exactly as tall as what it shows.
+pub fn fit_panel_height(wanted: f32, work_h_logical: f32) -> f32 {
+    let wanted = wanted.max(HEADER);
+    let cap = MAX_SHARE * work_h_logical;
+    if cap > 0.0 { wanted.min(cap) } else { wanted }
+}
+
 /// Panel height in logical px for `rows` repo rows: room for every row, at
 /// least `MIN_PANEL`, at most 60% of the work area (the screen wins on a
 /// tiny one). Extra rows scroll.
