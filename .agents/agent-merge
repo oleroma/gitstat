@@ -17,8 +17,12 @@ merge_into_main() {
   fi
   # The full checks main runs after a merge, run on the branch first so main stays green,
   # unless they already passed on this commit (a PC build or an earlier check run).
-  local checks
-  if checked "$(git rev-parse HEAD)"; then
+  local checks title=()
+  if [ "$(git diff --name-only origin/main HEAD)" = "insights.md" ]; then
+    # Notes only: no checks on the branch, and [skip ci] so main doesn't run them either.
+    checks="Only insights.md changed, so the full checks were skipped."
+    title=(-f "commit_title=Merge $BRANCH (insights only) [skip ci]")
+  elif checked "$(git rev-parse HEAD)"; then
     checks="The full checks had already passed on $(git rev-parse --short HEAD)."
   else
     run_fallback check || finish checks-failed "The full checks failed on $BRANCH: $RUN_URL" \
@@ -29,7 +33,7 @@ merge_into_main() {
   n="$(pr_number "$BRANCH")"
   [ -n "$n" ] || die "No open PR from $BRANCH into main."
   pr_ready "$n"
-  gh api -X PUT "repos/$SLUG/pulls/$n/merge" -f merge_method=merge >/dev/null
+  gh api -X PUT "repos/$SLUG/pulls/$n/merge" -f merge_method=merge "${title[@]}" >/dev/null
   rm -f "$attempts_file" "$files_file"
   finish done "Merged $BRANCH into main: https://github.com/$SLUG/pull/$n" "The feature branch is kept." \
     "$checks"
