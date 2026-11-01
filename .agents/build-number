@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Prints the repo's next build number, one more than the last one on GitHub, and claims it by
+# pushing a build/<n> tag on HEAD. Run by agent-build pc and by fallback.yml before the build
+# hook, which gets the number as BUILD_NUMBER. Two builds at once never get the same number:
+# the second tag push is refused and that build tries the next number. A repo's count starts
+# at the number in .agents/hooks/first-build-number, if it has one, otherwise at 1.
+# Usage: .agents/build-number   (prints only the number)
+set -euo pipefail
+cd "$(dirname "$0")/.."
+first="$(tr -dc 0-9 2>/dev/null <.agents/hooks/first-build-number || true)"
+
+for _ in 1 2 3 4 5; do
+  last="$(git ls-remote --tags origin 'refs/tags/build/*' | sed -nE 's#.*refs/tags/build/([0-9]+)$#\1#p' | sort -n | tail -n 1)"
+  n=$((${last:-0} + 1))
+  if [ "$n" -lt "${first:-1}" ]; then n="$first"; fi
+  if git push -q origin "HEAD:refs/tags/build/$n" >&2; then
+    echo "$n"
+    exit 0
+  fi
+done
+echo "Couldn't claim a build number on GitHub after 5 tries." >&2
+exit 1

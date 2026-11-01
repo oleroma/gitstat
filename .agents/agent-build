@@ -23,6 +23,10 @@ build_pc() {
     bash "$HOOKS/quick-test" || die "Quick tests failed at $commit. Not built."
   fi
 
+  # The repo's next build number, claimed on GitHub; the build hook makes the version from it.
+  BUILD_NUMBER="$(bash "$AGENTS_DIR/build-number")" || die "Couldn't get a build number from GitHub. Not built."
+  export BUILD_NUMBER
+
   local out_file="$BUILD_DIR/logs/build-output.txt"
   if ! bash "$HOOKS/build" >"$out_file"; then
     cat "$out_file"

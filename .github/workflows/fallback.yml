@@ -49,6 +49,8 @@ jobs:
   windows:
     if: github.event_name != 'push'
     runs-on: windows-latest
+    permissions:
+      contents: write # the build number step pushes a build/<n> tag
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -62,6 +64,11 @@ jobs:
         if: inputs.mode != 'check'
         shell: bash
         run: bash .agents/hooks/quick-test
+
+      - name: Build number
+        if: inputs.mode != 'check'
+        shell: bash
+        run: n="$(bash .agents/build-number)" && echo "BUILD_NUMBER=$n" >> "$GITHUB_ENV"
 
       - name: Build
         id: build

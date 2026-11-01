@@ -7,10 +7,13 @@ cd "$(dirname "$0")/../.."
 # Relative, so Git Bash never has to convert the path for cargo.
 export CARGO_TARGET_DIR=build/target
 
+# The version is the package version in Cargo.toml, bumped by hand, plus the build number.
+# agent-build pc and fallback.yml set BUILD_NUMBER.
+n="${BUILD_NUMBER:?Set by agent-build pc and fallback.yml from .agents/build-number}"
+
 cargo build --release --locked
 
-# The package version in Cargo.toml, bumped by hand.
-version="$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -n 1)"
+version="$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -n 1)-$n"
 exe="$CARGO_TARGET_DIR/release/gitstat.exe"
 [ -f "$exe" ] || { echo "No $exe: gitstat.exe builds only on Windows." >&2; exit 1; }
 echo "build-file: $exe $version"
