@@ -35,6 +35,12 @@ pub struct AppState {
     pub prs: HashMap<PathBuf, Vec<crate::github::Pr>>,
     /// Why the last GitHub poll read nothing.
     pub github_problem: Option<String>,
+    /// The GitHub account's repos with no clone here, most recently pushed
+    /// first.
+    pub remote_repos: Vec<crate::github::RemoteRepo>,
+    /// The list of those is folded: in the panel, in big mode. Folded at
+    /// first, since an account can have many.
+    remote_folded: [bool; 2],
     /// The pull request list is folded to its heading: in the panel, in
     /// big mode. Kept while gitstat runs, so the panel reopens the same.
     prs_folded: [bool; 2],
@@ -62,6 +68,8 @@ impl AppState {
             folder_skips: Vec::new(),
             prs: HashMap::new(),
             github_problem: None,
+            remote_repos: Vec::new(),
+            remote_folded: [true; 2],
             prs_folded: [false; 2],
         }
     }
@@ -147,7 +155,22 @@ impl AppState {
         } else {
             self.prs.extend(report.prs);
         }
+        if let Some(remote) = report.remote_only {
+            self.remote_repos = remote;
+        }
         self.github_problem = report.problem;
+    }
+
+    /// Whether the not-cloned repo list is folded, in big mode or the panel.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn remote_folded(&self, big: bool) -> bool {
+        self.remote_folded[usize::from(big)]
+    }
+
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn fold_remote(&mut self, big: bool) {
+        let f = &mut self.remote_folded[usize::from(big)];
+        *f = !*f;
     }
 
     /// Whether the pull request list is folded, in big mode or the panel.
@@ -244,6 +267,41 @@ mod tests {
         state.statuses = statuses;
         state.has_result = true;
         state
+    }
+
+    #[test]
+    fn github_report_keeps_remote_repos_when_unread() {
+        let mut s = state(Vec::new());
+        assert!(s.remote_folded(false) && s.remote_folded(true));
+        let repo = crate::github::RemoteRepo {
+            slug: "o/a".into(),
+            url: "https://github.com/o/a".into(),
+            private: false,
+            fork: false,
+            pushed_at: String::new(),
+            default_branch: "main".into(),
+            checks: crate::github::Checks::None,
+            open_prs: 0,
+        };
+        s.github_report(crate::github::Report {
+            remote_only: Some(vec![repo.clone()]),
+            ..Default::default()
+        });
+        assert_eq!(s.remote_repos, std::slice::from_ref(&repo));
+        // A failed poll reads no list: the last one stays.
+        s.github_report(crate::github::Report {
+            problem: Some("offline".into()),
+            ..Default::default()
+        });
+        assert_eq!(s.remote_repos, [repo]);
+        assert_eq!(s.github_problem.as_deref(), Some("offline"));
+        s.github_report(crate::github::Report {
+            remote_only: Some(Vec::new()),
+            ..Default::default()
+        });
+        assert!(s.remote_repos.is_empty() && s.github_problem.is_none());
+        s.fold_remote(false);
+        assert!(!s.remote_folded(false) && s.remote_folded(true));
     }
 
     #[test]

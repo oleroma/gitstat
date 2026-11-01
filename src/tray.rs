@@ -70,6 +70,7 @@ pub enum Setting {
     OverlayHideFullscreen,
     FolderIcons,
     GithubPrs,
+    GithubRepos,
 }
 
 impl Setting {
@@ -84,6 +85,7 @@ impl Setting {
             Setting::OverlayHideFullscreen => cfg.overlay.hide_in_fullscreen,
             Setting::FolderIcons => cfg.folder_icons,
             Setting::GithubPrs => cfg.github_prs,
+            Setting::GithubRepos => cfg.github_repos,
         }
     }
 
@@ -98,6 +100,7 @@ impl Setting {
             Setting::OverlayHideFullscreen => &mut cfg.overlay.hide_in_fullscreen,
             Setting::FolderIcons => &mut cfg.folder_icons,
             Setting::GithubPrs => &mut cfg.github_prs,
+            Setting::GithubRepos => &mut cfg.github_repos,
         };
         *field = !*field;
     }
@@ -189,6 +192,10 @@ impl Tray {
         let folder_icons = check("Folder icons in Explorer", Setting::FolderIcons);
         let watch = check("Watch for changes", Setting::Watch);
         let github_prs = check("GitHub pull requests (via gh)", Setting::GithubPrs);
+        let github_repos = check(
+            "GitHub repos not cloned here (via gh)",
+            Setting::GithubRepos,
+        );
 
         let corner_menu = Submenu::new("Badge corner", defaults.overlay.enabled);
         let corners: Vec<(CheckMenuItem, Corner)> = CORNERS
@@ -232,6 +239,7 @@ impl Tray {
                 &window.0,
                 &icons_only.0,
                 &github_prs.0,
+                &github_repos.0,
                 &repo_click_menu,
                 &PredefinedMenuItem::separator(),
                 &overlay.0,
@@ -301,6 +309,7 @@ impl Tray {
                 folder_icons,
                 watch,
                 github_prs,
+                github_repos,
             ],
             corner_menu,
             corners,

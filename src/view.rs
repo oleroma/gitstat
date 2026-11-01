@@ -2,7 +2,7 @@
 //! the normal window itself (`show_window`, `close_window`).
 
 use crate::git::RepoStatus;
-use crate::github::{Checks, Mergeable, Pr, PrState, Review};
+use crate::github::{Checks, Mergeable, Pr, PrState, RemoteRepo, Review};
 use crate::monitor::WatchMode;
 use crate::panel;
 use crate::state::{AppState, Input};
@@ -295,7 +295,12 @@ pub fn panel_rows(state: &AppState) -> usize {
     } else {
         usize::from(state.github_problem.is_some())
     };
-    repos + github
+    let remote = match state.remote_repos.len() {
+        0 => 0,
+        _ if state.remote_folded(false) => 1,
+        n => n + 1,
+    };
+    repos + github + remote
 }
 
 /// Opens a repo the way config's `repo_click` says: its folder, or its
@@ -577,6 +582,173 @@ fn pr_rows(
     out
 }
 
+/// One repo of the GitHub account that isn't cloned here; a click opens it
+/// on GitHub (and closes the panel, not the window). Only a browser link.
+fn remote_row(
+    index: usize,
+    r: &RemoteRepo,
+    p: &Palette,
+    mode: Mode,
+    icons_only: bool,
+) -> AnyElement {
+    let url = r.url.clone();
+    // (glyph, words, colour) for the right side and the tooltip.
+    let mut marks: Vec<(String, String, Hsla)> = Vec::new();
+    match r.checks {
+        Checks::Failing => marks.push(("✗".into(), "checks failing".into(), p.red)),
+        Checks::Pending => marks.push(("●".into(), "checks running".into(), p.amber)),
+        Checks::Passing => marks.push(("✓".into(), "checks pass".into(), p.green)),
+        Checks::None => {}
+    }
+    if r.open_prs > 0 {
+        let words = match r.open_prs {
+            1 => "1 open PR".to_string(),
+            n => format!("{n} open PRs"),
+        };
+        marks.push((format!("⇅{}", r.open_prs), words, p.text));
+    }
+    if r.private {
+        marks.push(("◆".into(), "private".into(), p.muted));
+    }
+    if r.fork {
+        marks.push(("⑂".into(), "fork".into(), p.muted));
+    }
+    let pushed = match r.pushed_at.get(..10) {
+        Some(day) => format!("last push {day}"),
+        None => "never pushed".to_string(),
+    };
+    let mut lines = vec![
+        (r.slug.clone(), p.text),
+        ("On GitHub, not cloned here".to_string(), p.muted),
+        (pushed.clone(), p.muted),
+    ];
+    if !r.default_branch.is_empty() {
+        lines.push((format!("default branch {}", r.default_branch), p.muted));
+    }
+    lines.extend(marks.iter().map(|(_, words, c)| (words.clone(), *c)));
+    let right =
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_2()
+            .text_sm()
+            .children(marks.iter().take(if icons_only { 4 } else { 2 }).map(
+                |(glyph, words, c)| {
+                    div().text_color(*c).child(if icons_only {
+                        glyph.clone()
+                    } else {
+                        words.clone()
+                    })
+                },
+            ));
+    div()
+        .id(("remote", index))
+        .flex()
+        .items_center()
+        .gap(px(10.))
+        .px_4()
+        .py(px(6.))
+        .cursor_pointer()
+        .hover(|style| style.bg(p.hover))
+        .tooltip(tip(lines, p))
+        .on_click(move |_, window, cx| {
+            cx.open_url(&url);
+            if mode == Mode::Panel {
+                panel::dismiss(window, cx);
+            }
+        })
+        // A dashed ring: a repo with no folder here.
+        .child(
+            div()
+                .flex_none()
+                .size(px(14.))
+                .rounded_full()
+                .border_1()
+                .border_dashed()
+                .border_color(p.muted),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_color(p.text)
+                .when(!icons_only, |d| d.child(r.slug.clone())),
+        )
+        .when(!icons_only, |d| {
+            d.child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(p.muted)
+                    .child(r.pushed_at.get(..10).unwrap_or("").to_string()),
+            )
+        })
+        .child(right)
+        .into_any_element()
+}
+
+/// The heading and rows of the account's repos that aren't cloned here, or
+/// the GitHub problem line when the pull requests aren't showing it.
+fn remote_rows(
+    remote: &[RemoteRepo],
+    problem: Option<&str>,
+    p: &Palette,
+    mode: Mode,
+    icons_only: bool,
+    fold: (bool, OnClick),
+) -> Vec<AnyElement> {
+    let mut out = Vec::new();
+    if remote.is_empty() {
+        if let Some(problem) = problem {
+            out.push(
+                div()
+                    .px_4()
+                    .py(px(6.))
+                    .border_t_1()
+                    .border_color(p.border)
+                    .text_xs()
+                    .text_color(p.muted)
+                    .truncate()
+                    .child(format!("GitHub repos: {problem}"))
+                    .into_any_element(),
+            );
+        }
+        return out;
+    }
+    let (folded, toggle) = fold;
+    let heading = format!("On GitHub, not cloned · {}", remote.len());
+    out.push(
+        div()
+            .id("remote-heading")
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_4()
+            .pt_3()
+            .pb_1()
+            .when(folded, |d| d.pb_3())
+            .border_t_1()
+            .border_color(p.border)
+            .text_xs()
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .text_color(p.muted)
+            .cursor_pointer()
+            .hover(|style| style.bg(p.hover))
+            .child(div().flex_1().min_w_0().truncate().child(heading))
+            .child(div().flex_none().child(if folded { "▸" } else { "▾" }))
+            .on_click(toggle)
+            .into_any_element(),
+    );
+    if !folded {
+        for (i, r) in remote.iter().enumerate() {
+            out.push(remote_row(i, r, p, mode, icons_only));
+        }
+    }
+    out
+}
+
 /// Big mode's pull request list at its tallest: the heading and about
 /// six rows.
 const WINDOW_PRS_HEIGHT: f32 = 230.;
@@ -762,6 +934,25 @@ impl Render for StatusView {
                 })
             })
         };
+        let fold_remote = |big: bool| -> OnClick {
+            let state = self.state.clone();
+            Box::new(move |_, _, cx| {
+                state.update(cx, |s, cx| {
+                    s.fold_remote(big);
+                    cx.notify();
+                })
+            })
+        };
+        let pr_problem = state
+            .github_problem
+            .as_deref()
+            .filter(|_| state.config.github_prs);
+        // The pull requests show a GitHub problem; without them, this does.
+        let remote_problem = if state.config.github_prs || !state.config.github_repos {
+            None
+        } else {
+            state.github_problem.as_deref()
+        };
         let mut rows: Vec<AnyElement> = Vec::new();
         match mode {
             // Without timelines (never, once the app is up) a plain list.
@@ -836,12 +1027,20 @@ impl Render for StatusView {
                 }
                 rows.extend(pr_rows(
                     &open_prs,
-                    state.github_problem.as_deref(),
+                    pr_problem,
                     &p,
                     mode,
                     icons_only,
                     Some((state.prs_folded(false), fold_prs(false))),
                     cx,
+                ));
+                rows.extend(remote_rows(
+                    &state.remote_repos,
+                    remote_problem,
+                    &p,
+                    mode,
+                    icons_only,
+                    (state.remote_folded(false), fold_remote(false)),
                 ));
             }
         }
@@ -910,15 +1109,24 @@ impl Render for StatusView {
         // high, scrolling when there are more.
         let window_prs = (mode == Mode::Window)
             .then(|| {
-                pr_rows(
+                let mut rows = pr_rows(
                     &open_prs,
-                    state.github_problem.as_deref(),
+                    pr_problem,
                     &p,
                     mode,
                     false,
                     Some((state.prs_folded(true), fold_prs(true))),
                     cx,
-                )
+                );
+                rows.extend(remote_rows(
+                    &state.remote_repos,
+                    remote_problem,
+                    &p,
+                    mode,
+                    false,
+                    (state.remote_folded(true), fold_remote(true)),
+                ));
+                rows
             })
             .filter(|rows| !rows.is_empty())
             .map(|rows| {

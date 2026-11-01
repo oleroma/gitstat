@@ -180,9 +180,19 @@ fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
                 changed = true;
             }
             Input::Github(report) => {
-                // A poll that was under way when the option went off.
-                if state.read(cx).config.github_prs {
-                    state.update(cx, |s, _| s.github_report(report));
+                let c = &state.read(cx).config;
+                if c.github_prs || c.github_repos {
+                    state.update(cx, |s, _| {
+                        let (prs, repos) = (s.config.github_prs, s.config.github_repos);
+                        s.github_report(report);
+                        // A poll that was under way when one option went off.
+                        if !prs {
+                            s.prs.clear();
+                        }
+                        if !repos {
+                            s.remote_repos.clear();
+                        }
+                    });
                     prs_stale = true;
                     changed = true;
                 }
@@ -484,14 +494,21 @@ fn apply_config(old: &Config, new: Config, cx: &mut App) {
             .icons
             .sync(statuses, new.folder_icons, new.folder_icon_mode);
     }
-    shared.github.settings(new.github_prs, new.interval());
+    let wants = crate::github::Wants {
+        prs: new.github_prs,
+        remote_repos: new.github_repos,
+    };
+    shared.github.settings(wants, new.interval());
     shared.tray.sync_settings(&new);
+    if !new.github_repos {
+        state.update(cx, |s, _| s.remote_repos.clear());
+    }
     if !new.github_prs {
-        state.update(cx, |s, _| {
-            s.prs.clear();
-            s.github_problem = None;
-        });
+        state.update(cx, |s, _| s.prs.clear());
         sync_pr_colors(cx);
+    }
+    if !new.github_prs && !new.github_repos {
+        state.update(cx, |s, _| s.github_problem = None);
     }
 }
 

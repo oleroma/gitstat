@@ -104,6 +104,9 @@ pub struct Config {
     /// Open pull requests from GitHub in the panel, read through the `gh`
     /// CLI every interval.
     pub github_prs: bool,
+    /// The signed-in GitHub account's repos (and its organisations') that
+    /// aren't cloned under `path`, read through the `gh` CLI every interval.
+    pub github_repos: bool,
     /// What clicking a repo opens: its folder or its GitHub page.
     pub repo_click: RepoClick,
 }
@@ -122,6 +125,7 @@ impl Default for Config {
             folder_icons: false,
             folder_icon_mode: FolderIconMode::default(),
             github_prs: true,
+            github_repos: true,
             repo_click: RepoClick::default(),
         }
     }
@@ -410,6 +414,14 @@ mod tests {
             assert_eq!(serde_json::from_str::<Corner>(text).unwrap(), corner);
         }
         assert!(serde_json::from_str::<Corner>("\"BottomRight\"").is_err());
+    }
+
+    #[test]
+    fn github_repos_default_on() {
+        let parse = |text: &str| serde_json::from_str::<Config>(text);
+        assert!(Config::default().github_repos);
+        assert!(parse("{}").unwrap().github_repos);
+        assert!(!parse(r#"{ "github_repos": false }"#).unwrap().github_repos);
     }
 
     #[test]

@@ -6,6 +6,10 @@
 //! read (`git remote get-url origin`). GraphQL reads go out as a POST to
 //! `/graphql`; that is how GitHub's GraphQL API takes every request.
 //!
+//! It also lists the signed-in account's own repos (and its organisations'),
+//! so the app can show the ones not cloned under the watched folder. That is
+//! one more read-only `query` per poll, a page of 100 repos at a time.
+//!
 //! The poller thread asks again every sweep interval and when the refresh
 //! button is pressed, and reports every repo's pull requests at once.
 
@@ -28,6 +32,8 @@ const MAX_OPEN: usize = 30;
 /// Merged and closed ones, for the graph's colours.
 const MAX_DONE: usize = 30;
 const GH_TIMEOUT: Duration = Duration::from_secs(45);
+/// Pages of 100 account repos read per poll, at most.
+const MAX_REPO_PAGES: usize = 10;
 /// A new repo list waits this long for more changes before a poll.
 const SETTLE: Duration = Duration::from_secs(3);
 
@@ -97,6 +103,22 @@ impl Pr {
     }
 }
 
+/// A repo of the signed-in account (or one of its organisations) on GitHub.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteRepo {
+    /// `owner/name`.
+    pub slug: String,
+    pub url: String,
+    pub private: bool,
+    pub fork: bool,
+    /// ISO 8601 of the last push, empty when never pushed.
+    pub pushed_at: String,
+    pub default_branch: String,
+    /// The default branch's latest commit's combined checks.
+    pub checks: Checks,
+    pub open_prs: u64,
+}
+
 /// One poll's result.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Report {
@@ -107,11 +129,30 @@ pub struct Report {
     /// Why nothing could be read: `gh` missing or signed out. Repos whose
     /// earlier pull requests are still worth showing are kept by the app.
     pub problem: Option<String>,
+    /// The account's repos with no clone among the polled repos, most
+    /// recently pushed first. `None` when not asked for, or when they
+    /// couldn't be read (then the app keeps the last list).
+    pub remote_only: Option<Vec<RemoteRepo>>,
+}
+
+/// What a poll reads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Wants {
+    /// Pull requests of the cloned repos.
+    pub prs: bool,
+    /// The account's repos that aren't cloned here.
+    pub remote_repos: bool,
+}
+
+impl Wants {
+    fn any(self) -> bool {
+        self.prs || self.remote_repos
+    }
 }
 
 enum Cmd {
     Repos(Vec<PathBuf>),
-    Settings { enabled: bool, every: Duration },
+    Settings { wants: Wants, every: Duration },
     Refresh,
     Shutdown,
 }
@@ -134,8 +175,8 @@ impl Poller {
         let _ = self.tx.send(Cmd::Repos(repos));
     }
 
-    pub fn settings(&self, enabled: bool, every: Duration) {
-        let _ = self.tx.send(Cmd::Settings { enabled, every });
+    pub fn settings(&self, wants: Wants, every: Duration) {
+        let _ = self.tx.send(Cmd::Settings { wants, every });
     }
 
     pub fn refresh(&self) {
@@ -152,7 +193,7 @@ impl Drop for Poller {
 
 fn run(rx: mpsc::Receiver<Cmd>, sink: impl Fn(Report)) {
     let mut repos: Vec<PathBuf> = Vec::new();
-    let mut enabled = false;
+    let mut wants = Wants::default();
     let mut every = Duration::from_secs(5 * 60);
     let mut next: Option<Instant> = None;
     loop {
@@ -164,18 +205,16 @@ fn run(rx: mpsc::Receiver<Cmd>, sink: impl Fn(Report)) {
             Ok(Cmd::Repos(r)) => {
                 let grew = r.iter().any(|p| !repos.contains(p));
                 repos = r;
-                if enabled && grew {
+                if wants.any() && grew {
                     next = Some(Instant::now() + SETTLE);
                 }
             }
-            Ok(Cmd::Settings {
-                enabled: on,
-                every: e,
-            }) => {
-                let turned_on = on && !enabled;
-                enabled = on;
+            Ok(Cmd::Settings { wants: w, every: e }) => {
+                // Something newly asked for is read right away.
+                let turned_on = (w.prs && !wants.prs) || (w.remote_repos && !wants.remote_repos);
+                wants = w;
                 every = e;
-                next = if !enabled {
+                next = if !wants.any() {
                     // Off: the app clears what it shows.
                     None
                 } else if turned_on {
@@ -184,11 +223,11 @@ fn run(rx: mpsc::Receiver<Cmd>, sink: impl Fn(Report)) {
                     next.map(|at| at.min(Instant::now() + every))
                 };
             }
-            Ok(Cmd::Refresh) if enabled => next = Some(Instant::now()),
+            Ok(Cmd::Refresh) if wants.any() => next = Some(Instant::now()),
             Ok(Cmd::Refresh) => {}
             Ok(Cmd::Shutdown) | Err(RecvTimeoutError::Disconnected) => return,
             Err(RecvTimeoutError::Timeout) => {
-                sink(poll(&repos));
+                sink(poll(&repos, wants));
                 next = Some(Instant::now() + every);
             }
         }
@@ -201,12 +240,29 @@ fn slug(repo: &Path) -> Option<String> {
     web.strip_prefix("https://github.com/").map(str::to_string)
 }
 
-fn poll(repos: &[PathBuf]) -> Report {
+fn poll(repos: &[PathBuf], wants: Wants) -> Report {
     let targets: Vec<(PathBuf, String)> = repos
         .iter()
         .filter_map(|r| slug(r).map(|s| (r.clone(), s)))
         .collect();
     let mut report = Report::default();
+    // Before the first discovery every repo would look not cloned.
+    if wants.remote_repos && !repos.is_empty() {
+        match account_repos() {
+            Ok(all) => {
+                let cloned: Vec<&str> = targets.iter().map(|(_, s)| s.as_str()).collect();
+                report.remote_only = Some(not_cloned(all, &cloned));
+            }
+            Err(e) => {
+                // Signed out or offline: the pull requests would fail alike.
+                report.problem = Some(e);
+                return report;
+            }
+        }
+    }
+    if !wants.prs {
+        return report;
+    }
     for batch in targets.chunks(BATCH) {
         let slugs: Vec<&str> = batch.iter().map(|(_, s)| s.as_str()).collect();
         match gh_graphql(&query(&slugs)) {
@@ -224,6 +280,102 @@ fn poll(repos: &[PathBuf]) -> Report {
         }
     }
     report
+}
+
+/// Every repo the signed-in account owns or reaches through an
+/// organisation it belongs to, archived ones left out, a page at a time.
+fn account_repos() -> Result<Vec<RemoteRepo>, String> {
+    let mut all = Vec::new();
+    let mut after: Option<String> = None;
+    for _ in 0..MAX_REPO_PAGES {
+        let json = gh_graphql(&repos_query(after.as_deref()))?;
+        let (page, next) = parse_repos(&json);
+        all.extend(page);
+        match next {
+            Some(cursor) => after = Some(cursor),
+            None => break,
+        }
+    }
+    Ok(all)
+}
+
+/// The account's repos that aren't among `cloned` (`owner/name`, matched
+/// ignoring case as GitHub does), most recently pushed first.
+fn not_cloned(all: Vec<RemoteRepo>, cloned: &[&str]) -> Vec<RemoteRepo> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<RemoteRepo> = all
+        .into_iter()
+        .filter(|r| !cloned.iter().any(|c| c.eq_ignore_ascii_case(&r.slug)))
+        .filter(|r| seen.insert(r.slug.to_lowercase()))
+        .collect();
+    out.sort_by(|a, b| b.pushed_at.cmp(&a.pushed_at));
+    out
+}
+
+/// One page of the account's repos, after `cursor`. A read-only `query`.
+fn repos_query(cursor: Option<&str>) -> String {
+    // Cursors are base64-ish; anything else is dropped rather than quoted.
+    let after = cursor
+        .filter(|c| {
+            c.bytes().all(|b| {
+                b.is_ascii_alphanumeric() || matches!(b, b'=' | b'+' | b'/' | b'-' | b'_' | b':')
+            })
+        })
+        .map(|c| format!(",after:\"{c}\""))
+        .unwrap_or_default();
+    format!(
+        "query{{viewer{{repositories(first:100{after},\
+         ownerAffiliations:[OWNER,ORGANIZATION_MEMBER],isArchived:false,\
+         orderBy:{{field:PUSHED_AT,direction:DESC}}){{\
+         pageInfo{{hasNextPage endCursor}}\
+         nodes{{nameWithOwner url isPrivate isFork pushedAt \
+         pullRequests(states:OPEN){{totalCount}} \
+         defaultBranchRef{{name target{{...on Commit{{statusCheckRollup{{state}}}}}}}}}}}}}}}}"
+    )
+}
+
+/// A page of repos and the cursor of the next page, if there is one.
+fn parse_repos(json: &Value) -> (Vec<RemoteRepo>, Option<String>) {
+    let repos = &json["data"]["viewer"]["repositories"];
+    let page = repos["nodes"]
+        .as_array()
+        .map(|nodes| nodes.iter().filter_map(parse_repo).collect())
+        .unwrap_or_default();
+    let info = &repos["pageInfo"];
+    let next = info["hasNextPage"]
+        .as_bool()
+        .unwrap_or(false)
+        .then(|| info["endCursor"].as_str().map(str::to_string))
+        .flatten();
+    (page, next)
+}
+
+fn parse_repo(n: &Value) -> Option<RemoteRepo> {
+    let s = |v: &Value| v.as_str().unwrap_or("").to_string();
+    let slug = n["nameWithOwner"].as_str()?.to_string();
+    let branch = &n["defaultBranchRef"];
+    Some(RemoteRepo {
+        url: n["url"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("https://github.com/{slug}")),
+        slug,
+        private: n["isPrivate"].as_bool().unwrap_or(false),
+        fork: n["isFork"].as_bool().unwrap_or(false),
+        pushed_at: s(&n["pushedAt"]),
+        default_branch: s(&branch["name"]),
+        checks: checks(branch["target"]["statusCheckRollup"]["state"].as_str()),
+        open_prs: n["pullRequests"]["totalCount"].as_u64().unwrap_or(0),
+    })
+}
+
+fn checks(state: Option<&str>) -> Checks {
+    match state {
+        Some("SUCCESS") => Checks::Passing,
+        Some("FAILURE" | "ERROR") => Checks::Failing,
+        Some("PENDING" | "EXPECTED") => Checks::Pending,
+        _ => Checks::None,
+    }
 }
 
 fn gh_graphql(query: &str) -> Result<Value, String> {
@@ -339,12 +491,7 @@ fn parse_pr(n: &Value, viewer: &str) -> Option<Pr> {
         Some("CONFLICTING") => Mergeable::Conflicts,
         _ => Mergeable::Unknown,
     };
-    let checks = match n["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["state"].as_str() {
-        Some("SUCCESS") => Checks::Passing,
-        Some("FAILURE" | "ERROR") => Checks::Failing,
-        Some("PENDING" | "EXPECTED") => Checks::Pending,
-        _ => Checks::None,
-    };
+    let checks = checks(n["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["state"].as_str());
     let review_requested = !viewer.is_empty()
         && n["reviewRequests"]["nodes"].as_array().is_some_and(|a| {
             a.iter()
@@ -483,6 +630,70 @@ mod tests {
             .map(|(_, p)| p.number)
             .collect();
         assert_eq!(order, [4, 3, 6, 1, 2]);
+    }
+
+    #[test]
+    fn repos_query_is_read_only_and_pages() {
+        for q in [repos_query(None), repos_query(Some("Y3Vyc29yOjEwMA=="))] {
+            assert!(q.starts_with("query{"));
+            assert!(!q.to_lowercase().contains("mutation"));
+            assert_eq!(q.matches('{').count(), q.matches('}').count());
+        }
+        assert!(!repos_query(None).contains("after:"));
+        assert!(repos_query(Some("Y3Vyc29yOjEwMA==")).contains(",after:\"Y3Vyc29yOjEwMA==\""));
+        // Anything that could break out of the string is dropped.
+        assert!(!repos_query(Some("x\"){evil}")).contains("after:"));
+    }
+
+    fn repo_node(slug: &str, pushed: &str) -> Value {
+        json!({
+            "nameWithOwner": slug, "url": format!("https://github.com/{slug}"),
+            "isPrivate": true, "isFork": false, "pushedAt": pushed,
+            "pullRequests": {"totalCount": 2},
+            "defaultBranchRef": {"name": "main",
+                "target": {"statusCheckRollup": {"state": "FAILURE"}}}
+        })
+    }
+
+    #[test]
+    fn parses_account_repos_and_pages() {
+        let json = json!({"data": {"viewer": {"repositories": {
+            "pageInfo": {"hasNextPage": true, "endCursor": "abc"},
+            "nodes": [repo_node("o/a", "2026-10-01T00:00:00Z"), {"url": "no name"},
+                      {"nameWithOwner": "o/empty", "defaultBranchRef": null}]
+        }}}});
+        let (page, next) = parse_repos(&json);
+        assert_eq!(next.as_deref(), Some("abc"));
+        assert_eq!(page.len(), 2);
+        let a = &page[0];
+        assert_eq!(a.slug, "o/a");
+        assert!(a.private && !a.fork);
+        assert_eq!(a.default_branch, "main");
+        assert_eq!(a.checks, Checks::Failing);
+        assert_eq!(a.open_prs, 2);
+        let empty = &page[1];
+        assert_eq!(empty.url, "https://github.com/o/empty");
+        assert_eq!(empty.checks, Checks::None);
+        assert_eq!(empty.pushed_at, "");
+
+        let last = json!({"data": {"viewer": {"repositories": {
+            "pageInfo": {"hasNextPage": false, "endCursor": "def"}, "nodes": []
+        }}}});
+        assert_eq!(parse_repos(&last), (Vec::new(), None));
+    }
+
+    #[test]
+    fn not_cloned_drops_clones_ignoring_case_and_sorts_newest_first() {
+        let all = ["o/Old", "o/cloned", "o/new", "o/new"]
+            .iter()
+            .zip(["2026-01", "2026-05", "2026-09", "2026-09"])
+            .map(|(s, at)| parse_repo(&repo_node(s, at)).unwrap())
+            .collect();
+        let left: Vec<String> = not_cloned(all, &["O/Cloned"])
+            .into_iter()
+            .map(|r| r.slug)
+            .collect();
+        assert_eq!(left, ["o/new", "o/Old"]);
     }
 
     #[test]

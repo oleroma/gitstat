@@ -164,6 +164,20 @@ token. It asks again every `interval_minutes` and on the refresh button, in
 one GraphQL query per 20 repos. Like everything in gitstat this only reads:
 nothing on GitHub or in the repos is ever changed.
 
+### GitHub repos not cloned here
+
+**Display ▸ GitHub repos not cloned here** (`"github_repos": true`, on by
+default) lists, under the pull requests, every repo of the account `gh` is
+signed in to, and of its organisations, that has no clone under `path`
+(archived repos are left out). A clone counts when its `origin` points at
+the repo on GitHub. The list starts folded; each row shows the repo's name,
+its last push, the checks on its default branch, its open pull requests and
+whether it is private or a fork. Click to open it in the browser.
+
+It is read through `gh` like the pull requests, in one more read-only GraphQL
+query per 100 repos, every `interval_minutes` and on the refresh button.
+gitstat never clones anything.
+
 ## Which repos
 
 gitstat looks in `path` and up to `depth` folder levels below it (3 by
@@ -249,6 +263,7 @@ from an older version keeps working:
   "folder_icons": false,
   "folder_icon_mode": "status",
   "github_prs": true,
+  "github_repos": true,
   "repo_click": "folder"
 }
 ```
@@ -272,6 +287,7 @@ from an older version keeps working:
 | `folder_icons` | false | Status icons on the repo folders, see above. Setting it by hand skips the confirmation. |
 | `folder_icon_mode` | `status` | `status` for the status folders, `repo-svg` for each repo's own `.gitstat/icon.svg` where it has one, see [Repo icons](#repo-icons). Only matters while `folder_icons` is on. |
 | `github_prs` | true | **Display ▸ GitHub pull requests**: open pull requests in the panel and big mode, read through `gh`, see [GitHub pull requests](#github-pull-requests). |
+| `github_repos` | true | **Display ▸ GitHub repos not cloned here**: the signed-in account's GitHub repos with no clone under `path`, read through `gh`, see [GitHub repos not cloned here](#github-repos-not-cloned-here). |
 | `repo_click` | `folder` | **Display ▸ Repo click opens**: what a click on a repo (its name in big mode, or in the menu) opens. `folder` for its folder, `github` for its GitHub page; a repo whose `origin` isn't on GitHub opens its folder either way. |
 
 Edits apply within about a second, without a restart. **Edit config.json** in
