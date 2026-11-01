@@ -1,6 +1,6 @@
 //! The notification-area icon and its right-click menu.
 
-use crate::config::{ClickAction, Config, Corner, FolderIconMode};
+use crate::config::{ClickAction, Config, Corner, FolderIconMode, RepoClick};
 use crate::git::RepoStatus;
 use crate::icon::{self, Badge};
 use crate::layout;
@@ -53,6 +53,7 @@ pub enum TrayAction {
     Toggle(Setting),
     SetCorner(Corner),
     SetFolderIconMode(FolderIconMode),
+    SetRepoClick(RepoClick),
     SetAutostart(bool),
     Quit,
 }
@@ -109,6 +110,11 @@ const CORNERS: [(Corner, &str); 4] = [
     (Corner::BottomRight, "Bottom right"),
 ];
 
+const REPO_CLICKS: [(RepoClick, &str); 2] = [
+    (RepoClick::Folder, "Folder"),
+    (RepoClick::Github, "GitHub page"),
+];
+
 const FOLDER_ICON_MODES: [(FolderIconMode, &str); 2] = [
     (FolderIconMode::Status, "Status folder"),
     (FolderIconMode::RepoSvg, "Repo icon"),
@@ -139,6 +145,7 @@ pub struct Tray {
     corners: Vec<(CheckMenuItem, Corner)>,
     folder_icon_menu: Submenu,
     folder_icon_modes: Vec<(CheckMenuItem, FolderIconMode)>,
+    repo_clicks: Vec<(CheckMenuItem, RepoClick)>,
     autostart: CheckMenuItem,
     edit_config: MenuItem,
     quit: MenuItem,
@@ -206,6 +213,18 @@ impl Tray {
             folder_icon_menu.append(item).map_err(|e| e.to_string())?;
         }
 
+        let repo_click_menu = Submenu::new("Repo click opens", true);
+        let repo_clicks: Vec<(CheckMenuItem, RepoClick)> = REPO_CLICKS
+            .iter()
+            .map(|&(click, label)| {
+                let on = click == defaults.repo_click;
+                (CheckMenuItem::new(label, true, on, None), click)
+            })
+            .collect();
+        for (item, _) in &repo_clicks {
+            repo_click_menu.append(item).map_err(|e| e.to_string())?;
+        }
+
         let display = Submenu::new("Display", true);
         display
             .append_items(&[
@@ -213,6 +232,7 @@ impl Tray {
                 &window.0,
                 &icons_only.0,
                 &github_prs.0,
+                &repo_click_menu,
                 &PredefinedMenuItem::separator(),
                 &overlay.0,
                 &corner_menu,
@@ -286,6 +306,7 @@ impl Tray {
             corners,
             folder_icon_menu,
             folder_icon_modes,
+            repo_clicks,
             autostart,
             edit_config,
             quit,
@@ -427,6 +448,11 @@ impl Tray {
             // Like the corners: exactly one stays checked.
             self.check_folder_icon_mode(*mode);
             Some(TrayAction::SetFolderIconMode(*mode))
+        } else if let Some((_, click)) = self.repo_clicks.iter().find(|(item, _)| item.id() == id) {
+            for (item, c) in &self.repo_clicks {
+                set_checked(item, c == click);
+            }
+            Some(TrayAction::SetRepoClick(*click))
         } else {
             self.repos
                 .iter()
@@ -461,6 +487,9 @@ impl Tray {
         }
         self.check_corner(cfg.overlay.corner);
         self.check_folder_icon_mode(cfg.folder_icon_mode);
+        for (item, c) in &self.repo_clicks {
+            set_checked(item, *c == cfg.repo_click);
+        }
         self.folder_icon_menu.set_enabled(cfg.folder_icons);
 
         let badge = cfg.overlay.enabled;

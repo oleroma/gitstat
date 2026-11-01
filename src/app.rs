@@ -355,7 +355,7 @@ fn on_action(action: TrayAction, cx: &mut App) -> bool {
         }
         TrayAction::ShowWindow => view::show_window(cx),
         TrayAction::Refresh => cx.global::<Shared>().monitor.send(Command::RefreshAll),
-        TrayAction::OpenRepo(path) => cx.open_with_system(&path),
+        TrayAction::OpenRepo(path) => view::open_repo(&path, cx),
         TrayAction::EditConfig => {
             let file = cx.global::<Ui>().state.read(cx).config_file.clone();
             cx.open_with_system(&file);
@@ -372,6 +372,7 @@ fn on_action(action: TrayAction, cx: &mut App) -> bool {
             cx,
         ),
         TrayAction::SetFolderIconMode(mode) => change_setting(|c| c.folder_icon_mode = mode, cx),
+        TrayAction::SetRepoClick(click) => change_setting(|c| c.repo_click = click, cx),
         TrayAction::SetAutostart(enabled) => {
             if let Err(e) = crate::autostart::set_enabled(enabled) {
                 crate::error_box(format!("Couldn't change the startup setting: {e}"));

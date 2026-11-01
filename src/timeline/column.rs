@@ -507,7 +507,7 @@ fn header(
         .border_color(p.border)
         .cursor_pointer()
         .hover(|s| s.bg(p.hover))
-        .on_click(move |_, _, cx| cx.open_with_system(&open))
+        .on_click(move |_, _, cx| crate::view::open_repo(&open, cx))
         .child(
             div()
                 .flex()

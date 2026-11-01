@@ -299,6 +299,25 @@ pub fn panel_rows(state: &AppState, show_synced: bool) -> usize {
     repos + github
 }
 
+/// Opens a repo the way config's `repo_click` says: its folder, or its
+/// GitHub page (the folder when it has none). Only opens; changes nothing.
+pub fn open_repo(path: &std::path::Path, cx: &mut App) {
+    let github = cx
+        .try_global::<Ui>()
+        .is_some_and(|ui| ui.state.read(cx).config.repo_click == crate::config::RepoClick::Github);
+    if github {
+        let web = cx
+            .try_global::<Ui>()
+            .and_then(|ui| ui.timelines.read(cx).web(path))
+            .or_else(|| crate::repo_info::origin_web(path));
+        if let Some(web) = web {
+            cx.open_url(&web);
+            return;
+        }
+    }
+    cx.open_with_system(path);
+}
+
 fn refresh(cx: &mut App) {
     if let Some(refresh) = cx.try_global::<Ui>().map(|ui| ui.refresh.clone()) {
         refresh(cx);
@@ -341,7 +360,7 @@ fn repo_row(index: usize, s: &RepoStatus, p: &Palette, mode: Mode, cx: &App) -> 
         .cursor_pointer()
         .hover(|style| style.bg(p.hover))
         .on_click(move |_, window, cx| {
-            cx.open_with_system(&path);
+            open_repo(&path, cx);
             if mode == Mode::Panel {
                 panel::dismiss(window, cx);
             }
@@ -969,9 +988,17 @@ impl Render for StatusView {
                         .truncate()
                         .when_some(capped.clone(), |d, _| d.text_color(p.amber))
                         .child(capped.unwrap_or_else(|| {
-                            "Click a repo's name to open its folder. Wheel scrolls a column, \
-                             Shift+wheel the table."
-                                .into()
+                            match state.config.repo_click {
+                                crate::config::RepoClick::Folder => {
+                                    "Click a repo's name to open its folder. Wheel scrolls a \
+                                     column, Shift+wheel the table."
+                                }
+                                crate::config::RepoClick::Github => {
+                                    "Click a repo's name to open it on GitHub. Wheel scrolls a \
+                                     column, Shift+wheel the table."
+                                }
+                            }
+                            .into()
                         })),
                 )
                 .child(edit_config),

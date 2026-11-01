@@ -13,7 +13,6 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
 use crate::git;
-use crate::repo_info::github_web;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -198,11 +197,7 @@ fn run(rx: mpsc::Receiver<Cmd>, sink: impl Fn(Report)) {
 
 /// `owner/name` of a repo's GitHub `origin`, read without changing anything.
 fn slug(repo: &Path) -> Option<String> {
-    let out = git::git(repo, &["remote", "get-url", "origin"], git::LOCAL_TIMEOUT).ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let web = github_web(String::from_utf8_lossy(&out.stdout).trim())?;
+    let web = crate::repo_info::origin_web(repo)?;
     web.strip_prefix("https://github.com/").map(str::to_string)
 }
 

@@ -251,6 +251,11 @@ impl Timelines {
         }
     }
 
+    /// The repo's GitHub page, once its graph has loaded.
+    pub fn web(&self, path: &Path) -> Option<String> {
+        self.slots.get(path)?.graph.as_ref()?.info.web.clone()
+    }
+
     /// Sets the PR states `path`'s graph colours its branches by. Cheap
     /// when nothing changed, so it can be called on every PR refresh.
     pub fn set_prs(&mut self, path: &Path, prs: PrColors, cx: &mut Context<Self>) {
@@ -753,7 +758,7 @@ impl Timelines {
                     this_for_label.update(cx, |t, _| t.focus(&open_path));
                     crate::view::show_window(cx);
                 } else {
-                    cx.open_with_system(&open_path);
+                    crate::view::open_repo(&open_path, cx);
                 }
             });
         let label = if icons_only {

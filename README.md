@@ -248,7 +248,8 @@ from an older version keeps working:
   },
   "folder_icons": false,
   "folder_icon_mode": "status",
-  "github_prs": true
+  "github_prs": true,
+  "repo_click": "folder"
 }
 ```
 
@@ -270,7 +271,8 @@ from an older version keeps working:
 | `overlay.hide_in_fullscreen` | true | Hide the badge while a fullscreen app or a presentation runs. |
 | `folder_icons` | false | Status icons on the repo folders, see above. Setting it by hand skips the confirmation. |
 | `folder_icon_mode` | `status` | `status` for the status folders, `repo-svg` for each repo's own `.gitstat/icon.svg` where it has one, see [Repo icons](#repo-icons). Only matters while `folder_icons` is on. |
-| `github_prs` | true | **Display ▸ GitHub pull requests**: open pull requests in the panel, read through `gh`, see [GitHub pull requests](#github-pull-requests). |
+| `github_prs` | true | **Display ▸ GitHub pull requests**: open pull requests in the panel and big mode, read through `gh`, see [GitHub pull requests](#github-pull-requests). |
+| `repo_click` | `folder` | **Display ▸ Repo click opens**: what a click on a repo (its name in big mode, or in the menu) opens. `folder` for its folder, `github` for its GitHub page; a repo whose `origin` isn't on GitHub opens its folder either way. |
 
 Edits apply within about a second, without a restart. **Edit config.json** in
 the menu or the panel opens the file. The menu's toggles write the file too;
