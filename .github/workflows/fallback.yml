@@ -1,56 +1,28 @@
 name: Fallback build
 
-# Run by hand on a feature branch when Olex's PC can't be reached (AGENTS.md step 3):
+# The fallback for a PC build (AGENTS.md step 3), started by agent-build ci on a feature branch:
 #   gh workflow run fallback.yml --ref <branch>
-# agent-merge runs it with -f mode=check to run the full checks on the branch before merging.
-# It runs the quick tests, builds, and saves the build file on the run, unzipped.
-# On a push to main (a feature merged after Olex's OK) it runs the full checks only and builds nothing.
-# Both use the repo's hooks in .agents/hooks/, the same ones PC builds run.
-# gitstat.exe builds only on Windows, so builds and branch checks run there; the Linux job
-# checks main and the platform-neutral code.
+# It does what a PC build does, with the same hooks in .agents/hooks/: quick tests, build,
+# full checks. When the full checks pass it marks the commit checked, as PC builds do.
+# Each build file is saved on the run unzipped. It never runs on a push.
+# gitstat.exe builds only on Windows, so everything runs there.
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
-    inputs:
-      mode:
-        description: "build: quick tests and build files; check: the full checks only (agent-merge)"
-        type: choice
-        options: [build, check]
-        default: build
 
 permissions:
-  contents: read
+  contents: write # the build number step pushes a build/<n> tag
+  statuses: write # marks the commit checked
 
-# A newer push to main cancels the older check still running; runs started by hand are never cancelled.
 concurrency:
-  group: fallback-${{ github.ref }}-${{ github.event_name }}-${{ inputs.mode }}
-  cancel-in-progress: ${{ github.event_name == 'push' }}
+  group: fallback-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  linux:
-    if: github.event_name == 'push' || inputs.mode == 'check'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      # Branch runs save the cache too, so the next run on the branch reuses its work.
-      # Runs on main only read it, so main doesn't fill the repo's cache space.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: ". -> build/target"
-          save-if: ${{ github.event_name != 'push' }}
-
-      - name: Full checks
-        run: bash .agents/hooks/full-check
-
   windows:
-    if: github.event_name != 'push'
     runs-on: windows-latest
-    permissions:
-      contents: write # the build number step pushes a build/<n> tag
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -61,19 +33,13 @@ jobs:
           workspaces: ". -> build/target"
 
       - name: Quick tests
-        if: inputs.mode != 'check'
-        shell: bash
         run: bash .agents/hooks/quick-test
 
       - name: Build number
-        if: inputs.mode != 'check'
-        shell: bash
         run: n="$(bash .agents/build-number)" && echo "BUILD_NUMBER=$n" >> "$GITHUB_ENV"
 
       - name: Build
         id: build
-        if: inputs.mode != 'check'
-        shell: bash
         run: |
           set -o pipefail
           bash .agents/hooks/build | tee "$RUNNER_TEMP/build.out"
@@ -81,26 +47,15 @@ jobs:
           echo "file=$file" >> "$GITHUB_OUTPUT"
           echo "$(basename "$file")  SHA-256 \`$(sha256sum "$file" | cut -d' ' -f1)\`" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Full checks
-        if: inputs.mode == 'check'
-        shell: bash
-        run: bash .agents/hooks/full-check
-
       # Saved on the run as the plain file, not a zip, so the download link gives the file itself.
       - uses: actions/upload-artifact@v7
-        if: inputs.mode != 'check'
         with:
           path: ${{ steps.build.outputs.file }}
           archive: false
 
-  # Marks the commit checked once both jobs pass, so agent-merge can skip a second run.
-  mark-checked:
-    if: inputs.mode == 'check'
-    needs: [linux, windows]
-    runs-on: ubuntu-latest
-    permissions:
-      statuses: write
-    steps:
+      - name: Full checks
+        run: bash .agents/hooks/full-check
+
       - name: Mark the commit checked
         env:
           GH_TOKEN: ${{ github.token }}
