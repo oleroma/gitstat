@@ -452,6 +452,93 @@ pub fn hue(name: &str, n: usize) -> usize {
     (h as usize) % n.max(1)
 }
 
+/// A GitHub pull request's state, for colouring the branch it is from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+// Built by the GitHub PR polling once it lands.
+#[allow(dead_code)]
+pub enum PrState {
+    Open,
+    Draft,
+    Merged,
+    Closed,
+}
+
+impl PrState {
+    /// Which state a branch with several PRs shows: the live one first.
+    fn rank(self) -> u8 {
+        match self {
+            PrState::Open => 0,
+            PrState::Draft => 1,
+            PrState::Merged => 2,
+            PrState::Closed => 3,
+        }
+    }
+
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn label(self) -> &'static str {
+        match self {
+            PrState::Open => "PR open",
+            PrState::Draft => "PR draft",
+            PrState::Merged => "PR merged",
+            PrState::Closed => "PR closed",
+        }
+    }
+}
+
+/// The PR state of each branch that has a PR, by the PR's head branch.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PrColors {
+    by_branch: HashMap<String, PrState>,
+}
+
+impl PrColors {
+    /// From each PR's head branch name and state. A branch with several
+    /// PRs shows open over draft over merged over closed.
+    // Called by the GitHub PR polling once it lands.
+    #[allow(dead_code)]
+    pub fn from_prs<'a>(prs: impl IntoIterator<Item = (&'a str, PrState)>) -> Self {
+        let mut by_branch: HashMap<String, PrState> = HashMap::new();
+        for (branch, state) in prs {
+            by_branch
+                .entry(branch.to_string())
+                .and_modify(|s| {
+                    if state.rank() < s.rank() {
+                        *s = state;
+                    }
+                })
+                .or_insert(state);
+        }
+        Self { by_branch }
+    }
+
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn is_empty(&self) -> bool {
+        self.by_branch.is_empty()
+    }
+
+    /// The PR state for a layout branch: a local `feature` or the
+    /// remote-tracking `origin/feature`.
+    pub fn of(&self, branch: &str) -> Option<PrState> {
+        if self.by_branch.is_empty() {
+            return None;
+        }
+        let name = branch.strip_prefix("origin/").unwrap_or(branch);
+        self.by_branch.get(name).copied()
+    }
+
+    /// The PR state that colours `node`, if any. Unpushed, unpulled,
+    /// trunk and merged commits keep their own colour: a PR only colours
+    /// the commits that are still just on its branch.
+    pub fn of_node(&self, node: &Node, branches: &[String]) -> Option<PrState> {
+        if node.class != Class::Branch {
+            return None;
+        }
+        node.branch
+            .and_then(|b| branches.get(b))
+            .and_then(|name| self.of(name))
+    }
+}
+
 /// A point in the view, in pixels.
 pub type Point = (f32, f32);
 
@@ -680,6 +767,29 @@ mod tests {
         assert_eq!(branch(3), None);
         // Where topic and main meet, HEAD's lane keeps the commit.
         assert_eq!(branch(5), Some("main"));
+
+        // A PR on topic colours only topic's own commit.
+        let prs = PrColors::from_prs([("topic", PrState::Draft), ("main", PrState::Open)]);
+        assert_eq!(prs.of_node(&l.nodes[0], &l.branches), Some(PrState::Draft));
+        for row in 1..6 {
+            assert_eq!(prs.of_node(&l.nodes[row], &l.branches), None, "row {row}");
+        }
+    }
+
+    #[test]
+    fn pr_colors_pick_the_live_pr_and_match_remotes() {
+        let prs = PrColors::from_prs([
+            ("feature", PrState::Closed),
+            ("feature", PrState::Open),
+            ("feature", PrState::Merged),
+            ("old", PrState::Closed),
+            ("old", PrState::Merged),
+        ]);
+        assert_eq!(prs.of("feature"), Some(PrState::Open));
+        assert_eq!(prs.of("origin/feature"), Some(PrState::Open));
+        assert_eq!(prs.of("old"), Some(PrState::Merged));
+        assert_eq!(prs.of("other"), None);
+        assert!(PrColors::default().of("feature").is_none());
     }
 
     #[test]

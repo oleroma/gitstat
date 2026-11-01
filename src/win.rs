@@ -249,6 +249,27 @@ pub unsafe fn move_overlay(h: isize, left: i32, top: i32) {
     }
 }
 
+/// Moves and sizes a normal window so its client area is `r`, without
+/// activating it or changing its z-order.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn place_window(h: isize, r: Rect) {
+    let Some(hwnd) = live(h) else { return };
+    unsafe {
+        let (dx, dy, bw, bh) = frame(hwnd);
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            r.left - dx,
+            r.top - dy,
+            r.width() + bw,
+            r.height() + bh,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
 /// Whether the primary (left, unless swapped) mouse button is down right now.
 pub fn left_button_down() -> bool {
     let vk = if unsafe { GetSystemMetrics(SM_SWAPBUTTON) } != 0 {
