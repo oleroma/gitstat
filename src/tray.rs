@@ -1,6 +1,8 @@
 //! The notification-area icon and its right-click menu.
 
-use crate::config::{ClickAction, Config, Corner, FolderIconMode, RepoClick};
+use crate::config::{
+    BadgeNumber, ClickAction, Config, Corner, FolderIconMode, RepoClick, RepoSort,
+};
 use crate::git::RepoStatus;
 use crate::icon::{self, Badge};
 use crate::layout;
@@ -54,6 +56,8 @@ pub enum TrayAction {
     SetCorner(Corner),
     SetFolderIconMode(FolderIconMode),
     SetRepoClick(RepoClick),
+    SetBadgeNumber(BadgeNumber),
+    SetSort(RepoSort),
     SetAutostart(bool),
     Quit,
 }
@@ -70,6 +74,7 @@ pub enum Setting {
     OverlayHideFullscreen,
     FolderIcons,
     GithubPrs,
+    GithubRepos,
 }
 
 impl Setting {
@@ -84,6 +89,7 @@ impl Setting {
             Setting::OverlayHideFullscreen => cfg.overlay.hide_in_fullscreen,
             Setting::FolderIcons => cfg.folder_icons,
             Setting::GithubPrs => cfg.github_prs,
+            Setting::GithubRepos => cfg.github_repos,
         }
     }
 
@@ -98,6 +104,7 @@ impl Setting {
             Setting::OverlayHideFullscreen => &mut cfg.overlay.hide_in_fullscreen,
             Setting::FolderIcons => &mut cfg.folder_icons,
             Setting::GithubPrs => &mut cfg.github_prs,
+            Setting::GithubRepos => &mut cfg.github_repos,
         };
         *field = !*field;
     }
@@ -113,6 +120,26 @@ const CORNERS: [(Corner, &str); 4] = [
 const REPO_CLICKS: [(RepoClick, &str); 2] = [
     (RepoClick::Folder, "Folder"),
     (RepoClick::Github, "GitHub page"),
+];
+
+const SORTS: [(RepoSort, &str); 7] = [
+    (RepoSort::Name, "Name"),
+    (RepoSort::Status, "Status, worst first"),
+    (RepoSort::LastCommit, "Last commit"),
+    (RepoSort::LastWorked, "Last worked on"),
+    (RepoSort::LastPullRequest, "Last pull request activity"),
+    (RepoSort::OpenPullRequests, "Most open pull requests"),
+    (RepoSort::HangingBranches, "Most hanging branches"),
+];
+
+const BADGE_NUMBERS: [(BadgeNumber, &str); 7] = [
+    (BadgeNumber::Unsynced, "Unsynced repos"),
+    (BadgeNumber::Dirty, "Repos with uncommitted changes"),
+    (BadgeNumber::Ahead, "Repos to push"),
+    (BadgeNumber::Behind, "Repos to pull"),
+    (BadgeNumber::PullRequests, "Open pull requests"),
+    (BadgeNumber::PullRequestsForYou, "Pull requests needing you"),
+    (BadgeNumber::ReviewRequests, "Reviews asked of you"),
 ];
 
 const FOLDER_ICON_MODES: [(FolderIconMode, &str); 2] = [
@@ -146,6 +173,8 @@ pub struct Tray {
     folder_icon_menu: Submenu,
     folder_icon_modes: Vec<(CheckMenuItem, FolderIconMode)>,
     repo_clicks: Vec<(CheckMenuItem, RepoClick)>,
+    badge_numbers: Vec<(CheckMenuItem, BadgeNumber)>,
+    sorts: Vec<(CheckMenuItem, RepoSort)>,
     autostart: CheckMenuItem,
     edit_config: MenuItem,
     quit: MenuItem,
@@ -189,6 +218,10 @@ impl Tray {
         let folder_icons = check("Folder icons in Explorer", Setting::FolderIcons);
         let watch = check("Watch for changes", Setting::Watch);
         let github_prs = check("GitHub pull requests (via gh)", Setting::GithubPrs);
+        let github_repos = check(
+            "GitHub repos not cloned here (via gh)",
+            Setting::GithubRepos,
+        );
 
         let corner_menu = Submenu::new("Badge corner", defaults.overlay.enabled);
         let corners: Vec<(CheckMenuItem, Corner)> = CORNERS
@@ -225,13 +258,43 @@ impl Tray {
             repo_click_menu.append(item).map_err(|e| e.to_string())?;
         }
 
+        let badge_number_menu = Submenu::new("Number on the icon", true);
+        let badge_numbers: Vec<(CheckMenuItem, BadgeNumber)> = BADGE_NUMBERS
+            .iter()
+            .map(|&(n, label)| {
+                let on = n == defaults.badge_number;
+                (CheckMenuItem::new(label, true, on, None), n)
+            })
+            .collect();
+        for (i, (item, _)) in badge_numbers.iter().enumerate() {
+            // The pull request counts below a line.
+            if i == 4 {
+                badge_number_menu
+                    .append(&PredefinedMenuItem::separator())
+                    .map_err(|e| e.to_string())?;
+            }
+            badge_number_menu.append(item).map_err(|e| e.to_string())?;
+        }
+
+        let sort_menu = Submenu::new("Sort repos by", true);
+        let sorts: Vec<(CheckMenuItem, RepoSort)> = SORTS
+            .iter()
+            .map(|&(s, label)| (CheckMenuItem::new(label, true, s == defaults.sort, None), s))
+            .collect();
+        for (item, _) in &sorts {
+            sort_menu.append(item).map_err(|e| e.to_string())?;
+        }
+
         let display = Submenu::new("Display", true);
         display
             .append_items(&[
                 &panel.0,
                 &window.0,
                 &icons_only.0,
+                &badge_number_menu,
+                &sort_menu,
                 &github_prs.0,
+                &github_repos.0,
                 &repo_click_menu,
                 &PredefinedMenuItem::separator(),
                 &overlay.0,
@@ -301,12 +364,15 @@ impl Tray {
                 folder_icons,
                 watch,
                 github_prs,
+                github_repos,
             ],
             corner_menu,
             corners,
             folder_icon_menu,
             folder_icon_modes,
             repo_clicks,
+            badge_numbers,
+            sorts,
             autostart,
             edit_config,
             quit,
@@ -315,22 +381,19 @@ impl Tray {
         Ok(tray)
     }
 
-    pub fn update(&mut self, snap: &TraySnapshot) {
+    /// `badge` is what the icon shows, `note` what its number counts when
+    /// that isn't unsynced repos.
+    pub fn update(&mut self, snap: &TraySnapshot, badge: Badge, note: Option<&str>) {
         let unsynced = snap.statuses.iter().filter(|s| !s.is_synced()).count();
-        let badge = if !snap.has_result {
-            Badge::Checking
-        } else if snap.problem.is_some() {
-            Badge::Problem
-        } else if unsynced == 0 {
-            Badge::AllSynced
-        } else {
-            Badge::Unsynced(unsynced)
-        };
         self.set_badge(badge, win::tray_icon_size());
 
         let summary = summary(snap, unsynced);
+        let tooltip = match note {
+            Some(note) => format!("gitstat: {summary} · {note}"),
+            None => format!("gitstat: {summary}"),
+        };
         // Windows caps tooltips at 127 characters.
-        let tooltip: String = format!("gitstat: {summary}").chars().take(127).collect();
+        let tooltip: String = tooltip.chars().take(127).collect();
         if tooltip != self.tooltip {
             let _ = self.icon.set_tooltip(Some(&tooltip));
             self.tooltip = tooltip;
@@ -453,6 +516,16 @@ impl Tray {
                 set_checked(item, c == click);
             }
             Some(TrayAction::SetRepoClick(*click))
+        } else if let Some((_, n)) = self.badge_numbers.iter().find(|(item, _)| item.id() == id) {
+            for (item, b) in &self.badge_numbers {
+                set_checked(item, b == n);
+            }
+            Some(TrayAction::SetBadgeNumber(*n))
+        } else if let Some((_, s)) = self.sorts.iter().find(|(item, _)| item.id() == id) {
+            for (item, o) in &self.sorts {
+                set_checked(item, o == s);
+            }
+            Some(TrayAction::SetSort(*s))
         } else {
             self.repos
                 .iter()
@@ -489,6 +562,12 @@ impl Tray {
         self.check_folder_icon_mode(cfg.folder_icon_mode);
         for (item, c) in &self.repo_clicks {
             set_checked(item, *c == cfg.repo_click);
+        }
+        for (item, n) in &self.badge_numbers {
+            set_checked(item, *n == cfg.badge_number);
+        }
+        for (item, s) in &self.sorts {
+            set_checked(item, *s == cfg.sort);
         }
         self.folder_icon_menu.set_enabled(cfg.folder_icons);
 

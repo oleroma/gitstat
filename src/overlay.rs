@@ -62,6 +62,7 @@ fn face(badge: Badge) -> (Hsla, String) {
         Badge::Problem => (rgb(0xd29922).into(), "!".to_string()),
         Badge::AllSynced => (rgb(0x2ea043).into(), "✓".to_string()),
         Badge::Unsynced(n) => (rgb(0xd73a49).into(), icon::count_text(n)),
+        Badge::Count(n) => (rgb(0x2ea043).into(), icon::count_text(n)),
     }
 }
 
@@ -451,6 +452,9 @@ fn tooltip_text(s: &AppState) -> String {
         s.unsynced(),
     );
     let mut text = format!("gitstat: {summary}");
+    if let Some(note) = s.badge_note() {
+        text.push_str(&format!("\nBadge: {note}"));
+    }
     const SHOWN: usize = 12;
     let unsynced: Vec<_> = s
         .sorted_for_panel()
