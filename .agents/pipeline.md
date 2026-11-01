@@ -22,7 +22,7 @@ graph TD
     RC -->|Reached| FETCH[PC session: fetch branch, check out origin/branch in build/src]
     FETCH --> PC[Script: build/src/.agents/agent-build pc]
     RC -->|Can't reach| CI[Script: agent-build ci]
-    PC --> PCS[quick-test hook, build hook, copy, keep last 4]
+    PC --> PCS[CI build of this commit? download it; else quick-test hook, build-number, build hook; copy, keep last 4]
     PCS -->|failed| ERR
     PCS --> INSTALL[Script: build/src/.agents/agent-install]
     INSTALL --> APK{Script: APK?}
@@ -31,7 +31,7 @@ graph TD
     PH -->|No| WHY[LLM: say why not installed]
     PH -->|Yes| INST[Script: vibrate, notifications, adb install -r]
     INST -->|Failed or downgrade| WHY
-    CI --> CIS[Run fallback.yml, wait, artifact id, link, download]
+    CI --> CIS[Run fallback.yml: build-number, build; wait, artifact id, link, download]
     CIS -->|failed| ERR
     CIS --> UP[LLM: post direct link, upload file]
     ASKI --> OK
