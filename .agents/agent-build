@@ -9,24 +9,28 @@ cd "$WORKTREE"
 
 HOOKS="$WORKTREE/.agents/hooks"
 
-# ci_build_run <sha>: prints the newest successful fallback build run on <sha> whose build files
-# are still on GitHub, or nothing.
+# ci_build_run <sha>: prints "<run> <version>" for the newest fallback build of <sha> that passed
+# every job and whose build files are still on GitHub, or nothing. CI records both in the
+# commit's full-check status: target_url is the run, the description ends "version <version>".
 ci_build_run() {
-  local run
-  for run in $(gh api "repos/$SLUG/actions/workflows/fallback.yml/runs?head_sha=$1&event=workflow_dispatch&status=success&per_page=10" \
-    --jq '.workflow_runs[].id'); do
+  local run version
+  while read -r run version; do
+    [[ "$run" =~ ^[0-9]+$ && "$version" =~ ^[A-Za-z0-9._+-]+$ ]] || continue
     if [ "$(gh api "repos/$SLUG/actions/runs/$run/artifacts" --jq '[.artifacts[] | select(.expired | not)] | length')" -gt 0 ]; then
-      echo "$run"
+      echo "$run $version"
       return 0
     fi
-  done
+  done < <(gh api "repos/$SLUG/commits/$1/statuses?per_page=100" --jq '.[]
+    | select(.context == "full-check" and .state == "success")
+    | select((.target_url // "") | test("/actions/runs/[0-9]+$"))
+    | select((.description // "") | test("version [^ ]+$"))
+    | "\(.target_url | capture("/actions/runs/(?<id>[0-9]+)$").id) \(.description | capture("version (?<v>[^ ]+)$").v)"')
 }
 
-# fetch_ci_build <run> <dir>: downloads the run's build files into <dir> and sets files, names
-# and version as a build on the PC would. The version is read from the build hook's
-# "build-file: <path> <version>" lines in the run's job logs.
+# fetch_ci_build <run> <dir>: downloads the run's build files into <dir> and sets files and
+# names as a build on the PC would.
 fetch_ci_build() {
-  local run="$1" dir="$2" art id name job
+  local run="$1" dir="$2" art id name
   rm -rf "$dir"
   mkdir -p "$dir"
   while IFS= read -r art; do
@@ -36,12 +40,6 @@ fetch_ci_build() {
     files+=("$dir/$name")
     names+=("$name")
   done < <(gh api "repos/$SLUG/actions/runs/$run/artifacts" --jq '.artifacts[] | select(.expired | not) | "\(.id) \(.name)"')
-  for job in $(gh api "repos/$SLUG/actions/runs/$run/jobs" --jq '.jobs[] | select(.conclusion == "success") | .id'); do
-    version="$(gh api "repos/$SLUG/actions/jobs/$job/logs" | tr -d '\r' |
-      sed -nE 's/^[0-9T:.Z-]+ build-file: [^ ]+ ([^ ]+)$/\1/p' | head -n 1)"
-    if [ -n "$version" ]; then break; fi
-  done
-  [ -n "$version" ] || die "Found no build-file line in the logs of CI run $run."
   [ "${#files[@]}" -gt 0 ] || die "CI run $run has no build files left."
 }
 
@@ -58,7 +56,7 @@ build_pc() {
   # When CI already built this commit (agent-build ci while the PC was away), download and
   # install that build instead of building it again.
   local version="" line rel v files=() names=() ci_run="" built_here=1
-  ci_run="$(ci_build_run "$(git rev-parse HEAD)")"
+  read -r ci_run version < <(ci_build_run "$(git rev-parse HEAD)") || true
   if [ -n "$ci_run" ]; then
     built_here=0
     fetch_ci_build "$ci_run" "$BUILD_DIR/logs/ci-build"
