@@ -395,12 +395,13 @@ fn pr_marks(pr: &Pr, p: &Palette) -> Vec<(&'static str, &'static str, Hsla)> {
 }
 
 /// One open pull request; a click opens it on GitHub (and closes the
-/// panel). Only a browser link: nothing is changed on GitHub.
+/// panel, not the window). Only a browser link: nothing is changed on GitHub.
 fn pr_row(
     index: usize,
     s: &RepoStatus,
     pr: &Pr,
     p: &Palette,
+    mode: Mode,
     icons_only: bool,
     cx: &App,
 ) -> AnyElement {
@@ -441,7 +442,9 @@ fn pr_row(
         .tooltip(tip(lines, p))
         .on_click(move |_, window, cx| {
             cx.open_url(&url);
-            panel::dismiss(window, cx);
+            if mode == Mode::Panel {
+                panel::dismiss(window, cx);
+            }
         })
         .child(crate::repo_marks::global_mark(s, 16.0, tone, cx))
         .child(
@@ -462,6 +465,63 @@ fn pr_row(
         .child(right)
         .into_any_element()
 }
+
+/// The pull requests' heading and rows, or the one GitHub problem line.
+fn pr_rows(
+    open_prs: &[(&RepoStatus, &Pr)],
+    problem: Option<&str>,
+    p: &Palette,
+    mode: Mode,
+    icons_only: bool,
+    cx: &App,
+) -> Vec<AnyElement> {
+    let mut out = Vec::new();
+    if !open_prs.is_empty() {
+        let asked = open_prs
+            .iter()
+            .filter(|(_, pr)| pr.review_requested)
+            .count();
+        let mut heading = format!("Pull requests · {} open", open_prs.len());
+        if asked > 0 {
+            heading.push_str(&format!(" · {asked} for your review"));
+        }
+        out.push(
+            div()
+                .px_4()
+                .pt_3()
+                .pb_1()
+                .border_t_1()
+                .border_color(p.border)
+                .text_xs()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(if asked > 0 { p.amber } else { p.muted })
+                .truncate()
+                .child(heading)
+                .into_any_element(),
+        );
+        for (i, (s, pr)) in open_prs.iter().enumerate() {
+            out.push(pr_row(i, s, pr, p, mode, icons_only, cx));
+        }
+    } else if let Some(problem) = problem {
+        out.push(
+            div()
+                .px_4()
+                .py(px(6.))
+                .border_t_1()
+                .border_color(p.border)
+                .text_xs()
+                .text_color(p.muted)
+                .truncate()
+                .child(format!("Pull requests: {problem}"))
+                .into_any_element(),
+        );
+    }
+    out
+}
+
+/// Big mode's pull request list at its tallest: the heading and about
+/// six rows.
+const WINDOW_PRS_HEIGHT: f32 = 230.;
 
 /// A small square glyph button for the panel header.
 fn icon_button(
@@ -535,11 +595,7 @@ impl Render for StatusView {
         if sweeping {
             subline.push_str(" · checking…");
         }
-        let open_prs = if mode == Mode::Panel {
-            state.open_prs()
-        } else {
-            Vec::new()
-        };
+        let open_prs = state.open_prs();
 
         let titles = div()
             .flex()
@@ -707,46 +763,14 @@ impl Render for StatusView {
                         }
                     }
                 }
-                if !open_prs.is_empty() {
-                    let asked = open_prs
-                        .iter()
-                        .filter(|(_, pr)| pr.review_requested)
-                        .count();
-                    let mut heading = format!("Pull requests · {} open", open_prs.len());
-                    if asked > 0 {
-                        heading.push_str(&format!(" · {asked} for your review"));
-                    }
-                    rows.push(
-                        div()
-                            .px_4()
-                            .pt_3()
-                            .pb_1()
-                            .border_t_1()
-                            .border_color(p.border)
-                            .text_xs()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(if asked > 0 { p.amber } else { p.muted })
-                            .truncate()
-                            .child(heading)
-                            .into_any_element(),
-                    );
-                    for (i, (s, pr)) in open_prs.iter().enumerate() {
-                        rows.push(pr_row(i, s, pr, &p, icons_only, cx));
-                    }
-                } else if let Some(problem) = &state.github_problem {
-                    rows.push(
-                        div()
-                            .px_4()
-                            .py(px(6.))
-                            .border_t_1()
-                            .border_color(p.border)
-                            .text_xs()
-                            .text_color(p.muted)
-                            .truncate()
-                            .child(format!("Pull requests: {problem}"))
-                            .into_any_element(),
-                    );
-                }
+                rows.extend(pr_rows(
+                    &open_prs,
+                    state.github_problem.as_deref(),
+                    &p,
+                    mode,
+                    icons_only,
+                    cx,
+                ));
             }
         }
 
@@ -800,6 +824,32 @@ impl Render for StatusView {
             .children(rows)
             .when(empty, |list| {
                 list.child(div().p_4().text_sm().text_color(p.muted).child(empty_text))
+            });
+
+        // Big mode lists the pull requests under the columns, a few rows
+        // high, scrolling when there are more.
+        let window_prs = (mode == Mode::Window)
+            .then(|| {
+                pr_rows(
+                    &open_prs,
+                    state.github_problem.as_deref(),
+                    &p,
+                    mode,
+                    false,
+                    cx,
+                )
+            })
+            .filter(|rows| !rows.is_empty())
+            .map(|rows| {
+                div()
+                    .id("prs")
+                    .flex()
+                    .flex_col()
+                    .flex_none()
+                    .max_h(px(WINDOW_PRS_HEIGHT))
+                    .overflow_y_scroll()
+                    .bg(p.surface)
+                    .children(rows)
             });
 
         let config_file: PathBuf = state.config_file.clone();
@@ -891,6 +941,7 @@ impl Render for StatusView {
                 Some(table) if !empty => d.child(table),
                 _ => d.child(list),
             })
+            .children(window_prs)
             .when(!icons_only, |d| d.child(footer))
             .children(
                 self.timelines
@@ -934,6 +985,10 @@ fn summary_bar(statuses: &[RepoStatus], checking: bool, p: &Palette) -> gpui::Di
 }
 
 /// A tooltip of coloured lines.
+/// The tooltip's widest, and the characters of `text_xs` that fit in it.
+const TIP_WIDTH: f32 = 320.;
+const TIP_LINE_CHARS: usize = 44;
+
 struct Tip {
     lines: Vec<(SharedString, Hsla)>,
     bg: Hsla,
@@ -942,10 +997,17 @@ struct Tip {
 
 impl Render for Tip {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        // A line that wraps needs a definite width: under only a max width
+        // its height is measured as one line and the next line overlaps it.
+        let wraps = self
+            .lines
+            .iter()
+            .any(|(text, _)| text.chars().count() > TIP_LINE_CHARS);
         div()
             .flex()
             .flex_col()
-            .max_w(px(320.))
+            .max_w(px(TIP_WIDTH))
+            .when(wraps, |d| d.w(px(TIP_WIDTH)))
             .px_2()
             .py_1()
             .rounded_md()
