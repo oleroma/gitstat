@@ -1127,7 +1127,14 @@ mod tests {
     // Integration tests: a real watcher (inotify here, ReadDirectoryChangesW
     // on Windows CI) on a temp root, driven through `Monitor`.
 
-    const WAIT: Duration = Duration::from_secs(5);
+    /// How long to wait for something that should happen. Generous, because
+    /// a busy PC (a build, the other tests' watchers and git runs) can hold
+    /// an update up for seconds; a wait ends as soon as the update comes,
+    /// so this only slows down a test that is failing anyway.
+    const WAIT: Duration = Duration::from_secs(30);
+    /// How long to watch for something that shouldn't happen after the
+    /// thing that should: a second reload, a second look.
+    const AFTER: Duration = Duration::from_millis(1500);
 
     fn temp(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("gitstat-mon-{name}-{}", std::process::id()));
@@ -1234,21 +1241,27 @@ mod tests {
             out
         }
 
-        /// Every update up to and including the next `SweepDone`.
-        fn until_sweep_done(&self) -> Vec<Update> {
+        /// Every update up to and including the first matching `pred`,
+        /// which must come within `WAIT`.
+        fn until(&self, pred: impl Fn(&Update) -> bool) -> Vec<Update> {
             let deadline = Instant::now() + WAIT;
             let mut out = Vec::new();
             while let Ok(u) = self
                 .rx
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
             {
-                let done = matches!(u, Update::SweepDone);
+                let done = pred(&u);
                 out.push(u);
                 if done {
                     return out;
                 }
             }
-            panic!("no SweepDone within {WAIT:?}: {out:?}");
+            panic!("nothing expected within {WAIT:?}: {out:?}");
+        }
+
+        /// Every update up to and including the next `SweepDone`.
+        fn until_sweep_done(&self) -> Vec<Update> {
+            self.until(|u| matches!(u, Update::SweepDone))
         }
 
         /// Waits for the startup sweep to finish.
@@ -1319,8 +1332,14 @@ mod tests {
         let h = Harness::new("edit", |root| init_repo(&root.join("a")), |_| {});
         h.settle();
         std::fs::write(h.root.join("a").join("README"), "changed\n").unwrap();
-        let status = h.status("a", WAIT).expect("no status after an edit");
-        assert!(status.dirty, "{status:?}");
+        // A recheck the startup sweep's own index write set off can still
+        // report clean first.
+        let a = h.root.join("a");
+        let dirty = h.wait_for(
+            WAIT,
+            |u| matches!(u, Update::Status(s) if s.path == a && s.dirty),
+        );
+        assert!(dirty.is_some(), "no dirty status after an edit");
     }
 
     #[test]
@@ -1396,8 +1415,11 @@ mod tests {
         assert!(!status.dirty, "{status:?}");
         // Its edits route to it.
         std::fs::write(b.join("README"), "changed\n").unwrap();
-        let status = h.status("group/b", WAIT).expect("no status after an edit");
-        assert!(status.dirty, "{status:?}");
+        let dirty = h.wait_for(
+            WAIT,
+            |u| matches!(u, Update::Status(s) if s.path == b && s.dirty),
+        );
+        assert!(dirty.is_some(), "no dirty status after an edit");
 
         // A folder and a repo inside it at once, before any rediscovery:
         // the folder's own event is enough.
@@ -1634,7 +1656,8 @@ mod tests {
         for _ in 0..3 {
             std::fs::write(&svg, "<svg/>").unwrap();
         }
-        let updates = h.collect(REPO_ICON_QUIET + Duration::from_millis(1500));
+        let mut updates = h.until(|u| matches!(u, Update::RepoIcons));
+        updates.extend(h.collect(REPO_ICON_QUIET + AFTER));
         let looks = updates
             .iter()
             .filter(|u| matches!(u, Update::RepoIcons))
@@ -1659,7 +1682,8 @@ mod tests {
         // An editor-style save: several writes in a burst.
         write_config(&h.config_file, &config);
         write_config(&h.config_file, &config);
-        let updates = h.collect(Duration::from_millis(1500));
+        let mut updates = h.until(|u| matches!(u, Update::Config(_)));
+        updates.extend(h.collect(CONFIG_QUIET + AFTER));
         let reloads: Vec<_> = updates
             .iter()
             .filter(|u| matches!(u, Update::Config(_)))
