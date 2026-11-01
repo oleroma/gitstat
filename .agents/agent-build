@@ -9,6 +9,42 @@ cd "$WORKTREE"
 
 HOOKS="$WORKTREE/.agents/hooks"
 
+# ci_build_run <sha>: prints the newest successful fallback build run on <sha> whose build files
+# are still on GitHub, or nothing.
+ci_build_run() {
+  local run
+  for run in $(gh api "repos/$SLUG/actions/workflows/fallback.yml/runs?head_sha=$1&event=workflow_dispatch&status=success&per_page=10" \
+    --jq '.workflow_runs[].id'); do
+    if [ "$(gh api "repos/$SLUG/actions/runs/$run/artifacts" --jq '[.artifacts[] | select(.expired | not)] | length')" -gt 0 ]; then
+      echo "$run"
+      return 0
+    fi
+  done
+}
+
+# fetch_ci_build <run> <dir>: downloads the run's build files into <dir> and sets files, names
+# and version as a build on the PC would. The version is read from the build hook's
+# "build-file: <path> <version>" lines in the run's job logs.
+fetch_ci_build() {
+  local run="$1" dir="$2" art id name job
+  rm -rf "$dir"
+  mkdir -p "$dir"
+  while IFS= read -r art; do
+    id="${art%% *}"
+    name="${art#* }"
+    gh api "repos/$SLUG/actions/artifacts/$id/zip" >"$dir/$name"
+    files+=("$dir/$name")
+    names+=("$name")
+  done < <(gh api "repos/$SLUG/actions/runs/$run/artifacts" --jq '.artifacts[] | select(.expired | not) | "\(.id) \(.name)"')
+  for job in $(gh api "repos/$SLUG/actions/runs/$run/jobs" --jq '.jobs[] | select(.conclusion == "success") | .id'); do
+    version="$(gh api "repos/$SLUG/actions/jobs/$job/logs" | tr -d '\r' |
+      sed -nE 's/^[0-9T:.Z-]+ build-file: [^ ]+ ([^ ]+)$/\1/p' | head -n 1)"
+    if [ -n "$version" ]; then break; fi
+  done
+  [ -n "$version" ] || die "Found no build-file line in the logs of CI run $run."
+  [ "${#files[@]}" -gt 0 ] || die "CI run $run has no build files left."
+}
+
 build_pc() {
   [ "$WORKTREE" -ef "$BUILD_DIR/src" ] || die "Run this from the build/src worktree, as in AGENTS.md step 3."
 
@@ -19,38 +55,46 @@ build_pc() {
   local commit
   commit="$(git rev-parse --short=7 HEAD)"
 
-  if [ -f "$HOOKS/quick-test" ]; then
-    bash "$HOOKS/quick-test" || die "Quick tests failed at $commit. Not built."
-  fi
+  # When CI already built this commit (agent-build ci while the PC was away), download and
+  # install that build instead of building it again.
+  local version="" line rel v files=() names=() ci_run="" built_here=1
+  ci_run="$(ci_build_run "$(git rev-parse HEAD)")"
+  if [ -n "$ci_run" ]; then
+    built_here=0
+    fetch_ci_build "$ci_run" "$BUILD_DIR/logs/ci-build"
+  else
+    if [ -f "$HOOKS/quick-test" ]; then
+      bash "$HOOKS/quick-test" || die "Quick tests failed at $commit. Not built."
+    fi
 
-  # The repo's next build number, claimed on GitHub; the build hook makes the version from it.
-  BUILD_NUMBER="$(bash "$AGENTS_DIR/build-number")" || die "Couldn't get a build number from GitHub. Not built."
-  export BUILD_NUMBER
+    # The repo's next build number, claimed on GitHub; the build hook makes the version from it.
+    BUILD_NUMBER="$(bash "$AGENTS_DIR/build-number")" || die "Couldn't get a build number from GitHub. Not built."
+    export BUILD_NUMBER
 
-  local out_file="$BUILD_DIR/logs/build-output.txt"
-  if ! bash "$HOOKS/build" >"$out_file"; then
+    local out_file="$BUILD_DIR/logs/build-output.txt"
+    if ! bash "$HOOKS/build" >"$out_file"; then
+      cat "$out_file"
+      die "Build failed at $commit."
+    fi
     cat "$out_file"
-    die "Build failed at $commit."
-  fi
-  cat "$out_file"
 
-  # The hook prints one "build-file: <path> <version>" line per build file.
-  local version="" line rel v files=() names=()
-  while IFS= read -r line; do
-    case "$line" in
-      "build-file: "*)
-        line="${line#build-file: }"
-        rel="${line% *}"
-        v="${line##* }"
-        [ -n "$rel" ] && [ "$rel" != "$line" ] || die "Bad build-file line from the build hook: $line"
-        [ -f "$WORKTREE/$rel" ] || die "Build file not found: $rel"
-        files+=("$WORKTREE/$rel")
-        names+=("$(basename "$rel")")
-        if [ -z "$version" ]; then version="$v"; fi
-        ;;
-    esac
-  done <"$out_file"
-  [ "${#files[@]}" -gt 0 ] || die "The build hook printed no \"build-file: <path> <version>\" line."
+    # The hook prints one "build-file: <path> <version>" line per build file.
+    while IFS= read -r line; do
+      case "$line" in
+        "build-file: "*)
+          line="${line#build-file: }"
+          rel="${line% *}"
+          v="${line##* }"
+          [ -n "$rel" ] && [ "$rel" != "$line" ] || die "Bad build-file line from the build hook: $line"
+          [ -f "$WORKTREE/$rel" ] || die "Build file not found: $rel"
+          files+=("$WORKTREE/$rel")
+          names+=("$(basename "$rel")")
+          if [ -z "$version" ]; then version="$v"; fi
+          ;;
+      esac
+    done <"$out_file"
+    [ "${#files[@]}" -gt 0 ] || die "The build hook printed no \"build-file: <path> <version>\" line."
+  fi
 
   # One folder per build, and the newest build files directly in build/.
   local dest="$BUILD_DIR/builds/$version-$commit" old
@@ -70,6 +114,7 @@ build_pc() {
   git -C "$MAIN_REPO" worktree prune
 
   local summary=("Built $version-$commit:") name
+  if [ "$built_here" = 0 ]; then summary=("Downloaded $version-$commit from CI (https://github.com/$SLUG/actions/runs/$ci_run), not built again:"); fi
   for name in "${names[@]}"; do summary+=("File: $BUILD_DIR/$name"); done
 
   # Install it. agent-install prints its own result and summary; keep the summary lines.
@@ -85,7 +130,8 @@ build_pc() {
 
   # The full checks, after the install so the phone gets the build first. When they pass, the
   # commit is marked checked and agent-merge won't run them again in CI.
-  if [ -f "$HOOKS/full-check" ]; then
+  # A CI build skips them: agent-merge runs them in CI.
+  if [ "$built_here" = 1 ] && [ -f "$HOOKS/full-check" ]; then
     local head
     head="$(git rev-parse HEAD)"
     if bash "$HOOKS/full-check"; then

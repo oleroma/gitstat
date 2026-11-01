@@ -22,7 +22,7 @@ graph TD
     RC -->|Reached| FETCH[PC session: fetch branch, check out origin/branch in build/src]
     FETCH --> PC[Script: build/src/.agents/agent-build pc]
     RC -->|Can't reach| CI[Script: agent-build ci]
-    PC --> PCS[quick-test hook, build-number, build hook, copy, keep last 4]
+    PC --> PCS[CI build of this commit? download it; else quick-test hook, build-number, build hook; copy, keep last 4]
     PCS -->|failed| ERR
     PCS --> INSTALL[Script: build/src/.agents/agent-install]
     INSTALL --> APK{Script: APK?}
