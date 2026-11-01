@@ -472,7 +472,7 @@ fn parse_history(json: &Value) -> Option<RemoteHistory> {
 
 /// Seconds since 1970 for an ISO 8601 UTC time as GitHub writes it:
 /// `2026-11-01T14:05:00Z`.
-fn unix_time(s: &str) -> Option<i64> {
+pub(crate) fn unix_time(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     if b.len() < 19 {
         return None;
@@ -693,6 +693,25 @@ pub fn panel_order<'a>(prs: impl Iterator<Item = (&'a Path, &'a Pr)>) -> Vec<(&'
             .then_with(|| b.updated_at.cmp(&a.updated_at))
     });
     open
+}
+
+/// An open pull request for other modules' tests.
+#[cfg(test)]
+pub fn tests_pr() -> Pr {
+    Pr {
+        number: 1,
+        title: "t".into(),
+        url: String::new(),
+        state: PrState::Open,
+        author: "a".into(),
+        head_branch: "b".into(),
+        head_oid: String::new(),
+        review: Review::None,
+        review_requested: false,
+        checks: Checks::None,
+        mergeable: Mergeable::Unknown,
+        updated_at: "2026-11-01T00:00:00Z".into(),
+    }
 }
 
 #[cfg(test)]

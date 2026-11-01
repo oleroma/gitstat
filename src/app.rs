@@ -429,6 +429,7 @@ fn on_action(action: TrayAction, cx: &mut App) -> bool {
         TrayAction::SetFolderIconMode(mode) => change_setting(|c| c.folder_icon_mode = mode, cx),
         TrayAction::SetRepoClick(click) => change_setting(|c| c.repo_click = click, cx),
         TrayAction::SetBadgeNumber(n) => change_setting(|c| c.badge_number = n, cx),
+        TrayAction::SetSort(s) => change_setting(|c| c.sort = s, cx),
         TrayAction::SetAutostart(enabled) => {
             if let Err(e) = crate::autostart::set_enabled(enabled) {
                 crate::error_box(format!("Couldn't change the startup setting: {e}"));

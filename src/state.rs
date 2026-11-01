@@ -315,6 +315,7 @@ impl AppState {
                 path: crate::github::remote_path(&r.slug),
                 has_upstream: true,
                 remote_only: true,
+                last_commit: crate::github::unix_time(&r.pushed_at).unwrap_or(0),
                 ..Default::default()
             })
             .collect();
@@ -367,11 +368,76 @@ impl AppState {
             .collect()
     }
 
-    /// Worst first, then by name.
+    /// The cloned repos in the configured order; the panel splits them
+    /// into unsynced and synced keeping it.
     pub fn sorted_for_panel(&self) -> Vec<&RepoStatus> {
-        let mut sorted: Vec<&RepoStatus> = self.statuses.iter().collect();
-        sorted.sort_by_cached_key(|s| (severity(s), s.name.to_lowercase()));
+        self.sorted(&self.statuses)
+    }
+
+    /// `list` in the configured order, by name among equals.
+    pub fn sorted<'a>(&self, list: &'a [RepoStatus]) -> Vec<&'a RepoStatus> {
+        use crate::config::RepoSort;
+        use std::cmp::Reverse;
+        let mut sorted: Vec<&RepoStatus> = list.iter().collect();
+        let sort = self.config.sort;
+        // Larger is earlier, then the name.
+        sorted.sort_by_cached_key(|s| {
+            let score: (i64, i64) = match sort {
+                RepoSort::Name => (0, 0),
+                RepoSort::Status => (-i64::from(severity(s)), 0),
+                RepoSort::LastCommit => (s.last_commit, 0),
+                RepoSort::LastWorked => (s.last_worked, 0),
+                RepoSort::LastPullRequest => (self.last_pr_time(s), 0),
+                RepoSort::OpenPullRequests => self.pr_counts(s),
+                RepoSort::HangingBranches => (self.hanging(s) as i64, 0),
+            };
+            (Reverse(score), s.name.to_lowercase())
+        });
         sorted
+    }
+
+    /// When `s`'s newest pull request was last updated, Unix seconds.
+    fn last_pr_time(&self, s: &RepoStatus) -> i64 {
+        self.prs
+            .get(&s.path)
+            .into_iter()
+            .flatten()
+            .filter_map(|p| crate::github::unix_time(&p.updated_at))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// (needing you, open) pull requests of `s`.
+    fn pr_counts(&self, s: &RepoStatus) -> (i64, i64) {
+        if s.remote_only {
+            let open = self
+                .remote_repos
+                .iter()
+                .find(|r| crate::github::remote_path(&r.slug) == s.path)
+                .map_or(0, |r| r.open_prs as i64);
+            return (0, open);
+        }
+        let prs = self.prs.get(&s.path).map(Vec::as_slice).unwrap_or_default();
+        let count = |f: fn(&crate::github::Pr) -> bool| prs.iter().filter(|p| f(p)).count() as i64;
+        (
+            count(crate::github::Pr::needs_attention),
+            count(crate::github::Pr::is_open),
+        )
+    }
+
+    /// `s`'s branches that aren't merged and have no open pull request; a
+    /// merged pull request counts as merged (squash merges).
+    pub fn hanging(&self, s: &RepoStatus) -> usize {
+        let prs = self.prs.get(&s.path).map(Vec::as_slice).unwrap_or_default();
+        s.unmerged
+            .iter()
+            .filter(|b| {
+                !prs.iter().any(|p| {
+                    &p.head_branch == *b
+                        && (p.is_open() || p.state == crate::github::PrState::Merged)
+                })
+            })
+            .count()
     }
 }
 
@@ -443,6 +509,56 @@ mod tests {
         state.statuses = statuses;
         state.has_result = true;
         state
+    }
+
+    #[test]
+    fn sorts_by_the_configured_key_then_name() {
+        use crate::config::RepoSort;
+        let mk = |name: &str, f: &dyn Fn(&mut RepoStatus)| {
+            let mut r = repo(name);
+            f(&mut r);
+            r
+        };
+        let list = vec![
+            mk("b", &|r| {
+                r.last_commit = 30;
+                r.last_worked = 1;
+                r.unmerged = vec!["x".into(), "y".into()];
+            }),
+            mk("a", &|r| {
+                r.last_commit = 10;
+                r.last_worked = 3;
+                r.dirty = true;
+            }),
+            mk("c", &|r| {
+                r.last_commit = 20;
+                r.last_worked = 2;
+                r.unmerged = vec!["z".into()];
+            }),
+        ];
+        let mut s = state(Vec::new());
+        let order = |s: &AppState| -> Vec<String> {
+            s.sorted(&list).iter().map(|r| r.name.clone()).collect()
+        };
+        assert_eq!(order(&s), ["a", "b", "c"]);
+        s.config.sort = RepoSort::Status;
+        assert_eq!(order(&s), ["a", "b", "c"]);
+        s.config.sort = RepoSort::LastCommit;
+        assert_eq!(order(&s), ["b", "c", "a"]);
+        s.config.sort = RepoSort::LastWorked;
+        assert_eq!(order(&s), ["a", "c", "b"]);
+        s.config.sort = RepoSort::HangingBranches;
+        assert_eq!(order(&s), ["b", "c", "a"]);
+        // An open PR on y leaves b one hanging branch, tied with c: by name.
+        let mut pr = crate::github::tests_pr();
+        pr.head_branch = "y".into();
+        s.prs.insert(PathBuf::from("b"), vec![pr]);
+        assert_eq!(s.hanging(&list[0]), 1);
+        assert_eq!(order(&s), ["b", "c", "a"]);
+        s.config.sort = RepoSort::OpenPullRequests;
+        assert_eq!(order(&s), ["b", "a", "c"]);
+        s.config.sort = RepoSort::LastPullRequest;
+        assert_eq!(order(&s), ["b", "a", "c"]);
     }
 
     #[test]
@@ -576,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn panel_order_is_worst_first_then_name() {
+    fn status_order_is_worst_first_then_name() {
         let synced = repo("a-synced");
         let dirty = RepoStatus {
             dirty: true,
@@ -599,7 +715,8 @@ mod tests {
             dirty: true,
             ..repo("a-dirty")
         };
-        let s = state(vec![synced, dirty, ahead, error, diverged, dirty2]);
+        let mut s = state(vec![synced, dirty, ahead, error, diverged, dirty2]);
+        s.config.sort = crate::config::RepoSort::Status;
         let names: Vec<&str> = s
             .sorted_for_panel()
             .iter()

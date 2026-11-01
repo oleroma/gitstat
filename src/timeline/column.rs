@@ -1018,6 +1018,6 @@ fn paint_column(
 }
 
 /// The repos in the table's order, for `ScrollHandle::scroll_to_item`.
-pub fn column_index(statuses: &[RepoStatus], path: &Path) -> Option<usize> {
+pub fn column_index(statuses: &[&RepoStatus], path: &Path) -> Option<usize> {
     statuses.iter().position(|s| s.path == path)
 }

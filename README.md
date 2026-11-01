@@ -27,6 +27,14 @@ still follows sync: red while any repo is unsynced, green with the number
 once all are current, and the ✓ when that number is 0 too. The tooltip says
 what the number counts.
 
+**Display ▸ Sort repos by** sets the order of the repos, the same in the
+panel and the big view: name (the default), status (worst first), last
+commit on any branch, last worked on (where HEAD last moved, from the
+reflog), last pull request activity, most open pull requests (the ones
+needing you count first), or most hanging branches. The panel keeps the
+unsynced repos above the synced ones and sorts within each group; the
+GitHub-only repos stay at the end, sorted the same way.
+
 The icon is drawn at the exact size the notification area uses at your
 display scale, with smooth edges and Segoe UI digits, so it stays crisp at
 125%, 150% and 200%. Above 99 it shows `99+`.
@@ -297,7 +305,8 @@ from an older version keeps working:
   "github_prs": true,
   "github_repos": true,
   "repo_click": "folder",
-  "badge_number": "unsynced"
+  "badge_number": "unsynced",
+  "sort": "name"
 }
 ```
 
@@ -323,6 +332,7 @@ from an older version keeps working:
 | `github_prs` | true | **Display ▸ GitHub pull requests**: open pull requests in the panel and big mode, read through `gh`, see [GitHub pull requests](#github-pull-requests). |
 | `github_repos` | true | **Display ▸ GitHub repos not cloned here**: the signed-in account's GitHub repos with no clone under `path`, read through `gh`, see [GitHub repos not cloned here](#github-repos-not-cloned-here). |
 | `badge_number` | `unsynced` | **Display ▸ Number on the icon**: what the number on the tray icon and the badge counts. `unsynced`, `dirty`, `ahead`, `behind`, `pull-requests`, `pull-requests-for-you` or `review-requests`. |
+| `sort` | `name` | **Display ▸ Sort repos by**: the order of the repos in the panel and the big view. `name`, `status`, `last-commit`, `last-worked`, `last-pull-request`, `open-pull-requests` or `hanging-branches`. |
 | `repo_click` | `folder` | **Display ▸ Repo click opens**: what a click on a repo (its name in big mode, or in the menu) opens. `folder` for its folder, `github` for its GitHub page; a repo whose `origin` isn't on GitHub opens its folder either way. |
 
 Edits apply within about a second, without a restart. **Edit config.json** in

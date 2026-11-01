@@ -1,6 +1,8 @@
 //! The notification-area icon and its right-click menu.
 
-use crate::config::{BadgeNumber, ClickAction, Config, Corner, FolderIconMode, RepoClick};
+use crate::config::{
+    BadgeNumber, ClickAction, Config, Corner, FolderIconMode, RepoClick, RepoSort,
+};
 use crate::git::RepoStatus;
 use crate::icon::{self, Badge};
 use crate::layout;
@@ -55,6 +57,7 @@ pub enum TrayAction {
     SetFolderIconMode(FolderIconMode),
     SetRepoClick(RepoClick),
     SetBadgeNumber(BadgeNumber),
+    SetSort(RepoSort),
     SetAutostart(bool),
     Quit,
 }
@@ -119,6 +122,16 @@ const REPO_CLICKS: [(RepoClick, &str); 2] = [
     (RepoClick::Github, "GitHub page"),
 ];
 
+const SORTS: [(RepoSort, &str); 7] = [
+    (RepoSort::Name, "Name"),
+    (RepoSort::Status, "Status, worst first"),
+    (RepoSort::LastCommit, "Last commit"),
+    (RepoSort::LastWorked, "Last worked on"),
+    (RepoSort::LastPullRequest, "Last pull request activity"),
+    (RepoSort::OpenPullRequests, "Most open pull requests"),
+    (RepoSort::HangingBranches, "Most hanging branches"),
+];
+
 const BADGE_NUMBERS: [(BadgeNumber, &str); 7] = [
     (BadgeNumber::Unsynced, "Unsynced repos"),
     (BadgeNumber::Dirty, "Repos with uncommitted changes"),
@@ -161,6 +174,7 @@ pub struct Tray {
     folder_icon_modes: Vec<(CheckMenuItem, FolderIconMode)>,
     repo_clicks: Vec<(CheckMenuItem, RepoClick)>,
     badge_numbers: Vec<(CheckMenuItem, BadgeNumber)>,
+    sorts: Vec<(CheckMenuItem, RepoSort)>,
     autostart: CheckMenuItem,
     edit_config: MenuItem,
     quit: MenuItem,
@@ -262,6 +276,15 @@ impl Tray {
             badge_number_menu.append(item).map_err(|e| e.to_string())?;
         }
 
+        let sort_menu = Submenu::new("Sort repos by", true);
+        let sorts: Vec<(CheckMenuItem, RepoSort)> = SORTS
+            .iter()
+            .map(|&(s, label)| (CheckMenuItem::new(label, true, s == defaults.sort, None), s))
+            .collect();
+        for (item, _) in &sorts {
+            sort_menu.append(item).map_err(|e| e.to_string())?;
+        }
+
         let display = Submenu::new("Display", true);
         display
             .append_items(&[
@@ -269,6 +292,7 @@ impl Tray {
                 &window.0,
                 &icons_only.0,
                 &badge_number_menu,
+                &sort_menu,
                 &github_prs.0,
                 &github_repos.0,
                 &repo_click_menu,
@@ -348,6 +372,7 @@ impl Tray {
             folder_icon_modes,
             repo_clicks,
             badge_numbers,
+            sorts,
             autostart,
             edit_config,
             quit,
@@ -496,6 +521,11 @@ impl Tray {
                 set_checked(item, b == n);
             }
             Some(TrayAction::SetBadgeNumber(*n))
+        } else if let Some((_, s)) = self.sorts.iter().find(|(item, _)| item.id() == id) {
+            for (item, o) in &self.sorts {
+                set_checked(item, o == s);
+            }
+            Some(TrayAction::SetSort(*s))
         } else {
             self.repos
                 .iter()
@@ -535,6 +565,9 @@ impl Tray {
         }
         for (item, n) in &self.badge_numbers {
             set_checked(item, *n == cfg.badge_number);
+        }
+        for (item, s) in &self.sorts {
+            set_checked(item, *s == cfg.sort);
         }
         self.folder_icon_menu.set_enabled(cfg.folder_icons);
 

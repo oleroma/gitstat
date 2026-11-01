@@ -32,6 +32,14 @@ pub struct RepoStatus {
     /// A GitHub repo with no clone here, listed after the cloned ones: no
     /// local state, and `path` is `github::remote_path`.
     pub remote_only: bool,
+    /// The newest commit on any branch, local or remote, Unix seconds.
+    pub last_commit: i64,
+    /// When HEAD last moved (commit, checkout, pull, rebase), from its
+    /// reflog, Unix seconds; 0 when unknown.
+    pub last_worked: i64,
+    /// Branches (by name, local and remote merged) whose commits aren't all
+    /// in the default branch, which itself is left out.
+    pub unmerged: Vec<String>,
 }
 
 impl RepoStatus {
@@ -362,6 +370,14 @@ pub fn check_repo_detailed(root: &Path, repo: &Path, fetch: bool) -> (RepoStatus
             status.behind = local.behind;
             status.fetch_failed = fetch_error.is_some();
             status.error = fetch_error;
+            // For sorting; the command-line build doesn't sort.
+            #[cfg(any(windows, test))]
+            {
+                let facts = crate::repo_info::sort_facts(repo);
+                status.last_commit = facts.last_commit;
+                status.last_worked = facts.last_worked;
+                status.unmerged = facts.unmerged;
+            }
             (status, local.ignored)
         }
         // The fetch error usually says more (it carries git's stderr).

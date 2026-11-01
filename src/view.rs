@@ -889,7 +889,7 @@ impl Render for StatusView {
                 }
                 // The GitHub repos with no clone, last, folded like the
                 // synced ones.
-                let remote = &state.remote_statuses;
+                let remote = state.sorted(&state.remote_statuses);
                 if !remote.is_empty() {
                     let open = !state.remote_folded(false);
                     let label =
@@ -970,17 +970,21 @@ impl Render for StatusView {
         };
         let table = match (&timelines, mode) {
             (Some(t), Mode::Window) => {
+                // In the configured order; the GitHub repos with no clone
+                // come after the cloned ones.
+                let order: Vec<&RepoStatus> = state
+                    .sorted(&state.statuses)
+                    .into_iter()
+                    .chain(state.sorted(&state.remote_statuses))
+                    .collect();
                 if let Some(i) = focus
                     .as_deref()
-                    .and_then(|f| crate::timeline::column_index(&state.statuses, f))
+                    .and_then(|f| crate::timeline::column_index(&order, f))
                 {
                     self.table.scroll_to_item(i);
                 }
-                // The GitHub repos with no clone come after the cloned ones.
-                let columns: Vec<AnyElement> = state
-                    .statuses
-                    .iter()
-                    .chain(&state.remote_statuses)
+                let columns: Vec<AnyElement> = order
+                    .into_iter()
                     .enumerate()
                     .map(|(i, s)| Timelines::column(t, i, s, &p, dark, window, cx))
                     .collect();

@@ -41,6 +41,28 @@ pub enum RepoClick {
     Github,
 }
 
+/// The order of the repos in the panel (within its unsynced and synced
+/// groups) and of the big view's columns. GitHub-only repos follow it too,
+/// after the cloned ones.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RepoSort {
+    #[default]
+    Name,
+    /// Worst first: error, diverged, behind, ahead, dirty, no upstream.
+    Status,
+    /// Newest commit on any branch first.
+    LastCommit,
+    /// Where HEAD moved last first: the repo you last worked in.
+    LastWorked,
+    /// Most recently updated pull request first.
+    LastPullRequest,
+    /// Most pull requests needing you, then most open ones, first.
+    OpenPullRequests,
+    /// Most hanging branches first.
+    HangingBranches,
+}
+
 /// What the number on the tray icon and the corner badge counts. Their
 /// colour always follows sync: red while any repo is unsynced, else green.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,6 +158,8 @@ pub struct Config {
     pub repo_click: RepoClick,
     /// What the number on the tray icon and the corner badge counts.
     pub badge_number: BadgeNumber,
+    /// The order of the repos in the panel and the big view.
+    pub sort: RepoSort,
 }
 
 impl Default for Config {
@@ -156,6 +180,7 @@ impl Default for Config {
             github_repos: true,
             repo_click: RepoClick::default(),
             badge_number: BadgeNumber::default(),
+            sort: RepoSort::default(),
         }
     }
 }
@@ -546,6 +571,15 @@ mod tests {
                 .more_paths
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn sort_defaults_to_name() {
+        let parse = |text: &str| serde_json::from_str::<Config>(text);
+        assert_eq!(parse("{}").unwrap().sort, RepoSort::Name);
+        let s = parse(r#"{ "sort": "last-worked" }"#).unwrap();
+        assert_eq!(s.sort, RepoSort::LastWorked);
+        assert!(parse(r#"{ "sort": "newest" }"#).is_err());
     }
 
     #[test]

@@ -274,6 +274,104 @@ pub(crate) fn parse_branches(all: &str, merged: &str, default: Option<&str>) -> 
     by_name.into_values().collect()
 }
 
+/// What sorting the repos needs from one, read on every check.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SortFacts {
+    pub last_commit: i64,
+    pub last_worked: i64,
+    pub unmerged: Vec<String>,
+}
+
+/// Three read-only git calls: every branch with its commit time, the ones
+/// merged into the default branch, and HEAD's newest reflog entry.
+pub fn sort_facts(repo: &Path) -> SortFacts {
+    const FORMAT: &str = "--format=%(refname)%1f%(committerdate:unix)";
+    let all = text(
+        repo,
+        &["for-each-ref", FORMAT, "refs/heads", "refs/remotes"],
+    )
+    .unwrap_or_default();
+    let origin_head = text(repo, &["symbolic-ref", "-q", "refs/remotes/origin/HEAD"]);
+    let refnames: Vec<&str> = all.lines().filter_map(|l| l.split('\x1f').next()).collect();
+    let default = default_ref(origin_head.as_deref(), &refnames);
+    let merged = default
+        .as_deref()
+        .and_then(|d| {
+            let arg = format!("--merged={d}");
+            text(
+                repo,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    &arg,
+                    "refs/heads",
+                    "refs/remotes",
+                ],
+            )
+        })
+        .unwrap_or_default();
+    let short = default.as_deref().map(|d| {
+        d.strip_prefix("refs/remotes/")
+            .or_else(|| d.strip_prefix("refs/heads/"))
+            .unwrap_or(d)
+            .to_string()
+    });
+    let branches = parse_branches(&all, &merged, short.as_deref());
+    let last_worked = text(
+        repo,
+        &[
+            "log",
+            "-g",
+            "-1",
+            "--date=unix",
+            "--format=%gd",
+            "HEAD",
+            "--",
+        ],
+    )
+    .and_then(|t| reflog_time(&t))
+    .unwrap_or(0);
+    SortFacts {
+        last_commit: all
+            .lines()
+            .filter_map(|l| l.split('\x1f').nth(1)?.trim().parse().ok())
+            .max()
+            .unwrap_or(0),
+        last_worked,
+        unmerged: branches
+            .into_iter()
+            .filter(|b| !b.merged)
+            .map(|b| b.name)
+            .collect(),
+    }
+}
+
+/// The default branch's full refname: what `origin/HEAD` points at, else
+/// the first of the usual names among `refnames`.
+fn default_ref(origin_head: Option<&str>, refnames: &[&str]) -> Option<String> {
+    if let Some(r) = origin_head
+        .map(str::trim)
+        .filter(|r| r.starts_with("refs/"))
+    {
+        return Some(r.to_string());
+    }
+    [
+        "refs/remotes/origin/main",
+        "refs/remotes/origin/master",
+        "refs/heads/main",
+        "refs/heads/master",
+    ]
+    .into_iter()
+    .find(|c| refnames.contains(c))
+    .map(str::to_string)
+}
+
+/// The time in `HEAD@{1730000000}`, as `log -g --date=unix --format=%gd` prints.
+fn reflog_time(text: &str) -> Option<i64> {
+    let t = text.trim();
+    t.strip_prefix("HEAD@{")?.strip_suffix('}')?.parse().ok()
+}
+
 fn text(repo: &Path, args: &[&str]) -> Option<String> {
     let out = git::git(repo, args, git::LOCAL_TIMEOUT).ok()?;
     out.status
@@ -572,6 +670,28 @@ mod tests {
         );
         assert_eq!(local.len(), 1);
         assert_eq!(local[0].name, "x");
+    }
+
+    #[test]
+    fn sort_facts_of_a_repo() {
+        let dir = temp_repo("sort-facts");
+        let mut n = 0;
+        commit(&dir, "one", &mut n);
+        run(&dir, &["checkout", "-q", "-b", "wip"]);
+        commit(&dir, "two", &mut n);
+        run(&dir, &["checkout", "-q", "main"]);
+        let f = sort_facts(&dir);
+        // `commit` dates commits 60 s apart from 1_700_000_000.
+        assert_eq!(f.last_commit, 1_700_000_120);
+        assert_eq!(f.unmerged, ["wip"]);
+        assert!(f.last_worked > 1_700_000_000, "{}", f.last_worked);
+        assert_eq!(reflog_time("HEAD@{1730000000}\n"), Some(1_730_000_000));
+        assert_eq!(reflog_time(""), None);
+        assert_eq!(
+            default_ref(None, &["refs/heads/main", "refs/heads/x"]).as_deref(),
+            Some("refs/heads/main")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
