@@ -67,7 +67,7 @@ else
     # running exe be renamed, so it keeps running from .old.
     if mv -f "$installed" "$dest/gitstat.exe.old" 2>/dev/null; then
       mv -f "$new.tmp" "$installed"
-      outcome="the running gitstat didn't switch within 15 seconds, so it predates self-update; it keeps running, and the new build runs from its next start"
+      outcome="the running gitstat didn't switch within 15 seconds (it predates self-update, or runs from an exe an earlier install renamed); it keeps running, and the new build runs from its next start"
     else
       mv -f "$new.tmp" "$new"
       outcome="the running gitstat didn't switch within 15 seconds and gitstat.exe.old is in use; the new build is left as gitstat.exe.new for gitstat's next start"
