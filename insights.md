@@ -7,3 +7,8 @@ Proposed rule: Agents never write to AppData (`%LOCALAPPDATA%` or `%APPDATA%`), 
 Added: 2026-11-01. Status: open
 What happened: A cleanup of `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache` (where Windows redirects AppData writes from the MSIX Claude desktop app) found: an old gitstat build worktree (`gitstat-build`, Oct 20-22) that gitstat showed as a second worktree; two GyroPhone CI builds with APKs (198 MB); NuGet, kotlin and matplotlib caches; and split app settings, because apps started from a Claude session ran inside the package too: an Oryx started that way saved its newest config and launches only in the package folder, and GyroPhone got a second, different `host.key` there. Installs through `install` hooks into `AppData\Local\Programs` did land in the real folder. See gitstat-1 for the AppData rule itself.
 Proposed rule: Apps an agent starts for testing are started outside the Claude app's package, for example from the Start menu shortcut or Explorer, so they read and write their real settings in AppData instead of a redirected copy.
+
+## gitstat-3: Insight branches don't merge automatically
+Added: 2026-11-01. Status: open
+What happened: The shared rules tell an agent to run `agent-merge` straight after committing an insight on its own `insights-<topic>` branch, taking Olex's ask as his OK. Olex wants to look at insight entries before they reach `main`.
+Proposed rule: An `insights-<topic>` branch is not merged automatically. The agent commits the entry with `agent-commit`, leaves the PR open, and runs `agent-merge` only when Olex says to merge it.
