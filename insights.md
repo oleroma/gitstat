@@ -12,3 +12,8 @@ Proposed rule: Apps an agent starts for testing are started outside the Claude a
 Added: 2026-11-01. Status: open
 What happened: The shared rules tell an agent to run `agent-merge` straight after committing an insight on its own `insights-<topic>` branch, taking Olex's ask as his OK. Olex wants to look at insight entries before they reach `main`.
 Proposed rule: An `insights-<topic>` branch is not merged automatically. The agent commits the entry with `agent-commit`, leaves the PR open, and runs `agent-merge` only when Olex says to merge it.
+
+## gitstat-4: Skip CI for insight-only changes
+Added: 2026-11-01. Status: open
+What happened: `agent-merge` runs the full checks in GitHub CI and waits for them before merging, even when the branch only changes `insights.md`. Merging two lines of notes took minutes and looked to Olex like a stuck thread. The push to `main` then runs the full checks again for nothing.
+Proposed rule: When a branch changes only `insights.md`, `agent-merge` skips the CI checks on the branch and merges with `[skip ci]` so the push to `main` doesn't run them either.
