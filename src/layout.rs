@@ -287,6 +287,7 @@ const MAX_SHARE: f32 = 0.6;
 /// A measured panel height in logical px, kept on the screen: at most 60%
 /// of the work area, like `panel_height`, but with no minimum, so the panel
 /// is exactly as tall as what it shows.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn fit_panel_height(wanted: f32, work_h_logical: f32) -> f32 {
     let wanted = wanted.max(HEADER);
     let cap = MAX_SHARE * work_h_logical;
@@ -659,6 +660,14 @@ mod tests {
         let r = Rect::new(10, 20, 54, 64).outset(3);
         assert_eq!(r, Rect::new(7, 17, 57, 67));
         assert_eq!(r.centre(), (32, 42));
+    }
+
+    #[test]
+    fn fit_panel_height_has_no_minimum_but_stays_on_screen() {
+        assert_eq!(fit_panel_height(150.0, 1000.0), 150.0);
+        assert_eq!(fit_panel_height(10.0, 1000.0), HEADER);
+        assert_eq!(fit_panel_height(900.0, 1000.0), 600.0);
+        assert_eq!(fit_panel_height(150.0, 0.0), 150.0);
     }
 
     #[test]
