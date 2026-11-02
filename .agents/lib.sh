@@ -73,11 +73,25 @@ pr_ready() {
   gh api -X POST "repos/$SLUG/pulls/$1/ccr/ready_for_review" >/dev/null || gh pr ready "$1" -R "$SLUG"
 }
 
+# wait_main_cache: when cache.yml is still compiling main, waits for it (at most 30 minutes),
+# so the fallback run starts from main's warm caches instead of building cold. Never fails.
+wait_main_cache() {
+  local i
+  for i in $(seq 1 60); do
+    [ -n "$(gh run list -R "$SLUG" --workflow cache.yml --branch main --limit 5 --json status \
+      --jq '[.[] | select(.status != "completed")][0].status // empty' 2>/dev/null)" ] || return 0
+    if [ "$i" = 1 ]; then echo "Waiting for the main cache run to finish first." >&2; fi
+    sleep 30
+  done
+  return 0
+}
+
 # run_fallback: runs fallback.yml on BRANCH (the same tests and build as a PC build) and waits
 # for it. Sets RUN (the run id) and RUN_URL. Returns 1 if the run failed; stops if it can't be found.
 run_fallback() {
   local sha since i
   sha="$(git -C "$WORKTREE" rev-parse HEAD)"
+  wait_main_cache
   since="$(date -u -d '1 minute ago' +%Y-%m-%dT%H:%M:%SZ)"
   gh workflow run fallback.yml -R "$SLUG" --ref "$BRANCH"
   RUN=""
