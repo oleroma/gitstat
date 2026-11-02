@@ -31,7 +31,7 @@
 5. **Merge.** `bash .agents/agent-merge`. It merges the latest `main` into the branch, then the branch into `main`, keeping the branch.
 
 ## Scripts and hooks
-- The scripts in `.agents/` are the same in every repo, synced with these rules. An agent may change them, the shared rules, or its repo's workflows in its own repo when the change fixes broken behavior or carries a useful insight from its work. It makes the change on its feature branch like any other code and says so in its summary. Only when Olex asks, the "rulesetter" thread copies the merged change to the master and makes the same change in every other repo's rules, scripts and workflows.
+- The scripts in `.agents/` are the same in every repo, synced with these rules. When Olex asks, an agent may change them, the shared rules, or its repo's workflows in its own repo, to fix broken behavior or carry a useful insight from its work. It makes the change on its feature branch like any other code and says so in its summary. After the merge it passes the change to the "rulesetter" thread, which copies it to the master and makes the same change in every other repo's rules, scripts and workflows.
 - Each repo's hooks in `.agents/hooks/` are its only repo-specific part of the pipeline, and part of its code: an agent may change them when its task changes how the repo builds or tests, and says so in its summary.
   - `quick-test`: the quick tests, run before the build.
   - `full-check`: the slower checks, run after the build. Every repo has one, and it doesn't repeat the quick tests.
