@@ -34,6 +34,17 @@ built() {
     checked "$(git rev-parse HEAD^1)"
 }
 
+# docs_only: true if everything the branch changed since main is documentation (*.md files
+# and docs/), which no build uses, so such a branch merges without a build.
+docs_only() {
+  local f any=0
+  while IFS= read -r f; do
+    any=1
+    case "$f" in *.md | docs/*) ;; *) return 1 ;; esac
+  done < <(git diff --name-only "$(git merge-base HEAD origin/main)" HEAD)
+  [ "$any" = 1 ]
+}
+
 git fetch origin
 
 # A merge is in progress: this is the run after the agent resolved conflicts.
@@ -59,7 +70,7 @@ if [ -f "$(git rev-parse --git-path MERGE_HEAD)" ]; then
 fi
 
 # Nothing is checked again here: the build Olex tested already ran the full checks.
-built || finish not-built "$(git rev-parse --short HEAD) has no build whose full checks passed." \
+docs_only || built || finish not-built "$(git rev-parse --short HEAD) has no build whose full checks passed." \
   "Build it (step 3) and have Olex test it, then run agent-merge again."
 
 # main hasn't moved since the branch last took it in.
@@ -74,7 +85,7 @@ overlap="$(comm -12 \
 
 if git merge --no-edit origin/main; then
   git push origin "$BRANCH"
-  if [ -n "$overlap" ]; then
+  if [ -n "$overlap" ] && ! docs_only; then
     finish needs-testing "Merged the latest main. It changed files this feature also changed:" "$overlap" \
       "Build again (step 3). Once Olex says it still works, run agent-merge again."
   fi
