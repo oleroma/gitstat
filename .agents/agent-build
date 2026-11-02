@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Step 3: build the feature branch. A PC build then runs agent-install on it; a failed
+# Step 3: build the feature branch. A PC build posts its result on the feature's PR when it ends,
+# so the thread agent watching that PR wakes up. It runs agent-install on the build; a failed
 # install is reported in the summary but doesn't fail the build. When the phone wasn't
 # reachable, a PC build that passes its full checks publishes the APK as a pre-release on its
 # build/<n> tag instead, as the CI fallback does, so Obtainium on the phone can install it.
@@ -77,7 +78,19 @@ guard_other_build() {
   done < <(gh api "repos/$SLUG/pulls?state=open&per_page=100" --jq '.[] | "\(.number) \(.head.sha) \(.head.ref)"')
 }
 
+# report_pr <result text>: posts a PC build's result, whatever it is, as a comment on the open PR
+# whose head is this commit. The thread agent watches its PR, so the comment wakes it even when
+# the Remote Control report never reaches it.
+report_pr() {
+  local sha pr
+  sha="$(git -C "$WORKTREE" rev-parse HEAD)"
+  pr="$(gh api "repos/$SLUG/pulls?state=open&per_page=100" --jq ".[] | select(.head.sha == \"$sha\") | .number" | head -n 1)"
+  [ -n "$pr" ] || return 0
+  gh api -X POST "repos/$SLUG/issues/$pr/comments" -f body="$(printf 'PC build of %s finished:\n\n```\n%s\n```\n\n_Posted by agent-build pc._' "${sha:0:7}" "$1")" >/dev/null
+}
+
 build_pc() {
+  report() { report_pr "$@"; }
   [ "$WORKTREE" -ef "$BUILD_DIR/src" ] || die "Run this from the build/src worktree, as in AGENTS.md step 3."
 
   local lock="$BUILD_DIR/.build-lock"

@@ -24,6 +24,10 @@ FINISHED=0
 # Scripts redefine this to undo things such as a lock; it runs on every exit.
 cleanup() { :; }
 
+# Scripts redefine this to pass on the result (its full text as $1); it runs once, on every
+# exit, after the result is printed. Its failure never changes the result.
+report() { :; }
+
 # finish <word> [summary line...]: print the result and exit.
 finish() {
   set +x
@@ -35,6 +39,7 @@ finish() {
   out="$out"$'\n'"log: $LOG_FILE"
   printf '%s\n' "$out"
   printf '%s\n' "$out" >&3
+  report "$out" || true
   case "$word" in
     done) exit 0 ;;
     failed) exit 1 ;;
@@ -49,7 +54,11 @@ on_exit() {
   set +x
   cleanup || true
   if [ "$FINISHED" = 0 ]; then
-    printf 'result: failed\nUnexpected error (exit %s); the last command in the log failed.\nlog: %s\n' "$code" "$LOG_FILE" >&3
+    local out
+    out="$(printf 'result: failed\nUnexpected error (exit %s); the last command in the log failed.\nlog: %s' "$code" "$LOG_FILE")"
+    printf '%s\n' "$out" >&3
+    FINISHED=1
+    report "$out" || true
     exit 1
   fi
 }
