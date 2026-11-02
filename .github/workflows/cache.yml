@@ -1,0 +1,41 @@
+name: Main cache
+
+# Keeps main's build caches warm, so the fallback build (fallback.yml) on a new branch starts
+# from them: GitHub lets a branch read only its own caches and main's. Runs after each push to
+# main and only compiles, with the same cache setup as fallback.yml. It runs no tests or checks,
+# sets no status, and nothing waits for it.
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: main-cache
+  cancel-in-progress: true
+
+jobs:
+  # Same job id as fallback.yml's job: rust-cache keys its caches by job id.
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> build/target"
+
+      # What the quick-test, build and full-check hooks compile, without running or checking it.
+      # CARGO_TARGET_DIR is set per command, as the hooks do: a job-level CARGO_* variable would
+      # change rust-cache's key and miss fallback.yml's cache.
+      - run: CARGO_TARGET_DIR=build/target cargo test --locked --no-run
+      - run: CARGO_TARGET_DIR=build/target cargo build --release --locked
+      - run: CARGO_TARGET_DIR=build/target cargo clippy --locked --all-targets
