@@ -8,12 +8,8 @@ require_feature_branch
 message="${1:-}"
 [ -n "$message" ] || die "Usage: agent-commit \"<message>\""
 
-git add -A
+stage_all
 staged="$(git diff --cached --name-only)"
-if grep -q '^build/' <<<"$staged"; then
-  git reset -q -- build/ # only unstages; the files stay as they are
-  die "Files under build/ were about to be committed, so build/ isn't gitignored. Tell Olex."
-fi
 
 if [ -z "$staged" ]; then
   committed="Nothing new to commit."
