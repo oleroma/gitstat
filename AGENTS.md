@@ -21,13 +21,15 @@
 | `stuck` | `agent-merge` | Show Olex the files, ask what to do, stop |
 
 ## Steps
-1. **Start.** `bash .agents/agent-start <feature-name>` makes the branch and a draft PR. If Olex says to go on despite `other-agent`, run it with `--continue`.
+1. **Start.** `bash .agents/agent-start <feature-name>` makes the branch and a draft PR. If Olex says to go on despite `other-agent`, run it with `--continue`. Watch that PR's activity (subscribe to it) until it's merged: PC builds report there.
 2. **Edit.** Write the code, then `bash .agents/agent-commit "<message>"`.
 3. **Build.** Every build runs the `quick-test`, `build` and `full-check` hooks once and marks the commit checked; nothing runs them again. Try the PC first through Remote Control (actually try, don't guess):
    - `pc`: in `D:\dev\<repo>`, run `git fetch origin <branch>`, then `git -C build/src checkout --detach origin/<branch>` (the first time: `git worktree add --detach build/src origin/<branch>`), then `bash build/src/.agents/agent-build pc`. Report its summary. If it says a build file wasn't installed because it isn't an APK, ask Olex whether to install it. To install again without building, run `bash build/src/.agents/agent-install [<version>-<commit>]`.
    - `ci`, only when the PC can't be reached: `bash .agents/agent-build ci`. Post the download links in the project thread first, then upload the files.
    - `agent-build` stops with `other-build` when the newest build came from another feature whose PR is still open, since Olex may still be testing it. If Olex says to go on, run it again with `--replace`.
    - If checks fail in code this feature didn't change, tell Olex instead of fixing it in the feature.
+   - Post the build summary in the project thread as soon as `agent-build` finishes, before any wait or follow-up check, and say what Olex needs to do next. Only what is posted in the thread reaches Olex. Never end a turn waiting on Olex without telling him there what you're waiting for. A check on a device that needs Olex to act first (such as opening the app) is a separate Remote Control task, started after he says he's done it, never part of the build task.
+   - Don't rely on the Remote Control session's report alone: it can fail to arrive. A PC build posts its result, whatever it is, as a comment on the feature's PR, which wakes the thread agent watching it. As a backup, when a PC build starts, set one reminder for after it should be done. If no result has arrived by then, check whether the head commit has a `build/<n>` tag and a passed check, and post what you find (or that it's still running, and since when) without waiting for Olex to ask.
    - A branch that changes only documentation (`*.md` files and `docs/`) needs no build or test: go straight to step 5 when Olex says so.
 4. **Check.** Wait for Olex. If he asks for changes, go back to 2. When he says the feature works, go to 5.
 5. **Merge.** `bash .agents/agent-merge`. It merges the latest `main` into the branch, then the branch into `main`, keeping the branch.
