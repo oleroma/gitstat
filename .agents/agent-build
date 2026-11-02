@@ -151,6 +151,8 @@ build_pc() {
         summary+=("Publishing the APK for Obtainium failed (see the log).")
       fi
     fi
+  elif [ "${#away[@]}" -gt 0 ]; then
+    summary+=("The phone wasn't connected; CI already published this build for Obtainium.")
   fi
 
   finish done "${summary[@]}"
