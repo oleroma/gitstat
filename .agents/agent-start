@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Step 1: make a feature branch from the latest main and open a draft PR into main.
-# Usage: .agents/agent-start [--continue] <feature-name>
+# Step 1: make the feature branch and open a draft PR into main. The agent may already have
+# edited (on main, or on its handoff branch after waiting): the branch starts from there with
+# those edits as its first commit, and the latest main merged in.
+# Usage: .agents/agent-start [--continue] <feature-name>   (run it again after resolving conflicts)
 #   --continue  skip the check for other agents' draft PRs (Olex said to go on)
 source "$(dirname "$0")/lib.sh"
 cd "$WORKTREE"
@@ -14,30 +16,66 @@ name="${1:-}"
 [ -n "$name" ] || die "Usage: agent-start [--continue] <feature-name>"
 git check-ref-format --branch "$name" >/dev/null || die "\"$name\" isn't a valid branch name."
 case "$name" in
-  main) die "Pick a feature name, not $name." ;;
+  main | handoff/*) die "Pick a feature name, not $name." ;;
 esac
-[ -z "$(git status --porcelain)" ] || die "There are uncommitted changes. Commit them with agent-commit, or ask Olex."
 
 git fetch origin --prune
+current="$(git symbolic-ref --quiet --short HEAD)" || die "Not on a branch."
+
+# publish: pushes the branch and opens its draft PR.
+publish() {
+  git push -u origin "$name"
+  local url
+  url="$(gh api -X POST "repos/$SLUG/pulls" -f base=main -f head="$name" -f title="$name" \
+    -f body="Work in progress by an agent." -F draft=true --jq .html_url)"
+  finish done "Branch $name made, with main at $(git rev-parse --short origin/main) merged in." "Draft PR: $url"
+}
+
+# A run after resolving conflicts from merging main into the new branch.
+if [ "$current" = "$name" ]; then
+  git ls-remote --exit-code origin "refs/heads/$name" >/dev/null && die "$name is already pushed: this is its feature branch."
+  if [ -f "$(git rev-parse --git-path MERGE_HEAD)" ]; then
+    mapfile -t files < <(git diff --name-only --diff-filter=U)
+    left="$(conflict_markers "${files[@]}")"
+    [ -z "$left" ] || finish conflicts "Conflict markers are still in:" "$left" "Resolve them, then run agent-start $name again."
+    stage_all
+    git commit --no-edit
+  fi
+  publish
+fi
+
+case "$current" in
+  main | handoff/*) ;;
+  *) die "On $current, another feature branch. Start a feature from main, or from its handoff branch." ;;
+esac
 
 if [ "$skip_check" = 0 ]; then
   drafts="$(gh api "repos/$SLUG/pulls?base=main&state=open&per_page=100" \
     --jq '.[] | select(.draft) | "#\(.number) \(.head.ref) \(.html_url)"')"
   if [ -n "$drafts" ]; then
-    finish other-agent "Open draft PRs into main:" "$drafts"
+    finish other-agent "Another feature holds the repo. Open draft PRs into main:" "$drafts" \
+      "Ask Olex: join it or wait. Either way, first run agent-handoff $name to keep this work on GitHub."
   fi
 fi
 
 if git show-ref --verify --quiet "refs/heads/$name" ||
-  git ls-remote --exit-code --heads origin "$name" >/dev/null; then
+  git ls-remote --exit-code origin "refs/heads/$name" >/dev/null; then
   die "A branch named $name already exists. Pick another name."
 fi
 
-git switch --no-track -c "$name" origin/main
-# GitHub won't open a PR without a commit, so the branch starts with an empty one.
-git commit --allow-empty -m "Start $name"
-git push -u origin "$name"
-url="$(gh api -X POST "repos/$SLUG/pulls" -f base=main -f head="$name" -f title="$name" \
-  -f body="Work in progress by an agent." -F draft=true --jq .html_url)"
+# The branch starts where the agent worked, with its edits, if any, as the first commit.
+# GitHub won't open a PR without a commit, so with no edits it starts with an empty one.
+git switch --no-track -c "$name"
+stage_all
+if [ -n "$(git diff --cached --name-only)" ]; then
+  git commit -m "Start $name"
+else
+  git commit --allow-empty -m "Start $name"
+fi
 
-finish done "Branch $name made from main at $(git rev-parse --short origin/main)." "Draft PR: $url"
+if ! git merge --no-edit origin/main; then
+  mapfile -t files < <(git diff --name-only --diff-filter=U)
+  finish conflicts "Merging the latest main into $name conflicts in:" "${files[@]}" \
+    "Resolve them, then run agent-start $name again."
+fi
+publish

@@ -135,5 +135,23 @@ require_feature_branch() {
   BRANCH="$(git -C "$WORKTREE" symbolic-ref --quiet --short HEAD)" || die "Not on a branch."
   case "$BRANCH" in
     main) die "On $BRANCH: run this on a feature branch." ;;
+    handoff/*) die "On $BRANCH, a handoff branch: it's merged into a feature branch with agent-take, or made one with agent-start." ;;
   esac
+}
+
+# stage_all: stages every change, and dies if build/ isn't gitignored.
+stage_all() {
+  git add -A
+  if git diff --cached --name-only | grep -q '^build/'; then
+    git reset -q -- build/ # only unstages; the files stay as they are
+    die "Files under build/ were about to be committed, so build/ isn't gitignored. Tell Olex."
+  fi
+}
+
+# conflict_markers <files...>: prints the files that still hold conflict markers.
+conflict_markers() {
+  local f
+  for f in "$@"; do
+    if [ -f "$f" ] && grep -qE '^(<<<<<<<|>>>>>>>)( |$)' "$f"; then echo "$f"; fi
+  done
 }
