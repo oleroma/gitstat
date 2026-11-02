@@ -85,7 +85,8 @@ for f in "${paths[@]}"; do
     *.apk)
       install_apk "$f" "$name"
       NOTES+=("$name: $INSTALL_NOTE")
-      if [ "$PHONE_AWAY" = 1 ]; then echo "phone-away: $f"; fi
+      # To fd 3, where agent-build reads it: stdout goes to the log (lib.sh).
+      if [ "$PHONE_AWAY" = 1 ]; then echo "phone-away: $f" >&3; fi
       ;;
     *)
       if [ ! -f "$HOOKS/install" ]; then NOTES+=("$name: not an APK, ask Olex whether to install it."); fi
