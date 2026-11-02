@@ -5,11 +5,14 @@
 #   no argument: the newest build; otherwise that build from build/builds/
 # Installs each APK on the phone (in place, never a downgrade), then runs the repo's
 # install hook, if it has one, for the other build files and any setup after an install.
+# For each APK it couldn't install because no phone was reachable, it prints
+# "phone-away: <path>", so agent-build can publish that APK for Obtainium instead.
 source "$(dirname "$0")/lib.sh"
 cd "$WORKTREE"
 
 HOOKS="$WORKTREE/.agents/hooks"
 INSTALL_NOTE=""
+PHONE_AWAY=0
 NOTES=()
 
 [ "$WORKTREE" -ef "$BUILD_DIR/src" ] || die "Run this from the build/src worktree, as in AGENTS.md step 3."
@@ -38,9 +41,11 @@ phone_notify() { # phone_notify <adb> <title> <text>
 
 install_apk() { # install_apk <apk> <name>; sets INSTALL_NOTE
   local apk="$1" title="${2%.apk}" adb devices out
+  PHONE_AWAY=0
   adb="$(find_adb)"
   if [ -z "$adb" ]; then
     INSTALL_NOTE="Not installed: adb not found."
+    PHONE_AWAY=1
     return
   fi
   export MSYS_NO_PATHCONV=1
@@ -48,6 +53,7 @@ install_apk() { # install_apk <apk> <name>; sets INSTALL_NOTE
   devices="$("$adb" devices | awk 'NR > 1 && $2 == "device"' | wc -l | tr -d ' ')"
   if [ "$devices" = 0 ]; then
     INSTALL_NOTE="Not installed: no phone connected."
+    PHONE_AWAY=1
     return
   fi
   if [ "$devices" != 1 ]; then
@@ -79,6 +85,7 @@ for f in "${paths[@]}"; do
     *.apk)
       install_apk "$f" "$name"
       NOTES+=("$name: $INSTALL_NOTE")
+      if [ "$PHONE_AWAY" = 1 ]; then echo "phone-away: $f"; fi
       ;;
     *)
       if [ ! -f "$HOOKS/install" ]; then NOTES+=("$name: not an APK, ask Olex whether to install it."); fi

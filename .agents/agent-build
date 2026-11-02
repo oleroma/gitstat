@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Step 3: build the feature branch. A PC build then runs agent-install on it; a failed
-# install is reported in the summary but doesn't fail the build.
+# install is reported in the summary but doesn't fail the build. When the phone wasn't
+# reachable, a PC build that passes its full checks publishes the APK as a pre-release on its
+# build/<n> tag instead, as the CI fallback does, so Obtainium on the phone can install it.
 # Usage:
 #   build/src/.agents/agent-build pc   on the PC, from the build/src worktree (AGENTS.md step 3)
 #   .agents/agent-build ci             in the cloud, on the feature branch
@@ -116,10 +118,14 @@ build_pc() {
   for name in "${names[@]}"; do summary+=("File: $BUILD_DIR/$name"); done
 
   # Install it. agent-install prints its own result and summary; keep the summary lines.
-  local out
+  local out away=()
   if out="$(bash "$AGENTS_DIR/agent-install" "$version-$commit")"; then
     while IFS= read -r line; do
-      case "$line" in "result: "* | "log: "* | "Installed build "*) ;; *) summary+=("$line") ;; esac
+      case "$line" in
+        "result: "* | "log: "* | "Installed build "*) ;;
+        "phone-away: "*) away+=("${line#phone-away: }") ;;
+        *) summary+=("$line") ;;
+      esac
     done <<<"$out"
   else
     summary+=("Install failed: $(grep -v -e '^result: ' -e '^log: ' <<<"$out" | head -n 1)" "Install log: $(sed -n 's/^log: //p' <<<"$out")")
@@ -135,6 +141,16 @@ build_pc() {
     mark_checked "$(git rev-parse HEAD)" "Passed on the PC" ||
       die "${summary[@]}" "Full checks passed, but marking $commit checked on GitHub failed."
     summary+=("Full checks passed.")
+
+    # The phone wasn't reachable: publish the APKs for Obtainium, as the CI fallback does.
+    if [ "${#away[@]}" -gt 0 ]; then
+      if gh release create "build/$BUILD_NUMBER" "${away[@]}" -R "$SLUG" --verify-tag --prerelease \
+        --title "$version" --notes "PC build of $(git rev-parse HEAD), published because the phone wasn't connected" >/dev/null; then
+        summary+=("Published for Obtainium: https://github.com/$SLUG/releases/tag/build/$BUILD_NUMBER")
+      else
+        summary+=("Publishing the APK for Obtainium failed (see the log).")
+      fi
+    fi
   fi
 
   finish done "${summary[@]}"
