@@ -14,6 +14,7 @@
 | `failed` | all | Read the log, explain to Olex, stop |
 | `other-agent` | `agent-start` | Tell Olex which draft PR is open, ask whether to wait |
 | `checks-failed` | `agent-build` | Fix it, go back to step 2. Olex doesn't test this build |
+| `other-build` | `agent-build` | Tell Olex which build of which feature it would replace, ask whether to go on |
 | `conflicts` | `agent-merge` | Resolve them, run `agent-merge` again |
 | `needs-testing` | `agent-merge` | The merge touched this feature: go back to step 3 |
 | `not-built` | `agent-merge` | Something was committed after the last build: go back to step 3 |
@@ -25,6 +26,7 @@
 3. **Build.** Every build runs the `quick-test`, `build` and `full-check` hooks once and marks the commit checked; nothing runs them again. Try the PC first through Remote Control (actually try, don't guess):
    - `pc`: in `D:\dev\<repo>`, run `git fetch origin <branch>`, then `git -C build/src checkout --detach origin/<branch>` (the first time: `git worktree add --detach build/src origin/<branch>`), then `bash build/src/.agents/agent-build pc`. Report its summary. If it says a build file wasn't installed because it isn't an APK, ask Olex whether to install it. To install again without building, run `bash build/src/.agents/agent-install [<version>-<commit>]`.
    - `ci`, only when the PC can't be reached: `bash .agents/agent-build ci`. Post the download links in the project thread first, then upload the files.
+   - `agent-build` stops with `other-build` when the newest build came from another feature whose PR is still open, since Olex may still be testing it. If Olex says to go on, run it again with `--replace`.
    - If checks fail in code this feature didn't change, tell Olex instead of fixing it in the feature.
    - A branch that changes only documentation (`*.md` files and `docs/`) needs no build or test: go straight to step 5 when Olex says so.
 4. **Check.** Wait for Olex. If he asks for changes, go back to 2. When he says the feature works, go to 5.

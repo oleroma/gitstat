@@ -3,9 +3,11 @@
 # install is reported in the summary but doesn't fail the build. When the phone wasn't
 # reachable, a PC build that passes its full checks publishes the APK as a pre-release on its
 # build/<n> tag instead, as the CI fallback does, so Obtainium on the phone can install it.
+# Before it builds, it stops with "other-build" when the repo's newest build came from another
+# branch whose PR is still open, since Olex may still be testing that build; --replace builds anyway.
 # Usage:
-#   build/src/.agents/agent-build pc   on the PC, from the build/src worktree (AGENTS.md step 3)
-#   .agents/agent-build ci             in the cloud, on the feature branch
+#   build/src/.agents/agent-build pc [--replace]   on the PC, from the build/src worktree (AGENTS.md step 3)
+#   .agents/agent-build ci [--replace]             in the cloud, on the feature branch
 source "$(dirname "$0")/lib.sh"
 cd "$WORKTREE"
 
@@ -45,6 +47,36 @@ fetch_ci_build() {
   [ "${#files[@]}" -gt 0 ] || die "CI run $run has no build files left."
 }
 
+# contains <old> <new>: true when commit <old> is in <new>'s history, asked on GitHub.
+contains() {
+  case "$(gh api "repos/$SLUG/compare/$1...$2" --jq .status)" in
+    ahead | identical) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# guard_other_build <sha>: stops with other-build when the newest build/<n> tag is on a commit
+# that <sha> doesn't contain and main doesn't contain, but an open PR's branch does: that's
+# another feature's build, which Olex may still be testing. Builds of the same branch, and
+# builds after the other PR merged or closed, go ahead.
+guard_other_build() {
+  [ "$REPLACE" = 0 ] || return 0
+  local last n sha pr head ref
+  last="$(git ls-remote --tags origin 'refs/tags/build/*' | sed -nE 's#^([0-9a-f]+)\s+refs/tags/build/([0-9]+)$#\2 \1#p' | sort -n | tail -n 1)"
+  [ -n "$last" ] || return 0
+  n="${last%% *}"
+  sha="${last#* }"
+  if contains "$sha" "$1" || contains "$sha" main; then return 0; fi
+  while read -r pr head ref; do
+    [ -n "$pr" ] || continue
+    if contains "$sha" "$head"; then
+      finish other-build "The newest build, build/$n, came from $ref (PR #$pr: https://github.com/$SLUG/pull/$pr), which is still open." \
+        "Olex may still be testing it; this build would replace it on the phone. Not built." \
+        "Ask Olex. If he says to go on, run agent-build again with --replace."
+    fi
+  done < <(gh api "repos/$SLUG/pulls?state=open&per_page=100" --jq '.[] | "\(.number) \(.head.sha) \(.head.ref)"')
+}
+
 build_pc() {
   [ "$WORKTREE" -ef "$BUILD_DIR/src" ] || die "Run this from the build/src worktree, as in AGENTS.md step 3."
 
@@ -54,6 +86,7 @@ build_pc() {
 
   local commit
   commit="$(git rev-parse --short=7 HEAD)"
+  guard_other_build "$(git rev-parse HEAD)"
 
   # When CI already built this commit (agent-build ci while the PC was away), download and
   # install that build instead of building it again.
@@ -163,6 +196,7 @@ build_ci() {
   git fetch origin "$BRANCH"
   [ "$(git rev-parse HEAD)" = "$(git rev-parse "origin/$BRANCH")" ] ||
     die "HEAD isn't what's pushed on origin/$BRANCH. Run agent-commit first."
+  guard_other_build "$(git rev-parse HEAD)"
 
   local slug="$SLUG" run url
   # The run does what a PC build does: quick tests, build, full checks.
@@ -186,8 +220,15 @@ build_ci() {
   finish done "${summary[@]}" "Post the links in the project thread first, then upload the files."
 }
 
+REPLACE=0
+case "${2:-}" in
+  "") ;;
+  --replace) REPLACE=1 ;;
+  *) die "Usage: agent-build pc|ci [--replace]" ;;
+esac
+
 case "${1:-}" in
   pc) build_pc ;;
   ci) build_ci ;;
-  *) die "Usage: agent-build pc|ci" ;;
+  *) die "Usage: agent-build pc|ci [--replace]" ;;
 esac
