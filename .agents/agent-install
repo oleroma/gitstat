@@ -5,14 +5,17 @@
 #   no argument: the newest build; otherwise that build from build/builds/
 # Installs each APK on the phone (in place, never a downgrade), then runs the repo's
 # install hook, if it has one, for the other build files and any setup after an install.
-# For each APK it couldn't install because no phone was reachable, it prints
+# For each APK it couldn't install (no phone reachable, or the install failed), it prints
 # "phone-away: <path>", so agent-build can publish that APK for Obtainium instead.
+# It ends "failed" when an install or the install hook failed; no phone connected is not a
+# failure (the phone gets the build from Obtainium).
 source "$(dirname "$0")/lib.sh"
 cd "$WORKTREE"
 
 HOOKS="$WORKTREE/.agents/hooks"
 INSTALL_NOTE=""
 PHONE_AWAY=0
+FAILED=0
 NOTES=()
 
 [ "$WORKTREE" -ef "$BUILD_DIR/src" ] || die "Run this from the build/src worktree, as in AGENTS.md step 3."
@@ -50,7 +53,8 @@ install_apk() { # install_apk <apk> <name>; sets INSTALL_NOTE
   fi
   export MSYS_NO_PATHCONV=1
 
-  devices="$("$adb" devices | awk 'NR > 1 && $2 == "device"' | wc -l | tr -d ' ')"
+  # A tab ends the device name, which may hold spaces (a wireless phone that reconnected: "… (2)._adb-tls-connect._tcp").
+  devices="$("$adb" devices | awk -F'\t' 'NR > 1 && $2 == "device"' | wc -l | tr -d ' ')"
   if [ "$devices" = 0 ]; then
     INSTALL_NOTE="Not installed: no phone connected."
     PHONE_AWAY=1
@@ -64,17 +68,27 @@ install_apk() { # install_apk <apk> <name>; sets INSTALL_NOTE
   "$adb" shell cmd vibrator_manager synced oneshot 200 || true
   phone_notify "$adb" "$title" "Installing now"
   # -r keeps app data. Without -d, adb refuses a downgrade instead of wiping data.
-  if out="$("$adb" install -r "$apk" 2>&1)" && grep -q Success <<<"$out"; then
+  out="$("$adb" install -r "$apk" 2>&1)" || true
+  if ! grep -q Success <<<"$out" && ! grep -q 'Failure \[' <<<"$out"; then
+    # No answer from the package manager: the link dropped (wireless adb). Wait for the
+    # phone to come back, once, and try again.
     echo "$out"
+    echo "The install got no answer; waiting up to 20 s for the phone and trying once more."
+    timeout 20 "$adb" wait-for-device || true
+    out="$("$adb" install -r "$apk" 2>&1)" || true
+  fi
+  echo "$out"
+  if grep -q Success <<<"$out"; then
     phone_notify "$adb" "$title" "Install complete"
     INSTALL_NOTE="Installed on the phone."
   else
-    echo "$out"
     phone_notify "$adb" "$title" "Install failed"
+    FAILED=1
     if grep -q VERSION_DOWNGRADE <<<"$out"; then
       INSTALL_NOTE="Not installed: it's a downgrade, which would wipe app data."
     else
-      INSTALL_NOTE="Install failed: $(grep -m 1 -E 'Failure|Error' <<<"$out" || echo "see the log")"
+      INSTALL_NOTE="Install failed: $(grep -m 1 -E 'Failure|Error|offline|not found' <<<"$out" || echo "no answer from the phone (see the log)")"
+      PHONE_AWAY=1
     fi
   fi
 }
@@ -100,6 +114,7 @@ if [ -f "$HOOKS/install" ]; then
   hook_out="$BUILD_DIR/logs/install-output.txt"
   if ! bash "$HOOKS/install" "$build_id" "${paths[@]}" >"$hook_out"; then
     NOTES+=("The install hook failed; see the log.")
+    FAILED=1
   fi
   cat "$hook_out"
   while IFS= read -r line; do
@@ -107,4 +122,5 @@ if [ -f "$HOOKS/install" ]; then
   done <"$hook_out"
 fi
 
+if [ "$FAILED" = 1 ]; then finish failed "Install of build $build_id failed:" "${NOTES[@]}"; fi
 finish done "Installed build $build_id:" "${NOTES[@]}"
