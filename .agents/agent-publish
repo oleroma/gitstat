@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Publishes a PC build as a GitHub pre-release on its build/<n> tag, when Olex asks for one.
+# Runs on the PC, where build/builds keeps the last 4 builds' files and each part's newest build.
+# Usage: .agents/agent-publish [<build number>]
+#   no number: the newest build of main (the highest build/<n> tag on a commit in origin/main)
+# Publishes every file of that build. A part the build didn't make (its sources were unchanged,
+# so no build file) comes from the newest older build in build/builds whose commit is in that
+# build's history: that is the part's current version. Files are matched by name with the
+# build's version taken out, so gyrophone-0.1.440.apk and gyrophone-0.1.446.apk are one part.
+# The build's full checks must have passed. When the release already exists (a build that
+# couldn't reach the phone publishes its APK there), only the files it lacks are added.
+source "$(dirname "$0")/lib.sh"
+cd "$WORKTREE"
+
+git fetch -q origin main --tags
+
+n="${1:-}"
+if [ -z "$n" ]; then
+  n="$(git tag --merged origin/main -l 'build/*' | sed -nE 's#^build/([0-9]+)$#\1#p' | sort -n | tail -n 1)"
+  [ -n "$n" ] || die "No build/<n> tag on main yet."
+fi
+[[ "$n" =~ ^[0-9]+$ ]] || die "Usage: agent-publish [<build number>]"
+tag="build/$n"
+sha="$(git rev-parse -q --verify "refs/tags/$tag^{commit}")" || die "There's no $tag tag."
+short="$(git rev-parse --short=7 "$sha")"
+
+# The build's folder, <version>-<commit>.
+dir=""
+for d in "$BUILD_DIR"/builds/*-"$short"/; do
+  if [ -d "$d" ]; then dir="${d%/}"; fi
+done
+[ -n "$dir" ] || die "Build $n ($short) isn't in $BUILD_DIR/builds, which keeps only the last 4 PC builds (and each part's newest)." \
+  "Build it again, or run fallback.yml, which publishes its own builds."
+version="$(basename "$dir")"
+version="${version%-"$short"}"
+
+checked "$sha" || die "The full checks haven't passed on build $n ($short), so it isn't published."
+
+# part <file> <version>: the file's name without its version, so builds of one part match.
+part() {
+  local name
+  name="$(basename "$1")"
+  echo "${name//"$2"/}"
+}
+
+files=() notes=() seen=" "
+for f in "$dir"/*; do
+  [ -f "$f" ] || continue
+  files+=("$f")
+  seen+="$(part "$f" "$version") "
+done
+[ "${#files[@]}" -gt 0 ] || die "$dir holds no build files."
+
+# The parts this build didn't make, from older builds in this build's history, newest first.
+while read -r d; do
+  d="${d%/}"
+  [ "$d" != "$dir" ] || continue
+  dv="$(basename "$d")"
+  dc="${dv##*-}"
+  dv="${dv%-*}"
+  git merge-base --is-ancestor "$dc" "$sha" 2>/dev/null || continue
+  for f in "$d"/*; do
+    [ -f "$f" ] || continue
+    p="$(part "$f" "$dv")"
+    case "$seen" in *" $p "*) continue ;; esac
+    files+=("$f")
+    seen+="$p "
+    notes+=("$(basename "$f") is from build $dv ($dc): its sources haven't changed since.")
+  done
+done < <(ls -1dt "$BUILD_DIR"/builds/*/)
+
+body="Build $version of $sha."
+if [ "${#notes[@]}" -gt 0 ]; then body+=$'\n\n'"$(printf '%s\n' "${notes[@]}")"; fi
+
+url="https://github.com/$SLUG/releases/tag/$tag"
+if gh api "repos/$SLUG/releases/tags/$tag" >/dev/null 2>&1; then
+  have="$(gh api "repos/$SLUG/releases/tags/$tag" --jq '.assets[].name')"
+  add=()
+  for f in "${files[@]}"; do
+    grep -qxF "$(basename "$f")" <<<"$have" || add+=("$f")
+  done
+  if [ "${#add[@]}" -eq 0 ]; then
+    finish done "Build $version was already published with all its files: $url"
+  fi
+  gh release upload "$tag" "${add[@]}" -R "$SLUG" || die "Adding the files to the existing release $tag failed."
+  summary=("Added to the existing pre-release $tag: $url")
+  for f in "${add[@]}"; do summary+=("File: $(basename "$f")"); done
+else
+  gh release create "$tag" "${files[@]}" -R "$SLUG" --verify-tag --prerelease --title "$version" --notes "$body" ||
+    die "Creating the pre-release $tag failed."
+  summary=("Published build $version as a pre-release: $url")
+  for f in "${files[@]}"; do summary+=("File: $(basename "$f")"); done
+fi
+summary+=("${notes[@]}")
+finish done "${summary[@]}"

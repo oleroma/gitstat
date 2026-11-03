@@ -70,7 +70,9 @@ if [ -f "$(git rev-parse --git-path MERGE_HEAD)" ]; then
 fi
 
 # Nothing is checked again here: the build Olex tested already ran the full checks.
-docs_only || built || finish not-built "$(git rev-parse --short HEAD) has no build whose full checks passed." \
+# A branch that since its last build changed only pipeline files or documentation needs no new
+# build: Olex tests pipeline changes himself (lib.sh only_pipeline_changes).
+docs_only || built || only_pipeline_changes || finish not-built "$(git rev-parse --short HEAD) has no build whose full checks passed." \
   "Build it (step 3) and have Olex test it, then run agent-merge again."
 
 # main hasn't moved since the branch last took it in.

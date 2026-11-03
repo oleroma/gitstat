@@ -130,6 +130,39 @@ mark_checked() {
   gh api -X POST "repos/$SLUG/statuses/$1" -f state=success -f context=full-check -f description="$2" >/dev/null
 }
 
+# Olex tests changes to the pipeline himself (AGENTS.md, "Scripts and hooks"), so a branch whose
+# changes since its last build are only pipeline files or documentation isn't built again.
+
+# pipeline_file <path>: true for a file no build uses: the pipeline (.agents/, .github/workflows/)
+# or documentation (*.md files and docs/).
+pipeline_file() {
+  case "$1" in .agents/* | .github/workflows/* | *.md | docs/*) return 0 ;; *) return 1 ;; esac
+}
+
+# unbuilt_changes: prints the files this branch's own commits changed after its newest commit
+# whose full checks passed (since main when none has), one per line, without what merges of
+# main brought in. Sets LAST_CHECKED to that commit, or empty.
+unbuilt_changes() {
+  local c base
+  LAST_CHECKED=""
+  base="$(git merge-base HEAD origin/main)"
+  while read -r c; do
+    if checked "$c"; then LAST_CHECKED="$c"; break; fi
+  done < <(git rev-list --first-parent "$base..HEAD")
+  git log --first-parent --no-merges --format= --name-only "${LAST_CHECKED:-$base}..HEAD" | grep -v '^$' | sort -u
+}
+
+# only_pipeline_changes: true if the branch changed something since its last build and all of it
+# is pipeline files or documentation (unbuilt_changes). Sets CHANGES to that list.
+only_pipeline_changes() {
+  local f
+  CHANGES="$(unbuilt_changes)"
+  [ -n "$CHANGES" ] || return 1
+  while IFS= read -r f; do
+    pipeline_file "$f" || return 1
+  done <<<"$CHANGES"
+}
+
 # Sets BRANCH to the current branch, or stops if it isn't a feature branch.
 require_feature_branch() {
   BRANCH="$(git -C "$WORKTREE" symbolic-ref --quiet --short HEAD)" || die "Not on a branch."

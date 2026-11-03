@@ -6,9 +6,11 @@
 # build/<n> tag instead, as the CI fallback does, so Obtainium on the phone can install it.
 # Before it builds, it stops with "other-build" when the repo's newest build came from another
 # branch whose PR is still open, since Olex may still be testing that build; --replace builds anyway.
+# It also stops with "workflow-change" when everything the branch changed since its last build is
+# pipeline files or documentation: Olex tests those himself. Only Olex passes --force to build anyway.
 # Usage:
-#   build/src/.agents/agent-build pc [--replace]   on the PC, from the build/src worktree (AGENTS.md step 3)
-#   .agents/agent-build ci [--replace]             in the cloud, on the feature branch
+#   build/src/.agents/agent-build pc [--replace] [--force]   on the PC, from the build/src worktree (AGENTS.md step 3)
+#   .agents/agent-build ci [--replace] [--force]             in the cloud, on the feature branch
 source "$(dirname "$0")/lib.sh"
 cd "$WORKTREE"
 
@@ -78,6 +80,19 @@ guard_other_build() {
   done < <(gh api "repos/$SLUG/pulls?state=open&per_page=100" --jq '.[] | "\(.number) \(.head.sha) \(.head.ref)"')
 }
 
+# guard_workflow_change: stops with workflow-change when the branch changed only pipeline files or
+# documentation since its last build (lib.sh only_pipeline_changes). A build wouldn't test them.
+guard_workflow_change() {
+  [ "$FORCE" = 0 ] || return 0
+  only_pipeline_changes || return 0
+  local since="since main"
+  if [ -n "$LAST_CHECKED" ]; then since="since its last build (${LAST_CHECKED:0:7})"; fi
+  mapfile -t files <<<"$CHANGES"
+  finish workflow-change "Not built: $(git rev-parse --short=7 HEAD) changed only pipeline files or documentation $since:" "${files[@]}" \
+    "Olex tests these himself. Tell him in the thread what changed and how to test it; don't run it." \
+    "agent-merge accepts this branch without a new build."
+}
+
 # report_pr <result text>: posts a PC build's result, whatever it is, as a comment on the open PR
 # whose head is this commit. The thread agent watches its PR, so the comment wakes it even when
 # the Remote Control report never reaches it.
@@ -99,6 +114,7 @@ build_pc() {
 
   local commit
   commit="$(git rev-parse --short=7 HEAD)"
+  guard_workflow_change
   guard_other_build "$(git rev-parse HEAD)"
 
   # When CI already built this commit (agent-build ci while the PC was away), download and
@@ -155,8 +171,31 @@ build_pc() {
   printf '%s\n' "${names[@]}" >"$BUILD_DIR/.newest"
   echo "$version-$commit" >"$BUILD_DIR/.newest-build"
 
-  # Keep the last 4 builds. Old-style build folders may hold a worktree; prune forgets those.
-  ls -1dt "$BUILD_DIR"/builds/*/ | tail -n +5 | while read -r old; do rm -rf "$old"; done
+  # Keep the last 4 builds, plus the newest build of each part (and the newest one on main) that
+  # they don't have, so agent-publish still finds a part that hasn't been rebuilt for a while.
+  # A part is a file name without its build's version. Old-style build folders may hold a
+  # worktree; prune forgets those.
+  local seen=" " seen_main=" " i=0 d dv dc f p keep
+  git fetch -q origin main || true
+  while read -r d; do
+    d="${d%/}"
+    i=$((i + 1))
+    dv="$(basename "$d")"
+    dc="${dv##*-}"
+    dv="${dv%-*}"
+    keep=0
+    if [ "$i" -le 4 ]; then keep=1; fi
+    for f in "$d"/*; do
+      [ -f "$f" ] || continue
+      p="$(basename "$f")"
+      p="${p//"$dv"/}"
+      case "$seen" in *" $p "*) ;; *) keep=1 seen+="$p " ;; esac
+      if git merge-base --is-ancestor "$dc" origin/main 2>/dev/null; then
+        case "$seen_main" in *" $p "*) ;; *) keep=1 seen_main+="$p " ;; esac
+      fi
+    done
+    if [ "$keep" = 0 ]; then rm -rf "$d"; fi
+  done < <(ls -1dt "$BUILD_DIR"/builds/*/)
   git -C "$MAIN_REPO" worktree prune
 
   local summary=("Built $version-$commit:") name
@@ -164,18 +203,18 @@ build_pc() {
   for name in "${names[@]}"; do summary+=("File: $BUILD_DIR/$name"); done
 
   # Install it. agent-install prints its own result and summary; keep the summary lines.
-  local out away=()
-  if out="$(bash "$AGENTS_DIR/agent-install" "$version-$commit")"; then
-    while IFS= read -r line; do
-      case "$line" in
-        "result: "* | "log: "* | "Installed build "*) ;;
-        "phone-away: "*) away+=("${line#phone-away: }") ;;
-        *) summary+=("$line") ;;
-      esac
-    done <<<"$out"
-  else
-    summary+=("Install failed: $(grep -v -e '^result: ' -e '^log: ' <<<"$out" | head -n 1)" "Install log: $(sed -n 's/^log: //p' <<<"$out")")
-  fi
+  # A failed install doesn't fail the build: it was built (and is checked below); the summary
+  # says why the phone didn't get it, and an APK it couldn't install is published for Obtainium.
+  local out away=() installed=1
+  out="$(bash "$AGENTS_DIR/agent-install" "$version-$commit")" || installed=0
+  while IFS= read -r line; do
+    case "$line" in
+      "result: "* | "Installed build "* | "Install of build "*) ;;
+      "log: "*) if [ "$installed" = 0 ]; then summary+=("Install log: ${line#log: }"); fi ;;
+      "phone-away: "*) away+=("${line#phone-away: }") ;;
+      *) summary+=("$line") ;;
+    esac
+  done <<<"$out"
   echo "$out"
 
   # The full checks, after the install so the phone gets the build first. A CI build of this
@@ -209,6 +248,7 @@ build_ci() {
   git fetch origin "$BRANCH"
   [ "$(git rev-parse HEAD)" = "$(git rev-parse "origin/$BRANCH")" ] ||
     die "HEAD isn't what's pushed on origin/$BRANCH. Run agent-commit first."
+  guard_workflow_change
   guard_other_build "$(git rev-parse HEAD)"
 
   local slug="$SLUG" run url
@@ -234,14 +274,19 @@ build_ci() {
 }
 
 REPLACE=0
-case "${2:-}" in
-  "") ;;
-  --replace) REPLACE=1 ;;
-  *) die "Usage: agent-build pc|ci [--replace]" ;;
-esac
+FORCE=0
+MODE="${1:-}"
+shift || true
+for arg in "$@"; do
+  case "$arg" in
+    --replace) REPLACE=1 ;;
+    --force) FORCE=1 ;;
+    *) die "Usage: agent-build pc|ci [--replace] [--force]" ;;
+  esac
+done
 
-case "${1:-}" in
+case "$MODE" in
   pc) build_pc ;;
   ci) build_ci ;;
-  *) die "Usage: agent-build pc|ci [--replace]" ;;
+  *) die "Usage: agent-build pc|ci [--replace] [--force]" ;;
 esac
