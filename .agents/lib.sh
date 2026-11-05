@@ -170,7 +170,6 @@ require_feature_branch() {
   BRANCH="$(git -C "$WORKTREE" symbolic-ref --quiet --short HEAD)" || die "Not on a branch."
   case "$BRANCH" in
     main) die "On $BRANCH: run this on a feature branch." ;;
-    handoff/*) die "On $BRANCH, a handoff branch: it's merged into a feature branch with agent-take, or made one with agent-start." ;;
   esac
 }
 
