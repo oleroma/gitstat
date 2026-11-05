@@ -9,8 +9,9 @@
 # It also stops with "workflow-change" when everything the branch changed since its last build is
 # pipeline files or documentation: Olex tests those himself. Only Olex passes --force to build anyway.
 # Usage:
-#   build/src/.agents/agent-build pc [--replace] [--force]   on the PC, from the build/src worktree (AGENTS.md step 3)
-#   .agents/agent-build ci [--replace] [--force]             in the cloud, on the feature branch
+#   .agents/agent-build pc <branch> [--replace] [--force]   on the PC, in D:\dev\<repo>: builds <branch> in build/src
+#   .agents/agent-build ci <branch> [--replace] [--force]   in the cloud: checks out <branch>, builds it in CI
+# Without <branch> it builds what's checked out where it runs.
 source "$(dirname "$0")/lib.sh"
 cd "$WORKTREE"
 
@@ -272,20 +273,45 @@ build_ci() {
   finish done "${summary[@]}" "Post the links in the project thread."
 }
 
+USAGE="Usage: agent-build pc|ci <branch> [--replace] [--force]"
 REPLACE=0
 FORCE=0
+BRANCH=""
+FLAGS=()
 MODE="${1:-}"
 shift || true
 for arg in "$@"; do
   case "$arg" in
-    --replace) REPLACE=1 ;;
-    --force) FORCE=1 ;;
-    *) die "Usage: agent-build pc|ci [--replace] [--force]" ;;
+    --replace) REPLACE=1; FLAGS+=("$arg") ;;
+    --force) FORCE=1; FLAGS+=("$arg") ;;
+    -*) die "$USAGE" ;;
+    *) [ -z "$BRANCH" ] || die "$USAGE"; BRANCH="$arg" ;;
   esac
 done
+
+# With a branch, first bring the build checkout to that branch, then build there: on the PC
+# that's the build/src worktree (made the first time), in the cloud the branch itself.
+if [ -n "$BRANCH" ]; then
+  git fetch origin "$BRANCH" || die "Couldn't fetch $BRANCH."
+  case "$MODE" in
+    pc)
+      src="$MAIN_REPO/build/src"
+      if [ -e "$src/.git" ]; then
+        git -C "$src" checkout --detach "origin/$BRANCH" || die "Couldn't check out $BRANCH in build/src."
+      else
+        git -C "$MAIN_REPO" worktree add --detach "$src" "origin/$BRANCH" || die "Couldn't make build/src."
+      fi
+      exec bash "$src/.agents/agent-build" pc "${FLAGS[@]}" >&3 2>&3 3>&-
+      ;;
+    ci)
+      git checkout "$BRANCH" && git merge --ff-only "origin/$BRANCH" || die "Couldn't check out $BRANCH."
+      exec bash "$WORKTREE/.agents/agent-build" ci "${FLAGS[@]}" >&3 2>&3 3>&-
+      ;;
+  esac
+fi
 
 case "$MODE" in
   pc) build_pc ;;
   ci) build_ci ;;
-  *) die "Usage: agent-build pc|ci [--replace] [--force]" ;;
+  *) die "$USAGE" ;;
 esac
