@@ -6,8 +6,8 @@
 # does, so Obtainium on the phone can install it.
 # Before it builds, it stops with "other-build" when the repo's newest build came from another
 # branch whose PR is still open, since Olex may still be testing that build; --replace builds anyway.
-# It also stops with "workflow-change" when everything the branch changed since its last build is
-# pipeline files or documentation: Olex tests those himself. Only Olex passes --force to build anyway.
+# It also stops with "workflow-change" when everything the branch changed since main is pipeline
+# files or documentation: Olex tests those himself. Only Olex passes --force to build anyway.
 # Usage:
 #   .agents/agent-build pc <branch> [--replace] [--force]   on the PC, in D:\dev\<repo>: builds <branch> in build/src
 #   .agents/agent-build ci <branch> [--replace] [--force]   in the cloud: checks out <branch>, builds it in CI
@@ -81,15 +81,13 @@ guard_other_build() {
   done < <(gh api "repos/$SLUG/pulls?state=open&per_page=100" --jq '.[] | "\(.number) \(.head.sha) \(.head.ref)"')
 }
 
-# guard_workflow_change: stops with workflow-change when the branch changed only pipeline files or
-# documentation since its last build (lib.sh only_pipeline_changes). A build wouldn't test them.
+# guard_workflow_change: stops with workflow-change when the whole branch changed only pipeline
+# files or documentation since main (lib.sh only_pipeline_changes). A build wouldn't test them.
 guard_workflow_change() {
   [ "$FORCE" = 0 ] || return 0
   only_pipeline_changes || return 0
-  local since="since main"
-  if [ -n "$LAST_CHECKED" ]; then since="since its last build (${LAST_CHECKED:0:7})"; fi
   mapfile -t files <<<"$CHANGES"
-  finish workflow-change "Not built: $(git rev-parse --short=7 HEAD) changed only pipeline files or documentation $since:" "${files[@]}" \
+  finish workflow-change "Not built: $(git rev-parse --short=7 HEAD) changed only pipeline files or documentation since main:" "${files[@]}" \
     "Olex tests these himself. Tell him in the thread what changed and how to test it; don't run it." \
     "agent-merge accepts this branch without a new build."
 }
@@ -163,14 +161,20 @@ build_pc() {
   local dest="$BUILD_DIR/builds/$version-$commit" old
   mkdir -p "$dest"
   cp "${files[@]}" "$dest/"
-  if [ -f "$BUILD_DIR/.newest" ]; then
-    while IFS= read -r old; do
-      if [ -n "$old" ]; then rm -f "$BUILD_DIR/$old"; fi
-    done <"$BUILD_DIR/.newest"
-  fi
+  # builds/.newest lists the build files last copied to build/, removed before the new ones come.
+  # (Older scripts kept these two files directly in build/; those are read once and removed.)
+  local list
+  for list in "$BUILD_DIR/builds/.newest" "$BUILD_DIR/.newest"; do
+    if [ -f "$list" ]; then
+      while IFS= read -r old; do
+        if [ -n "$old" ]; then rm -f "$BUILD_DIR/$old"; fi
+      done <"$list"
+    fi
+  done
+  rm -f "$BUILD_DIR/.newest" "$BUILD_DIR/.newest-build"
   cp "${files[@]}" "$BUILD_DIR/"
-  printf '%s\n' "${names[@]}" >"$BUILD_DIR/.newest"
-  echo "$version-$commit" >"$BUILD_DIR/.newest-build"
+  printf '%s\n' "${names[@]}" >"$BUILD_DIR/builds/.newest"
+  echo "$version-$commit" >"$BUILD_DIR/builds/.newest-build"
 
   # Keep the last 4 builds, plus the newest build of each part (and the newest one on main) that
   # they don't have, so agent-publish still finds a part that hasn't been rebuilt for a while.

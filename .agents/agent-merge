@@ -34,6 +34,21 @@ built() {
     checked "$(git rev-parse HEAD^1)"
 }
 
+# built_but_pipeline: true if the branch's newest commit whose full checks passed is followed only
+# by commits that change pipeline files or documentation (lib.sh pipeline_file): those need no
+# new build, since Olex tests pipeline changes himself.
+built_but_pipeline() {
+  local c base last="" f
+  base="$(git merge-base HEAD origin/main)"
+  while read -r c; do
+    if checked "$c"; then last="$c"; break; fi
+  done < <(git rev-list --first-parent "$base..HEAD")
+  [ -n "$last" ] || return 1
+  while IFS= read -r f; do
+    if [ -n "$f" ] && ! pipeline_file "$f"; then return 1; fi
+  done < <(git log --first-parent --no-merges --format= --name-only "$last..HEAD")
+}
+
 # docs_only: true if everything the branch changed since main is documentation (*.md files
 # and docs/), which no build uses, so such a branch merges without a build.
 docs_only() {
@@ -70,9 +85,10 @@ if [ -f "$(git rev-parse --git-path MERGE_HEAD)" ]; then
 fi
 
 # Nothing is checked again here: the build Olex tested already ran the full checks.
-# A branch that since its last build changed only pipeline files or documentation needs no new
-# build: Olex tests pipeline changes himself (lib.sh only_pipeline_changes).
-docs_only || built || only_pipeline_changes || finish not-built "$(git rev-parse --short HEAD) has no build whose full checks passed." \
+# A branch that changed only pipeline files or documentation since main needs no build, and
+# neither do such commits after the branch's last checked build: Olex tests pipeline changes
+# himself (lib.sh only_pipeline_changes, built_but_pipeline).
+docs_only || built || only_pipeline_changes || built_but_pipeline || finish not-built "$(git rev-parse --short HEAD) has no build whose full checks passed." \
   "Build it (step 3) and have Olex test it, then run agent-merge again."
 
 # main hasn't moved since the branch last took it in.

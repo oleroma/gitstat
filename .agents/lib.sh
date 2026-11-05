@@ -132,8 +132,8 @@ mark_checked() {
   gh api -X POST "repos/$SLUG/statuses/$1" -f state=success -f context=full-check -f description="$2" >/dev/null
 }
 
-# Olex tests changes to the pipeline himself (AGENTS.md, "Scripts and hooks"), so a branch whose
-# changes since its last build are only pipeline files or documentation isn't built again.
+# Olex tests changes to the pipeline himself (AGENTS.md, "Scripts and hooks"), so a branch that
+# changes only pipeline files or documentation since main isn't built.
 
 # pipeline_file <path>: true for a file no build uses: the pipeline (.agents/, .github/workflows/),
 # documentation and rules (*.md files and docs/), and git and agent settings.
@@ -144,24 +144,21 @@ pipeline_file() {
   esac
 }
 
-# unbuilt_changes: prints the files this branch's own commits changed after its newest commit
-# whose full checks passed (since main when none has), one per line, without what merges of
-# main brought in. Sets LAST_CHECKED to that commit, or empty.
-unbuilt_changes() {
-  local c base
-  LAST_CHECKED=""
+# branch_changes: sets CHANGES to the files this branch's own commits changed since main, one per
+# line, without what merges of main brought in. Call it directly, not in $( ): a subshell would
+# lose CHANGES.
+branch_changes() {
+  local base
   base="$(git merge-base HEAD origin/main)"
-  while read -r c; do
-    if checked "$c"; then LAST_CHECKED="$c"; break; fi
-  done < <(git rev-list --first-parent "$base..HEAD")
-  git log --first-parent --no-merges --format= --name-only "${LAST_CHECKED:-$base}..HEAD" | grep -v '^$' | sort -u
+  CHANGES="$(git log --first-parent --no-merges --format= --name-only "$base..HEAD" | grep -v '^$' | sort -u || true)"
 }
 
-# only_pipeline_changes: true if the branch changed something since its last build and all of it
-# is pipeline files or documentation (unbuilt_changes). Sets CHANGES to that list.
+# only_pipeline_changes: true if the branch changed something and all of it, since main, is
+# pipeline files or documentation (branch_changes). Sets CHANGES to that list. A branch that also
+# changes code is built every time, even when its newest commits touch only pipeline files.
 only_pipeline_changes() {
   local f
-  CHANGES="$(unbuilt_changes)"
+  branch_changes
   [ -n "$CHANGES" ] || return 1
   while IFS= read -r f; do
     pipeline_file "$f" || return 1
