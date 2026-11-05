@@ -257,17 +257,15 @@ build_ci() {
   run="$RUN"
   url="$RUN_URL"
 
-  local arts art id name dest="$BUILD_DIR/ci/$run" summary=("Built on GitHub, full checks passed: $url")
+  local arts art id name summary=("Built on GitHub, full checks passed: $url")
   arts="$(gh api "repos/$slug/actions/runs/$run/artifacts" --jq '.artifacts[] | "\(.id) \(.name)"')"
   [ -n "$arts" ] || die "The fallback run saved no build file: $url"
-  mkdir -p "$dest"
 
-  # Artifacts are uploaded unzipped, so each download is the build file itself.
+  # Artifacts are uploaded unzipped, so each link downloads the build file itself.
   while IFS= read -r art; do
     id="${art%% *}"
     name="${art#* }"
-    gh api "repos/$slug/actions/artifacts/$id/zip" >"$dest/$name"
-    summary+=("$name: direct download link https://github.com/$slug/actions/runs/$run/artifacts/$id" "  File: $dest/$name")
+    summary+=("$name: direct download link https://github.com/$slug/actions/runs/$run/artifacts/$id")
   done <<<"$arts"
 
   finish done "${summary[@]}" "Post the links in the project thread."

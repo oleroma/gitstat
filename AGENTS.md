@@ -38,7 +38,7 @@
 5. **Merge.** `bash .agents/agent-merge`. It merges the latest `main` into the branch, then the branch into `main`, keeping the branch.
 
 ## Scripts and hooks
-- The scripts in `.agents/` are the same in every repo. When an agent finds a problem in them, the shared rules or its repo's workflows, it suggests a fix to Olex, and makes it on its feature branch only when he asks. Olex tests such changes himself: the agent pushes them and says what changed and how to test it, without running them. After the merge it passes the change to the "rulesetter" thread, which makes it in every repo.
+- The scripts in `.agents/` are the same in every repo. When an agent finds a problem in them, the shared rules or its repo's workflows, it suggests a fix to Olex, and makes it on its feature branch only when he asks. Olex tests such changes himself: the agent pushes them and says what changed and how to test it, without running them. After the merge, Olex has the "rulesetter" thread apply it to every repo.
 - Each repo's hooks in `.agents/hooks/` are its only repo-specific part of the pipeline, and part of its code: an agent may change them when its task changes how the repo builds or tests, and says so in its summary.
   - `quick-test`: the quick tests, run before the build.
   - `full-check`: the slower checks, run after the build. Every repo has one, and it doesn't repeat the quick tests.
@@ -59,7 +59,7 @@
 - Everywhere else (the rest of the repo, other repos, the PC, the phone), never do anything that loses data git can't bring back: no deleting files or folders, `git reset --hard`, `git clean`, `git checkout`/`git restore` over uncommitted changes, `git stash drop`, force pushes, deleting branches or tags, rewriting pushed history, or uninstalling apps. If one is needed, ask Olex first. Normal edits as part of the task are fine.
 
 ## Agent instruction files
-- These shared rules sit at the top of every repo's `AGENTS.md`, between the "shared rules" markers. Their master copy is `rules/AGENTS.md` in the DevDoctor project's files, kept and synced by the "rulesetter" thread. Apart from the fixes and insights above, when Olex asks a repo thread for a shared-rule change, pass his message to the rulesetter thread.
+- These shared rules sit at the top of every repo's `AGENTS.md`, between the "shared rules" markers. Their master copy is `rules/AGENTS.md` in the DevDoctor project's files, kept by the "rulesetter" thread, which applies it to every repo. A repo agent suggests shared-rule changes to Olex; when he approves, it makes them in its own `AGENTS.md` on its feature branch, and after the merge Olex has the rulesetter apply them everywhere.
 - Rules live only in `AGENTS.md`. Project instructions, project memory (the notes a project's threads share) and coordinator notes point to it and never restate it. Memory keeps only ids, Olex's decisions, state and workarounds. A coordinator passes Olex's words on by attaching his message, not by rewording it. If any of them disagrees with `AGENTS.md`, follow `AGENTS.md` and fix the memory in the same turn. A thread that merges a change to the rules or pipeline fixes its project's memory on that topic.
 - Rules for one repo go below the end marker, written by Olex or by an agent when Olex asks. Where they disagree with a shared rule, the repo rule wins in that repo. Otherwise leave all agent instruction files (`AGENTS.md`, `CLAUDE.md` and the like) alone and bring any needed change to Olex.
 
