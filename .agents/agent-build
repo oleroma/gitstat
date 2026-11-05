@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Step 3: build the feature branch. A PC build posts its result on the feature's PR when it ends,
 # so the thread agent watching that PR wakes up. It runs agent-install on the build; a failed
-# install is reported in the summary but doesn't fail the build. When the phone wasn't
-# reachable, a PC build that passes its full checks publishes the APK as a pre-release on its
-# build/<n> tag instead, as the CI fallback does, so Obtainium on the phone can install it.
+# install is reported in the summary but doesn't fail the build. Every PC build that passes its
+# full checks publishes its build files as a pre-release on its build/<n> tag, as the CI fallback
+# does, so Obtainium on the phone can install it.
 # Before it builds, it stops with "other-build" when the repo's newest build came from another
 # branch whose PR is still open, since Olex may still be testing that build; --replace builds anyway.
 # It also stops with "workflow-change" when everything the branch changed since its last build is
@@ -204,7 +204,7 @@ build_pc() {
 
   # Install it. agent-install prints its own result and summary; keep the summary lines.
   # A failed install doesn't fail the build: it was built (and is checked below); the summary
-  # says why the phone didn't get it, and an APK it couldn't install is published for Obtainium.
+  # says why the phone didn't get it; the build is published below either way.
   local out away=() installed=1
   out="$(bash "$AGENTS_DIR/agent-install" "$version-$commit")" || installed=0
   while IFS= read -r line; do
@@ -227,18 +227,17 @@ build_pc() {
       die "${summary[@]}" "Full checks passed, but marking $commit checked on GitHub failed."
     summary+=("Full checks passed.")
 
-    # The phone wasn't reachable: publish the APKs for Obtainium, as the CI fallback does.
-    if [ "${#away[@]}" -gt 0 ]; then
-      if gh release create "build/$BUILD_NUMBER" "${away[@]}" -R "$SLUG" --verify-tag --prerelease \
-        --title "$version" --notes "PC build of $(git rev-parse HEAD), published because the phone wasn't connected" >/dev/null; then
-        summary+=("Published for Obtainium: https://github.com/$SLUG/releases/tag/build/$BUILD_NUMBER")
-      else
-        summary+=("Publishing the APK for Obtainium failed (see the log).")
-      fi
+    # Every build is published, as the CI fallback does.
+    if gh release create "build/$BUILD_NUMBER" "${files[@]}" -R "$SLUG" --verify-tag --prerelease \
+      --title "$version" --notes "PC build of $(git rev-parse HEAD)" >/dev/null; then
+      summary+=("Published: https://github.com/$SLUG/releases/tag/build/$BUILD_NUMBER")
+    else
+      summary+=("Publishing the build failed (see the log).")
     fi
-  elif [ "${#away[@]}" -gt 0 ]; then
-    summary+=("The phone wasn't connected; CI already published this build for Obtainium.")
+  else
+    summary+=("CI already published this build.")
   fi
+  if [ "${#away[@]}" -gt 0 ]; then summary+=("The phone wasn't connected; it can install the build from the pre-release."); fi
 
   finish done "${summary[@]}"
 }

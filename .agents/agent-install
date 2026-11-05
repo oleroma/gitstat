@@ -6,7 +6,7 @@
 # Installs each APK on the phone (in place, never a downgrade), then runs the repo's
 # install hook, if it has one, for the other build files and any setup after an install.
 # For each APK it couldn't install (no phone reachable, or the install failed), it prints
-# "phone-away: <path>", so agent-build can publish that APK for Obtainium instead.
+# "phone-away: <path>", so agent-build can say the phone gets it from the pre-release.
 # It ends "failed" when an install or the install hook failed; no phone connected is not a
 # failure (the phone gets the build from Obtainium).
 source "$(dirname "$0")/lib.sh"
