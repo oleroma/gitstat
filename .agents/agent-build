@@ -270,7 +270,7 @@ build_ci() {
     summary+=("$name: direct download link https://github.com/$slug/actions/runs/$run/artifacts/$id" "  File: $dest/$name")
   done <<<"$arts"
 
-  finish done "${summary[@]}" "Post the links in the project thread first, then upload the files."
+  finish done "${summary[@]}" "Post the links in the project thread."
 }
 
 REPLACE=0
