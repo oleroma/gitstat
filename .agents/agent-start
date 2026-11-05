@@ -2,7 +2,7 @@
 # Step 1: make the feature branch and open a draft PR into main. Any edits already made on main
 # become the branch's first commit, with the latest main merged in.
 # Usage: .agents/agent-start [--continue] <feature-name>   (run it again after resolving conflicts)
-#   --continue  skip the check for other agents' draft PRs (Olex said to go on)
+#   --continue  skip the check for other agents' draft PRs (the task isn't a feature, or Olex said to go on)
 source "$(dirname "$0")/lib.sh"
 cd "$WORKTREE"
 
@@ -53,7 +53,8 @@ if [ "$skip_check" = 0 ]; then
     --jq '.[] | select(.draft) | "#\(.number) \(.head.ref) \(.html_url)"')"
   if [ -n "$drafts" ]; then
     finish other-agent "Another feature holds the repo. Open draft PRs into main:" "$drafts" \
-      "Make no branch. Ask Olex whether to wait for it to merge or to send this task to that feature's thread."
+      "If this task isn't a feature, run agent-start --continue $name." \
+      "Otherwise make no branch: ask Olex whether to wait for it to merge or to send this task to that feature's thread."
   fi
 fi
 

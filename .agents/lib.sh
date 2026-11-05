@@ -135,10 +135,13 @@ mark_checked() {
 # Olex tests changes to the pipeline himself (AGENTS.md, "Scripts and hooks"), so a branch whose
 # changes since its last build are only pipeline files or documentation isn't built again.
 
-# pipeline_file <path>: true for a file no build uses: the pipeline (.agents/, .github/workflows/)
-# or documentation (*.md files and docs/).
+# pipeline_file <path>: true for a file no build uses: the pipeline (.agents/, .github/workflows/),
+# documentation and rules (*.md files and docs/), and git and agent settings.
 pipeline_file() {
-  case "$1" in .agents/* | .github/workflows/* | *.md | docs/*) return 0 ;; *) return 1 ;; esac
+  case "$1" in
+    .agents/* | .github/workflows/* | *.md | docs/* | .gitignore | .gitattributes | .claude/* | LICENSE*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # unbuilt_changes: prints the files this branch's own commits changed after its newest commit
