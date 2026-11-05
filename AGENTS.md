@@ -67,6 +67,7 @@
 
 ## Agent instruction files
 - These shared rules sit at the top of every repo's `AGENTS.md`, between the "shared rules" markers. Their master copy is `rules/AGENTS.md` in the DevDoctor project's files, kept and synced by the "rulesetter" thread. Apart from the fixes and insights above, when Olex asks a repo thread for a shared-rule change, pass his message to the rulesetter thread.
+- Rules live only in `AGENTS.md`. Project instructions, project memory (the notes a project's threads share) and coordinator notes point to it and never restate it. Memory keeps only ids, Olex's decisions, state and workarounds. A coordinator passes Olex's words on by attaching his message, not by rewording it. If any of them disagrees with `AGENTS.md`, follow `AGENTS.md` and fix the memory in the same turn. A thread that merges a change to the rules or pipeline fixes its project's memory on that topic.
 - Rules for one repo go below the end marker, written by Olex or by an agent when Olex asks. Where they disagree with a shared rule, the repo rule wins in that repo. Otherwise leave all agent instruction files (`AGENTS.md`, `CLAUDE.md` and the like) alone and bring any needed change to Olex.
 
 ## On the PC
