@@ -113,6 +113,8 @@ run_fallback() {
   done
   [ -n "$RUN" ] || die "Started the fallback workflow but couldn't find its run."
   RUN_URL="https://github.com/$SLUG/actions/runs/$RUN"
+  # Shown right away (not only in the result), so the run can be followed while it builds.
+  echo "CI run: $RUN_URL" >&3
   gh run watch -R "$SLUG" "$RUN" --exit-status --interval 15
 }
 
