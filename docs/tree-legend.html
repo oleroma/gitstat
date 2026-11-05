@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gitstat Tree Legend</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one narrow reference sheet, a row per marker with its drawing on the left, drawn on the same surface the app uses. */
+:root {
+  --bg: #f6f8fa; --surface: #ffffff; --fg: #1f2328; --muted: #59636e; --line: #d1d9e0;
+  --merged: #8250df; --unpushed: #9a6700; --unpulled: #0969da; --trunk: #656d76; --head: #1f2328;
+  --stash: #59636e; --added: #1a7f37; --removed: #cf222e; --pr-open: #1a7f37; --pr-draft: #afb8c1;
+  --h0: #0969da; --h1: #bc4c00; --h2: #bf3989; --h3: #9a6700; --h4: #1b7c83; --h5: #c4432b;
+  --sans: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", Consolas, ui-monospace, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0d1117; --surface: #161b22; --fg: #e6edf3; --muted: #8b949e; --line: #30363d;
+  --merged: #a371f7; --unpushed: #d29922; --unpulled: #58a6ff; --trunk: #8b949e; --head: #e6edf3;
+  --stash: #8b949e; --added: #3fb950; --removed: #f85149; --pr-open: #3fb950; --pr-draft: #6e7681;
+  --h0: #4493f8; --h1: #f0883e; --h2: #f778ba; --h3: #e3b341; --h4: #39c5cf; --h5: #ff7b72;
+  color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #0d1117; --surface: #161b22; --fg: #e6edf3; --muted: #8b949e; --line: #30363d;
+  --merged: #a371f7; --unpushed: #d29922; --unpulled: #58a6ff; --trunk: #8b949e; --head: #e6edf3;
+  --stash: #8b949e; --added: #3fb950; --removed: #f85149; --pr-open: #3fb950; --pr-draft: #6e7681;
+  --h0: #4493f8; --h1: #f0883e; --h2: #f778ba; --h3: #e3b341; --h4: #39c5cf; --h5: #ff7b72;
+  color-scheme: dark }
+
+body { margin: 0; background: var(--bg); color: var(--fg); font-family: var(--sans); font-size: 15px; line-height: 1.5; }
+.wrap { max-width: 760px; margin: 0 auto; padding-block: 40px 64px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: flex; flex-direction: column; gap: 36px; }
+header { display: flex; flex-direction: column; gap: 6px; }
+h1 { font-size: 26px; font-weight: 600; margin: 0; text-wrap: balance; }
+header p { margin: 0; color: var(--muted); max-width: 62ch; }
+section { display: flex; flex-direction: column; gap: 10px; }
+h2 { font-size: 12px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin: 0; }
+.sheet { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.row { display: grid; grid-template-columns: 112px minmax(0, 1fr); gap: 16px; align-items: center; padding: 12px 16px; border-top: 1px solid var(--line); }
+.row:first-child { border-top: 0; }
+.row svg { width: 112px; height: 40px; display: block; }
+.row .name { font-weight: 500; }
+.row .what { color: var(--muted); font-size: 14px; }
+.row .txt { min-width: 0; }
+.pillcell { display: flex; align-items: center; justify-content: flex-start; min-height: 40px; flex-wrap: wrap; gap: 4px; }
+.pill { font-family: var(--mono); font-size: 12px; padding: 1px 7px; border-radius: 999px; border: 1px solid currentColor; white-space: nowrap; }
+.glyph { font-family: var(--mono); font-size: 15px; display: inline-flex; gap: 4px; align-items: center; }
+.glyph b { font-weight: 400; color: var(--fg); font-size: 13px; }
+.note { font-size: 14px; color: var(--muted); margin: 0; max-width: 66ch; }
+code { font-family: var(--mono); font-size: .92em; }
+.sw { display: inline-block; width: 10px; height: 10px; border-radius: 50%; vertical-align: -1px; margin-right: 2px; }
+@media (max-width: 460px) {
+  .row { grid-template-columns: 84px minmax(0, 1fr); gap: 12px; padding: 10px 12px; }
+  .row svg { width: 84px; height: 30px; }
+}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <header>
+    <h1>What the shapes in the tree mean</h1>
+    <p>Every marker gitstat draws in the tray strips and in the big column view, drawn here with the app's own colours. It follows your light or dark theme like the app does.</p>
+  </header>
+
+  <section>
+    <h2>Commit dots</h2>
+    <div class="sheet">
+      <div class="row">
+        <svg viewBox="0 0 112 40" aria-hidden="true">
+          <line x1="8" y1="20" x2="104" y2="20" stroke="var(--h0)" stroke-opacity=".8" stroke-width="1.5"/>
+          <circle cx="36" cy="20" r="5" fill="var(--h0)"/><circle cx="76" cy="20" r="5" fill="var(--h0)"/>
+        </svg>
+        <div class="txt"><div class="name">Filled dot</div><div class="what">A commit. Its colour says what kind (see Colours below). The lines between dots are parent links.</div></div>
+      </div>
+      <div class="row">
+        <svg viewBox="0 0 112 40" aria-hidden="true">
+          <line x1="8" y1="20" x2="104" y2="20" stroke="var(--trunk)" stroke-opacity=".8" stroke-width="1.5"/>
+          <circle cx="56" cy="20" r="10" fill="var(--head)" fill-opacity=".22"/><circle cx="56" cy="20" r="5" fill="var(--head)"/>
+        </svg>
+        <div class="txt"><div class="name">Dot with a soft halo</div><div class="what">HEAD: the commit you have checked out. In the column view its hash is also bold.</div></div>
+      </div>
+      <div class="row">
+        <svg viewBox="0 0 112 40" aria-hidden="true">
+          <line x1="8" y1="20" x2="104" y2="20" stroke="var(--unpulled)" stroke-opacity=".8" stroke-width="1.5"/>
+          <circle cx="56" cy="20" r="5" fill="var(--surface)" stroke="var(--unpulled)" stroke-width="2"/>
+        </svg>
+        <div class="txt"><div class="name">Blue ring</div><div class="what">A commit on the remote that you haven't pulled yet.</div></div>
+      </div>
+      <div class="row">
+        <svg viewBox="0 0 112 40" aria-hidden="true">
+          <path d="M8 20 H104" stroke="var(--trunk)" stroke-opacity=".8" stroke-width="1.5" fill="none"/>
+          <path d="M20 10 H36 C48 10 44 20 56 20" stroke="var(--h2)" stroke-opacity=".8" stroke-width="1.5" fill="none"/>
+          <circle cx="20" cy="10" r="4" fill="var(--h2)"/>
+          <circle cx="56" cy="20" r="4.4" fill="var(--surface)" stroke="var(--trunk)" stroke-width="2"/>
+          <circle cx="88" cy="20" r="5" fill="var(--trunk)"/>
+        </svg>
+        <div class="txt"><div class="name">Small ring where lines join</div><div class="what">A merge commit. Its ring is a little smaller than the not-pulled ring.</div></div>
+      </div>
+      <div class="row">
+        <svg viewBox="0 0 112 40" aria-hidden="true">
+          <line x1="8" y1="24" x2="52" y2="24" stroke="var(--trunk)" stroke-opacity=".8" stroke-width="1.5"/>
+          <circle cx="48" cy="24" r="5" fill="var(--trunk)"/>
+          <path d="M53 24 C64 24 62 13 73 13" stroke="var(--unpushed)" stroke-opacity=".8" stroke-width="1.2" stroke-dasharray="2.5 2.5" fill="none"/>
+          <circle cx="79" cy="13" r="5.5" fill="var(--surface)" stroke="var(--unpushed)" stroke-width="1.3" stroke-dasharray="2.16 2.16"/>
+        </svg>
+        <div class="txt"><div class="name">Dashed amber ring</div><div class="what">Uncommitted changes in the working folder. It sits just right of HEAD, joined by a dashed line.</div></div>
+      </div>
+      <div class="row">
+        <svg viewBox="0 0 112 40" aria-hidden="true">
+          <line x1="8" y1="20" x2="104" y2="20" stroke="var(--trunk)" stroke-opacity=".8" stroke-width="1.5"/>
+          <circle cx="56" cy="20" r="9" fill="none" stroke="var(--head)" stroke-width="1.3"/>
+          <circle cx="56" cy="20" r="5" fill="var(--trunk)"/>
+        </svg>
+        <div class="txt"><div class="name">Thin outer ring, briefly</div><div class="what">You clicked the dot and its commit id went to the clipboard.</div></div>
+      </div>
+      <div class="row">
+        <svg viewBox="0 0 112 40" aria-hidden="true">
+          <line x1="8" y1="14" x2="104" y2="14" stroke="var(--h1)" stroke-opacity=".8" stroke-width="1.5"/>
+          <circle cx="56" cy="14" r="5" fill="var(--h1)"/>
+          <line x1="8" y1="32" x2="104" y2="32" stroke="var(--h4)" stroke-opacity=".35" stroke-width="1.5"/>
+          <circle cx="56" cy="32" r="5" fill="var(--h4)" fill-opacity=".5"/>
+        </svg>
+        <div class="txt"><div class="name">Faded dot and line</div><div class="what">A branch past the fifth lane. Extra lanes are folded onto the outer edge and dimmed.</div></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Marks next to a dot</h2>
+    <div class="sheet">
+      <div class="row">
+        <svg viewBox="0 0 112 40" aria-hidden="true">
+          <line x1="8" y1="25" x2="104" y2="25" stroke="var(--trunk)" stroke-opacity=".8" stroke-width="1.5"/>
+          <circle cx="56" cy="25" r="5" fill="var(--trunk)"/>
+          <path d="M56 11 L60 15 L56 19 L52 15 Z" fill="var(--trunk)"/>
+        </svg>
+        <div class="txt"><div class="name">Small diamond above</div><div class="what">The commit has a tag. Every build pushes a <code>build/&lt;n&gt;</code> tag, so most built commits carry one.</div></div>
+      </div>
+      <div class="row">
+        <svg viewBox="0 0 112 40" aria-hidden="true">
+          <line x1="8" y1="16" x2="104" y2="16" stroke="var(--trunk)" stroke-opacity=".8" stroke-width="1.5"/>
+          <circle cx="44" cy="16" r="5" fill="var(--trunk)"/>
+          <path d="M44 21 C44 30 54 30 62 30" stroke="var(--stash)" stroke-opacity=".8" stroke-width="1.2" stroke-dasharray="1.4 2" fill="none"/>
+          <rect x="62" y="26.5" width="7" height="7" fill="none" stroke="var(--stash)" stroke-width="1.3"/>
+        </svg>
+        <div class="txt"><div class="name">Hollow square on a dotted line</div><div class="what">A stash made on top of that commit.</div></div>
+      </div>
+      <div class="row">
+        <svg viewBox="0 0 112 40" aria-hidden="true">
+          <line x1="12" y1="20" x2="80" y2="20" stroke="var(--h4)" stroke-opacity=".24" stroke-width="10" stroke-linecap="round"/>
+          <line x1="8" y1="20" x2="104" y2="20" stroke="var(--h4)" stroke-opacity=".8" stroke-width="1.5"/>
+          <circle cx="80" cy="20" r="5" fill="var(--h4)"/><circle cx="46" cy="20" r="5" fill="var(--h4)"/>
+        </svg>
+        <div class="txt"><div class="name">Soft wide band under a line</div><div class="what">Another worktree of the same repo is checked out on that line. The band starts at its checked-out commit.</div></div>
+      </div>
+    </div>
+    <p class="note">In the big column view the tag and stash marks aren't drawn on the graph. They show as labels beside the row instead (see Column view below).</p>
+  </section>
+
+  <section>
+    <h2>Colours</h2>
+    <div class="sheet">
+      <div class="row"><div class="pillcell"><span class="sw" style="background:var(--trunk)"></span></div><div class="txt"><div class="name">Grey</div><div class="what">On the default branch (main).</div></div></div>
+      <div class="row"><div class="pillcell"><span class="sw" style="background:var(--unpushed)"></span></div><div class="txt"><div class="name">Amber</div><div class="what">Committed here but not pushed yet.</div></div></div>
+      <div class="row"><div class="pillcell"><span class="sw" style="background:var(--unpulled)"></span></div><div class="txt"><div class="name">Blue</div><div class="what">On the remote, not pulled yet (drawn as a ring).</div></div></div>
+      <div class="row"><div class="pillcell"><span class="sw" style="background:var(--merged)"></span></div><div class="txt"><div class="name">Purple</div><div class="what">Merged into the default branch, or its pull request was merged.</div></div></div>
+      <div class="row"><div class="pillcell"><span class="sw" style="background:var(--pr-open)"></span></div><div class="txt"><div class="name">Green</div><div class="what">The branch has an open pull request.</div></div></div>
+      <div class="row"><div class="pillcell"><span class="sw" style="background:var(--pr-draft)"></span></div><div class="txt"><div class="name">Pale grey</div><div class="what">The branch has a draft pull request. It's kept a different grey from main's.</div></div></div>
+      <div class="row"><div class="pillcell"><span class="sw" style="background:var(--removed)"></span></div><div class="txt"><div class="name">Red</div><div class="what">The branch's pull request was closed without merging.</div></div></div>
+      <div class="row"><div class="pillcell"><span class="sw" style="background:var(--h0)"></span><span class="sw" style="background:var(--h1)"></span><span class="sw" style="background:var(--h2)"></span><span class="sw" style="background:var(--h3)"></span><span class="sw" style="background:var(--h4)"></span><span class="sw" style="background:var(--h5)"></span></div><div class="txt"><div class="name">Other hues</div><div class="what">Any other branch. Each branch gets one of six colours picked from its name, so it keeps the same colour every time.</div></div></div>
+    </div>
+    <p class="note">Pull request colours win over the rest: a branch with an open PR is green even if some of it is unpushed.</p>
+  </section>
+
+  <section>
+    <h2>Column view</h2>
+    <div class="sheet">
+      <div class="row"><div class="pillcell"><span class="pill" style="color:var(--h1)">◆ v0.3.0</span></div><div class="txt"><div class="name">◆ label</div><div class="what">A tag on that commit.</div></div></div>
+      <div class="row"><div class="pillcell"><span class="pill" style="color:var(--h0)">feature</span></div><div class="txt"><div class="name">Coloured label</div><div class="what">A local branch pointing at that commit.</div></div></div>
+      <div class="row"><div class="pillcell"><span class="pill" style="color:var(--muted)">origin/main</span></div><div class="txt"><div class="name">Grey label</div><div class="what">A remote branch pointing at that commit.</div></div></div>
+      <div class="row"><div class="pillcell"><span class="pill" style="color:var(--stash)">stash@{0}</span></div><div class="txt"><div class="name">stash@{n} label</div><div class="what">A stash made on that commit.</div></div></div>
+      <div class="row"><div class="pillcell"><span class="pill" style="color:var(--h4)">⌂ src</span></div><div class="txt"><div class="name">⌂ label</div><div class="what">Another worktree has this commit checked out.</div></div></div>
+      <div class="row"><div class="pillcell"><span class="glyph"><span style="color:var(--added)">+42</span><span style="color:var(--removed)">−7</span></span></div><div class="txt"><div class="name">+N −N</div><div class="what">Lines added and removed by the commit.</div></div></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Column header summary</h2>
+    <div class="sheet">
+      <div class="row">
+        <svg viewBox="0 0 112 40" aria-hidden="true">
+          <rect x="8" y="16" width="96" height="8" rx="4" fill="var(--line)"/>
+          <path d="M12 16 H48 V24 H12 A4 4 0 0 1 12 16 Z" fill="var(--merged)"/>
+          <rect x="48" y="16" width="22" height="8" fill="var(--pr-open)"/>
+          <path d="M70 16 H100 A4 4 0 0 1 100 24 H70 Z" fill="var(--unpushed)"/>
+        </svg>
+        <div class="txt"><div class="name">Split bar</div><div class="what">The repo's branches (besides main) split by fate: merged, in an open PR, or hanging.</div></div>
+      </div>
+      <div class="row"><div class="pillcell"><span class="glyph"><span style="color:var(--merged)">●</span><b>12</b></span></div><div class="txt"><div class="name">Purple ●</div><div class="what">Branches already merged into main.</div></div></div>
+      <div class="row"><div class="pillcell"><span class="glyph"><span style="color:var(--pr-open)">●</span><b>3</b></span></div><div class="txt"><div class="name">Green ●</div><div class="what">Branches in open pull requests.</div></div></div>
+      <div class="row"><div class="pillcell"><span class="glyph"><span style="color:var(--unpushed)">●</span><b>2</b></span></div><div class="txt"><div class="name">Amber ●</div><div class="what">Hanging branches: not merged and no open PR. A count of zero is shown faded.</div></div></div>
+      <div class="row"><div class="pillcell"><span class="glyph"><span style="color:var(--muted)">⧉</span><b>2</b></span></div><div class="txt"><div class="name">⧉</div><div class="what">How many worktrees the repo has, counting the main one.</div></div></div>
+      <div class="row"><div class="pillcell"><span class="glyph"><span style="color:var(--muted)">◷</span><b>3d</b></span></div><div class="txt"><div class="name">◷</div><div class="what">How long ago the last merge into main was.</div></div></div>
+      <div class="row"><div class="pillcell"><span class="glyph"><span style="color:var(--muted)">▸ ▾</span></span></div><div class="txt"><div class="name">▸ / ▾</div><div class="what">Click to open or fold the details, which list the branch names behind each count.</div></div></div>
+    </div>
+  </section>
+</div>
+</body>
+</html>
