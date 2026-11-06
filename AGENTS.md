@@ -57,7 +57,7 @@
 
 ## Agent instruction files
 - These shared rules sit at the top of every repo's `AGENTS.md`, between the "shared rules" markers. Their master copy is `rules/AGENTS.md` in the DevDoctor project's files, kept by the "rulesetter" thread, which applies it to every repo. A repo agent suggests shared-rule changes to Olex; when he approves, it makes them in its own `AGENTS.md` on its feature branch, and after the merge Olex has the rulesetter apply them everywhere.
-- `AGENTS.md` is the main rules file; project instructions and project memory refer to it. When Olex says "check memory", compare project memory with `AGENTS.md`, and for each line that conflicts with it, suggest to Olex either removing the line from memory or moving it into this repo's rules below the end marker. Change nothing until he answers. A coordinator passes Olex's words on by attaching his message, not by rewording it.
+- Every rule for agents lives in `AGENTS.md`; project instructions and project memory refer to it rather than hold rules. At the start of every session, look for rules in project memory (lines that say how agents should work). Delete each one `AGENTS.md` already covers; move any other into this repo's rules below the end marker in a small PR, and delete it from memory once that merges. Tell Olex in one line what you moved. A coordinator passes Olex's words on by attaching his message, not by rewording it.
 - Rules for one repo go below the end marker, written by Olex or by an agent when Olex asks. Where they disagree with a shared rule, the repo rule wins in that repo. Otherwise leave all agent instruction files (`AGENTS.md`, `CLAUDE.md` and the like) alone and bring any needed change to Olex.
 
 ## On the PC
