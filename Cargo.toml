@@ -60,7 +60,7 @@ simplecss = "0.2.2"
 # Embeds assets/gitstat.ico as the exe's icon (Explorer, the Start menu).
 embed-resource = "3"
 
+# No LTO and the default codegen units: every build is a branch build, and these make
+# its final step several times slower for an exe that runs the same.
 [profile.release]
-lto = "thin"
-codegen-units = 1
 strip = true
