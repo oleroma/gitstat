@@ -24,13 +24,11 @@
 ## Steps
 1. **Start.** Before editing, `bash .agents/agent-start <feature-name>` makes the branch from the latest `main` and opens a draft PR. Watch that PR's activity (subscribe to it) until it's merged: every build's result shows there.
 2. **Edit.** Write the code, then `bash .agents/agent-commit "<message>"`.
-3. **Build.** Every build runs the `quick-test`, `build` and `full-check` hooks once and marks the commit checked. Feature threads don't build: the project's thread titled exactly "builder" runs every build, on the PC or in CI, one at a time. If the project has none, ask the coordinator to start one with that title.
-   - **Feature thread:** first run `bash .agents/hooks/quick-test` in your session and fix what fails; if the session can't run it, say so in your request. Then ask the builder to build your branch and say what the build should show. The result shows on your PR (the PC build's comment or the CI checks): as soon as it does, post only what was done, in one line, such as "Build 334 installed." or "Build 334 published." Pass on to Olex what the builder sends him or asks of him, and send his answer back.
-   - **Builder thread:** it keeps a Remote Control session on the PC, which Olex approves once. For each request:
-     - `pc`: run `bash .agents/agent-build pc <branch>`. To install again without building, run `bash .agents/agent-install [<version>-<commit>]`. If the phone dropped off wireless adb, ask for Olex to turn wireless debugging off and on, then run it again.
-     - `ci`: when Remote Control can't start (the PC is offline or doesn't pick up), run `bash .agents/agent-build ci <branch>` right away and say so in the feature thread. Send it the CI run link as soon as it shows.
-     - When a build fails, send the feature thread one message with the failing step and the log lines that matter. The feature fixes it and asks again.
-     - Never edit code or merge.
+3. **Build.** Every build runs the `quick-test`, `build` and `full-check` hooks once and marks the commit checked. The feature thread builds its own branch.
+   - First run `bash .agents/hooks/quick-test` in your session and fix what fails.
+   - **CI** (the default): run `bash .agents/agent-build ci <branch>` from your session and post the CI run link as soon as it shows.
+   - **PC**, when Olex wants the build installed from the PC: ask him for a Remote Control session on the PC for this feature, then run `bash .agents/agent-build pc <branch>` there. To install again without building, run `bash .agents/agent-install [<version>-<commit>]`. If the phone dropped off wireless adb, ask Olex to turn wireless debugging off and on, then run it again.
+   - The result shows on your PR (the PC build's comment or the CI checks): as soon as it does, post only what was done, in one line, such as "Build 334 installed." or "Build 334 published."
    - If checks fail in code this feature didn't change, tell Olex instead of fixing it in the feature.
    - Run `agent-build` and `agent-install` in the background with output to a file, never through a pipe: the build daemons they start keep a pipe open, so the command would never return.
    - Build only what the code needs to work: a branch that changes only files no build uses needs no build, and `agent-build` stops with `workflow-change`.
@@ -51,7 +49,7 @@
 - Everything made by building, testing or running the program (outputs, logs, screenshots, caches, downloads) goes in the repo's gitignored `build/` folder, nowhere else in the repo. Leave files other tools keep in the repo (such as `.delta/` and `.gitstat/`) alone.
 - `build/src` is the one PC build worktree, reused so builds stay incremental. Nothing is ever edited in it.
 - Every build gets the repo's next build number, pushed as a `build/<n>` tag by `.agents/build-number`. The version is the hand-bumped version name plus the number, `<name>-<n>` (or `0.1.<n>` where the name holds it), and Android's `versionCode` is the number. A repo may start its count at the number in `.agents/hooks/first-build-number`.
-- When Olex asks to publish builds, ask the builder to run `bash .agents/agent-publish [<n>]` on the PC. It publishes build `<n>` (by default `main`'s newest build) as a pre-release on its `build/<n>` tag, with every part's current file.
+- When Olex asks to publish builds, run `bash .agents/agent-publish [<n>]` on the PC, through a Remote Control session. It publishes build `<n>` (by default `main`'s newest build) as a pre-release on its `build/<n>` tag, with every part's current file.
 - Keep builds fast: build caches on and never cleaned, build daemons kept running on the PC, quicker settings for branch builds as long as the build file runs the same way.
 
 ## Destructive actions
