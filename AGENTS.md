@@ -22,11 +22,11 @@
 | `stuck` | `agent-merge` | Show Olex the files, ask what to do, stop |
 
 ## Steps
-1. **Start.** Before editing, `bash .agents/agent-start <feature-name>` makes the branch from the latest `main` and opens a draft PR. Watch that PR's activity (subscribe to it) until it's merged: every build's result shows there.
+1. **Start.** Before editing, `bash .agents/agent-start <feature-name>` makes the branch from the latest `main` and opens a draft PR. Watch that PR's activity (subscribe to it) until it's merged: every build's result shows there. Also before editing, check whether the PC is online (your device list shows it reachable). If it is, ask Olex now for a Remote Control session on it for this feature, so step 3 builds on the PC; if not, step 3 builds in CI.
 2. **Edit.** Write the code, then `bash .agents/agent-commit "<message>"`.
 3. **Build.** Every build runs the `quick-test`, `build` and `full-check` hooks once and marks the commit checked. The feature thread builds its own branch.
-   - **CI** (the default): run `bash .agents/agent-build ci <branch>` from your session and post the CI run link as soon as it shows.
-   - **PC**, when Olex wants the build installed from the PC: ask him for a Remote Control session on the PC for this feature, then run `bash .agents/agent-build pc <branch>` there. To install again without building, run `bash .agents/agent-install [<version>-<commit>]`. If the phone dropped off wireless adb, ask Olex to turn wireless debugging off and on, then run it again.
+   - **PC**, when step 1 found it online: run `bash .agents/agent-build pc <branch>` in that Remote Control session. To install again without building, run `bash .agents/agent-install [<version>-<commit>]`. If the phone dropped off wireless adb, ask Olex to turn wireless debugging off and on, then run it again.
+   - **CI**, when the PC was offline or Olex says CI: run `bash .agents/agent-build ci <branch>` from your session and post the CI run link as soon as it shows.
    - The result shows on your PR (the PC build's comment or the CI checks): as soon as it does, post only what was done, in one line, such as "Build 334 installed." or "Build 334 published."
    - If checks fail in code this feature didn't change, tell Olex instead of fixing it in the feature.
    - Run `agent-build` and `agent-install` in the background with output to a file, never through a pipe: the build daemons they start keep a pipe open, so the command would never return.
