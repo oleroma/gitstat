@@ -27,12 +27,32 @@
 3. **Build.** Every build runs the `quick-test`, `build` and `full-check` hooks once and marks the commit checked. The feature thread builds its own branch.
    - **PC**, when step 1 found it online: run `bash .agents/agent-build pc <branch>` in that Remote Control session. To install again without building, run `bash .agents/agent-install [<version>-<commit>]`. If the phone dropped off wireless adb, ask Olex to turn wireless debugging off and on, then run it again.
    - **CI**, when the PC was offline or Olex says CI: run `bash .agents/agent-build ci <branch>` from your session and post the CI run link as soon as it shows.
-   - The result shows on your PR (the PC build's comment or the CI checks): as soon as it does, post only what was done, in one line, such as "Build 334 installed." or "Build 334 published."
+   - The result shows on your PR (the PC build's comment or the CI checks): as soon as it does, post only what was done, in one line, such as "📲 Build 334 installed on the phone." (see Status lines)
    - If checks fail in code this feature didn't change, tell Olex instead of fixing it in the feature.
    - Run `agent-build` and `agent-install` in the background with output to a file, never through a pipe: the build daemons they start keep a pipe open, so the command would never return.
    - Build only what the code needs to work: a branch that changes only files no build uses needs no build, and `agent-build` stops with `workflow-change`.
 4. **Check.** Wait for Olex. If he asks for changes, go back to 2. Merge only when he says "merge".
-5. **Merge.** `bash .agents/agent-merge`. It merges the latest `main` into the branch, then the branch into `main`, keeping the branch.
+5. **Merge.** `bash .agents/agent-merge`. It merges the latest `main` into the branch, then the branch into `main`, keeping the branch. Then post the end report, one line each:
+   ```
+   🔀 Merged tilt deadzone: <PR link>
+   ✏️ Deadzone slider in Settings, saved per device.
+   🔨🖥️🤖 Build 334 · 📲 installed · 📦 published
+   ```
+
+## Status lines
+Start each status line you post to Olex with its emoji. A build line adds where it builds (🖥️ on the PC, ☁️ in CI) and what it builds (🤖 Android APK, 🪟 Windows exe; both when it makes both).
+
+| Emoji | Means | Example |
+|---|---|---|
+| ✏️ | Edited, committed | ✏️ Added the tilt deadzone setting. |
+| 🔨 + where + what | Building | 🔨☁️🤖 Building the APK in CI: <run link> |
+| ✅ + what | Built, checks passed | ✅🤖 Build 334 passed its checks. |
+| 📲 | Installed on the phone | 📲 Build 334 installed on the phone. |
+| 🪟 | Installed on Windows | 🪟 gitstat 335 installed on Windows. |
+| 📦 | Published for Obtainium | 📦 Build 334 published. |
+| 🔀 | Merged | 🔀 Merged into main: <PR link> |
+| ❌ + what | Failed | ❌🤖 Build 334 failed: lint, unused import in Gyro.kt. Fixing it. |
+| ❓ | Needs Olex | ❓ Keep the old menu or replace it? |
 
 ## Scripts and hooks
 - The scripts in `.agents/` are the same in every repo. When an agent finds a problem in them, the shared rules or its repo's workflows, it suggests a fix to Olex, and makes it on its feature branch only when he asks. Olex tests such changes himself: the agent pushes them and says what changed and how to test it, without running them. After the merge, Olex has the "rulesetter" thread apply it to every repo.
