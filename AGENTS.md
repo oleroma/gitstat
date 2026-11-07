@@ -52,7 +52,8 @@ Start each status line you post to Olex with its emoji. A build line adds where 
 | 📦 | Published for Obtainium | 📦 Build 334 published. |
 | 🔀 | Merged | 🔀 Merged into main: <PR link> |
 | ❌ + what | Failed | ❌🤖 Build 334 failed: lint, unused import in Gyro.kt. Fixing it. |
-| ❓ | Needs Olex | ❓ Keep the old menu or replace it? |
+| ❓ | Needs Olex's choice | ❓ Keep the old menu or replace it? |
+| 🤔 | Clarifying question | 🤔 By "faster", do you mean the app start or the sync? |
 
 ## Scripts and hooks
 - The scripts in `.agents/` are the same in every repo. When an agent finds a problem in them, the shared rules or its repo's workflows, it suggests a fix to Olex, and makes it on its feature branch only when he asks. Olex tests such changes himself: the agent pushes them and says what changed and how to test it, without running them. After the merge, Olex has the "rulesetter" thread apply it to every repo.
