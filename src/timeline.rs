@@ -551,17 +551,14 @@ impl Timelines {
         if new == self.hover {
             return;
         }
-        if let Some(Hover {
-            dot: Dot::Commit(row),
-            repo,
-            ..
-        }) = &new
-        {
-            self.request_stat(repo, *row, cx);
-        }
         // Sliding from dot to dot keeps a card already up; a fresh hover
         // waits for the mouse to settle.
         let sliding = self.card && self.hover.is_some() && new.is_some();
+        // The line counts only show on the card, so a mouse passing over
+        // dots on its way somewhere doesn't start a git call for each.
+        if sliding {
+            self.request_hovered_stat(new.as_ref(), cx);
+        }
         let now = Instant::now();
         self.leave(now);
         self.hover_since = now;
@@ -577,6 +574,8 @@ impl Timelines {
                     if this.hover_generation == generation {
                         this.card = true;
                         this.card_shown += 1;
+                        let hover = this.hover.clone();
+                        this.request_hovered_stat(hover.as_ref(), cx);
                         cx.notify();
                     }
                 })
@@ -607,7 +606,22 @@ impl Timelines {
         cx.notify();
     }
 
+    fn request_hovered_stat(&mut self, hover: Option<&Hover>, cx: &mut Context<Self>) {
+        if let Some(Hover {
+            dot: Dot::Commit(row),
+            repo,
+            ..
+        }) = hover
+        {
+            self.request_stat(repo, *row, cx);
+        }
+    }
+
     fn request_stat(&mut self, path: &Path, row: usize, cx: &mut Context<Self>) {
+        // A GitHub-only repo has no clone to ask.
+        if crate::github::remote_slug(path).is_some() {
+            return;
+        }
         let Some(id) = self.commit_id(path, row) else {
             return;
         };
@@ -896,11 +910,11 @@ impl Timelines {
     pub fn hover_card(&self, p: &Palette, dark: bool, cx: &App) -> Option<AnyElement> {
         let h = self.hover.as_ref().filter(|_| self.card)?;
         // Gone with the dot when the tree turned clean or dirty under it.
-        let dirty = self
-            .state
-            .read(cx)
+        let state = self.state.read(cx);
+        let dirty = state
             .statuses
             .iter()
+            .chain(&state.remote_statuses)
             .find(|s| s.path == h.repo)?
             .dirty;
         if dirty != h.dirty {

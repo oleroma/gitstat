@@ -408,8 +408,8 @@ const STATUS_V2: (u32, u32) = (2, 16);
 /// `rev-parse --path-format=absolute`.
 #[cfg(any(windows, test))]
 const PATH_FORMAT: (u32, u32) = (2, 31);
-/// Beyond this many ignored directories nothing extra is filtered; the
-/// watcher just does a few more checks.
+/// Beyond this many ignored directories, and as many ignored files, nothing
+/// extra is filtered; the watcher just does a few more checks.
 const MAX_IGNORED: usize = 2048;
 
 fn fetch_repo(repo: &Path) -> Result<(), String> {
@@ -481,12 +481,14 @@ pub(crate) struct Parsed {
     /// `# branch.ab` is present only when the upstream exists, so a gone
     /// upstream counts as none, as `rev-list ...@{upstream}` failing did.
     pub has_upstream: bool,
-    /// Ignored directories, relative to the repo, with their trailing `/`.
+    /// Ignored directories, relative to the repo, with their trailing `/`,
+    /// and ignored files outside them, such as `debug.log`.
     pub ignored: Vec<String>,
 }
 
 pub(crate) fn parse_status_v2(out: &[u8]) -> Parsed {
     let mut parsed = Parsed::default();
+    let (mut dirs, mut files) = (0, 0);
     let mut fields = out.split(|&b| b == 0);
     while let Some(field) = fields.next() {
         match field.first() {
@@ -508,13 +510,18 @@ pub(crate) fn parse_status_v2(out: &[u8]) -> Parsed {
                 }
             }
             Some(b'!') => {
-                if let Some(path) = field.strip_prefix(b"! ")
-                    && path.ends_with(b"/")
-                    && parsed.ignored.len() < MAX_IGNORED
-                {
-                    parsed
-                        .ignored
-                        .push(String::from_utf8_lossy(path).into_owned());
+                if let Some(path) = field.strip_prefix(b"! ") {
+                    let count = if path.ends_with(b"/") {
+                        &mut dirs
+                    } else {
+                        &mut files
+                    };
+                    if *count < MAX_IGNORED {
+                        *count += 1;
+                        parsed
+                            .ignored
+                            .push(String::from_utf8_lossy(path).into_owned());
+                    }
                 }
             }
             Some(_) => {
@@ -725,6 +732,9 @@ pub(crate) fn run_quiet(mut command: Command, timeout: Duration) -> Result<Outpu
     let stderr = spawn_reader(child.stderr.take());
 
     let deadline = Instant::now() + timeout;
+    // Most git calls take a few milliseconds, so poll fast at first and back
+    // off to 50 ms: a fixed 50 ms sleep made every call take at least that.
+    let mut pause = Duration::from_millis(1);
     let exit = loop {
         match child.try_wait() {
             Ok(Some(exit)) => break exit,
@@ -739,14 +749,17 @@ pub(crate) fn run_quiet(mut command: Command, timeout: Duration) -> Result<Outpu
                 let _ = child.wait();
                 return Err("timed out".to_string());
             }
-            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_millis(50));
+            }
             Err(e) => return Err(e.to_string()),
         }
     };
     // Something git started (an ssh master, a credential helper) can keep the
     // pipes open after git exits, so don't wait on them for long.
     let collect =
-        |rx: mpsc::Receiver<Vec<u8>>| rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
+        |rx: mpsc::Receiver<Vec<u8>>| rx.recv_timeout(Duration::from_secs(1)).unwrap_or_default();
     Ok(Output {
         status: exit,
         stdout: collect(stdout),
@@ -923,7 +936,10 @@ mod tests {
             "! sub/node_modules/",
         ]));
         assert!(!ignored.dirty);
-        assert_eq!(ignored.ignored, vec!["target/", "sub/node_modules/"]);
+        assert_eq!(
+            ignored.ignored,
+            vec!["target/", "debug.log", "sub/node_modules/"]
+        );
 
         let submodule = "1 .M S.M. 160000 160000 160000 aaaa aaaa vendor/lib";
         assert!(parse(&with_header(&[upstream, even, submodule])).dirty);
@@ -939,6 +955,13 @@ mod tests {
         let parsed = parse(&records);
         assert_eq!(parsed.ignored.len(), MAX_IGNORED);
         assert!(!parsed.dirty);
+        // Files have their own cap, so they can't crowd out the folders.
+        let mut records: Vec<String> = (0..MAX_IGNORED + 10).map(|i| format!("! f{i}.o")).collect();
+        records.push("! target/".into());
+        let records: Vec<&str> = records.iter().map(String::as_str).collect();
+        let parsed = parse(&records);
+        assert_eq!(parsed.ignored.len(), MAX_IGNORED + 1);
+        assert_eq!(parsed.ignored.last().map(String::as_str), Some("target/"));
     }
 
     #[test]

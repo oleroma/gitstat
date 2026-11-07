@@ -317,12 +317,28 @@ pub fn open_repo(path: &std::path::Path, cx: &mut App) {
     if github {
         let web = cx
             .try_global::<Ui>()
-            .and_then(|ui| ui.timelines.read(cx).web(path))
-            .or_else(|| crate::repo_info::origin_web(path));
+            .and_then(|ui| ui.timelines.read(cx).web(path));
         if let Some(web) = web {
             cx.open_url(&web);
             return;
         }
+        // Not drawn yet: ask git off the UI thread, which a slow or busy
+        // disk would otherwise freeze.
+        let repo = path.to_path_buf();
+        let task = cx.background_spawn(async move {
+            let web = crate::repo_info::origin_web(&repo);
+            (repo, web)
+        });
+        cx.spawn(async move |cx| {
+            let (repo, web) = task.await;
+            cx.update(|cx| match web {
+                Some(web) => cx.open_url(&web),
+                None => cx.open_with_system(&repo),
+            })
+            .ok();
+        })
+        .detach();
+        return;
     }
     cx.open_with_system(path);
 }

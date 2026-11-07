@@ -424,7 +424,12 @@ fn on_action(action: TrayAction, cx: &mut App) -> bool {
             }
         }
         TrayAction::ShowWindow => view::show_window(cx),
-        TrayAction::Refresh => cx.global::<Shared>().send_monitors(Command::RefreshAll),
+        TrayAction::Refresh => {
+            // The same as the panel's ↻: GitHub is asked again too.
+            let shared = cx.global::<Shared>();
+            shared.send_monitors(Command::RefreshAll);
+            shared.github.refresh();
+        }
         TrayAction::OpenRepo(path) => view::open_repo(&path, cx),
         TrayAction::EditConfig => {
             let file = cx.global::<Ui>().state.read(cx).config_file.clone();
@@ -517,11 +522,15 @@ fn ask_folder_icons(cx: &mut App) {
     }
     shared.consent_pending = true;
     let answer = win::confirm_box(FOLDER_ICONS_CONSENT.to_string());
-    let wait = cx
-        .background_executor()
-        .spawn(async move { answer.join().unwrap_or(false) });
+    // Waited for on a thread of its own: the box can stay open for minutes,
+    // and a background executor thread waiting that long is one fewer for
+    // timelines and icons.
+    let (tx, wait) = futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(answer.join().unwrap_or(false));
+    });
     cx.spawn(async move |cx| {
-        let yes = wait.await;
+        let yes = wait.await.unwrap_or(false);
         cx.update(|cx| {
             cx.global_mut::<Shared>().consent_pending = false;
             if yes {

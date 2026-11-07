@@ -410,10 +410,13 @@ impl AppState {
     /// (needing you, open) pull requests of `s`.
     fn pr_counts(&self, s: &RepoStatus) -> (i64, i64) {
         if s.remote_only {
+            // Compared as text: building a path per repo made sorting
+            // hundreds of them quadratic in allocations.
+            let slug = crate::github::remote_slug(&s.path);
             let open = self
                 .remote_repos
                 .iter()
-                .find(|r| crate::github::remote_path(&r.slug) == s.path)
+                .find(|r| slug == Some(r.slug.as_str()))
                 .map_or(0, |r| r.open_prs as i64);
             return (0, open);
         }

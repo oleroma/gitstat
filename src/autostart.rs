@@ -59,9 +59,14 @@ pub fn is_enabled() -> bool {
 }
 
 pub fn set_enabled(enabled: bool) -> Result<(), String> {
+    // Before the key is open, so a missing exe can't leave it open.
+    let value = if enabled {
+        Some(wide(&command_line().ok_or("can't find gitstat.exe")?))
+    } else {
+        None
+    };
     let key = open_run_key(KEY_SET_VALUE).ok_or("can't open the Run registry key")?;
-    let status = if enabled {
-        let value = wide(&command_line().ok_or("can't find gitstat.exe")?);
+    let status = if let Some(value) = value {
         unsafe {
             RegSetValueExW(
                 key,

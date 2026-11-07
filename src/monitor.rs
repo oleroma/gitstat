@@ -844,15 +844,28 @@ impl Scheduler {
         self.retries.retain(|path, _| repos.contains(path));
         self.sweep.retain(|path| repos.contains(path));
 
+        // A linked worktree's dirs take a git call to find, so the ones
+        // already found are kept; only new and unresolved repos ask again.
+        let unresolved = std::mem::take(&mut self.unresolved);
+        let known: HashMap<PathBuf, RepoRoute> = self
+            .router
+            .routes()
+            .filter(|r| !force && !unresolved.contains(&r.path))
+            .map(|r| (r.path.clone(), r.clone()))
+            .collect();
         let ignored: HashMap<PathBuf, Vec<String>> = self
             .router
             .routes()
             .map(|r| (r.path.clone(), r.ignored.clone()))
             .collect();
-        self.unresolved.clear();
         let mut routes: Vec<RepoRoute> = Vec::new();
         for repo in &self.repos {
-            let (mut route, resolved) = route_for(repo, &self.root);
+            // A `.git` folder costs nothing to route, and may have just
+            // replaced a `.git` file.
+            let (mut route, resolved) = match known.get(repo) {
+                Some(route) if !repo.join(".git").is_dir() => (route.clone(), true),
+                _ => route_for(repo, &self.root),
+            };
             route.ignored = ignored.get(repo).cloned().unwrap_or_default();
             if !resolved {
                 self.unresolved.insert(repo.clone());
