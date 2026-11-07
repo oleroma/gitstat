@@ -55,6 +55,24 @@ Start each status line you post to Olex with its emoji. A build line adds where 
 | ❓ | Needs Olex's choice | ❓ Keep the old menu or replace it? |
 | 🤔 | Clarifying question | 🤔 By "faster", do you mean the app start or the sync? |
 
+A status line is its emoji and a few words. Add one short sentence of context when Olex has to act (what to do and why), something failed (the cause and the next step), something is unusual (slower than normal, a retry, a different path than planned), or it changes what he was last told.
+
+When Olex says "sup", reply with one line per piece of current work, the ones that need him first. Each line starts with its state, then its status line:
+
+| Emoji | Means |
+|---|---|
+| 👉 | Needs Olex (an answer, a test, a "merge") |
+| ⏳ | In progress, nothing needed from him; for a running command, add how long it has run |
+| ⚙️ | A running command with no action emoji |
+| 💤 | Nothing going on (the whole reply) |
+
+```
+👉 📲 tilt deadzone: build 334 installed. Test the slider in Settings.
+⏳ 🔨☁️🤖 sync fix building in CI, 9 min in. Slower than usual: cold cache.
+⏳ ⚙️ harvest-rules.sh, 1 min in
+🔀 menu cleanup merged
+```
+
 ## Scripts and hooks
 - The scripts in `.agents/` are the same in every repo. When an agent finds a problem in them, the shared rules or its repo's workflows, it suggests a fix to Olex, and makes it on its feature branch only when he asks. Olex tests such changes himself: the agent pushes them and says what changed and how to test it, without running them. After the merge, Olex has the "rulesetter" thread apply it to every repo.
 - Each repo's hooks in `.agents/hooks/` are its only repo-specific part of the pipeline. They are pipeline, not code: a branch that changes only hooks (with other pipeline files or docs) isn't built, and Olex tests it himself like any pipeline change. An agent may change them when its task changes how the repo builds or tests, and says so in its summary.
