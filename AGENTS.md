@@ -55,6 +55,8 @@ Start each status line you post to Olex with its emoji. A build line adds where 
 | ❓ | Needs Olex's choice | ❓ Keep the old menu or replace it? |
 | 🤔 | Clarifying question | 🤔 By "faster", do you mean the app start or the sync? |
 
+Never post a bare URL: write each link as a Markdown link with a word or two of text, such as [CI run](…) or [build 334](…).
+
 A status line is its emoji and a few words. Add one short sentence of context when Olex has to act (what to do and why), something failed (the cause and the next step), something is unusual (slower than normal, a retry, a different path than planned), or it changes what he was last told.
 
 When Olex says "sup", reply with one line per piece of current work, the ones that need him first. Each line starts with its state, then its status line:
