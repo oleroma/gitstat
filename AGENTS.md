@@ -27,7 +27,7 @@
 3. **Build.** Every build runs the `quick-test`, `build` and `full-check` hooks once and marks the commit checked. The feature thread builds its own branch.
    - **PC**, when step 1 found it online: run `bash .agents/agent-build pc <branch>` in that Remote Control session. To install again without building, run `bash .agents/agent-install [<version>-<commit>]`. If the phone dropped off wireless adb, ask Olex to turn wireless debugging off and on, then run it again.
    - **CI**, when the PC was offline or Olex says CI: run `bash .agents/agent-build ci <branch>` from your session and post the CI run link as soon as it shows.
-   - The result shows on your PR (the PC build's comment or the CI checks): as soon as it does, post only what was done, in one line, such as "📲 Build 334 installed on the phone." (see Status lines)
+   - Every build is published as a pre-release on its `build/<n>` tag before its full checks. Watch the build's output: as soon as it shows the build is ready (a PC build's "Ready" lines, a CI build's "Published build" line), post it in one line, such as "📲📦 Build 334 installed and published." (see Status lines). Then post the full checks' result only if they fail.
    - If checks fail in code this feature didn't change, tell Olex instead of fixing it in the feature.
    - Run `agent-build` and `agent-install` in the background with output to a file, never through a pipe: the build daemons they start keep a pipe open, so the command would never return.
    - Build only what the code needs to work: a branch that changes only files no build uses needs no build, and `agent-build` stops with `workflow-change`.
