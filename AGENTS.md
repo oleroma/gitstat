@@ -22,7 +22,7 @@
 | `stuck` | `agent-merge` | Show Olex the files, ask what to do, stop |
 
 ## Steps
-1. **Start.** Before editing, `bash .agents/agent-start <feature-name>` makes the branch from the latest `main` and opens a draft PR. Watch that PR's activity (subscribe to it) until it's merged: every build's result shows there. Also before editing, check whether the PC is online (your device list shows it reachable). If it is, ask Olex now for a Remote Control session on it for this feature, so step 3 builds on the PC; if not, step 3 builds in CI.
+1. **Start.** Before editing, `bash .agents/agent-start <feature-name>` makes the branch from the latest `main` and opens a draft PR. Watch that PR's activity (subscribe to it) until it's merged: every build's result shows there. Also before editing, check whether the PC is online (your device list shows it reachable). If it is, ask Olex now for a Remote Control session on it for this feature, so step 3 builds on the PC; if not, step 3 builds in CI. When Olex says "I'm on", his PC is on and most likely the phone too: from then on build and install on the PC, and if the phone isn't connected over adb, tell him.
 2. **Edit.** Write the code, then `bash .agents/agent-commit "<message>"`.
 3. **Build.** Every build runs the `quick-test`, `build` and `full-check` hooks once and marks the commit checked. The feature thread builds its own branch.
    - **PC**, when step 1 found it online: run `bash .agents/agent-build pc <branch>` in that Remote Control session. To install again without building, run `bash .agents/agent-install [<version>-<commit>]`. If the phone dropped off wireless adb, ask Olex to turn wireless debugging off and on, then run it again.
