@@ -13,7 +13,7 @@
 | `done` | all | Next step |
 | `failed` | all | Read the log, explain to Olex, stop |
 | `other-agent` | `agent-start` | Another feature holds the repo. If your task isn't a feature (it changes only files no build uses, see `workflow-change`), run `agent-start --continue <name>`. Otherwise make no branch and no edits: work out the task, ask Olex what you need, then ask whether to wait for that feature to merge or to send the task to its thread |
-| `checks-failed` | `agent-build` | Fix it, go back to step 2. Olex doesn't test this build |
+| `checks-failed` | `agent-build` | Fix it, go back to step 2. Olex doesn't test this build. After 3 failed builds in a row, stop and tell Olex what keeps failing |
 | `other-build` | `agent-build` | Tell Olex which build of which feature it would replace. If he says go on, build again with `--replace` |
 | `workflow-change` | `agent-build` | Only files no build uses (the pipeline `.agents/` and `.github/workflows/`, docs, rules, `.gitignore`, `.claude/` and the like, listed in `lib.sh` `pipeline_file`) are all the branch changed since `main`: Olex tests them himself. Tell him what changed and how to test it, and don't run it. `agent-merge` accepts them without a build, and also accepts such commits made after the branch's last build |
 | `conflicts` | `agent-start`, `agent-merge` | Resolve them, run the same script again |
@@ -23,11 +23,11 @@
 
 ## Steps
 1. **Start.** Before editing, `bash .agents/agent-start <feature-name>` makes the branch from the latest `main` and opens a draft PR. Watch that PR's activity (subscribe to it) until it's merged: every build's result shows there. Also before editing, check whether the PC is online (your device list shows it reachable). If it is, ask Olex now for a Remote Control session on it for this feature, so step 3 builds on the PC; if not, step 3 builds in CI. When Olex says "I'm on", his PC is on and most likely the phone too: from then on build and install on the PC, and if the phone isn't connected over adb, tell him.
-2. **Edit.** Write the code, then `bash .agents/agent-commit "<message>"`.
+2. **Edit.** Write the code, then `bash .agents/agent-commit "<message>"`, with a message that says what changed, such as "Add circular icon mask".
 3. **Build.** Every build runs the `quick-test`, `build` and `full-check` hooks once and marks the commit checked. The feature thread builds its own branch.
-   - **PC**, when step 1 found it online: run `bash .agents/agent-build pc <branch>` in that Remote Control session. To install again without building, run `bash .agents/agent-install [<version>-<commit>]`. If the phone dropped off wireless adb, ask Olex to turn wireless debugging off and on, then run it again.
+   - **PC**, when step 1 found it online: run `bash .agents/agent-build pc <branch>` in that Remote Control session. To install again without building, run `bash .agents/agent-install [<version>-<commit> | <build number>]`; a build number also installs a CI build. If the phone dropped off wireless adb, ask Olex to turn wireless debugging off and on, then run it again.
    - **CI**, when the PC was offline or Olex says CI: run `bash .agents/agent-build ci <branch>` from your session and post the CI run link as soon as it shows.
-   - Every build is published as a pre-release on its `build/<n>` tag before its full checks. Watch the build's output: as soon as it shows the build is ready (a PC build's "Ready" lines, a CI build's "Published build" line), post it in one line, such as "📲📦 Build 334 installed and published." (see Status lines). Then post the full checks' result only if they fail.
+   - Every build is published as a pre-release on its `build/<n>` tag before its full checks. Watch the build's output: as soon as it shows the build is ready (a PC build's "Ready" lines, a CI build's "Published build" line), post it in one line, such as "📲📦 Build 334 installed and published, full checks still running." (see Status lines). Don't ask Olex to test it, or say it works, until the full checks pass. Then post the full checks' result: pass in one line, fail with the cause.
    - If checks fail in code this feature didn't change, tell Olex instead of fixing it in the feature.
    - Run `agent-build` and `agent-install` in the background with output to a file, never through a pipe: the build daemons they start keep a pipe open, so the command would never return.
    - Build only what the code needs to work: a branch that changes only files no build uses needs no build, and `agent-build` stops with `workflow-change`.
