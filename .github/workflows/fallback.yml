@@ -4,7 +4,8 @@ name: Fallback build
 #   gh workflow run fallback.yml --ref <branch>
 # It does what a PC build does, with the same hooks in .agents/hooks/: quick tests, build,
 # full checks. When they all pass it marks the commit checked, as PC builds do.
-# Each build file is saved on the run unzipped. It never runs on a push.
+# Each build is published as a pre-release on its build/<n> tag before the full checks, and
+# agent-build takes its links and files from there. It never runs on a push.
 # Every job has a timeout-minutes. Keep its actions on the Node 24 runtime.
 # gitstat.exe builds only on Windows, so everything runs there.
 on:
@@ -50,16 +51,21 @@ jobs:
           echo "version=$(tr -d '\r' <"$RUNNER_TEMP/build.out" | sed -n 's/^build-file: [^ ]* \([^ ]*\)$/\1/p' | head -n 1)" >> "$GITHUB_OUTPUT"
           echo "$(basename "$file")  SHA-256 \`$(sha256sum "$file" | cut -d' ' -f1)\`" >> "$GITHUB_STEP_SUMMARY"
 
-      # Saved on the run as the plain file, not a zip, so the download link gives the file itself.
-      - uses: actions/upload-artifact@v7
-        with:
-          path: ${{ steps.build.outputs.file }}
-          archive: false
+      # Every build is published as a pre-release on its build/<n> tag, before the full checks
+      # so it's ready sooner; only the full checks mark the commit checked for agent-merge.
+      - name: Publish the build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FILE: ${{ steps.build.outputs.file }}
+          VERSION: ${{ steps.build.outputs.version }}
+        run: >-
+          gh release create "build/$BUILD_NUMBER" "$FILE" --verify-tag --prerelease
+          --title "$VERSION" --notes "CI fallback build of $GITHUB_REF_NAME ($GITHUB_SHA)"
 
       - name: Full checks
         run: bash .agents/hooks/full-check
 
-      # agent-build pc reads the version from this status when it reuses this build.
+      # agent-build pc reuses this build's pre-release when this status says it passed in CI.
       - name: Mark the commit checked
         env:
           GH_TOKEN: ${{ github.token }}
@@ -69,13 +75,3 @@ jobs:
           gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA"
           -f state=success -f context=full-check -f description="Passed in CI: version $VERSION"
           -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-
-      # Every build is published as a pre-release on its build/<n> tag.
-      - name: Publish the build
-        env:
-          GH_TOKEN: ${{ github.token }}
-          FILE: ${{ steps.build.outputs.file }}
-          VERSION: ${{ steps.build.outputs.version }}
-        run: >-
-          gh release create "build/$BUILD_NUMBER" "$FILE" --verify-tag --prerelease
-          --title "$VERSION" --notes "CI fallback build of $GITHUB_REF_NAME ($GITHUB_SHA)"
