@@ -60,7 +60,7 @@ jobs:
           VERSION: ${{ steps.build.outputs.version }}
         run: >-
           gh release create "build/$BUILD_NUMBER" "$FILE" --verify-tag --prerelease
-          --title "$VERSION" --notes "CI fallback build of $GITHUB_REF_NAME ($GITHUB_SHA)"
+          --title "$VERSION" --notes "$(bash .agents/release-notes "$GITHUB_SHA" "$BUILD_NUMBER" "CI fallback build of $GITHUB_REF_NAME ($GITHUB_SHA)")"
 
       - name: Full checks
         run: bash .agents/hooks/full-check

@@ -234,7 +234,8 @@ build_pc() {
   # fallback does, and shown at once so Olex hears it's ready without waiting for the checks.
   if [ "$built_here" = 1 ]; then
     if gh release create "build/$BUILD_NUMBER" "${files[@]}" -R "$SLUG" --verify-tag --prerelease \
-      --title "$version" --notes "PC build of $(git rev-parse HEAD)" >/dev/null; then
+      --title "$version" \
+      --notes "$(bash "$AGENTS_DIR/release-notes" "$(git rev-parse HEAD)" "$BUILD_NUMBER" "PC build of $(git rev-parse HEAD)")" >/dev/null; then
       summary+=("Published: https://github.com/$SLUG/releases/tag/build/$BUILD_NUMBER")
     else
       summary+=("Publishing the build failed (see the log).")
