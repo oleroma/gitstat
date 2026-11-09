@@ -450,11 +450,17 @@ fn sync_sets(repo: &Path, has_remotes: bool) -> (HashSet<String>, HashSet<String
 
 /// The GitHub page of `repo`'s `origin`, read without changing anything.
 pub fn origin_web(repo: &Path) -> Option<String> {
-    let out = git::git(repo, &["remote", "get-url", "origin"], git::LOCAL_TIMEOUT).ok()?;
+    read_origin_web(repo).ok().flatten()
+}
+
+/// Like [`origin_web`], but an error when git couldn't be asked (it timed
+/// out or didn't start), so "no GitHub origin" is a real answer.
+pub fn read_origin_web(repo: &Path) -> Result<Option<String>, String> {
+    let out = git::git(repo, &["remote", "get-url", "origin"], git::LOCAL_TIMEOUT)?;
     if !out.status.success() {
-        return None;
+        return Ok(None);
     }
-    github_web(String::from_utf8_lossy(&out.stdout).trim())
+    Ok(github_web(String::from_utf8_lossy(&out.stdout).trim()))
 }
 
 /// The GitHub page of a remote URL, from its https, ssh or scp form.

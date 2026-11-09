@@ -17,6 +17,9 @@ pub const MAX_WAIT: Duration = Duration::from_secs(5);
 pub const MIN_GAP: Duration = Duration::from_secs(2);
 /// A watcher overflow (rescan) checks every repo at most this often.
 pub const RESCAN_MIN_GAP: Duration = Duration::from_secs(10);
+/// While overflows keep coming (an `npm install`, a big checkout), the gap
+/// doubles up to this, so the churn doesn't keep every repo rechecked.
+pub const RESCAN_MAX_GAP: Duration = Duration::from_secs(120);
 pub const REPOSET_QUIET: Duration = Duration::from_secs(1);
 /// Folder churn that never pauses still gets a rediscovery this long after
 /// its first event (or after the walk gap, if that ends later).
@@ -44,7 +47,8 @@ pub struct RepoRoute {
     pub path: PathBuf,
     pub git_dir: PathBuf,
     pub common_dir: PathBuf,
-    /// Ignored directory prefixes, relative to `path`, from `git status --ignored`.
+    /// Ignored directory prefixes (with their trailing `/`) and ignored
+    /// files, relative to `path`, from `git status --ignored`.
     pub ignored: Vec<String>,
 }
 
@@ -54,18 +58,33 @@ struct Keyed {
     path: String,
     git_dir: String,
     common_dir: String,
+    /// Ignored directory prefixes, folded.
     ignored: Vec<String>,
+    /// Ignored files outside those, folded.
+    ignored_files: HashSet<String>,
 }
 
 impl Keyed {
     fn new(route: RepoRoute) -> Self {
-        Self {
+        let mut keyed = Self {
             path: key(&route.path),
             git_dir: key(&route.git_dir),
             common_dir: key(&route.common_dir),
-            ignored: fold_ignored(&route.ignored),
+            ignored: Vec::new(),
+            ignored_files: HashSet::new(),
             route,
-        }
+        };
+        keyed.fold_ignored();
+        keyed
+    }
+
+    /// Splits the route's ignored paths into folder prefixes and files.
+    fn fold_ignored(&mut self) {
+        let (dirs, files): (Vec<String>, Vec<String>) = fold_ignored(&self.route.ignored)
+            .into_iter()
+            .partition(|p| p.ends_with('/'));
+        self.ignored = dirs;
+        self.ignored_files = files.into_iter().collect();
     }
 }
 
@@ -118,8 +137,8 @@ impl Router {
 
     pub fn set_ignored(&mut self, repo: &Path, ignored: Vec<String>) {
         if let Some(keyed) = self.routes.iter_mut().find(|r| r.route.path == repo) {
-            keyed.ignored = fold_ignored(&ignored);
             keyed.route.ignored = ignored;
+            keyed.fold_ignored();
         }
     }
 
@@ -360,6 +379,9 @@ fn is_ignored(route: &Keyed, rel: &str) -> bool {
     if rel.is_empty() {
         return false;
     }
+    if route.ignored_files.contains(rel) {
+        return true;
+    }
     // `target` itself (a directory timestamp) as well as `target/x`.
     let dir = format!("{rel}/");
     route.ignored.iter().any(|prefix| dir.starts_with(prefix))
@@ -472,6 +494,8 @@ pub struct Debouncer {
     /// The repo list as of the last `retain`, for rescans.
     known: Vec<PathBuf>,
     last_rescan: Option<Instant>,
+    /// How long after `last_rescan` the next one may run.
+    rescan_gap: Duration,
     /// A rate-limited rescan waiting for its turn.
     rescan_at: Option<Instant>,
     /// A deferred rescan ran inside `due`; the scheduler rediscovers repos.
@@ -530,14 +554,22 @@ impl Debouncer {
     }
 
     /// The watcher lost events: a Local check of every known repo, at most
-    /// once per `RESCAN_MIN_GAP`. Returns false when it was deferred.
+    /// once per `RESCAN_MIN_GAP`, backing off to `RESCAN_MAX_GAP` while
+    /// overflows keep coming. Returns false when it was deferred.
     pub fn rescan(&mut self, now: Instant) -> bool {
+        let gap = self.rescan_gap.max(RESCAN_MIN_GAP);
         if let Some(last) = self.last_rescan
-            && now < last + RESCAN_MIN_GAP
+            && now < last + gap
         {
-            self.rescan_at = Some(last + RESCAN_MIN_GAP);
+            self.rescan_at = Some(last + gap);
             return false;
         }
+        // Another overflow soon after the last rescan means the churn goes
+        // on; after a quiet spell, start again from the shortest gap.
+        self.rescan_gap = match self.last_rescan {
+            Some(last) if now < last + gap * 2 => (gap * 2).min(RESCAN_MAX_GAP),
+            _ => RESCAN_MIN_GAP,
+        };
         self.last_rescan = Some(now);
         self.rescan_at = None;
         for repo in self.known.clone() {
@@ -1265,12 +1297,17 @@ mod tests {
         let mut router = router();
         router.set_ignored(
             Path::new("/dev/r"),
-            vec!["target/".into(), "web/node_modules/".into()],
+            vec![
+                "target/".into(),
+                "web/node_modules/".into(),
+                "web/server.log".into(),
+            ],
         );
         for path in [
             "/dev/r/target",
             "/dev/r/target/debug/x.o",
             "/dev/r/web/node_modules/a/b.js",
+            "/dev/r/web/server.log",
         ] {
             assert_eq!(
                 classes(&router, path, CREATE),
@@ -1282,6 +1319,8 @@ mod tests {
             "/dev/r/targets.txt",
             "/dev/r/web/index.js",
             "/dev/r/src/target",
+            "/dev/r/server.log",
+            "/dev/r/web/server.log.1",
         ] {
             assert_eq!(
                 classes(&router, path, CREATE),
@@ -1294,7 +1333,7 @@ mod tests {
             classes(&router, "/dev/gitstat/target/x", CREATE),
             one("/dev/gitstat", Class::Worktree)
         );
-        assert_eq!(router.routes().next().map(|r| r.ignored.len()), Some(2));
+        assert_eq!(router.routes().next().map(|r| r.ignored.len()), Some(3));
     }
 
     #[cfg(windows)]
@@ -1651,6 +1690,28 @@ mod tests {
         assert!(d.due(t + RESCAN_MIN_GAP - ms(1), 6).is_empty());
         assert_eq!(d.due(t + RESCAN_MIN_GAP, 6).len(), 2);
         assert_eq!(d.next_deadline(), None);
+    }
+
+    #[test]
+    fn rescans_back_off_while_overflows_continue() {
+        let t = Instant::now();
+        let repos = vec![PathBuf::from("/dev/a")];
+        let mut d = Debouncer::default();
+        d.retain(&repos);
+        let mut at = t;
+        assert!(d.rescan(at));
+        // Each deferred rescan that runs during the churn doubles the gap.
+        for gap in [10, 20, 40, 80, 120, 120] {
+            assert!(!d.rescan(at + ms(500)));
+            at += Duration::from_secs(gap);
+            assert_eq!(d.rescan_at, Some(at), "gap {gap}");
+            assert!(d.rescan(at));
+        }
+        // After a quiet spell the gap starts over.
+        at += Duration::from_secs(600);
+        assert!(d.rescan(at));
+        assert!(!d.rescan(at + ms(500)));
+        assert_eq!(d.rescan_at, Some(at + RESCAN_MIN_GAP));
     }
 
     #[test]

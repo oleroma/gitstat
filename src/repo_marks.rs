@@ -19,6 +19,11 @@ use gpui::{
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
+
+/// How long after a draw that timed out, or had to wait for other icons,
+/// it is tried again.
+const RETRY_AFTER: Duration = Duration::from_secs(2);
 
 /// A picture size: the tone and the device px.
 type Key = (Tone, u32);
@@ -101,15 +106,38 @@ impl RepoMarks {
         let name = path.to_string_lossy().into_owned();
         let (tone, n) = key;
         let task = cx.background_spawn(async move {
-            renderer
-                .render_rgba(&name, &svg, tone, &[n])
-                .ok()
-                .and_then(|images| images.into_iter().next())
-                .and_then(|(n, rgba)| to_image(n, rgba))
+            match renderer.render_rgba(&name, &svg, tone, &[n]) {
+                Ok(images) => Ok(images
+                    .into_iter()
+                    .next()
+                    .and_then(|(n, rgba)| to_image(n, rgba))),
+                // Timed out or waiting for other icons: worth another try.
+                Err(e) if e.transient => Err(()),
+                Err(_) => Ok(None),
+            }
         });
         let repo = path.to_path_buf();
+        let retry = cx.background_executor().clone();
         cx.spawn(async move |this, cx| {
-            let image = task.await;
+            let image = match task.await {
+                Ok(image) => image,
+                Err(()) => {
+                    // Still marked as drawing until then, so frames in
+                    // between don't ask again; the renderer keeps a late
+                    // result for the next try.
+                    retry.timer(RETRY_AFTER).await;
+                    this.update(cx, |this, cx| {
+                        if let Some(entry) = this.entries.get_mut(&repo)
+                            && entry.generation == generation
+                        {
+                            entry.drawing.remove(&key);
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                    return;
+                }
+            };
             this.update(cx, |this, cx| {
                 let Some(entry) = this.entries.get_mut(&repo) else {
                     return;

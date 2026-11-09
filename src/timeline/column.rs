@@ -21,7 +21,7 @@ use gpui::{
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// A column's width.
 pub const COLUMN_WIDTH: f32 = 380.0;
@@ -40,6 +40,8 @@ const BAND: f32 = 10.0;
 const PAD: f32 = 14.0;
 /// Commits whose stats one git call reads.
 const STATS_BATCH: usize = 64;
+/// How long after a failed batch its line stats are asked for again.
+const STATS_RETRY: Duration = Duration::from_secs(10);
 
 impl Timelines {
     /// The repo to bring into view when big mode next draws, once.
@@ -114,8 +116,23 @@ impl Timelines {
         let repo = path.to_path_buf();
         let asked = ids.clone();
         let task = cx.background_spawn(async move { history::stats(&repo, &asked) });
+        let retry = cx.background_executor().clone();
         cx.spawn(async move |this, cx| {
-            let found = task.await.unwrap_or_default();
+            let found = match task.await {
+                Ok(found) => found,
+                Err(_) => {
+                    // Git failed as a whole (timed out, busy): ask again a
+                    // little later instead of keeping no change for good.
+                    retry.timer(STATS_RETRY).await;
+                    this.update(cx, |this, _| {
+                        for id in &ids {
+                            this.stats_pending.remove(id);
+                        }
+                    })
+                    .ok();
+                    return;
+                }
+            };
             this.update(cx, |this, cx| {
                 for id in ids {
                     this.stats_pending.remove(&id);

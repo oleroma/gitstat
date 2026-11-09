@@ -193,6 +193,9 @@ impl Drop for Poller {
 
 fn run(rx: mpsc::Receiver<Cmd>, sink: impl Fn(Report)) {
     let mut repos: Vec<PathBuf> = Vec::new();
+    // Each repo's slug, `None` for no GitHub origin: a remote URL almost
+    // never changes, so only new repos and a refresh ask git again.
+    let mut slugs: HashMap<PathBuf, Option<String>> = HashMap::new();
     let mut wants = Wants::default();
     let mut every = Duration::from_secs(5 * 60);
     let mut next: Option<Instant> = None;
@@ -205,6 +208,7 @@ fn run(rx: mpsc::Receiver<Cmd>, sink: impl Fn(Report)) {
             Ok(Cmd::Repos(r)) => {
                 let grew = r.iter().any(|p| !repos.contains(p));
                 repos = r;
+                slugs.retain(|path, _| repos.contains(path));
                 if wants.any() && grew {
                     next = Some(Instant::now() + SETTLE);
                 }
@@ -223,31 +227,53 @@ fn run(rx: mpsc::Receiver<Cmd>, sink: impl Fn(Report)) {
                     next.map(|at| at.min(Instant::now() + every))
                 };
             }
-            Ok(Cmd::Refresh) if wants.any() => next = Some(Instant::now()),
+            Ok(Cmd::Refresh) if wants.any() => {
+                slugs.clear();
+                next = Some(Instant::now());
+            }
             Ok(Cmd::Refresh) => {}
             Ok(Cmd::Shutdown) | Err(RecvTimeoutError::Disconnected) => return,
             Err(RecvTimeoutError::Timeout) => {
-                sink(poll(&repos, wants));
+                sink(poll(&repos, wants, &mut slugs));
                 next = Some(Instant::now() + every);
             }
         }
     }
 }
 
-/// `owner/name` of a repo's GitHub `origin`, read without changing anything.
-fn slug(repo: &Path) -> Option<String> {
-    let web = crate::repo_info::origin_web(repo)?;
-    web.strip_prefix("https://github.com/").map(str::to_string)
+/// `owner/name` of a repo's GitHub `origin`, read without changing
+/// anything. An error when git couldn't be asked.
+fn slug(repo: &Path) -> Result<Option<String>, String> {
+    let web = crate::repo_info::read_origin_web(repo)?;
+    Ok(web.and_then(|w| w.strip_prefix("https://github.com/").map(str::to_string)))
 }
 
-fn poll(repos: &[PathBuf], wants: Wants) -> Report {
+fn poll(repos: &[PathBuf], wants: Wants, slugs: &mut HashMap<PathBuf, Option<String>>) -> Report {
+    // A repo git couldn't be asked about isn't known not to be cloned.
+    let mut unknown = false;
     let targets: Vec<(PathBuf, String)> = repos
         .iter()
-        .filter_map(|r| slug(r).map(|s| (r.clone(), s)))
+        .filter_map(|r| {
+            let found = match slugs.get(r) {
+                Some(found) => found.clone(),
+                None => match slug(r) {
+                    Ok(found) => {
+                        slugs.insert(r.clone(), found.clone());
+                        found
+                    }
+                    Err(_) => {
+                        unknown = true;
+                        None
+                    }
+                },
+            };
+            found.map(|s| (r.clone(), s))
+        })
         .collect();
     let mut report = Report::default();
     // Before the first discovery every repo would look not cloned.
-    if wants.remote_repos && !repos.is_empty() {
+    // Then the app keeps the last list.
+    if wants.remote_repos && !repos.is_empty() && !unknown {
         match account_repos() {
             Ok(all) => {
                 let cloned: Vec<&str> = targets.iter().map(|(_, s)| s.as_str()).collect();
