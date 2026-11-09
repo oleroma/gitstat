@@ -114,6 +114,16 @@ build_pc() {
   guard_workflow_change
   guard_other_build "$(git rev-parse HEAD)"
 
+  # An Android repo: say at once whether the phone is on adb, so Olex can connect it while this
+  # builds. The install runs after the build, so a phone connected by then still gets it.
+  if [ -f "$WORKTREE/gradlew" ]; then
+    if command -v adb >/dev/null 2>&1 && [ "$(adb devices | awk -F'\t' 'NR > 1 && $2 == "device"' | wc -l)" -gt 0 ]; then
+      echo "Phone online: the build will be installed on it." >&3
+    else
+      echo "Phone offline: connect it before the build ends to have it installed." >&3
+    fi
+  fi
+
   # When CI already built this commit (agent-build ci while the PC was away), download and
   # install that build instead of building it again.
   local version="" line rel v files=() names=() ci_tag="" built_here=1
@@ -232,7 +242,7 @@ build_pc() {
   else
     summary+=("CI already published this build.")
   fi
-  if [ "${#away[@]}" -gt 0 ]; then summary+=("The phone wasn't connected; it can install the build from the pre-release."); fi
+  if [ "${#away[@]}" -gt 0 ]; then summary+=("Not installed: the phone wasn't connected; it can get the build from the pre-release."); fi
   printf 'Ready, full checks still running:\n%s\n' "$(printf '%s\n' "${summary[@]}")" >&3
 
   # The full checks, after the install so the phone gets the build first. A CI build of this
