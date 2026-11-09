@@ -96,7 +96,9 @@ wait_main_cache() {
 }
 
 # run_fallback: runs fallback.yml on BRANCH (the same tests and build as a PC build) and waits
-# for it. Sets RUN (the run id) and RUN_URL. Returns 1 if the run failed; stops if it can't be found.
+# for it. Sets RUN (the run id) and RUN_URL. Shows the run link at once, and the release lines
+# (release_lines) as soon as every build job has published, before the full checks end.
+# Returns 1 if the run failed; stops if it can't be found.
 run_fallback() {
   local sha since i
   sha="$(git -C "$WORKTREE" rev-parse HEAD)"
@@ -115,7 +117,39 @@ run_fallback() {
   RUN_URL="https://github.com/$SLUG/actions/runs/$RUN"
   # Shown right away (not only in the result), so the run can be followed while it builds.
   echo "CI run: $RUN_URL" >&3
-  gh run watch -R "$SLUG" "$RUN" --exit-status --interval 15
+  local published=0 state="" n
+  while :; do
+    sleep 15
+    if [ "$published" = 0 ] && [ "$(fallback_published "$RUN")" = true ]; then
+      published=1
+      n="$(newest_build_tag "$sha")"
+      if [ -n "$n" ]; then release_lines "$n" >&3; fi
+    fi
+    state="$(gh api "repos/$SLUG/actions/runs/$RUN" --jq '"\(.status) \(.conclusion // "")"')"
+    case "$state" in completed*) break ;; esac
+  done
+  [ "$state" = "completed success" ]
+}
+
+# fallback_published <run>: prints true once every build job of the run that isn't skipped has
+# passed its "Publish" step (and at least one has).
+fallback_published() {
+  gh api "repos/$SLUG/actions/runs/$1/jobs" --jq '[.jobs[] | select(.conclusion != "skipped")
+    | {p: ([.steps[]? | select(.name | startswith("Publish"))][0]), started: ((.steps | length) > 0 or .status == "completed")}]
+    | ((map(select(.p != null)) | length > 0 and all(.p.conclusion == "success")) and all(.started))'
+}
+
+# newest_build_tag <sha>: the highest n whose build/<n> tag is on <sha>, or nothing.
+newest_build_tag() {
+  git -C "$WORKTREE" ls-remote --tags origin 'refs/tags/build/*' |
+    sed -nE "s#^$1\s+refs/tags/build/([0-9]+)\$#\1#p" | sort -n | tail -n 1
+}
+
+# release_lines <n>: the build/<n> pre-release's link and a direct download link for each file.
+release_lines() {
+  local url="https://github.com/$SLUG/releases/tag/build/$1"
+  echo "Published build $(gh api "repos/$SLUG/releases/tags/build/$1" --jq .name): $url"
+  gh api "repos/$SLUG/releases/tags/build/$1" --jq '.assets[] | "\(.name): direct download link \(.browser_download_url)"'
 }
 
 # Every build, on the PC or in CI, runs the full checks once. When they pass, the commit gets a

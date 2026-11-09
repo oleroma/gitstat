@@ -100,6 +100,10 @@ base="$(git merge-base HEAD origin/main)"
 overlap="$(comm -12 \
   <(git diff --name-only "$base" HEAD | sort) \
   <(git diff --name-only "$base" origin/main | sort) | grep -v '^$' || true)"
+# Files no build uses (lib.sh pipeline_file) don't change what Olex tested.
+overlap="$(while IFS= read -r f; do
+  if [ -n "$f" ] && ! pipeline_file "$f"; then echo "$f"; fi
+done <<<"$overlap")"
 
 if git merge --no-edit origin/main; then
   git push origin "$BRANCH"

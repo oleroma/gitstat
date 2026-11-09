@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Installs a build made by agent-build pc, which runs this itself after building.
 # Run it on its own to install without building.
-# Usage: build/src/.agents/agent-install [<version>-<commit>]
-#   no argument: the newest build; otherwise that build from build/builds/
+# Usage: build/src/.agents/agent-install [<version>-<commit> | <n>]
+#   no argument: the newest build; <version>-<commit>: that build from build/builds/;
+#   <n>: build n (a CI build too), downloaded from its build/<n> pre-release if not in build/builds/
 # Installs each APK on the phone (in place, never a downgrade), then runs the repo's
 # install hook, if it has one, for the other build files and any setup after an install.
 # For each APK it couldn't install (no phone reachable, or the install failed), it prints
@@ -26,6 +27,18 @@ if [ -z "$build_id" ]; then
   if [ ! -f "$newest" ]; then newest="$BUILD_DIR/.newest-build"; fi
   [ -f "$newest" ] || die "No build to install yet: run agent-build pc first."
   build_id="$(head -n 1 "$newest")"
+fi
+# A build number: find it in build/builds/, or download it from its pre-release.
+n="${build_id#build/}"
+if [[ "$n" =~ ^[0-9]+$ ]]; then
+  title="$(gh api "repos/$SLUG/releases/tags/build/$n" --jq .name)" || die "No build/$n pre-release."
+  sha="$(gh api "repos/$SLUG/commits/build/$n" --jq .sha)" || die "Couldn't find the commit of build/$n."
+  build_id="$title-${sha:0:7}"
+  if [ ! -d "$BUILD_DIR/builds/$build_id" ]; then
+    mkdir -p "$BUILD_DIR/builds/$build_id"
+    gh release download "build/$n" -R "$SLUG" -D "$BUILD_DIR/builds/$build_id" ||
+      { rm -rf "$BUILD_DIR/builds/$build_id"; die "Couldn't download the files of build/$n."; }
+  fi
 fi
 dir="$BUILD_DIR/builds/$build_id"
 [ -d "$dir" ] || die "No build $build_id in build/builds/. Builds there: $(ls -1 "$BUILD_DIR/builds" 2>/dev/null | tr '\n' ' ')"
