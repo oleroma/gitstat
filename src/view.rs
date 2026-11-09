@@ -303,6 +303,47 @@ pub fn panel_rows(state: &AppState) -> usize {
     repos + github + remote
 }
 
+/// The big-mode columns worth building: the ones in view and one more on
+/// each side. The rest are empty boxes of the same width, so the table
+/// scrolls as far, but hovering or animating one column doesn't lay out
+/// every repo's. Scrolling redraws the view, which builds the new ones.
+fn shown_columns(
+    table: &ScrollHandle,
+    window: &Window,
+    count: usize,
+    focused: Option<usize>,
+) -> std::ops::Range<usize> {
+    let w = crate::timeline::COLUMN_WIDTH;
+    // Before the first paint the table has no size yet; the window's
+    // width is as wide as it can be.
+    let width = match f32::from(table.bounds().size.width) {
+        w if w > 0.0 => w,
+        _ => f32::from(window.viewport_size().width),
+    };
+    let fits = (width / w).ceil() as usize + 1;
+    // A column about to be scrolled to may land at either edge.
+    let (first, last) = match focused {
+        Some(i) => (i.saturating_sub(fits), i + fits),
+        None => {
+            let left = (-f32::from(table.offset().x)).max(0.0);
+            let first = (left / w).floor() as usize;
+            (first.saturating_sub(1), first + fits)
+        }
+    };
+    first..(last + 1).min(count)
+}
+
+/// An unbuilt column: as wide and tall as a real one, with its border.
+fn column_placeholder(p: &Palette) -> AnyElement {
+    div()
+        .flex_none()
+        .w(px(crate::timeline::COLUMN_WIDTH))
+        .h_full()
+        .border_r_1()
+        .border_color(p.border)
+        .into_any_element()
+}
+
 /// Opens a repo the way config's `repo_click` says: its folder, or its
 /// GitHub page (the folder when it has none). Only opens; changes nothing.
 pub fn open_repo(path: &std::path::Path, cx: &mut App) {
@@ -993,16 +1034,23 @@ impl Render for StatusView {
                     .into_iter()
                     .chain(state.sorted(&state.remote_statuses))
                     .collect();
-                if let Some(i) = focus
+                let focused = focus
                     .as_deref()
-                    .and_then(|f| crate::timeline::column_index(&order, f))
-                {
+                    .and_then(|f| crate::timeline::column_index(&order, f));
+                if let Some(i) = focused {
                     self.table.scroll_to_item(i);
                 }
+                let shown = shown_columns(&self.table, window, order.len(), focused);
                 let columns: Vec<AnyElement> = order
                     .into_iter()
                     .enumerate()
-                    .map(|(i, s)| Timelines::column(t, i, s, &p, dark, window, cx))
+                    .map(|(i, s)| {
+                        if shown.contains(&i) {
+                            Timelines::column(t, i, s, &p, dark, window, cx)
+                        } else {
+                            column_placeholder(&p)
+                        }
+                    })
                     .collect();
                 Some(
                     div()
