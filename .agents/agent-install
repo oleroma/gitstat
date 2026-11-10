@@ -32,6 +32,8 @@ fi
 n="${build_id#build/}"
 if [[ "$n" =~ ^[0-9]+$ ]]; then
   title="$(gh api "repos/$SLUG/releases/tags/build/$n" --jq .name)" || die "No build/$n pre-release."
+  # The title becomes a folder name below: without "/" it stays inside build/builds/.
+  [[ "$title" =~ ^[A-Za-z0-9._+-]+$ ]] || die "build/$n has an odd title: $title"
   sha="$(gh api "repos/$SLUG/commits/build/$n" --jq .sha)" || die "Couldn't find the commit of build/$n."
   build_id="$title-${sha:0:7}"
   if [ ! -d "$BUILD_DIR/builds/$build_id" ]; then
