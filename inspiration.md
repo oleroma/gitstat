@@ -9,7 +9,3 @@ gitstat was written with the help of AI (Claude). No screenshots, images or code
 ## Other software
 
 - **GPUI** (Zed Industries): named as the UI framework gitstat is built on.
-- **ab_glyph**: named as the library that draws the tray icon's digits.
-- **Segoe UI** (Microsoft): named as the font the tray icon's digits are drawn from. It comes with Windows and isn't shipped with gitstat.
-- **Windows Explorer**, **Files** app, **File Pilot**: named in the README as file managers, in the section on gitstat's folder icons.
-- **Git** and **GitHub**: named as what gitstat reads its repo status from.
