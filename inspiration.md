@@ -1,15 +1,15 @@
-# Inspiration and third-party names
+# Inspiration and names mentioned
 
-gitstat was written with the help of AI (Claude). This page lists, by name, every product, project and piece of other people's work that shaped it or is named in it, and how it was used. gitstat is not affiliated with or endorsed by any of them. All trademarks belong to their owners.
+gitstat was written with the help of AI (Claude). This page lists, by name, every product, project and piece of other people's work that is named somewhere in gitstat's code, docs or history, and the context it was named in. Being named here doesn't mean gitstat includes or depends on it. gitstat is not affiliated with or endorsed by any of them. All trademarks belong to their owners.
 
-## Ideas and approaches
+## Inspiration
 
-- **GitKraken** (Axosoft): the commit graph draws merging branches converging on the dot, as GitKraken does. No GitKraken code or art is used.
+- **GitKraken** (Axosoft): named in a code comment as the look the commit graph follows, with merging branches converging on the dot. No GitKraken code or art is included.
 
-## Software and libraries used
+## Other software
 
-- **GPUI** (Zed Industries): the UI framework gitstat is built on, along with the Zed-maintained crates it pulls in.
-- **ab_glyph**: draws the tray icon's digits.
-- **Segoe UI** (Microsoft): the tray icon's digits are drawn from the Segoe UI font installed with Windows. The font is not shipped with gitstat.
-- **Windows Explorer**, **Files** app, **File Pilot**: named in the README as file managers that show gitstat's folder icons.
-- **Git** and **GitHub**: gitstat runs git and reads the GitHub API.
+- **GPUI** (Zed Industries): named as the UI framework gitstat is built on.
+- **ab_glyph**: named as the library that draws the tray icon's digits.
+- **Segoe UI** (Microsoft): named as the font the tray icon's digits are drawn from. It comes with Windows and isn't shipped with gitstat.
+- **Windows Explorer**, **Files** app, **File Pilot**: named in the README as file managers, in the section on gitstat's folder icons.
+- **Git** and **GitHub**: named as what gitstat reads its repo status from.
