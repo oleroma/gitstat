@@ -6,6 +6,7 @@
 
 mod config;
 mod git;
+mod repo_config;
 
 // Platform-neutral, but only the tray app uses them; tests cover them on Linux.
 #[cfg(any(windows, test))]

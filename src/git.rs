@@ -7,6 +7,8 @@ use std::sync::{OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::repo_config::{self, Guard};
+
 /// Parallel `git fetch`es. Enough to hide network latency without
 /// hammering a remote that hosts most of the repos. The timeline caps its
 /// history loads at this too.
@@ -61,6 +63,9 @@ impl RepoStatus {
             return "on GitHub only".to_string();
         }
         if let Some(error) = &self.error {
+            if error.starts_with(repo_config::WARNING) {
+                return format!("⚠ {error}");
+            }
             return format!("error: {error}");
         }
         let mut parts = Vec::new();
@@ -359,8 +364,21 @@ pub fn check_repo_detailed(root: &Path, repo: &Path, fetch: bool) -> (RepoStatus
         path: repo.to_path_buf(),
         ..Default::default()
     };
-    let fetch_error = if fetch { fetch_repo(repo).err() } else { None };
-    status.fetch_errored = fetch_error.is_some();
+    // Read before any other git call here, and again on every check, since
+    // a change to `.git/config` triggers one.
+    let guard = repo_config::guard(repo);
+    if let Guard::Blocked(_) = guard {
+        status.error = guard.warning();
+        return (status, Vec::new());
+    }
+    // A risky repo is never fetched; its warning takes the fetch error's
+    // place, so the local state still shows.
+    let fetch_error = match guard {
+        Guard::Risky(_) => guard.warning(),
+        _ if fetch => fetch_repo(repo).err(),
+        _ => None,
+    };
+    status.fetch_errored = fetch && guard == Guard::Safe && fetch_error.is_some();
 
     match local_status(repo, supports(STATUS_V2)) {
         Ok(local) => {
@@ -419,6 +437,13 @@ fn fetch_repo(repo: &Path) -> Result<(), String> {
     if supports(FETCH_QUIET_FLAGS) {
         args.extend(["--no-write-fetch-head", "--no-auto-maintenance"]);
     }
+    // No hooks: a fetch updates refs, which runs a `reference-transaction`
+    // hook from the repo. A folder that doesn't exist holds none.
+    let no_hooks = format!(
+        "core.hooksPath={}",
+        std::env::temp_dir().join("gitstat-no-hooks").display()
+    );
+    let args = [&["-c", no_hooks.as_str()][..], &args].concat();
     let out = git(repo, &args, FETCH_TIMEOUT)?;
     if out.status.success() {
         return Ok(());
@@ -681,9 +706,28 @@ fn parse_version(text: &str) -> Option<(u32, u32)> {
     Some((parts.next()??, parts.next()??))
 }
 
-/// Runs git in `repo`; see [`run_git`].
+/// Runs git in `repo`; see [`run_git`]. Checks the repo's config first:
+/// see [`repo_config::guard`].
 pub(crate) fn git(repo: &Path, args: &[&str], timeout: Duration) -> Result<Output, String> {
-    run_git(Some(repo), args, timeout)
+    let guard = repo_config::guard(repo);
+    match guard {
+        Guard::Safe => run_git(Some(repo), args, timeout),
+        Guard::Risky(_) => {
+            let args = [&repo_config::SAFE_ARGS[..], args].concat();
+            run_git(Some(repo), &args, timeout)
+        }
+        Guard::Blocked(_) => Err(guard.warning().unwrap_or_default()),
+    }
+}
+
+/// Runs git in `repo` without checking its config, for reading the config.
+pub(crate) fn git_unguarded(repo: &Path, args: &[&str]) -> Result<Output, String> {
+    run_git(Some(repo), args, LOCAL_TIMEOUT)
+}
+
+/// `config --show-scope` arrived in 2.26.
+pub(crate) fn supports_show_scope() -> bool {
+    supports((2, 26))
 }
 
 /// Runs git (in `repo` when given) with no console window, no credential
@@ -697,7 +741,10 @@ fn run_git(repo: Option<&Path>, args: &[&str], timeout: Duration) -> Result<Outp
     if let Some(repo) = repo {
         command.arg("-C").arg(repo);
     }
+    // gitstat's log and show never want a signature checked, which would
+    // run the repo's `gpg.program`.
     command
+        .args(["-c", "log.showSignature=false"])
         .args(args)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -1105,6 +1152,121 @@ mod tests {
             after_check, after_plain,
             "control: plain status should refresh the index"
         );
+    }
+
+    /// A script that writes `marker` when run, in git's own path form.
+    fn marker_script(root: &Path, marker: &Path) -> String {
+        let script = root.join("evil.sh");
+        let marker = marker.to_string_lossy().replace('\\', "/");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho ran >> '{marker}'\nexit 1\n"),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        script.to_string_lossy().replace('\\', "/")
+    }
+
+    /// A repo copied in with a hostile `.git/config` runs nothing through
+    /// gitstat: not on status (core.fsmonitor), fetch (core.sshCommand), or
+    /// history; it still shows its local state, with a warning.
+    #[test]
+    fn hostile_config_runs_nothing() {
+        let root = temp_root("hostile-config");
+        let repo = root.join("r");
+        init_repo(&repo);
+        std::fs::write(repo.join("a.txt"), "a").unwrap();
+        let marker = root.join("marker");
+        let script = marker_script(&root, &marker);
+        run(&repo, &["config", "core.fsmonitor", &script]);
+        run(&repo, &["config", "core.sshCommand", &script]);
+        run(
+            &repo,
+            &["remote", "add", "origin", "ssh://example.invalid/r.git"],
+        );
+
+        // Control: plain git does run it.
+        run(&repo, &["status", "--porcelain"]);
+        assert!(
+            marker.exists(),
+            "control: plain status should run core.fsmonitor"
+        );
+        std::fs::remove_file(&marker).unwrap();
+
+        let (status, _) = check_repo_detailed(&root, &repo, true);
+        let _ = crate::history::refs(&repo);
+        let _ = git_dirs(&repo);
+        let ran = marker.exists();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(!ran, "gitstat ran the repo's command");
+        assert!(status.dirty, "local state still read: {status:?}");
+        assert!(status.fetch_failed && !status.fetch_errored);
+        assert!(status.label().starts_with("⚠ unsafe"), "{}", status.label());
+        assert_eq!(
+            status.error.as_deref(),
+            Some("unsafe .git/config (core.fsmonitor): not fetched")
+        );
+    }
+
+    /// A filter's clean command runs on status itself, so such a repo gets
+    /// no git calls at all.
+    #[test]
+    fn filter_config_blocks_every_call() {
+        let root = temp_root("hostile-filter");
+        let repo = root.join("r");
+        init_repo(&repo);
+        std::fs::write(repo.join(".gitattributes"), "*.txt filter=x\n").unwrap();
+        std::fs::write(repo.join("a.txt"), "a").unwrap();
+        run(&repo, &["add", "."]);
+        commit(&repo, "a");
+        let marker = root.join("marker");
+        let script = marker_script(&root, &marker);
+        run(&repo, &["config", "filter.x.clean", &script]);
+        // New stat data, so status has to clean the file to compare it.
+        std::fs::write(repo.join("a.txt"), "b").unwrap();
+
+        // Control: plain git does run it.
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["status"])
+            .output();
+        assert!(
+            marker.exists(),
+            "control: plain status should run the filter"
+        );
+        std::fs::remove_file(&marker).unwrap();
+
+        let (status, _) = check_repo_detailed(&root, &repo, true);
+        let refs = crate::history::refs(&repo);
+        let ran = marker.exists();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(!ran, "gitstat ran the repo's filter");
+        assert!(refs.is_err());
+        assert_eq!(
+            status.error.as_deref(),
+            Some("unsafe .git/config (filter.x.clean): not checked")
+        );
+    }
+
+    /// Git's own fsmonitor daemon (`core.fsmonitor=true`) isn't flagged.
+    #[test]
+    fn builtin_fsmonitor_is_safe() {
+        let root = temp_root("builtin-fsmonitor");
+        let repo = root.join("r");
+        init_repo(&repo);
+        run(&repo, &["config", "core.fsmonitor", "false"]);
+        let (status, _) = check_repo_detailed(&root, &repo, false);
+        let guard = repo_config::guard(&repo);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(guard, Guard::Safe);
+        assert_eq!(status.error, None);
     }
 
     #[test]
