@@ -19,7 +19,7 @@
 | `workflow-change` | `agent-build` | Only files no build uses (the pipeline `.agents/` and `.github/workflows/`, docs, rules, `.gitignore`, `.claude/` and the like, listed in `lib.sh` `pipeline_file`) are all the branch changed since `main`: Olex tests them himself. Tell him what changed and how to test it, and don't run it. `agent-merge` accepts them without a build, and also accepts such commits made after the branch's last build |
 | `conflicts` | `agent-start`, `agent-merge` | Resolve them, run the same script again |
 | `needs-testing` | `agent-merge` | The merge touched this feature: go back to step 3 |
-| `not-built` | `agent-merge` | Something was committed after the last build: go back to step 3 |
+| `not-built` | `agent-merge` | Something was committed after the last build: go back to step 3. If Olex said to merge without a build, run `agent-merge --unbuilt` instead |
 | `stuck` | `agent-merge` | Show Olex the files, ask what to do, stop |
 
 ## Steps
@@ -36,7 +36,7 @@
    - Run `agent-build` and `agent-install` in the background with output to a file, never through a pipe: the build daemons they start keep a pipe open, so the command would never return.
    - Build only what the code needs to work: a branch that changes only files no build uses needs no build, and `agent-build` stops with `workflow-change`.
 4. **Check.** Wait for Olex. If he asks for changes, go back to 2. Merge only when he says "merge".
-5. **Merge.** `bash .agents/agent-merge`. It merges the latest `main` into the branch, then the branch into `main`, keeping the branch. Then post the end report, one line each:
+5. **Merge.** `bash .agents/agent-merge`. It merges the latest `main` into the branch, then the branch into `main`, keeping the branch. When Olex says to merge without building (such as "skip build", then "merge"), run `bash .agents/agent-merge --unbuilt`: it merges without a checked build and without asking to test again, and the next branch made from `main` builds the parts this one changed along with its own. Say "not built" in the end report. Then post the end report, one line each:
    ```
    🔀 Merged tilt deadzone: <PR link>
    ✏️ Deadzone slider in Settings, saved per device.

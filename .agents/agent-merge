@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Step 5: bring the latest main into the feature branch, then merge the branch into main.
-# Usage: .agents/agent-merge   (run it again after resolving conflicts)
+# Usage: .agents/agent-merge [--unbuilt]   (run it again after resolving conflicts)
+#   --unbuilt: only when Olex says to merge without a build. Merges without a checked build and
+#   without asking to test again; the merge commit's title ends in "(unbuilt)", so the next
+#   branch's build also builds the parts this one changed (hooks/parts).
+UNBUILT=0
+if [ "${1:-}" = --unbuilt ]; then UNBUILT=1; shift; fi
 source "$(dirname "$0")/lib.sh"
 cd "$WORKTREE"
 require_feature_branch
@@ -19,9 +24,15 @@ merge_into_main() {
   n="$(pr_number "$BRANCH")"
   [ -n "$n" ] || die "No open PR from $BRANCH into main."
   pr_ready "$n"
-  gh api -X PUT "repos/$SLUG/pulls/$n/merge" -f merge_method=merge >/dev/null ||
+  local title=()
+  if [ "$UNBUILT" = 1 ]; then title=(-f "commit_title=Merge pull request #$n from $BRANCH (unbuilt)"); fi
+  gh api -X PUT "repos/$SLUG/pulls/$n/merge" -f merge_method=merge "${title[@]}" >/dev/null ||
     die "GitHub refused to merge PR #$n, most likely because main moved meanwhile. Run agent-merge again."
   rm -f "$attempts_file" "$files_file"
+  if [ "$UNBUILT" = 1 ]; then
+    finish done "Merged $BRANCH into main unbuilt: https://github.com/$SLUG/pull/$n" \
+      "The next build of a branch made from main after this builds its parts too." "The feature branch is kept."
+  fi
   finish done "Merged $BRANCH into main: https://github.com/$SLUG/pull/$n" "The feature branch is kept."
 }
 
@@ -88,7 +99,7 @@ fi
 # A branch that changed only pipeline files or documentation since main needs no build, and
 # neither do such commits after the branch's last checked build: Olex tests pipeline changes
 # himself (lib.sh only_pipeline_changes, built_but_pipeline).
-docs_only || built || only_pipeline_changes || built_but_pipeline || finish not-built "$(git rev-parse --short HEAD) has no build whose full checks passed." \
+[ "$UNBUILT" = 1 ] || docs_only || built || only_pipeline_changes || built_but_pipeline || finish not-built "$(git rev-parse --short HEAD) has no build whose full checks passed." \
   "Build it (step 3) and have Olex test it, then run agent-merge again."
 
 # main hasn't moved since the branch last took it in.
@@ -107,7 +118,7 @@ done <<<"$overlap")"
 
 if git merge --no-edit origin/main; then
   git push origin "$BRANCH"
-  if [ -n "$overlap" ] && ! docs_only; then
+  if [ -n "$overlap" ] && [ "$UNBUILT" = 0 ] && ! docs_only; then
     finish needs-testing "Merged the latest main. It changed files this feature also changed:" "$overlap" \
       "Build again (step 3). Once Olex says it still works, run agent-merge again."
   fi
