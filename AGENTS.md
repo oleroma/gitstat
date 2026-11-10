@@ -95,6 +95,7 @@ When Olex says "sup", reply with one line per piece of current work, the ones th
 - Every build gets the repo's next build number, pushed as a `build/<n>` tag by `.agents/build-number`. The version is the hand-bumped version name plus the number, `<name>-<n>` (or `0.1.<n>` where the name holds it), and Android's `versionCode` is the number. A repo may start its count at the number in `.agents/hooks/first-build-number`.
 - When Olex asks to publish builds, run `bash .agents/agent-publish [<n>]` on the PC, through a Remote Control session. It publishes build `<n>` (by default `main`'s newest build) as a pre-release on its `build/<n>` tag, with every part's current file.
 - Keep builds fast: build caches on and never cleaned, build daemons kept running on the PC, quicker settings for branch builds as long as the build file runs the same way.
+- When bumping Gradle, run `./gradlew wrapper --gradle-version <v> --gradle-distribution-sha256-sum <sum>`, with the sum from gradle.org, so the wrapper keeps checking its download.
 
 ## Destructive actions
 - Destructive actions are allowed only inside the repo's `build/` folder, and only what the task needs. Never wipe `build/`.
