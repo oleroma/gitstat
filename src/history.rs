@@ -37,6 +37,9 @@ pub struct Commit {
     /// Author time, Unix seconds.
     pub time: i64,
     pub subject: String,
+    /// The whole message, when the history came with it (GitHub's does);
+    /// empty for a clone's commits, whose message is read on hover.
+    pub message: String,
 }
 
 impl Commit {
@@ -309,6 +312,32 @@ pub fn stat(repo: &Path, id: &str) -> Result<Stat, String> {
     Ok(parse_stat(&String::from_utf8_lossy(&out.stdout)))
 }
 
+/// One commit's whole message, subject and body, trailing blank lines
+/// dropped.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn message(repo: &Path, id: &str) -> Result<String, String> {
+    if !(id.len() >= 40 && id.bytes().all(|b| b.is_ascii_hexdigit())) {
+        return Err("not a commit id".to_string());
+    }
+    let out = git::git(
+        repo,
+        &[
+            "show",
+            "--no-color",
+            "--no-show-signature",
+            "--no-patch",
+            "--format=%B",
+            id,
+            "--",
+        ],
+        git::LOCAL_TIMEOUT,
+    )?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+}
+
 /// Line stats of several commits in one git call, for a column of rows.
 /// Commits git can't show are left out.
 pub fn stats(repo: &Path, ids: &[String]) -> Result<HashMap<String, Stat>, String> {
@@ -454,6 +483,7 @@ fn parse_log(out: &str) -> Vec<Commit> {
                 email,
                 time,
                 subject,
+                message: String::new(),
             })
         })
         .collect()

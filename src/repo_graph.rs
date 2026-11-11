@@ -358,6 +358,7 @@ mod tests {
             email: "a@x".into(),
             time,
             subject: id.into(),
+            message: String::new(),
         };
         let h = crate::github::RemoteHistory {
             default_branch: Some("main".into()),

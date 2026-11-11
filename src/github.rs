@@ -444,7 +444,7 @@ fn history_query(owner: &str, name: &str) -> String {
          refs(refPrefix:\"refs/heads/\",first:{REMOTE_BRANCHES},\
          orderBy:{{field:TAG_COMMIT_DATE,direction:DESC}}){{nodes{{name \
          target{{...on Commit{{oid history(first:{REMOTE_DEPTH}){{nodes{{oid \
-         committedDate messageHeadline author{{name email}} \
+         committedDate messageHeadline message author{{name email}} \
          parents(first:3){{nodes{{oid}}}}}}}}}}}}}}}}}}}}"
     )
 }
@@ -489,6 +489,7 @@ fn parse_history(json: &Value) -> Option<RemoteHistory> {
                 email: c["author"]["email"].as_str().unwrap_or("").to_string(),
                 time: c["committedDate"].as_str().and_then(unix_time).unwrap_or(0),
                 subject: c["messageHeadline"].as_str().unwrap_or("").to_string(),
+                message: c["message"].as_str().unwrap_or("").trim_end().to_string(),
             });
         }
     }
