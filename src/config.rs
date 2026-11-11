@@ -170,6 +170,73 @@ pub struct Config {
     /// How long the panel takes to slide in from the taskbar, in ms; 0
     /// shows it at once.
     pub panel_slide_ms: u32,
+    /// Which sections of the repo list are folded, in the panel and the
+    /// big window alike.
+    pub folds: Folds,
+}
+
+/// The sections the panel lists, and the big window shows as groups of
+/// columns (the pull requests as the list under them).
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Section {
+    /// Repos with something to do: dirty, ahead, behind, erroring.
+    NeedsYou,
+    Synced,
+    PullRequests,
+    /// The GitHub repos with no clone here.
+    GithubOnly,
+}
+
+/// Each section folded (true) or open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Folds {
+    pub needs_you: bool,
+    pub synced: bool,
+    pub pull_requests: bool,
+    pub github_only: bool,
+}
+
+impl Default for Folds {
+    fn default() -> Self {
+        Self {
+            needs_you: false,
+            synced: true,
+            pull_requests: false,
+            github_only: true,
+        }
+    }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl Folds {
+    pub fn folded(&self, section: Section) -> bool {
+        *self.field(section)
+    }
+
+    pub fn toggle(&mut self, section: Section) {
+        let f = self.field_mut(section);
+        *f = !*f;
+    }
+
+    fn field(&self, section: Section) -> &bool {
+        match section {
+            Section::NeedsYou => &self.needs_you,
+            Section::Synced => &self.synced,
+            Section::PullRequests => &self.pull_requests,
+            Section::GithubOnly => &self.github_only,
+        }
+    }
+
+    fn field_mut(&mut self, section: Section) -> &mut bool {
+        match section {
+            Section::NeedsYou => &mut self.needs_you,
+            Section::Synced => &mut self.synced,
+            Section::PullRequests => &mut self.pull_requests,
+            Section::GithubOnly => &mut self.github_only,
+        }
+    }
 }
 
 impl Default for Config {
@@ -194,6 +261,7 @@ impl Default for Config {
             scroll_together: true,
             flip_animation: true,
             panel_slide_ms: 150,
+            folds: Folds::default(),
         }
     }
 }
@@ -620,6 +688,23 @@ mod tests {
         assert!(parse("{}").unwrap().flip_animation);
         let off = parse(r#"{ "flip_animation": false }"#).unwrap();
         assert!(!off.flip_animation);
+    }
+
+    #[test]
+    fn folds_default_and_toggle_one_section() {
+        let parse = |text: &str| serde_json::from_str::<Config>(text);
+        let f = parse("{}").unwrap().folds;
+        assert!(!f.folded(Section::NeedsYou) && f.folded(Section::Synced));
+        assert!(!f.folded(Section::PullRequests) && f.folded(Section::GithubOnly));
+        let f = parse(r#"{ "folds": { "synced": false } }"#).unwrap().folds;
+        assert!(!f.folded(Section::Synced) && f.folded(Section::GithubOnly));
+        let mut g = f;
+        g.toggle(Section::NeedsYou);
+        assert!(g.folded(Section::NeedsYou));
+        assert_eq!(
+            [Section::Synced, Section::PullRequests, Section::GithubOnly].map(|s| g.folded(s)),
+            [Section::Synced, Section::PullRequests, Section::GithubOnly].map(|s| f.folded(s)),
+        );
     }
 
     #[test]

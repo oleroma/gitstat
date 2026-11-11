@@ -63,6 +63,9 @@ pub enum TrayAction {
     SetSort(RepoSort),
     /// How long the panel slides in for, in ms; 0 for no slide.
     SetPanelSlide(u32),
+    /// Folds or opens a section of the repo list, in the panel and big
+    /// mode both.
+    Fold(crate::config::Section),
     SetAutostart(bool),
     /// How often to fetch, in minutes.
     SetInterval(f64),
