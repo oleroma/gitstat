@@ -1,4 +1,6 @@
-//! The notification-area icon and its right-click menu.
+//! The notification-area icon and its right-click menu. The menu holds only
+//! what's used day to day; every option lives in the settings window
+//! (settings.rs).
 
 use crate::config::{
     BadgeNumber, ClickAction, Config, Corner, FolderIconMode, RepoClick, RepoSort,
@@ -6,13 +8,14 @@ use crate::config::{
 use crate::git::RepoStatus;
 use crate::icon::{self, Badge};
 use crate::layout;
+use crate::settings::Setting;
 use crate::state::Input;
 use crate::win;
 use futures::channel::mpsc::UnboundedSender;
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 /// Routes tray clicks and menu picks into the UI loop's channel. Call it once,
@@ -41,7 +44,7 @@ pub fn install_handlers(tx: UnboundedSender<Input>) {
     }));
 }
 
-/// Something the user did in the tray.
+/// Something the user did in the tray, the panel or the settings window.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TrayAction {
     /// A left click, with the icon's rect in physical px.
@@ -59,96 +62,15 @@ pub enum TrayAction {
     SetBadgeNumber(BadgeNumber),
     SetSort(RepoSort),
     SetAutostart(bool),
+    /// How often to fetch, in minutes.
+    SetInterval(f64),
+    /// How many folder levels to look for repos in.
+    SetDepth(i64),
+    /// The folders to look for repos in: `path`, then `more_paths`.
+    SetFolders(String, Vec<String>),
+    OpenSettings,
     Quit,
 }
-
-/// The on/off settings the menu can flip.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Setting {
-    Watch,
-    Panel,
-    Window,
-    IconsOnly,
-    Overlay,
-    OverlayHideSynced,
-    OverlayHideFullscreen,
-    FolderIcons,
-    GithubPrs,
-    GithubRepos,
-    ScrollTogether,
-}
-
-impl Setting {
-    pub fn is_on(self, cfg: &Config) -> bool {
-        match self {
-            Setting::Watch => cfg.watch,
-            Setting::Panel => cfg.panel,
-            Setting::Window => cfg.window,
-            Setting::IconsOnly => cfg.icons_only,
-            Setting::Overlay => cfg.overlay.enabled,
-            Setting::OverlayHideSynced => cfg.overlay.hide_when_synced,
-            Setting::OverlayHideFullscreen => cfg.overlay.hide_in_fullscreen,
-            Setting::FolderIcons => cfg.folder_icons,
-            Setting::GithubPrs => cfg.github_prs,
-            Setting::GithubRepos => cfg.github_repos,
-            Setting::ScrollTogether => cfg.scroll_together,
-        }
-    }
-
-    pub fn toggle(self, cfg: &mut Config) {
-        let field = match self {
-            Setting::Watch => &mut cfg.watch,
-            Setting::Panel => &mut cfg.panel,
-            Setting::Window => &mut cfg.window,
-            Setting::IconsOnly => &mut cfg.icons_only,
-            Setting::Overlay => &mut cfg.overlay.enabled,
-            Setting::OverlayHideSynced => &mut cfg.overlay.hide_when_synced,
-            Setting::OverlayHideFullscreen => &mut cfg.overlay.hide_in_fullscreen,
-            Setting::FolderIcons => &mut cfg.folder_icons,
-            Setting::GithubPrs => &mut cfg.github_prs,
-            Setting::GithubRepos => &mut cfg.github_repos,
-            Setting::ScrollTogether => &mut cfg.scroll_together,
-        };
-        *field = !*field;
-    }
-}
-
-const CORNERS: [(Corner, &str); 4] = [
-    (Corner::TopLeft, "Top left"),
-    (Corner::TopRight, "Top right"),
-    (Corner::BottomLeft, "Bottom left"),
-    (Corner::BottomRight, "Bottom right"),
-];
-
-const REPO_CLICKS: [(RepoClick, &str); 2] = [
-    (RepoClick::Folder, "Folder"),
-    (RepoClick::Github, "GitHub page"),
-];
-
-const SORTS: [(RepoSort, &str); 7] = [
-    (RepoSort::Name, "Name"),
-    (RepoSort::Status, "Status, worst first"),
-    (RepoSort::LastCommit, "Last commit"),
-    (RepoSort::LastWorked, "Last worked on"),
-    (RepoSort::LastPullRequest, "Last pull request activity"),
-    (RepoSort::OpenPullRequests, "Most open pull requests"),
-    (RepoSort::HangingBranches, "Most hanging branches"),
-];
-
-const BADGE_NUMBERS: [(BadgeNumber, &str); 7] = [
-    (BadgeNumber::Unsynced, "Unsynced repos"),
-    (BadgeNumber::Dirty, "Repos with uncommitted changes"),
-    (BadgeNumber::Ahead, "Repos to push"),
-    (BadgeNumber::Behind, "Repos to pull"),
-    (BadgeNumber::PullRequests, "Open pull requests"),
-    (BadgeNumber::PullRequestsForYou, "Pull requests needing you"),
-    (BadgeNumber::ReviewRequests, "Reviews asked of you"),
-];
-
-const FOLDER_ICON_MODES: [(FolderIconMode, &str); 2] = [
-    (FolderIconMode::Status, "Status folder"),
-    (FolderIconMode::RepoSvg, "Repo icon"),
-];
 
 /// The menu is built once and changed in place. Replacing it with
 /// `set_menu` while it's open would destroy the menu the user is looking at.
@@ -169,17 +91,7 @@ pub struct Tray {
     panel_shown: Cell<bool>,
     window_shown: Cell<bool>,
     refresh: MenuItem,
-    /// Settings that live in the Display submenu, plus Watch for changes.
-    settings: Vec<(CheckMenuItem, Setting)>,
-    corner_menu: Submenu,
-    corners: Vec<(CheckMenuItem, Corner)>,
-    folder_icon_menu: Submenu,
-    folder_icon_modes: Vec<(CheckMenuItem, FolderIconMode)>,
-    repo_clicks: Vec<(CheckMenuItem, RepoClick)>,
-    badge_numbers: Vec<(CheckMenuItem, BadgeNumber)>,
-    sorts: Vec<(CheckMenuItem, RepoSort)>,
-    autostart: CheckMenuItem,
-    edit_config: MenuItem,
+    settings: MenuItem,
     quit: MenuItem,
 }
 
@@ -207,119 +119,7 @@ impl Tray {
         let open_panel = MenuItem::new("Open status panel", true, None);
         let open_window = MenuItem::new("Open status window", true, None);
         let refresh = MenuItem::new("Checking…", false, None);
-
-        let check = |label: &str, setting: Setting| {
-            let item = CheckMenuItem::new(label, true, setting.is_on(&defaults), None);
-            (item, setting)
-        };
-        let panel = check("Status panel on click", Setting::Panel);
-        let window = check("Status window", Setting::Window);
-        let icons_only = check("Icons only (panel and badge)", Setting::IconsOnly);
-        let overlay = check("Corner badge", Setting::Overlay);
-        let hide_synced = check("Hide badge when all synced", Setting::OverlayHideSynced);
-        let hide_fullscreen = check("Hide badge in fullscreen", Setting::OverlayHideFullscreen);
-        let folder_icons = check("Folder icons in Explorer", Setting::FolderIcons);
-        let watch = check("Watch for changes", Setting::Watch);
-        let github_prs = check("GitHub pull requests (via gh)", Setting::GithubPrs);
-        let github_repos = check(
-            "GitHub repos not cloned here (via gh)",
-            Setting::GithubRepos,
-        );
-
-        let scroll_together = check("Scroll big view columns together", Setting::ScrollTogether);
-
-        let corner_menu = Submenu::new("Badge corner", defaults.overlay.enabled);
-        let corners: Vec<(CheckMenuItem, Corner)> = CORNERS
-            .iter()
-            .map(|&(corner, label)| {
-                let item = CheckMenuItem::new(label, true, corner == defaults.overlay.corner, None);
-                (item, corner)
-            })
-            .collect();
-        for (item, _) in &corners {
-            corner_menu.append(item).map_err(|e| e.to_string())?;
-        }
-        let folder_icon_menu = Submenu::new("Folder icon style", defaults.folder_icons);
-        let folder_icon_modes: Vec<(CheckMenuItem, FolderIconMode)> = FOLDER_ICON_MODES
-            .iter()
-            .map(|&(mode, label)| {
-                let on = mode == defaults.folder_icon_mode;
-                (CheckMenuItem::new(label, true, on, None), mode)
-            })
-            .collect();
-        for (item, _) in &folder_icon_modes {
-            folder_icon_menu.append(item).map_err(|e| e.to_string())?;
-        }
-
-        let repo_click_menu = Submenu::new("Repo click opens", true);
-        let repo_clicks: Vec<(CheckMenuItem, RepoClick)> = REPO_CLICKS
-            .iter()
-            .map(|&(click, label)| {
-                let on = click == defaults.repo_click;
-                (CheckMenuItem::new(label, true, on, None), click)
-            })
-            .collect();
-        for (item, _) in &repo_clicks {
-            repo_click_menu.append(item).map_err(|e| e.to_string())?;
-        }
-
-        let badge_number_menu = Submenu::new("Number on the icon", true);
-        let badge_numbers: Vec<(CheckMenuItem, BadgeNumber)> = BADGE_NUMBERS
-            .iter()
-            .map(|&(n, label)| {
-                let on = n == defaults.badge_number;
-                (CheckMenuItem::new(label, true, on, None), n)
-            })
-            .collect();
-        for (i, (item, _)) in badge_numbers.iter().enumerate() {
-            // The pull request counts below a line.
-            if i == 4 {
-                badge_number_menu
-                    .append(&PredefinedMenuItem::separator())
-                    .map_err(|e| e.to_string())?;
-            }
-            badge_number_menu.append(item).map_err(|e| e.to_string())?;
-        }
-
-        let sort_menu = Submenu::new("Sort repos by", true);
-        let sorts: Vec<(CheckMenuItem, RepoSort)> = SORTS
-            .iter()
-            .map(|&(s, label)| (CheckMenuItem::new(label, true, s == defaults.sort, None), s))
-            .collect();
-        for (item, _) in &sorts {
-            sort_menu.append(item).map_err(|e| e.to_string())?;
-        }
-
-        let display = Submenu::new("Display", true);
-        display
-            .append_items(&[
-                &panel.0,
-                &window.0,
-                &icons_only.0,
-                &scroll_together.0,
-                &badge_number_menu,
-                &sort_menu,
-                &github_prs.0,
-                &github_repos.0,
-                &repo_click_menu,
-                &PredefinedMenuItem::separator(),
-                &overlay.0,
-                &corner_menu,
-                &hide_synced.0,
-                &hide_fullscreen.0,
-                &PredefinedMenuItem::separator(),
-                &folder_icons.0,
-                &folder_icon_menu,
-            ])
-            .map_err(|e| e.to_string())?;
-
-        let autostart = CheckMenuItem::new(
-            "Start with Windows",
-            true,
-            crate::autostart::is_enabled(),
-            None,
-        );
-        let edit_config = MenuItem::new("Edit config.json", true, None);
+        let settings = MenuItem::new("Settings…", true, None);
         let quit = MenuItem::new("Quit", true, None);
         menu.append_items(&[
             &summary,
@@ -329,11 +129,8 @@ impl Tray {
             &open_panel,
             &open_window,
             &refresh,
-            &display,
-            &watch.0,
-            &autostart,
-            &edit_config,
             &PredefinedMenuItem::separator(),
+            &settings,
             &quit,
         ])
         .map_err(|e| e.to_string())?;
@@ -360,28 +157,7 @@ impl Tray {
             panel_shown: Cell::new(true),
             window_shown: Cell::new(true),
             refresh,
-            settings: vec![
-                panel,
-                window,
-                icons_only,
-                overlay,
-                hide_synced,
-                hide_fullscreen,
-                folder_icons,
-                watch,
-                github_prs,
-                github_repos,
-                scroll_together,
-            ],
-            corner_menu,
-            corners,
-            folder_icon_menu,
-            folder_icon_modes,
-            repo_clicks,
-            badge_numbers,
-            sorts,
-            autostart,
-            edit_config,
+            settings,
             quit,
         };
         tray.sync_settings(&defaults);
@@ -497,42 +273,10 @@ impl Tray {
             Some(TrayAction::ShowWindow)
         } else if id == self.refresh.id() {
             Some(TrayAction::Refresh)
-        } else if id == self.edit_config.id() {
-            Some(TrayAction::EditConfig)
+        } else if id == self.settings.id() {
+            Some(TrayAction::OpenSettings)
         } else if id == self.quit.id() {
             Some(TrayAction::Quit)
-        } else if id == self.autostart.id() {
-            // Windows has already flipped the check mark.
-            Some(TrayAction::SetAutostart(self.autostart.is_checked()))
-        } else if let Some((_, setting)) = self.settings.iter().find(|(item, _)| item.id() == id) {
-            Some(TrayAction::Toggle(*setting))
-        } else if let Some((_, corner)) = self.corners.iter().find(|(item, _)| item.id() == id) {
-            // Picking the checked corner again unchecks it; keep exactly one.
-            self.check_corner(*corner);
-            Some(TrayAction::SetCorner(*corner))
-        } else if let Some((_, mode)) = self
-            .folder_icon_modes
-            .iter()
-            .find(|(item, _)| item.id() == id)
-        {
-            // Like the corners: exactly one stays checked.
-            self.check_folder_icon_mode(*mode);
-            Some(TrayAction::SetFolderIconMode(*mode))
-        } else if let Some((_, click)) = self.repo_clicks.iter().find(|(item, _)| item.id() == id) {
-            for (item, c) in &self.repo_clicks {
-                set_checked(item, c == click);
-            }
-            Some(TrayAction::SetRepoClick(*click))
-        } else if let Some((_, n)) = self.badge_numbers.iter().find(|(item, _)| item.id() == id) {
-            for (item, b) in &self.badge_numbers {
-                set_checked(item, b == n);
-            }
-            Some(TrayAction::SetBadgeNumber(*n))
-        } else if let Some((_, s)) = self.sorts.iter().find(|(item, _)| item.id() == id) {
-            for (item, o) in &self.sorts {
-                set_checked(item, o == s);
-            }
-            Some(TrayAction::SetSort(*s))
         } else {
             self.repos
                 .iter()
@@ -559,36 +303,10 @@ impl Tray {
             .or_else(|| point_rect(position.x, position.y))
     }
 
-    /// Makes the menu match `cfg`. Cheap enough to call after every change:
-    /// it only touches what differs.
+    /// Makes the menu match `cfg`: the open items for the panel and window
+    /// that are on, and what a left click does. Cheap enough to call after
+    /// every change: it only touches what differs.
     pub fn sync_settings(&self, cfg: &Config) {
-        for (item, setting) in &self.settings {
-            set_checked(item, setting.is_on(cfg));
-        }
-        self.check_corner(cfg.overlay.corner);
-        self.check_folder_icon_mode(cfg.folder_icon_mode);
-        for (item, c) in &self.repo_clicks {
-            set_checked(item, *c == cfg.repo_click);
-        }
-        for (item, n) in &self.badge_numbers {
-            set_checked(item, *n == cfg.badge_number);
-        }
-        for (item, s) in &self.sorts {
-            set_checked(item, *s == cfg.sort);
-        }
-        self.folder_icon_menu.set_enabled(cfg.folder_icons);
-
-        let badge = cfg.overlay.enabled;
-        self.corner_menu.set_enabled(badge);
-        for (item, setting) in &self.settings {
-            if matches!(
-                setting,
-                Setting::OverlayHideSynced | Setting::OverlayHideFullscreen
-            ) {
-                item.set_enabled(badge);
-            }
-        }
-
         // Window first: the panel item sits just above it.
         self.show_item(&self.open_window, &self.window_shown, cfg.window, 0);
         let above = usize::from(self.window_shown.get());
@@ -619,22 +337,6 @@ impl Tray {
         if ok {
             shown.set(want);
         }
-    }
-
-    fn check_corner(&self, corner: Corner) {
-        for (item, c) in &self.corners {
-            set_checked(item, *c == corner);
-        }
-    }
-
-    fn check_folder_icon_mode(&self, mode: FolderIconMode) {
-        for (item, m) in &self.folder_icon_modes {
-            set_checked(item, *m == mode);
-        }
-    }
-
-    pub fn set_autostart_checked(&self, checked: bool) {
-        self.autostart.set_checked(checked);
     }
 
     /// Removes the icon from the notification area right away. Otherwise it
@@ -701,12 +403,6 @@ fn set_text(item: &MenuItem, text: &str) {
     }
 }
 
-fn set_checked(item: &CheckMenuItem, checked: bool) {
-    if item.is_checked() != checked {
-        item.set_checked(checked);
-    }
-}
-
 /// Straight RGBA, which is what `CreateIcon` (tray-icon's `from_rgba`) takes.
 fn make_icon(badge: Badge, size: u32) -> Result<Icon, String> {
     Icon::from_rgba(icon::render(badge, size), size, size).map_err(|e| e.to_string())
@@ -754,31 +450,5 @@ mod tests {
             "no repos found (search stopped early)"
         );
         assert_eq!(summary(&snap(&[], false), 0), "no repos found");
-    }
-
-    #[test]
-    fn toggle_flips_exactly_its_setting() {
-        let all = [
-            Setting::Watch,
-            Setting::Panel,
-            Setting::Window,
-            Setting::IconsOnly,
-            Setting::Overlay,
-            Setting::OverlayHideSynced,
-            Setting::OverlayHideFullscreen,
-            Setting::FolderIcons,
-            Setting::GithubPrs,
-            Setting::GithubRepos,
-            Setting::ScrollTogether,
-        ];
-        for setting in all {
-            let before = Config::default();
-            let mut after = before.clone();
-            setting.toggle(&mut after);
-            for other in all {
-                let flipped = other.is_on(&before) != other.is_on(&after);
-                assert_eq!(flipped, other == setting, "{setting:?} vs {other:?}");
-            }
-        }
     }
 }

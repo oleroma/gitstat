@@ -47,6 +47,8 @@ mod panel;
 #[cfg(windows)]
 mod repo_marks;
 #[cfg(windows)]
+mod settings;
+#[cfg(windows)]
 mod timeline;
 #[cfg(windows)]
 mod tray;
