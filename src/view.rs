@@ -105,6 +105,8 @@ pub fn show_window(cx: &mut App) {
                         at(bounds.origin.y + bounds.size.height),
                     );
                     cx.spawn(async move |_| {
+                        // Minimising goes the way closing does.
+                        unsafe { win::minimize_closes(h) };
                         if let Some(client) = win::client_rect(h) {
                             crate::morph::seen_client(requested, client);
                         }

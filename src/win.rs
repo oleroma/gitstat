@@ -7,7 +7,7 @@
 //! lose the resulting `WM_SIZE`/`WM_MOVE`.
 
 use crate::layout::Rect;
-use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::{
     DWMNCRP_DISABLED, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_NCRENDERING_POLICY,
     DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND, DwmSetWindowAttribute,
@@ -25,10 +25,12 @@ use windows_sys::Win32::UI::Controls::{
 use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, GetSystemMetricsForDpi, MDT_EFFECTIVE_DPI};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON};
 use windows_sys::Win32::UI::Shell::{
-    QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState,
+    DefSubclassProc, QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
+    SHQueryUserNotificationState, SetWindowSubclass,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CW_USEDEFAULT, CreateWindowExW, SendMessageW, WS_EX_TOPMOST, WS_POPUP,
+    CW_USEDEFAULT, CreateWindowExW, PostMessageW, SC_MINIMIZE, SendMessageW, WM_CLOSE,
+    WM_SYSCOMMAND, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GWL_EXSTYLE, GetClientRect, GetCursorPos, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
@@ -418,6 +420,34 @@ const PARKED: i32 = -32000;
 /// off-screen, click-through and never activated. `SW_SHOWNORMAL` restores
 /// the normal position, which is this one: it is never minimised or maximised.
 ///
+/// Makes minimising the window close it instead (the minimise button, the
+/// taskbar button, Win+Down), so it goes the same way as closing: through
+/// GPUI's should-close callback.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`, on the window's thread.
+pub unsafe fn minimize_closes(h: isize) {
+    let Some(hwnd) = live(h) else { return };
+    unsafe {
+        SetWindowSubclass(hwnd, Some(minimize_closes_proc), 1, 0);
+    }
+}
+
+unsafe extern "system" fn minimize_closes_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    if msg == WM_SYSCOMMAND && (wparam & 0xFFF0) as u32 == SC_MINIMIZE {
+        unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
+        return 0;
+    }
+    unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+}
+
 /// # Safety
 /// Call only from a spawned task outside `update`.
 pub unsafe fn harden_keepalive(h: isize) {
