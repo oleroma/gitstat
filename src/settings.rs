@@ -525,6 +525,26 @@ fn views(cfg: &Config, p: &Palette) -> Vec<AnyElement> {
                     cfg,
                     p,
                 ),
+                setting_row(
+                    "Panel slides in",
+                    "From the taskbar's side, or the badge's, when the panel opens.",
+                    segmented(
+                        "panel-slide",
+                        [(0, "Off"), (100, "Fast"), (150, "Normal"), (300, "Slow")]
+                            .into_iter()
+                            .map(|(ms, label)| {
+                                (
+                                    label,
+                                    cfg.panel_slide_ms == ms,
+                                    TrayAction::SetPanelSlide(ms),
+                                )
+                            })
+                            .collect(),
+                        cfg.panel,
+                        p,
+                    ),
+                    p,
+                ),
                 flag(
                     "flip-animation",
                     "Flip animation",

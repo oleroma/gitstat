@@ -167,6 +167,9 @@ pub struct Config {
     /// words fade, each repo's tree turns from its strip to its column,
     /// and the words come back. Off, the window just opens.
     pub flip_animation: bool,
+    /// How long the panel takes to slide in from the taskbar, in ms; 0
+    /// shows it at once.
+    pub panel_slide_ms: u32,
 }
 
 impl Default for Config {
@@ -190,6 +193,7 @@ impl Default for Config {
             sort: RepoSort::default(),
             scroll_together: true,
             flip_animation: true,
+            panel_slide_ms: 150,
         }
     }
 }

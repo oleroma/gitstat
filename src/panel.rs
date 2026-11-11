@@ -41,6 +41,28 @@ pub struct PanelSlot {
     /// px it was last fitted to.
     anchor: Option<Anchor>,
     height: f32,
+    /// Where the open panel's client area goes, physical px.
+    rect: Option<Rect>,
+    /// The slide in under way: when it began, how long it lasts, and the
+    /// work area edge it comes from.
+    slide: Option<Slide>,
+}
+
+#[derive(Clone, Copy)]
+struct Slide {
+    start: Instant,
+    len: Duration,
+    edge: layout::Edge,
+    work: Rect,
+}
+
+impl Slide {
+    fn progress(&self) -> f32 {
+        if self.len.is_zero() {
+            return 1.0;
+        }
+        (self.start.elapsed().as_secs_f32() / self.len.as_secs_f32()).min(1.0)
+    }
 }
 
 impl Global for PanelSlot {}
@@ -115,7 +137,21 @@ fn open(anchor: Anchor, cx: &mut App) {
     };
     crate::morph::clear_strips();
     let rows = view::panel_rows(state.read(cx));
-    let bounds = logical(place(anchor, Height::Rows(rows), cx));
+    let rect = place(anchor, Height::Rows(rows), cx);
+    // Slides in from the taskbar's side, or the badge's top or bottom.
+    let ms = state.read(cx).config.panel_slide_ms;
+    let slide = (ms > 0).then(|| {
+        let (edge, work) = slide_from(anchor);
+        Slide {
+            start: Instant::now(),
+            len: Duration::from_millis(u64::from(ms.min(2000))),
+            edge,
+            work,
+        }
+    });
+    // Opened where the slide starts, out of sight.
+    let first = slide.map_or(rect, |s| layout::slide(rect, s.work, s.edge, 0.0).0);
+    let bounds = logical(first);
     let mut hwnd = None;
     let handle = cx
         .open_window(
@@ -149,6 +185,65 @@ fn open(anchor: Anchor, cx: &mut App) {
     slot.toggled_at = Some(Instant::now());
     slot.anchor = Some(anchor);
     slot.height = 0.0;
+    slot.rect = Some(rect);
+    slot.slide = slide.filter(|_| handle.is_some());
+    if let (Some(slide), Some(handle), Some(h)) = (slot.slide, handle, slot.hwnd) {
+        run_slide(slide, handle, h, cx);
+    }
+}
+
+/// Moves the panel in, frame by frame, until its slide ends or the panel
+/// closes. Reads the panel's place each frame, so a refit while sliding
+/// lands where it should.
+fn run_slide(slide: Slide, handle: WindowHandle<StatusView>, h: isize, cx: &mut App) {
+    cx.spawn(async move |cx| {
+        loop {
+            let step = cx.update(|cx| {
+                let slot = cx.default_global::<PanelSlot>();
+                if slot.handle != Some(handle) {
+                    return None;
+                }
+                let rect = slot.rect?;
+                let t = slide.progress();
+                if t >= 1.0 {
+                    slot.slide = None;
+                }
+                Some((rect, t))
+            });
+            let Ok(Some((rect, t))) = step else { break };
+            if t >= 1.0 {
+                unsafe { win::slide_panel(h, rect, None) };
+                break;
+            }
+            let (moved, shown) = layout::slide(rect, slide.work, slide.edge, t);
+            unsafe { win::slide_panel(h, moved, Some(shown)) };
+            cx.background_executor()
+                .timer(Duration::from_millis(7))
+                .await;
+        }
+    })
+    .detach();
+}
+
+/// The work area edge the panel slides in from, and that work area.
+fn slide_from(anchor: Anchor) -> (layout::Edge, Rect) {
+    let rect = match anchor {
+        Anchor::Tray(Some(rect)) | Anchor::Overlay { rect, .. } => rect,
+        Anchor::Tray(None) => {
+            let (x, y) = win::cursor_pos();
+            Rect::new(x, y, x + 1, y + 1)
+        }
+    };
+    let (cx, cy) = rect.centre();
+    let mon = win::monitor_at(cx, cy);
+    let edge = match anchor {
+        Anchor::Overlay { corner, .. } => match corner {
+            Corner::TopLeft | Corner::TopRight => layout::Edge::Top,
+            Corner::BottomLeft | Corner::BottomRight => layout::Edge::Bottom,
+        },
+        Anchor::Tray(_) => layout::taskbar_edge(mon.rect, mon.work, rect),
+    };
+    (edge, mon.work)
 }
 
 /// Resizes the open panel to `height` logical px of content, keeping it on
@@ -166,6 +261,12 @@ pub fn fit(height: f32, cx: &mut App) {
     }
     slot.height = height;
     let r = place(anchor, Height::Fit(height), cx);
+    let slot = cx.default_global::<PanelSlot>();
+    slot.rect = Some(r);
+    // A slide under way moves it there itself.
+    if slot.slide.is_some() {
+        return;
+    }
     // Native window calls must run outside this update.
     cx.spawn(async move |_| unsafe { win::place_window(h, r) })
         .detach();

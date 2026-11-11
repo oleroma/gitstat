@@ -13,7 +13,7 @@ use windows_sys::Win32::Graphics::Dwm::{
     DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND, DwmSetWindowAttribute,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    ClientToScreen, CreateEllipticRgn, DeleteObject, GetMonitorInfoW, HMONITOR,
+    ClientToScreen, CreateEllipticRgn, CreateRectRgn, DeleteObject, GetMonitorInfoW, HMONITOR,
     MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
     SetWindowRgn,
 };
@@ -323,6 +323,37 @@ pub unsafe fn place_morph(h: isize, r: Rect) {
             r.height() + bh,
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
+    }
+}
+
+/// Moves the panel's client area to `moved` without resizing it, showing
+/// only the part inside `shown` (screen px), for its slide in. `None`
+/// shows it whole again, with its rounded corners.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn slide_panel(h: isize, moved: Rect, shown: Option<Rect>) {
+    let Some(hwnd) = live(h) else { return };
+    unsafe {
+        let (dx, dy, bw, bh) = frame(hwnd);
+        let (wl, wt) = (moved.left - dx, moved.top - dy);
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            wl,
+            wt,
+            moved.width() + bw,
+            moved.height() + bh,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        let rgn = match shown {
+            // Region coordinates are relative to the window.
+            Some(r) => CreateRectRgn(r.left - wl, r.top - wt, r.right - wl, r.bottom - wt),
+            None => std::ptr::null_mut(),
+        };
+        if SetWindowRgn(hwnd, rgn, 1) == 0 && !rgn.is_null() {
+            DeleteObject(rgn);
+        }
     }
 }
 

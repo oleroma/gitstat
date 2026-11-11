@@ -458,6 +458,7 @@ fn on_action(action: TrayAction, cx: &mut App) -> bool {
         TrayAction::SetRepoClick(click) => change_setting(|c| c.repo_click = click, cx),
         TrayAction::SetBadgeNumber(n) => change_setting(|c| c.badge_number = n, cx),
         TrayAction::SetSort(s) => change_setting(|c| c.sort = s, cx),
+        TrayAction::SetPanelSlide(ms) => change_setting(|c| c.panel_slide_ms = ms, cx),
         TrayAction::SetInterval(minutes) => change_setting(|c| c.interval_minutes = minutes, cx),
         TrayAction::SetDepth(depth) => change_setting(|c| c.depth = depth, cx),
         TrayAction::SetFolders(path, more) => change_setting(

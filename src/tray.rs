@@ -61,6 +61,8 @@ pub enum TrayAction {
     SetRepoClick(RepoClick),
     SetBadgeNumber(BadgeNumber),
     SetSort(RepoSort),
+    /// How long the panel slides in for, in ms; 0 for no slide.
+    SetPanelSlide(u32),
     SetAutostart(bool),
     /// How often to fetch, in minutes.
     SetInterval(f64),
