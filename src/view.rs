@@ -12,8 +12,9 @@ use crate::win;
 use futures::channel::mpsc::UnboundedSender;
 use gpui::{
     AnyElement, App, AppContext, Bounds, Context, Entity, FocusHandle, Global, Hsla, IntoElement,
-    ParentElement, Render, ScrollHandle, SharedString, Styled, Window, WindowAppearance,
-    WindowBounds, WindowHandle, WindowKind, WindowOptions, div, point, prelude::*, px, rgb, size,
+    ParentElement, Render, ScrollHandle, ScrollWheelEvent, SharedString, Styled, Window,
+    WindowAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions, div, point,
+    prelude::*, px, rgb, size,
 };
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -1182,12 +1183,12 @@ impl Render for StatusView {
                         .child(capped.unwrap_or_else(|| {
                             match state.config.repo_click {
                                 crate::config::RepoClick::Folder => {
-                                    "Click a repo's name to open its folder. Wheel scrolls a \
-                                     column, Shift+wheel the table."
+                                    "Click a repo's name to open its folder. Wheel over the \
+                                     commits scrolls them, anywhere else the table."
                                 }
                                 crate::config::RepoClick::Github => {
-                                    "Click a repo's name to open it on GitHub. Wheel scrolls a \
-                                     column, Shift+wheel the table."
+                                    "Click a repo's name to open it on GitHub. Wheel over the \
+                                     commits scrolls them, anywhere else the table."
                                 }
                             }
                             .into()
@@ -1227,19 +1228,44 @@ impl Render for StatusView {
             .size_full()
             .bg(p.bg)
             .text_color(p.text)
-            .child(header)
+            .child(sideways(header, mode, cx))
             .map(|d| match table {
                 Some(table) if !empty => d.child(table),
                 _ => d.child(list),
             })
             .children(window_prs)
-            .when(!icons_only, |d| d.child(footer))
+            .when(!icons_only, |d| d.child(sideways(footer, mode, cx)))
             .children(
                 self.timelines
                     .as_ref()
                     .and_then(|t| t.read(cx).hover_card(&p, dark, cx)),
             )
     }
+}
+
+/// In the window, a wheel over `part` (the header or the footer) scrolls the
+/// table sideways, as it does over the columns' headers; only over a
+/// column's commits does it scroll up and down.
+fn sideways(part: impl IntoElement, mode: Mode, cx: &mut Context<StatusView>) -> AnyElement {
+    if mode != Mode::Window {
+        return part.into_any_element();
+    }
+    div()
+        .flex_none()
+        .child(part)
+        .on_scroll_wheel(cx.listener(|this, e: &ScrollWheelEvent, window, cx| {
+            let d = e.delta.pixel_delta(window.line_height());
+            let dx = if d.x.abs() > d.y.abs() { d.x } else { d.y };
+            let table = &this.table;
+            let o = table.offset();
+            let max = table.max_offset().width;
+            let x = (o.x + dx).clamp(-max, px(0.));
+            if x != o.x {
+                table.set_offset(point(x, o.y));
+                cx.notify();
+            }
+        }))
+        .into_any_element()
 }
 
 /// A bar of the repos' tones: green synced, amber local work, red needs

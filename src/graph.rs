@@ -602,6 +602,7 @@ mod tests {
             email: String::new(),
             time: 0,
             subject: String::new(),
+            message: String::new(),
         }
     }
 

@@ -149,11 +149,11 @@ fn main() {
         } else {
             single_instance()
         };
-        if !first {
-            let _ = error_box(
-                "gitstat is already running. Look for its icon in the notification area.".into(),
-            )
-            .join();
+        if !first
+            && !(ask_restart()
+                && stop_other_gitstats()
+                && wait_for_single_instance(self_update::HANDOVER))
+        {
             return;
         }
         log_panics();
@@ -333,6 +333,92 @@ fn wait_for_single_instance(timeout: std::time::Duration) -> bool {
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
+}
+
+/// Says gitstat is already running and asks whether to restart it: quit the
+/// running one and go on with this one. True for Restart.
+#[cfg(windows)]
+fn ask_restart() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        IDYES, MB_ICONINFORMATION, MB_SETFOREGROUND, MB_YESNO, MessageBoxW,
+    };
+    let text: Vec<u16> = "gitstat is already running. Look for its icon in the notification \
+         area.\n\nRestart it? Yes quits the running gitstat and starts this one."
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let title: Vec<u16> = "gitstat".encode_utf16().chain(Some(0)).collect();
+    let answer = unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            title.as_ptr(),
+            MB_YESNO | MB_ICONINFORMATION | MB_SETFOREGROUND,
+        )
+    };
+    answer == IDYES
+}
+
+/// Ends every other gitstat.exe process and waits for each to be gone.
+/// False when one couldn't be ended, with a warning saying so.
+#[cfg(windows)]
+fn stop_other_gitstats() -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcessId, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
+        WaitForSingleObject,
+    };
+    let me = unsafe { GetCurrentProcessId() };
+    let mut others = Vec::new();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut more = Process32FirstW(snap, &mut entry) != 0;
+        while more {
+            let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(260);
+            let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
+            if name.eq_ignore_ascii_case("gitstat.exe") && entry.th32ProcessID != me {
+                others.push(entry.th32ProcessID);
+            }
+            more = Process32NextW(snap, &mut entry) != 0;
+        }
+        CloseHandle(snap);
+    }
+    let mut stopped = true;
+    for pid in others {
+        unsafe {
+            let process = OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid);
+            if process.is_null() {
+                stopped = false;
+                continue;
+            }
+            if TerminateProcess(process, 0) != 0 {
+                WaitForSingleObject(process, 5000);
+            } else {
+                stopped = false;
+            }
+            CloseHandle(process);
+        }
+    }
+    if !stopped {
+        let _ = error_box(
+            "gitstat couldn't quit the gitstat that is running. Quit it from its \
+             tray menu, then start gitstat again."
+                .into(),
+        )
+        .join();
+    }
+    stopped
 }
 
 /// Shows a warning on its own thread. A message box on the main thread would

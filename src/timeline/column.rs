@@ -2,10 +2,10 @@
 //! stats, its history running down as a vertical tree with each commit's
 //! hash, subject and line stats beside its dot.
 //!
-//! A column shares its repo's slot with the strip: the same graph, and the
-//! same scroll, measured in strip px, so the strip and the column show the
-//! same commit. The column's top rests on the newest row rather than on
-//! HEAD, so commits not yet pulled stay in sight above it.
+//! A column shares its repo's slot with the strip, so the same graph, but
+//! scrolls on its own: wheeling the panel's strips leaves the table where
+//! it was. The column's top rests on the newest row rather than on HEAD, so
+//! commits not yet pulled stay in sight above it.
 
 use super::{Colors, Dot, Grow, STEP, Timelines, ink};
 use crate::git::RepoStatus;
@@ -55,41 +55,76 @@ impl Timelines {
     }
 
     /// The first row a column shows at `now`, fractional while between rows
-    /// or gliding, and whether it is gliding. The column rests on the newest
-    /// row; HEAD's row is where the strip rests.
+    /// or gliding, and whether it is gliding.
     fn column_top(&self, path: &Path, now: Instant) -> (f32, bool) {
-        let Some(slot) = self.slots.get(path) else {
-            return (0.0, false);
-        };
-        let home = slot.graph.as_ref().map_or(0.0, |g| g.home());
-        let (scroll, gliding) = slot.shown_scroll(now);
-        ((scroll / STEP - home).max(0.0), gliding)
+        self.slots
+            .get(path)
+            .map_or((0.0, false), |slot| slot.shown_top(now))
     }
 
     /// Scrolls a column `rows` rows down (negative: up), loading more
-    /// history near the end. Below home the strip and column agree; above
-    /// it the column has nothing to show, so it starts from home.
-    fn scroll_column(&mut self, path: &Path, rows: f32, cx: &mut Context<Self>) {
-        let Some(slot) = self.slots.get_mut(path) else {
+    /// history near the end. With `together`, every column moves to the
+    /// same row, as far as it has rows.
+    fn scroll_column(&mut self, path: &Path, rows: f32, together: bool, cx: &mut Context<Self>) {
+        let Some(own) = self.slots.get(path).and_then(|s| {
+            let g = s.graph.as_ref()?;
+            Some((s.top, last_top(g)))
+        }) else {
             return;
         };
-        let Some(g) = &slot.graph else { return };
-        let n = g.commits.len() as f32;
-        let home = g.home() * STEP;
-        let max = ((n - 1.0) * STEP).max(home);
-        let to = (slot.scroll.max(home) + rows * STEP).clamp(home, max);
-        let near_end = !g.end && n * STEP - to < super::PRELOAD;
-        // Gliding up from above home would sweep through rows the column
-        // never shows.
-        if slot.scroll < home {
-            slot.scroll = home;
-            slot.glide = None;
+        let to = if together {
+            // Go on from where the columns were scrolled together, unless
+            // this column shows something else (scrolled before the setting
+            // was on, or moved by a reload): then the rest line up with it.
+            let base = if (self.table_top.min(own.1) - own.0).abs() < 1e-3 {
+                self.table_top
+            } else {
+                own.0
+            };
+            let longest = self
+                .slots
+                .values()
+                .filter_map(|s| s.graph.as_deref().map(last_top))
+                .fold(0.0, f32::max);
+            (base + rows).clamp(0.0, longest)
+        } else {
+            (own.0 + rows).clamp(0.0, own.1)
+        };
+        if together {
+            self.table_top = to;
         }
-        slot.glide_to(to, Instant::now());
-        if near_end {
-            self.load_more(path, cx);
+        let now = Instant::now();
+        let mut more = Vec::new();
+        for (p, slot) in self.slots.iter_mut() {
+            if !together && p != path {
+                continue;
+            }
+            let Some(g) = &slot.graph else { continue };
+            let top = to.min(last_top(g));
+            if !g.end && (g.commits.len() as f32 - top) * STEP < super::PRELOAD {
+                more.push(p.clone());
+            }
+            slot.glide_top_to(top, now);
+        }
+        for p in more {
+            self.load_more(&p, cx);
         }
         self.unhover();
+        cx.notify();
+    }
+
+    /// A double click on a column: back to its top, or every column's when
+    /// they scroll together.
+    fn column_home(&mut self, path: &Path, together: bool, cx: &mut Context<Self>) {
+        if together {
+            self.table_top = 0.0;
+        }
+        let now = Instant::now();
+        for (p, slot) in self.slots.iter_mut() {
+            if together || p == path {
+                slot.glide_top_to(0.0, now);
+            }
+        }
         cx.notify();
     }
 
@@ -159,6 +194,7 @@ impl Timelines {
         cx: &App,
     ) -> AnyElement {
         let t = this.read(cx);
+        let together = t.state.read(cx).config.scroll_together;
         let path = status.path.clone();
         let slot = t.slots.get(&path);
         let graph = slot.and_then(|s| s.graph.clone());
@@ -216,6 +252,9 @@ impl Timelines {
         let (shown, shown_path) = (this.clone(), path.clone());
         let paint_path = path.clone();
         let web = graph.as_ref().and_then(|g| g.info.web.clone());
+        // Rows scrolled together line up across the table, so they get
+        // lines like the columns'.
+        let row_lines = together.then_some(p.border);
         let painter = canvas(
             move |bounds, window, cx| {
                 if window.content_mask().bounds.intersects(&bounds) {
@@ -228,6 +267,9 @@ impl Timelines {
                 window.insert_hitbox(bounds, HitboxBehavior::Normal)
             },
             move |bounds, hitbox, window, _cx| {
+                if let Some(color) = row_lines {
+                    paint_row_lines(bounds, top, color, window);
+                }
                 let Some(g) = graph else { return };
                 if moving {
                     window.request_animation_frame();
@@ -268,12 +310,7 @@ impl Timelines {
                         return;
                     }
                     if e.click_count >= 2 {
-                        e2.update(cx, |t, cx| {
-                            if let Some(slot) = t.slots.get_mut(&path2) {
-                                slot.scroll = slot.graph.as_ref().map_or(0.0, |g| g.home() * STEP);
-                                cx.notify();
-                            }
-                        });
+                        e2.update(cx, |t, cx| t.column_home(&path2, together, cx));
                         return;
                     }
                     let Some((_, Dot::Commit(row))) = at_row(&dots2, e.position) else {
@@ -312,7 +349,9 @@ impl Timelines {
                     return;
                 }
                 cx.stop_propagation();
-                entity.update(cx, |t, cx| t.scroll_column(&wheel_path, -y / ROW, cx));
+                entity.update(cx, |t, cx| {
+                    t.scroll_column(&wheel_path, -y / ROW, together, cx)
+                });
             })
             .child(painter)
             .children(texts)
@@ -887,6 +926,43 @@ impl Geometry {
         let n = (f32::from(height) / ROW).ceil() as usize + 1;
         first..first + n
     }
+}
+
+/// The rows' thin lines across a column, one between each two rows, the
+/// same colour and width as the lines between the columns.
+fn paint_row_lines(bounds: Bounds<Pixels>, top: f32, color: Hsla, window: &mut Window) {
+    let s = window.scale_factor();
+    let (ox, oy) = (f32::from(bounds.left()), f32::from(bounds.top()));
+    let (x1, h) = (f32::from(bounds.right()), f32::from(bounds.size.height));
+    // The line under row k sits where row k + 1 starts.
+    let mut y = (1.0 - top.fract()) * ROW;
+    while y < h {
+        // On the device pixel grid, so a line stays one crisp pixel.
+        let at = ink::pos(s, oy + y, 1.0);
+        ink::line(window, (ox, at), (x1, at), 1.0, color, None);
+        y += ROW;
+    }
+}
+
+/// A column's highest top: its last row.
+fn last_top(g: &RepoGraph) -> f32 {
+    (g.commits.len() as f32 - 1.0).max(0.0)
+}
+
+/// Where a column whose top was `top` in `old` goes in this reload of it:
+/// still the newest row if it was there, else the same commit, so new
+/// commits don't slide what was being looked at.
+pub(super) fn carry_top(g: &RepoGraph, old: &RepoGraph, top: f32) -> f32 {
+    if top < 1e-3 || old.commits.is_empty() {
+        return 0.0;
+    }
+    let row = (top.round() as usize).min(old.commits.len() - 1);
+    let id = &old.commits[row].id;
+    let at = match g.commits.iter().position(|c| &c.id == id) {
+        Some(n) => n as f32 + top - row as f32,
+        None => top,
+    };
+    at.clamp(0.0, last_top(g))
 }
 
 /// Paints the visible part of a column; returns each painted dot's centre.

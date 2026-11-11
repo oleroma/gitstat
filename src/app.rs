@@ -473,12 +473,20 @@ fn quit(cx: &mut App) {
     cx.quit();
 }
 
-/// Swaps in the build an install left next to the exe, starts it and quits.
-/// Returns true when quitting. A failed swap leaves this gitstat running and
-/// is tried again on the next poll.
+/// Swaps in the build an install left next to the exe, starts it and quits;
+/// or, run from outside the install folder, starts the installed build an
+/// install asked it to hand over to, and quits. Returns true when quitting.
+/// A failed swap leaves this gitstat running and is tried again on the next
+/// poll.
 fn update_and_restart(cx: &mut App) -> bool {
     use crate::self_update;
     let result = std::env::current_exe().and_then(|exe| {
+        if let Some(installed) = self_update::handover(&exe) {
+            // Taken first, so a failed start isn't tried on every poll.
+            std::fs::remove_file(self_update::handover_file(&exe))?;
+            self_update::restart(&installed)?;
+            return Ok(true);
+        }
         if !self_update::swap(&exe)? {
             return Ok(false);
         }
