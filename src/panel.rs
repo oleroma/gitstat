@@ -81,7 +81,24 @@ pub fn toggle(anchor: Anchor, cx: &mut App) {
     {
         return;
     }
-    open(anchor, cx);
+    open(anchor, true, cx);
+}
+
+/// The open panel's client area, or the last one's, physical px.
+pub fn last_rect(cx: &App) -> Option<Rect> {
+    cx.try_global::<PanelSlot>()?.rect
+}
+
+/// Opens the panel where it last was, at once, for the flip back from
+/// the big window. False when it has never been open.
+pub fn reopen(cx: &mut App) -> bool {
+    let Some(anchor) = cx.try_global::<PanelSlot>().and_then(|s| s.anchor) else {
+        return false;
+    };
+    if !is_open(cx) {
+        open(anchor, false, cx);
+    }
+    true
 }
 
 pub fn close(cx: &mut App) {
@@ -122,7 +139,7 @@ pub(crate) fn dismiss(window: &mut Window, cx: &mut App) {
     window.remove_window();
 }
 
-fn open(anchor: Anchor, cx: &mut App) {
+fn open(anchor: Anchor, slide: bool, cx: &mut App) {
     let Some(state) = cx.try_global::<Ui>().map(|ui| ui.state.clone()) else {
         return;
     };
@@ -140,7 +157,7 @@ fn open(anchor: Anchor, cx: &mut App) {
     let rect = place(anchor, Height::Rows(rows), cx);
     // Slides in from the taskbar's side, or the badge's top or bottom.
     let ms = state.read(cx).config.panel_slide_ms;
-    let slide = (ms > 0).then(|| {
+    let slide = (slide && ms > 0).then(|| {
         let (edge, work) = slide_from(anchor);
         Slide {
             start: Instant::now(),

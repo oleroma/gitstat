@@ -14,7 +14,7 @@ use futures::channel::mpsc::UnboundedSender;
 use gpui::{
     AnyElement, App, AppContext, Bounds, Context, Entity, FocusHandle, Global, Hsla, IntoElement,
     ParentElement, Render, ScrollHandle, ScrollWheelEvent, SharedString, Styled, Window,
-    WindowAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions, div, point,
+    WindowAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions, canvas, div, point,
     prelude::*, px, rgb, size,
 };
 use std::path::PathBuf;
@@ -124,6 +124,14 @@ pub fn show_window(cx: &mut App) {
         )
         .ok();
     cx.default_global::<WindowSlot>().handle = handle;
+}
+
+/// How far the open big window's table is scrolled sideways, logical px.
+pub fn table_scroll(cx: &App) -> f32 {
+    cx.try_global::<WindowSlot>()
+        .and_then(|s| s.handle)
+        .and_then(|h| h.read(cx).ok())
+        .map_or(0.0, |v| (-f32::from(v.table.offset().x)).max(0.0))
 }
 
 /// Whether the big window is open.
@@ -239,6 +247,10 @@ impl StatusView {
         }
         cx.observe_window_appearance(window, |_, _, cx| cx.notify())
             .detach();
+        if mode == Mode::Window {
+            // Closing flips it back into the panel when it can.
+            window.on_window_should_close(cx, |window, cx| !crate::morph::flip_back(window, cx));
+        }
         if mode == Mode::Panel {
             cx.observe_window_activation(window, |this: &mut Self, window, cx| {
                 if window.is_window_active() {
@@ -326,6 +338,20 @@ pub fn panel_rows(state: &AppState) -> usize {
     repos + prs + section(state.remote_statuses.len(), Section::GithubOnly)
 }
 
+/// Notes where a panel section's heading is drawn, for the flip.
+fn seen_header(section: Section) -> impl IntoElement {
+    canvas(
+        |_, _, _| {},
+        move |bounds, _, window, _| {
+            if window.content_mask().bounds.intersects(&bounds) {
+                crate::morph::seen_header(section, bounds);
+            }
+        },
+    )
+    .absolute()
+    .inset_0()
+}
+
 /// Folds or opens `section` everywhere, saved in config.json.
 fn fold(section: crate::config::Section) -> OnClick {
     Box::new(move |_, _, cx| {
@@ -337,14 +363,80 @@ fn fold(section: crate::config::Section) -> OnClick {
     })
 }
 
-/// The big-mode columns worth building: the ones in view and one more on
+/// A folded or open section's narrow column in big mode, its name
+/// running down it.
+pub(crate) const SPINE_WIDTH: f32 = 30.0;
+
+/// One cell of big mode's table, left to right.
+#[derive(Clone, Copy)]
+pub(crate) enum Cell<'a> {
+    /// A section's spine, with how many repos it holds.
+    Spine(Section, usize),
+    Repo(&'a RepoStatus),
+}
+
+impl Cell<'_> {
+    pub(crate) fn width(&self) -> f32 {
+        match self {
+            Cell::Spine(..) => SPINE_WIDTH,
+            Cell::Repo(_) => crate::timeline::COLUMN_WIDTH,
+        }
+    }
+}
+
+/// Big mode's table: each section with repos as its spine, then its
+/// repos' columns unless it is folded. Needs you, synced, then the GitHub
+/// repos with no clone, each in the configured order.
+pub(crate) fn table_cells(state: &AppState) -> Vec<Cell<'_>> {
+    let sorted = state.sorted(&state.statuses);
+    let (bad, good): (Vec<&RepoStatus>, Vec<&RepoStatus>) =
+        sorted.into_iter().partition(|s| !s.is_synced());
+    let remote = state.sorted(&state.remote_statuses);
+    let mut cells = Vec::new();
+    for (section, repos) in [
+        (Section::NeedsYou, bad),
+        (Section::Synced, good),
+        (Section::GithubOnly, remote),
+    ] {
+        if repos.is_empty() {
+            continue;
+        }
+        cells.push(Cell::Spine(section, repos.len()));
+        if !state.folded(section) {
+            cells.extend(repos.into_iter().map(Cell::Repo));
+        }
+    }
+    cells
+}
+
+/// Each cell's left edge in the unscrolled table, logical px.
+pub(crate) fn cell_lefts(cells: &[Cell]) -> Vec<f32> {
+    let mut x = 0.0;
+    cells
+        .iter()
+        .map(|c| {
+            let at = x;
+            x += c.width();
+            at
+        })
+        .collect()
+}
+
+/// The cell holding `path`'s column.
+pub(crate) fn cell_of(cells: &[Cell], path: &std::path::Path) -> Option<usize> {
+    cells
+        .iter()
+        .position(|c| matches!(c, Cell::Repo(s) if s.path == path))
+}
+
+/// The big-mode cells worth building: the ones in view and one more on
 /// each side. The rest are empty boxes of the same width, so the table
 /// scrolls as far, but hovering or animating one column doesn't lay out
 /// every repo's. Scrolling redraws the view, which builds the new ones.
 fn shown_columns(
     table: &ScrollHandle,
     window: &Window,
-    count: usize,
+    lefts: &[f32],
     focused: Option<usize>,
 ) -> std::ops::Range<usize> {
     let w = crate::timeline::COLUMN_WIDTH;
@@ -354,17 +446,84 @@ fn shown_columns(
         w if w > 0.0 => w,
         _ => f32::from(window.viewport_size().width),
     };
-    let fits = (width / w).ceil() as usize + 1;
     // A column about to be scrolled to may land at either edge.
-    let (first, last) = match focused {
-        Some(i) => (i.saturating_sub(fits), i + fits),
+    let (from, to) = match focused.and_then(|i| lefts.get(i)) {
+        Some(&x) => (x - width, x + width + w),
         None => {
             let left = (-f32::from(table.offset().x)).max(0.0);
-            let first = (left / w).floor() as usize;
-            (first.saturating_sub(1), first + fits)
+            (left - w, left + width + w)
         }
     };
-    first..(last + 1).min(count)
+    let first = lefts
+        .iter()
+        .position(|&x| x + w > from)
+        .unwrap_or(lefts.len());
+    let last = lefts.iter().rposition(|&x| x < to).map_or(0, |i| i + 1);
+    first..last.max(first)
+}
+
+/// A section's spine in big mode: its fold arrow, count and name down a
+/// narrow column; a click folds or opens it.
+fn spine(section: Section, count: usize, folded: bool, p: &Palette) -> AnyElement {
+    let (name, color) = match section {
+        Section::NeedsYou => ("NEED YOU", p.red),
+        Section::Synced => ("SYNCED", p.green),
+        Section::GithubOnly => ("GITHUB ONLY", p.muted),
+        Section::PullRequests => ("PULL REQUESTS", p.muted),
+    };
+    let id = match section {
+        Section::NeedsYou => "spine-needs-you",
+        Section::Synced => "spine-synced",
+        Section::GithubOnly => "spine-github-only",
+        Section::PullRequests => "spine-prs",
+    };
+    div()
+        .id(id)
+        .flex_none()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap_1()
+        .w(px(SPINE_WIDTH))
+        .h_full()
+        .pt_2()
+        .border_r_1()
+        .border_color(p.border)
+        .bg(p.bg)
+        .cursor_pointer()
+        .hover(|s| s.bg(p.hover))
+        .text_xs()
+        .text_color(color)
+        .child(
+            div()
+                .text_color(p.muted)
+                .child(if folded { "▸" } else { "▾" }),
+        )
+        .child(
+            div()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child(count.to_string()),
+        )
+        // GPUI can't turn text, so the name's letters stack down the spine.
+        .children(name.chars().map(|c| {
+            div().h(px(13.)).font_family("Consolas").child(if c == ' ' {
+                String::new()
+            } else {
+                c.to_string()
+            })
+        }))
+        .child(
+            // Where the flip lands this section's spine.
+            canvas(
+                |_, _, _| {},
+                move |bounds, _, window, _| crate::morph::seen_spine(bounds, window),
+            )
+            .absolute()
+            .inset_0(),
+        )
+        .relative()
+        .on_click(fold(section))
+        .into_any_element()
 }
 
 /// An unbuilt column: as wide and tall as a real one, with its border.
@@ -930,6 +1089,8 @@ impl Render for StatusView {
                     rows.push(
                         div()
                             .id("needs-you")
+                            .relative()
+                            .child(seen_header(Section::NeedsYou))
                             .flex()
                             .items_center()
                             .gap(px(10.))
@@ -979,6 +1140,8 @@ impl Render for StatusView {
                     rows.push(
                         div()
                             .id("synced")
+                            .relative()
+                            .child(seen_header(Section::Synced))
                             .flex()
                             .items_center()
                             .gap(px(10.))
@@ -1036,6 +1199,8 @@ impl Render for StatusView {
                     rows.push(
                         div()
                             .id("remote")
+                            .relative()
+                            .child(seen_header(Section::GithubOnly))
                             .flex()
                             .items_center()
                             .gap(px(10.))
@@ -1096,29 +1261,24 @@ impl Render for StatusView {
         };
         let table = match (&timelines, mode) {
             (Some(t), Mode::Window) => {
-                // In the configured order; the GitHub repos with no clone
-                // come after the cloned ones.
-                let order: Vec<&RepoStatus> = state
-                    .sorted(&state.statuses)
-                    .into_iter()
-                    .chain(state.sorted(&state.remote_statuses))
-                    .collect();
-                let focused = focus
-                    .as_deref()
-                    .and_then(|f| crate::timeline::column_index(&order, f));
+                // Each section's spine, then its repos' columns unless
+                // folded; the GitHub repos with no clone come last.
+                let cells = table_cells(state);
+                let lefts = cell_lefts(&cells);
+                let focused = focus.as_deref().and_then(|f| cell_of(&cells, f));
                 if let Some(i) = focused {
                     self.table.scroll_to_item(i);
                 }
-                let shown = shown_columns(&self.table, window, order.len(), focused);
-                let columns: Vec<AnyElement> = order
-                    .into_iter()
+                let shown = shown_columns(&self.table, window, &lefts, focused);
+                let columns: Vec<AnyElement> = cells
+                    .iter()
                     .enumerate()
-                    .map(|(i, s)| {
-                        if shown.contains(&i) {
+                    .map(|(i, cell)| match *cell {
+                        Cell::Spine(section, n) => spine(section, n, state.folded(section), &p),
+                        Cell::Repo(s) if shown.contains(&i) => {
                             Timelines::column(t, i, s, &p, dark, window, cx)
-                        } else {
-                            column_placeholder(&p)
                         }
+                        Cell::Repo(_) => column_placeholder(&p),
                     })
                     .collect();
                 Some(
@@ -1290,7 +1450,11 @@ impl Render for StatusView {
                 if event.keystroke.key == "escape" {
                     match mode {
                         Mode::Panel => panel::dismiss(window, cx),
-                        Mode::Window => window.remove_window(),
+                        Mode::Window => {
+                            if !crate::morph::flip_back(window, cx) {
+                                window.remove_window();
+                            }
+                        }
                     }
                 }
             })

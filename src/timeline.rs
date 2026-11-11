@@ -13,7 +13,7 @@ mod column;
 pub(crate) mod ink;
 mod morph;
 
-pub use column::{COLUMN_WIDTH, column_index};
+pub use column::COLUMN_WIDTH;
 pub use morph::{Ends, paint_tree};
 
 use crate::git::RepoStatus;
