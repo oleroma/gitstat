@@ -75,6 +75,7 @@ pub enum Setting {
     FolderIcons,
     GithubPrs,
     GithubRepos,
+    ScrollTogether,
 }
 
 impl Setting {
@@ -90,6 +91,7 @@ impl Setting {
             Setting::FolderIcons => cfg.folder_icons,
             Setting::GithubPrs => cfg.github_prs,
             Setting::GithubRepos => cfg.github_repos,
+            Setting::ScrollTogether => cfg.scroll_together,
         }
     }
 
@@ -105,6 +107,7 @@ impl Setting {
             Setting::FolderIcons => &mut cfg.folder_icons,
             Setting::GithubPrs => &mut cfg.github_prs,
             Setting::GithubRepos => &mut cfg.github_repos,
+            Setting::ScrollTogether => &mut cfg.scroll_together,
         };
         *field = !*field;
     }
@@ -223,6 +226,8 @@ impl Tray {
             Setting::GithubRepos,
         );
 
+        let scroll_together = check("Scroll big view columns together", Setting::ScrollTogether);
+
         let corner_menu = Submenu::new("Badge corner", defaults.overlay.enabled);
         let corners: Vec<(CheckMenuItem, Corner)> = CORNERS
             .iter()
@@ -291,6 +296,7 @@ impl Tray {
                 &panel.0,
                 &window.0,
                 &icons_only.0,
+                &scroll_together.0,
                 &badge_number_menu,
                 &sort_menu,
                 &github_prs.0,
@@ -365,6 +371,7 @@ impl Tray {
                 watch,
                 github_prs,
                 github_repos,
+                scroll_together,
             ],
             corner_menu,
             corners,
@@ -761,6 +768,8 @@ mod tests {
             Setting::OverlayHideFullscreen,
             Setting::FolderIcons,
             Setting::GithubPrs,
+            Setting::GithubRepos,
+            Setting::ScrollTogether,
         ];
         for setting in all {
             let before = Config::default();

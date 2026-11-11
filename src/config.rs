@@ -160,6 +160,9 @@ pub struct Config {
     pub badge_number: BadgeNumber,
     /// The order of the repos in the panel and the big view.
     pub sort: RepoSort,
+    /// The big view's columns scroll together, row for row, like the
+    /// panel's strips, with thin lines between the rows.
+    pub scroll_together: bool,
 }
 
 impl Default for Config {
@@ -181,6 +184,7 @@ impl Default for Config {
             repo_click: RepoClick::default(),
             badge_number: BadgeNumber::default(),
             sort: RepoSort::default(),
+            scroll_together: true,
         }
     }
 }
@@ -589,6 +593,15 @@ mod tests {
         let n = parse(r#"{ "badge_number": "pull-requests-for-you" }"#).unwrap();
         assert_eq!(n.badge_number, BadgeNumber::PullRequestsForYou);
         assert!(parse(r#"{ "badge_number": "prs" }"#).is_err());
+    }
+
+    #[test]
+    fn scroll_together_default_on() {
+        let parse = |text: &str| serde_json::from_str::<Config>(text);
+        assert!(Config::default().scroll_together);
+        assert!(parse("{}").unwrap().scroll_together);
+        let off = parse(r#"{ "scroll_together": false }"#).unwrap();
+        assert!(!off.scroll_together);
     }
 
     #[test]

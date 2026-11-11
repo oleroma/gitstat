@@ -227,6 +227,12 @@ pub struct Timelines {
     /// Big mode columns whose header shows its details, not just the
     /// one-line summary. Kept while gitstat runs.
     expanded: HashSet<PathBuf>,
+    /// Rows past home that big mode's columns were last scrolled to
+    /// together; a column with fewer rows stops at its last.
+    table_top: f32,
+    /// Full commit messages by id, read on first hover.
+    messages: HashMap<String, Arc<str>>,
+    messages_pending: HashSet<String>,
 }
 
 impl Timelines {
@@ -252,6 +258,9 @@ impl Timelines {
             focus: None,
             prs: HashMap::new(),
             expanded: HashSet::new(),
+            table_top: 0.0,
+            messages: HashMap::new(),
+            messages_pending: HashSet::new(),
         }
     }
 
@@ -614,7 +623,37 @@ impl Timelines {
         }) = hover
         {
             self.request_stat(repo, *row, cx);
+            self.request_message(repo, *row, cx);
         }
+    }
+
+    /// Reads the whole message of the commit at `row`, for its card. A
+    /// GitHub-only repo's history came with its messages.
+    fn request_message(&mut self, path: &Path, row: usize, cx: &mut Context<Self>) {
+        if crate::github::remote_slug(path).is_some() {
+            return;
+        }
+        let Some(id) = self.commit_id(path, row) else {
+            return;
+        };
+        if self.messages.contains_key(&id) || !self.messages_pending.insert(id.clone()) {
+            return;
+        }
+        let repo = path.to_path_buf();
+        let key = id.clone();
+        let task = cx.background_spawn(async move { history::message(&repo, &key) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.messages_pending.remove(&id);
+                if let Ok(message) = result {
+                    this.messages.insert(id, message.into());
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn request_stat(&mut self, path: &Path, row: usize, cx: &mut Context<Self>) {
@@ -950,7 +989,7 @@ impl Timelines {
             .flex()
             .flex_col()
             .gap_1()
-            .max_w(px(320.))
+            .max_w(px(420.))
             .px_3()
             .py_2()
             .rounded_md()
@@ -1041,6 +1080,14 @@ impl Timelines {
             .copied
             .as_ref()
             .is_some_and(|(p, r)| p == repo && *r == row);
+        // The whole message once read, else the subject until it is.
+        let message = self
+            .messages
+            .get(&c.id)
+            .map(|m| m.to_string())
+            .or_else(|| (!c.message.is_empty()).then(|| c.message.clone()))
+            .unwrap_or_else(|| c.subject.clone());
+        let (subject, body) = message_parts(&message);
         let mut lines = vec![
             div()
                 .flex()
@@ -1052,11 +1099,32 @@ impl Timelines {
                         .text_color(colors.node(g, row))
                         .child(c.short().to_string()),
                 )
-                .child(div().min_w_0().truncate().child(c.subject.clone()))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .child(subject),
+                )
                 .when(copied, |d| {
                     d.child(div().flex_none().text_color(p.muted).child("copied"))
                 })
                 .into_any_element(),
+        ];
+        if !body.is_empty() {
+            lines.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .pb_1()
+                    .children(body.into_iter().map(|line| {
+                        // A blank line between paragraphs keeps its height.
+                        div().min_h(px(6.)).child(line).into_any_element()
+                    }))
+                    .into_any_element(),
+            );
+        }
+        lines.extend([
             div()
                 .text_color(p.muted)
                 .child(format!(
@@ -1067,7 +1135,7 @@ impl Timelines {
                 ))
                 .into_any_element(),
             div().text_color(p.muted).child(stat).into_any_element(),
-        ];
+        ]);
         if head || !what.is_empty() || !refs.is_empty() {
             let mut parts = Vec::new();
             if head {
@@ -1105,6 +1173,37 @@ impl Timelines {
         }
         Some(lines)
     }
+}
+
+/// Lines of a message body a card shows at most; longer ones end in "…".
+const BODY_LINES: usize = 24;
+/// Characters of one body line a card shows at most.
+const BODY_LINE_CHARS: usize = 400;
+
+/// A message's subject, its first paragraph joined into one line as git
+/// does, and its body's lines after the blank line, at most `BODY_LINES`.
+fn message_parts(message: &str) -> (String, Vec<String>) {
+    let message = message.trim();
+    let (subject, body) = message.split_once("\n\n").unwrap_or((message, ""));
+    let subject = subject.lines().map(str::trim).collect::<Vec<_>>().join(" ");
+    let mut lines: Vec<String> = body
+        .trim_matches('\n')
+        .lines()
+        .map(|l| {
+            let l = l.trim_end();
+            match l.char_indices().nth(BODY_LINE_CHARS) {
+                Some((cut, _)) => format!("{}…", &l[..cut]),
+                None => l.to_string(),
+            }
+        })
+        .collect();
+    // Runs of blank lines show as one.
+    lines.dedup_by(|a, b| a.is_empty() && b.is_empty());
+    if lines.len() > BODY_LINES {
+        lines.truncate(BODY_LINES);
+        lines.push("…".to_string());
+    }
+    (subject, lines)
 }
 
 /// The work-in-progress card's lines. The repo's status says only that the
@@ -1460,4 +1559,32 @@ fn fade(bounds: Bounds<Pixels>, bg: Hsla, window: &mut Window) {
             linear_color_stop(bg.opacity(0.), 1.),
         ),
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_parts_split_subject_and_body() {
+        let (s, b) = message_parts("Add the thing\n\nWhy it was needed.\n\n\n\nMore.\n");
+        assert_eq!(s, "Add the thing");
+        assert_eq!(b, ["Why it was needed.", "", "More."]);
+        let (s, b) = message_parts("One line");
+        assert_eq!(s, "One line");
+        assert!(b.is_empty());
+        let (s, _) = message_parts("Wrapped\nsubject\n\nbody");
+        assert_eq!(s, "Wrapped subject");
+    }
+
+    #[test]
+    fn message_parts_cap_long_bodies() {
+        let long = format!("s\n\n{}", vec!["x"; BODY_LINES + 5].join("\n"));
+        let (_, b) = message_parts(&long);
+        assert_eq!(b.len(), BODY_LINES + 1);
+        assert_eq!(b.last().unwrap(), "…");
+        let wide = format!("s\n\n{}", "é".repeat(BODY_LINE_CHARS + 3));
+        let (_, b) = message_parts(&wide);
+        assert_eq!(b[0].chars().count(), BODY_LINE_CHARS + 1);
+    }
 }

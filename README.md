@@ -69,6 +69,13 @@ yet. Click the row to open the details, which list the hanging and in-review
 branches by name with their age, the worktrees and the last merge; click
 again to fold them.
 
+Below the header runs the repo's history, newest at the top. The wheel
+scrolls it; a double-click goes back to the top. With **Display ▸ Scroll big
+view columns together** (on by default) every column scrolls with it, row
+for row like the panel's strips, and thin lines between the rows line them
+up across the table; a column with fewer commits stops at its last. Hover a
+commit for its card, which shows the commit's whole message.
+
 A repo's name is its path below `path`, such as `dev\gitstat`, and lists
 everywhere sort by it.
 
@@ -310,7 +317,8 @@ from an older version keeps working:
   "github_repos": true,
   "repo_click": "folder",
   "badge_number": "unsynced",
-  "sort": "name"
+  "sort": "name",
+  "scroll_together": true
 }
 ```
 
@@ -324,6 +332,7 @@ from an older version keeps working:
 | `panel` | true | A tray left-click (and a badge click) opens the status panel. |
 | `window` | true | The status window is available from the menu, a double-click and the panel's ⧉ button. |
 | `icons_only` | false | **Display ▸ Icons only**: the panel and the badge show pictures, no words. Each repo is its `.gitstat/icon.svg` (or a status dot) beside its graph, the header a bar of green, amber and red repos, the badge a ring of the same colours around a dot in the most urgent one. Hover any of them for the words. |
+| `scroll_together` | true | **Display ▸ Scroll big view columns together**: every column of the big view scrolls with the one under the mouse, with thin lines between the rows. Off, each column scrolls on its own. |
 | `overlay.enabled` | false | Show the corner badge. |
 | `overlay.corner` | `bottom-right` | `top-left`, `top-right`, `bottom-left` or `bottom-right`. |
 | `overlay.offset_x`, `overlay.offset_y` | unset | Where the badge was dragged to: px at 100% scale from the left or right, and the top or bottom, edge of the corner. Unset is `margin`. Written by dragging, removed by picking a corner from the menu. |
