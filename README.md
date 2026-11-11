@@ -283,6 +283,9 @@ with a **gitstat** shortcut in the Start menu. The install never stops or
 starts gitstat: it leaves the new build next to the installed one as
 `gitstat.exe.new`. A running gitstat notices it within a few seconds, swaps
 it in and restarts itself; one that isn't running switches at its next start.
+A gitstat running from anywhere else, such as `build\gitstat.exe`, is handed
+`gitstat.exe.handover` next to its exe: it starts the installed build and
+quits, so the installed one takes over.
 The replaced exe is kept as `gitstat.exe.old` until the new gitstat removes
 it. `config.json` there is kept between installs; the first install copies
 `build\config.json`. If **Start with Windows** is on, it is pointed at the

@@ -6,6 +6,11 @@
 //! Windows won't overwrite or delete a running exe, but it will rename one:
 //! the running exe becomes `gitstat.exe.old` and is removed by the next
 //! gitstat once the old one has exited.
+//!
+//! A gitstat running from another folder, such as a build folder, isn't the
+//! installed one. An install leaves it `gitstat.exe.handover` holding the
+//! installed exe's path; it starts that exe and quits, so the installed
+//! build takes over.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -38,6 +43,24 @@ pub fn new_build(exe: &Path) -> PathBuf {
 /// Where the replaced exe goes: `gitstat.exe.old`.
 pub fn old_build(exe: &Path) -> PathBuf {
     with_suffix(exe, ".old")
+}
+
+/// Where an install asks a gitstat running elsewhere to hand over:
+/// `gitstat.exe.handover`, holding the installed exe's path.
+pub fn handover_file(exe: &Path) -> PathBuf {
+    with_suffix(exe, ".handover")
+}
+
+/// The exe an install asked this gitstat to hand over to, if it exists
+/// and isn't this one.
+pub fn handover(exe: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(handover_file(exe)).ok()?;
+    let target = PathBuf::from(text.trim());
+    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    };
+    (target.is_file() && !same(&target, exe)).then_some(target)
 }
 
 /// Whether a new build is waiting.
@@ -87,8 +110,8 @@ pub fn restart(exe: &Path) -> io::Result<()> {
         .map(drop)
 }
 
-/// Sends `found` once every `POLL` while a new build is waiting, and
-/// removes the replaced exe once the old gitstat has exited.
+/// Sends `found` once every `POLL` while a new build or a handover is
+/// waiting, and removes the replaced exe once the old gitstat has exited.
 #[cfg(windows)]
 pub fn watch(exe: PathBuf, found: impl Fn() + Send + 'static) {
     std::thread::Builder::new()
@@ -100,7 +123,7 @@ pub fn watch(exe: PathBuf, found: impl Fn() + Send + 'static) {
                 if !old_gone {
                     old_gone = remove_old(&exe);
                 }
-                if pending(&exe) {
+                if pending(&exe) || handover(&exe).is_some() {
                     found();
                 }
             }
@@ -170,6 +193,24 @@ mod tests {
         assert_eq!(fs::read_to_string(&exe).unwrap(), "v3");
         assert_eq!(fs::read_to_string(old_build(&exe)).unwrap(), "v2");
         fs::remove_dir_all(exe.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn hands_over_only_to_another_existing_exe() {
+        let exe = setup("handover", "v1");
+        let dir = exe.parent().unwrap();
+        assert_eq!(handover(&exe), None);
+        // Itself.
+        fs::write(handover_file(&exe), exe.display().to_string()).unwrap();
+        assert_eq!(handover(&exe), None);
+        // An exe that isn't there.
+        let installed = dir.join("installed.exe");
+        fs::write(handover_file(&exe), installed.display().to_string()).unwrap();
+        assert_eq!(handover(&exe), None);
+        fs::write(&installed, "v2").unwrap();
+        fs::write(handover_file(&exe), format!("{}\r\n", installed.display())).unwrap();
+        assert_eq!(handover(&exe), Some(installed));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

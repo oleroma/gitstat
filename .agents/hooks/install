@@ -7,6 +7,9 @@
 # gitstat that doesn't switch within 15 seconds predates self-update: its exe is renamed
 # to gitstat.exe.old instead (Windows allows that while it runs) and the new one put in
 # its place, to run from the next start.
+# A gitstat running from anywhere else (such as build\gitstat.exe) is asked to hand over:
+# gitstat.exe.handover next to its exe names the installed exe, which it starts before
+# quitting. One that doesn't within 15 seconds predates handover and is left running.
 # config.json there is kept; the first install takes build\config.json, so settings carry
 # over. A "Start with Windows" entry is pointed at the installed exe.
 # Prints "note: <text>" lines for the build summary.
@@ -40,6 +43,10 @@ new="$dest/gitstat.exe.new"
 # rename, so this also finds one already renamed to .old.
 running="$(ps "@(Get-Process gitstat -ErrorAction SilentlyContinue | Where-Object { \$_.Path -like '$dest_win\\gitstat.exe*' }).Count")"
 running="$(tr -d '\r' <<<"$running")"
+
+# gitstat running from anywhere else, one exe path per line.
+elsewhere="$(ps "Get-Process gitstat -ErrorAction SilentlyContinue | Where-Object { \$_.Path -and \$_.Path -notlike '$dest_win\\gitstat.exe*' } | ForEach-Object { \$_.Path } | Sort-Object -Unique")"
+elsewhere="$(tr -d '\r' <<<"$elsewhere")"
 
 # Copied under another name first, so gitstat never sees half a file.
 cp -f "$exe" "$new.tmp"
@@ -76,6 +83,24 @@ else
     outcome="the running gitstat switched to the new build and restarted itself"
   fi
 fi
+
+# Each gitstat running elsewhere hands over to the installed build, now in place.
+while IFS= read -r other; do
+  [ -n "$other" ] || continue
+  ticket="$(cygpath -u "$other").handover"
+  printf '%s' "$dest_win\gitstat.exe" >"$ticket"
+  for _ in $(seq 15); do
+    [ -f "$ticket" ] || break
+    sleep 1
+  done
+  if [ -f "$ticket" ]; then
+    rm -f "$ticket"
+    echo "note: a gitstat running from $other didn't hand over within 15 seconds (it predates handover); quit it and start gitstat from the Start menu."
+  else
+    echo "note: the gitstat running from $other handed over to the installed build."
+    [ "${running:-0}" != 0 ] || outcome="the installed build now runs in its place"
+  fi
+done <<<"$elsewhere"
 
 if [ ! -f "$dest/config.json" ]; then
   if [ -f "$build_dir/config.json" ]; then
