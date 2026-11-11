@@ -70,7 +70,8 @@ branches by name with their age, the worktrees and the last merge; click
 again to fold them.
 
 Below the header runs the repo's history, newest at the top. The wheel
-scrolls it; a double-click goes back to the top. With **Display ▸ Scroll big
+over it scrolls it; anywhere else in the window, column headers included, the
+wheel scrolls the table sideways. A double-click goes back to the top. With **Display ▸ Scroll big
 view columns together** (on by default) every column scrolls with it, row
 for row like the panel's strips, and thin lines between the rows line them
 up across the table; a column with fewer commits stops at its last. Hover a
