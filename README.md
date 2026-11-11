@@ -285,7 +285,10 @@ starts gitstat: it leaves the new build next to the installed one as
 it in and restarts itself; one that isn't running switches at its next start.
 A gitstat running from anywhere else, such as `build\gitstat.exe`, is handed
 `gitstat.exe.handover` next to its exe: it starts the installed build and
-quits, so the installed one takes over.
+quits, so the installed one takes over. Starting gitstat while one already
+runs asks whether to restart it: **Yes** quits the running one and goes on
+with the new start, so an older gitstat that doesn't hand over can be
+replaced from the Start menu in one step.
 The replaced exe is kept as `gitstat.exe.old` until the new gitstat removes
 it. `config.json` there is kept between installs; the first install copies
 `build\config.json`. If **Start with Windows** is on, it is pointed at the
