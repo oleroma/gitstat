@@ -36,6 +36,7 @@
    - Run `agent-build` and `agent-install` in the background with output to a file, never through a pipe: the build daemons they start keep a pipe open, so the command would never return.
    - Build only what the code needs to work: a branch that changes only files no build uses needs no build, and `agent-build` stops with `workflow-change`.
 4. **Check.** Wait for Olex. If he asks for changes, go back to 2. Merge only when he says "merge".
+   - A new feature asked for while one is open: a small one goes on the open branch and PR, a big one gets its own branch and PR after the open one merges.
 5. **Merge.** `bash .agents/agent-merge`. It merges the latest `main` into the branch, then the branch into `main`, keeping the branch. When Olex says to merge without building (such as "skip build", then "merge"), run `bash .agents/agent-merge --unbuilt`: it merges without a checked build and without asking to test again, and the next branch made from `main` builds the parts this one changed along with its own. Say "not built" in the end report. Then post the end report, one line each:
    ```
    🔀 Merged tilt deadzone: <PR link>
@@ -80,6 +81,8 @@ When Olex says "sup", reply with one line per piece of current work, the ones th
 ⏳ ⚙️ harvest-rules.sh, 1 min in
 🔀 menu cleanup merged
 ```
+
+When Olex says "wdyt", give your honest opinion.
 
 ## Scripts and hooks
 - The scripts in `.agents/` are the same in every repo. When an agent finds a problem in them, the shared rules or its repo's workflows, it suggests a fix to Olex, and makes it on its feature branch only when he asks. Olex tests such changes himself: the agent pushes them and says what changed and how to test it, without running them. After the merge, Olex has the "rulesetter" thread apply it to every repo.
