@@ -116,8 +116,7 @@ pub fn open_window(panel: &mut Window, focus: Option<PathBuf>, cx: &mut App) {
     let flip = cx.try_global::<Ui>().is_some_and(|ui| {
         let cfg = &ui.state.read(cx).config;
         cfg.flip_animation && cfg.window
-    }) && !view::window_open(cx)
-        && win::animations_on();
+    }) && !view::window_open(cx);
     if !(flip && start(panel, focus.as_deref(), cx)) {
         crate::panel::dismiss(panel, cx);
         view::show_window(cx);

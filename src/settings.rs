@@ -528,8 +528,7 @@ fn views(cfg: &Config, p: &Palette) -> Vec<AnyElement> {
                 flag(
                     "flip-animation",
                     "Flip animation",
-                    "Opening the window from the panel turns each repo's strip into its column. \
-                     Skipped when Windows animations are off.",
+                    "Opening the window from the panel turns each repo's strip into its column.",
                     Setting::FlipAnimation,
                     cfg.window && cfg.panel,
                     cfg,
