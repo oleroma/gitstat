@@ -98,19 +98,30 @@ struct Slot {
     /// Where the strip was shown when the wheel last moved it, and when:
     /// it glides from there to `scroll`.
     glide: Option<(f32, Instant)>,
+    /// Big mode's column scrolls on its own, apart from the strip: the row
+    /// at its top, 0 for the newest.
+    top: f32,
+    /// Like `glide`, for `top`.
+    top_glide: Option<(f32, Instant)>,
+}
+
+/// Where a glide from `glide` to `to` is at `now`, and whether it is still
+/// going.
+fn glided(to: f32, glide: Option<(f32, Instant)>, now: Instant) -> (f32, bool) {
+    match glide {
+        Some((from, start)) => {
+            let t = progress(start, now, GLIDE);
+            (from + (to - from) * t, t < 1.0)
+        }
+        None => (to, false),
+    }
 }
 
 impl Slot {
     /// The scroll to draw at `now`, part way along a glide, and whether
     /// the glide is still going.
     fn shown_scroll(&self, now: Instant) -> (f32, bool) {
-        match self.glide {
-            Some((from, start)) => {
-                let t = progress(start, now, GLIDE);
-                (from + (self.scroll - from) * t, t < 1.0)
-            }
-            None => (self.scroll, false),
-        }
+        glided(self.scroll, self.glide, now)
     }
 
     /// Moves the scroll to `to`, gliding from wherever it shows now.
@@ -118,6 +129,18 @@ impl Slot {
         let (shown, _) = self.shown_scroll(now);
         self.glide = Some((shown, now));
         self.scroll = to;
+    }
+
+    /// The column's top row to draw at `now`, and whether it is gliding.
+    fn shown_top(&self, now: Instant) -> (f32, bool) {
+        glided(self.top, self.top_glide, now)
+    }
+
+    /// Moves the column's top to `to`, gliding from wherever it shows now.
+    fn glide_top_to(&mut self, to: f32, now: Instant) {
+        let (shown, _) = self.shown_top(now);
+        self.top_glide = Some((shown, now));
+        self.top = to;
     }
 }
 
@@ -415,6 +438,11 @@ impl Timelines {
                 };
                 slot.scroll = row * STEP;
                 slot.glide = None;
+                slot.top = match &slot.graph {
+                    Some(old) => column::carry_top(&g, old, slot.top),
+                    None => 0.0,
+                };
+                slot.top_glide = None;
                 let mut g = *g;
                 if let Some(prs) = self.prs.get(&path) {
                     g.prs = prs.clone();
