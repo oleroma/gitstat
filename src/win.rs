@@ -33,9 +33,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GWL_EXSTYLE, GetClientRect, GetCursorPos, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
     HWND_TOPMOST, IDYES, IsWindow, IsWindowVisible, MB_ICONQUESTION, MB_SETFOREGROUND, MB_YESNO,
-    MessageBoxW, SM_CXSCREEN, SM_CXSMICON, SM_CYSCREEN, SM_SWAPBUTTON, SW_HIDE, SW_SHOWNOACTIVATE,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WS_EX_NOACTIVATE, WS_EX_TRANSPARENT,
+    MessageBoxW, SM_CXSCREEN, SM_CXSMICON, SM_CYSCREEN, SM_SWAPBUTTON, SPI_GETCLIENTAREAANIMATION,
+    SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SWP_SHOWWINDOW, SetWindowLongPtrW, SetWindowPos, ShowWindow, SystemParametersInfoW,
+    WINDOW_EX_STYLE, WS_EX_NOACTIVATE, WS_EX_TRANSPARENT,
 };
 
 /// The HWND of a GPUI window.
@@ -266,6 +267,71 @@ pub unsafe fn place_window(h: isize, r: Rect) {
             r.width() + bw,
             r.height() + bh,
             SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// A window's client area on screen, in physical px.
+pub fn client_rect(h: isize) -> Option<Rect> {
+    let hwnd = live(h)?;
+    let mut cr = RECT::default();
+    let mut origin = POINT { x: 0, y: 0 };
+    unsafe {
+        (GetClientRect(hwnd, &mut cr) != 0 && ClientToScreen(hwnd, &mut origin) != 0).then(|| {
+            Rect::new(
+                origin.x,
+                origin.y,
+                origin.x + cr.right,
+                origin.y + cr.bottom,
+            )
+        })
+    }
+}
+
+/// Whether Windows animates things inside windows (Settings > Accessibility
+/// > Visual effects > Animation effects). Assumed on if it can't be read.
+pub fn animations_on() -> bool {
+    let mut on: i32 = 1;
+    let ok =
+        unsafe { SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, (&raw mut on).cast(), 0) };
+    ok == 0 || on != 0
+}
+
+/// Styles the flip's window once: never activated, click-through, and no
+/// DWM border, rounded corners or shadow.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn style_morph(h: isize) {
+    let Some(hwnd) = live(h) else { return };
+    unsafe {
+        add_ex_style(hwnd, WS_EX_NOACTIVATE | WS_EX_TRANSPARENT);
+        dwm_set(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            DWMWCP_DONOTROUND as u32,
+        );
+        dwm_set(hwnd, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE);
+        dwm_set(hwnd, DWMWA_NCRENDERING_POLICY, DWMNCRP_DISABLED as u32);
+    }
+}
+
+/// Puts the flip's client area at `r`, topmost and shown without activation.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn place_morph(h: isize, r: Rect) {
+    let Some(hwnd) = live(h) else { return };
+    unsafe {
+        let (dx, dy, bw, bh) = frame(hwnd);
+        SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            r.left - dx,
+            r.top - dy,
+            r.width() + bw,
+            r.height() + bh,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
     }
 }

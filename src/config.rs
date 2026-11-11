@@ -163,6 +163,10 @@ pub struct Config {
     /// The big view's columns scroll together, row for row, like the
     /// panel's strips, with thin lines between the rows.
     pub scroll_together: bool,
+    /// Opening the window from the panel turns the panel into it: the
+    /// words fade, each repo's tree turns from its strip to its column,
+    /// and the words come back. Off, the window just opens.
+    pub flip_animation: bool,
 }
 
 impl Default for Config {
@@ -185,6 +189,7 @@ impl Default for Config {
             badge_number: BadgeNumber::default(),
             sort: RepoSort::default(),
             scroll_together: true,
+            flip_animation: true,
         }
     }
 }
@@ -602,6 +607,15 @@ mod tests {
         assert!(parse("{}").unwrap().scroll_together);
         let off = parse(r#"{ "scroll_together": false }"#).unwrap();
         assert!(!off.scroll_together);
+    }
+
+    #[test]
+    fn flip_animation_default_on() {
+        let parse = |text: &str| serde_json::from_str::<Config>(text);
+        assert!(Config::default().flip_animation);
+        assert!(parse("{}").unwrap().flip_animation);
+        let off = parse(r#"{ "flip_animation": false }"#).unwrap();
+        assert!(!off.flip_animation);
     }
 
     #[test]

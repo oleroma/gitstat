@@ -78,7 +78,7 @@ pub fn show_window(cx: &mut App) {
         let s = state.read(cx);
         (s.statuses.len(), s.has_result)
     };
-    let (bounds, _) = window_place(repos);
+    let (bounds, scale) = window_place(repos);
     let handle = cx
         .open_window(
             WindowOptions {
@@ -94,6 +94,22 @@ pub fn show_window(cx: &mut App) {
             |window, cx| {
                 // Safe: opened with show: true, so there is no parked placement.
                 window.activate_window();
+                // Where the client area came out, so the flip lands on it.
+                if let Some(h) = win::hwnd(window) {
+                    let at = |v: gpui::Pixels| (f32::from(v) * scale).round() as i32;
+                    let requested = crate::layout::Rect::new(
+                        at(bounds.origin.x),
+                        at(bounds.origin.y),
+                        at(bounds.origin.x + bounds.size.width),
+                        at(bounds.origin.y + bounds.size.height),
+                    );
+                    cx.spawn(async move |_| {
+                        if let Some(client) = win::client_rect(h) {
+                            crate::morph::seen_client(requested, client);
+                        }
+                    })
+                    .detach();
+                }
                 cx.new(|cx| {
                     let mut view = StatusView::new(state, Mode::Window, window, cx);
                     // Opened before the first check found the repos: fit
@@ -109,9 +125,16 @@ pub fn show_window(cx: &mut App) {
     cx.default_global::<WindowSlot>().handle = handle;
 }
 
+/// Whether the big window is open.
+pub fn window_open(cx: &App) -> bool {
+    cx.try_global::<WindowSlot>()
+        .and_then(|s| s.handle)
+        .is_some_and(|h| is_live(h.into(), cx))
+}
+
 /// Where the window goes for `repos` columns, in logical px, at the
 /// bottom-right of the primary work area, and that monitor's scale.
-fn window_place(repos: usize) -> (Bounds<gpui::Pixels>, f32) {
+pub(crate) fn window_place(repos: usize) -> (Bounds<gpui::Pixels>, f32) {
     let mon = win::primary_monitor();
     let scale = sane_scale(mon.scale);
     let (left, top) = (mon.work.left as f32 / scale, mon.work.top as f32 / scale);
@@ -814,8 +837,7 @@ impl Render for StatusView {
                 .when(state.config.window, |h| {
                     h.child(
                         icon_button("pop-out", "⧉", true, &p).on_click(|_, window, cx| {
-                            panel::dismiss(window, cx);
-                            show_window(cx);
+                            crate::morph::open_window(window, None, cx);
                         }),
                     )
                 })

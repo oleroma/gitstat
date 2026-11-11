@@ -113,6 +113,7 @@ fn open(anchor: Anchor, cx: &mut App) {
         }
         a => a,
     };
+    crate::morph::clear_strips();
     let rows = view::panel_rows(state.read(cx));
     let bounds = logical(place(anchor, Height::Rows(rows), cx));
     let mut hwnd = None;
@@ -223,7 +224,7 @@ fn place(anchor: Anchor, height: Height, cx: &App) -> Rect {
 /// A physical rect as GPUI's window bounds. GPUI converts window_bounds
 /// with the primary monitor's scale (the window is created at
 /// CW_USEDEFAULT), and the tray and the badge live on the primary monitor.
-fn logical(r: Rect) -> Bounds<gpui::Pixels> {
+pub(crate) fn logical(r: Rect) -> Bounds<gpui::Pixels> {
     let primary = view::sane_scale(win::primary_monitor().scale);
     let at = |v: i32| px(v as f32 / primary);
     Bounds::new(

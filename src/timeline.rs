@@ -11,8 +11,10 @@
 
 mod column;
 pub(crate) mod ink;
+mod morph;
 
 pub use column::{COLUMN_WIDTH, column_index};
+pub use morph::{Ends, paint_tree};
 
 use crate::git::RepoStatus;
 use crate::graph::{self, Class, PrColors, PrState, Seg};
@@ -59,6 +61,8 @@ const STROKE: f32 = 1.5;
 const BAND: f32 = 7.0;
 /// Px from the strip's right edge to HEAD.
 const PAD: f32 = 12.0;
+/// `PAD`, for the flip: the newest row's distance from a strip's right edge.
+pub const STRIP_PAD: f32 = PAD;
 /// The tail fades out over this many px at the left edge.
 const FADE: f32 = 24.0;
 /// A dot is hit within this many px.
@@ -288,6 +292,11 @@ impl Timelines {
     }
 
     /// Whether `path`'s column header shows its details.
+    /// A repo's loaded graph, for the flip.
+    pub fn graph_of(&self, path: &Path) -> Option<Arc<RepoGraph>> {
+        self.slots.get(path)?.graph.clone()
+    }
+
     pub fn header_open(&self, path: &Path) -> bool {
         self.expanded.contains(path)
     }
@@ -769,6 +778,10 @@ impl Timelines {
                 window.insert_hitbox(bounds, HitboxBehavior::Normal)
             },
             move |bounds, hitbox, window, _cx| {
+                // Where the flip starts this repo's tree, if it's in view.
+                if window.content_mask().bounds.intersects(&bounds) {
+                    crate::morph::seen_strip(&paint_path, bounds);
+                }
                 let Some(g) = graph else { return };
                 if moving {
                     window.request_animation_frame();
@@ -880,12 +893,11 @@ impl Timelines {
             // Big mode, scrolled to this repo's column; the folder when the
             // window is turned off.
             .on_click(move |_, window, cx| {
-                crate::panel::dismiss(window, cx);
                 let big = this_for_label.read(cx).state.read(cx).config.window;
                 if big {
-                    this_for_label.update(cx, |t, _| t.focus(&open_path));
-                    crate::view::show_window(cx);
+                    crate::morph::open_window(window, Some(open_path.clone()), cx);
                 } else {
+                    crate::panel::dismiss(window, cx);
                     crate::view::open_repo(&open_path, cx);
                 }
             });

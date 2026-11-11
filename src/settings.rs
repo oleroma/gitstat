@@ -32,6 +32,7 @@ pub enum Setting {
     GithubPrs,
     GithubRepos,
     ScrollTogether,
+    FlipAnimation,
 }
 
 impl Setting {
@@ -48,6 +49,7 @@ impl Setting {
             Setting::GithubPrs => cfg.github_prs,
             Setting::GithubRepos => cfg.github_repos,
             Setting::ScrollTogether => cfg.scroll_together,
+            Setting::FlipAnimation => cfg.flip_animation,
         }
     }
 
@@ -64,6 +66,7 @@ impl Setting {
             Setting::GithubPrs => &mut cfg.github_prs,
             Setting::GithubRepos => &mut cfg.github_repos,
             Setting::ScrollTogether => &mut cfg.scroll_together,
+            Setting::FlipAnimation => &mut cfg.flip_animation,
         };
         *field = !*field;
     }
@@ -519,6 +522,16 @@ fn views(cfg: &Config, p: &Palette) -> Vec<AnyElement> {
                     "The window's columns scroll row for row, with lines between the rows.",
                     Setting::ScrollTogether,
                     cfg.window,
+                    cfg,
+                    p,
+                ),
+                flag(
+                    "flip-animation",
+                    "Flip animation",
+                    "Opening the window from the panel turns each repo's strip into its column. \
+                     Skipped when Windows animations are off.",
+                    Setting::FlipAnimation,
+                    cfg.window && cfg.panel,
                     cfg,
                     p,
                 ),
@@ -1137,6 +1150,7 @@ mod tests {
             Setting::GithubPrs,
             Setting::GithubRepos,
             Setting::ScrollTogether,
+            Setting::FlipAnimation,
         ];
         for setting in all {
             let before = Config::default();
