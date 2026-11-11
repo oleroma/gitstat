@@ -58,7 +58,7 @@ elif [ "${running:-0}" = 0 ]; then
   # would swap that older build in.
   [ ! -f "$new" ] || cp -f "$new.tmp" "$new"
   mv -f "$new.tmp" "$installed"
-  outcome="gitstat isn't running; the new build runs from its next start"
+  outcome="the installed gitstat isn't running; the new build runs from its next start"
 else
   mv -f "$new.tmp" "$new"
   # gitstat looks for it every 3 seconds.
