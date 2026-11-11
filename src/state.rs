@@ -490,6 +490,8 @@ pub enum Input {
     Github(crate::github::Report),
     /// An install left a new build next to the exe (self_update.rs).
     NewBuild,
+    /// A change made in the settings window.
+    Action(crate::tray::TrayAction),
 }
 
 #[cfg(test)]

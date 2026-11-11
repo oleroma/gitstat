@@ -818,30 +818,41 @@ impl Render for StatusView {
                             show_window(cx);
                         }),
                     )
-                }),
-            Mode::Window => header.child(
-                div()
-                    .id("refresh")
-                    .flex_none()
-                    .px_3()
-                    .py_1()
-                    .rounded_md()
-                    .text_sm()
-                    .bg(p.button)
-                    .text_color(p.button_text)
-                    .when(sweeping, |b| b.opacity(0.6))
-                    .when(!sweeping, |b| b.cursor_pointer().hover(|s| s.opacity(0.9)))
-                    .child(if sweeping {
-                        "Checking…"
-                    } else {
-                        "Refresh now"
-                    })
-                    .on_click(move |_, _, cx| {
-                        if !sweeping {
-                            refresh(cx);
-                        }
+                })
+                .child(
+                    icon_button("settings", "⚙", true, &p).on_click(|_, window, cx| {
+                        panel::dismiss(window, cx);
+                        crate::settings::show(cx);
                     }),
-            ),
+                ),
+            Mode::Window => header
+                .child(
+                    icon_button("settings", "⚙", true, &p)
+                        .on_click(|_, _, cx| crate::settings::show(cx)),
+                )
+                .child(
+                    div()
+                        .id("refresh")
+                        .flex_none()
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .text_sm()
+                        .bg(p.button)
+                        .text_color(p.button_text)
+                        .when(sweeping, |b| b.opacity(0.6))
+                        .when(!sweeping, |b| b.cursor_pointer().hover(|s| s.opacity(0.9)))
+                        .child(if sweeping {
+                            "Checking…"
+                        } else {
+                            "Refresh now"
+                        })
+                        .on_click(move |_, _, cx| {
+                            if !sweeping {
+                                refresh(cx);
+                            }
+                        }),
+                ),
         };
 
         // Folds or unfolds the pull request list of the panel, or of big mode.

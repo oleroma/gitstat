@@ -1,12 +1,14 @@
-//! The GPUI side: startup, the one input loop, and the settings the tray
-//! menu changes. The views live in view.rs, panel.rs and overlay.rs.
+//! The GPUI side: startup, the one input loop, and the settings the
+//! settings window changes. The views live in view.rs, panel.rs, overlay.rs
+//! and settings.rs.
 
 use crate::config::{self, ClickAction, Config, FolderIconMode};
 use crate::folder_icons;
 use crate::monitor::{Command, Monitor, Update};
 use crate::panel::{self, Anchor};
+use crate::settings::{self, Setting};
 use crate::state::{AppState, Input};
-use crate::tray::{Setting, Tray, TrayAction, TraySnapshot};
+use crate::tray::{Tray, TrayAction, TraySnapshot};
 use crate::view::{self, Ui};
 use crate::{overlay, win};
 use futures::StreamExt;
@@ -281,6 +283,12 @@ fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
                     return false;
                 }
             }
+            Input::Action(action) => {
+                if !on_action(action, cx) {
+                    return false;
+                }
+                changed = true;
+            }
             input @ (Input::Tray(_) | Input::Menu(_)) => {
                 let Some(action) = cx.global::<Shared>().tray.map(&input) else {
                     continue;
@@ -450,14 +458,22 @@ fn on_action(action: TrayAction, cx: &mut App) -> bool {
         TrayAction::SetRepoClick(click) => change_setting(|c| c.repo_click = click, cx),
         TrayAction::SetBadgeNumber(n) => change_setting(|c| c.badge_number = n, cx),
         TrayAction::SetSort(s) => change_setting(|c| c.sort = s, cx),
+        TrayAction::SetInterval(minutes) => change_setting(|c| c.interval_minutes = minutes, cx),
+        TrayAction::SetDepth(depth) => change_setting(|c| c.depth = depth, cx),
+        TrayAction::SetFolders(path, more) => change_setting(
+            |c| {
+                c.path = path;
+                c.more_paths = more;
+            },
+            cx,
+        ),
         TrayAction::SetAutostart(enabled) => {
             if let Err(e) = crate::autostart::set_enabled(enabled) {
                 crate::error_box(format!("Couldn't change the startup setting: {e}"));
             }
-            cx.global::<Shared>()
-                .tray
-                .set_autostart_checked(crate::autostart::is_enabled());
+            settings::autostart_changed(cx);
         }
+        TrayAction::OpenSettings => settings::show(cx),
         TrayAction::Quit => {
             quit(cx);
             return false;
@@ -519,12 +535,9 @@ fn update_and_restart(cx: &mut App) -> bool {
 }
 
 /// Folder icons change the user's repo folders, so turning them on from the
-/// menu asks first. A hand edit of config.json is consent enough.
+/// settings window asks first. A hand edit of config.json is consent enough.
 fn ask_folder_icons(cx: &mut App) {
-    let cfg = cx.global::<Ui>().state.read(cx).config.clone();
     let shared = cx.global_mut::<Shared>();
-    // Windows has already ticked the item; untick it until the answer.
-    shared.tray.sync_settings(&cfg);
     if shared.consent_pending {
         return;
     }
@@ -550,7 +563,7 @@ fn ask_folder_icons(cx: &mut App) {
     .detach();
 }
 
-/// A menu toggle: change one field, save, apply. A save that is refused
+/// A settings change: change one field, save, apply. A save that is refused
 /// (config.json doesn't parse) keeps the change in memory, with one notice
 /// per session. The monitor gets the change directly either way: it only
 /// rereads a file that saved.
@@ -563,8 +576,6 @@ fn change_setting(f: impl FnOnce(&mut Config), cx: &mut App) {
     let mut new = old.clone();
     f(&mut new);
     if new == old {
-        // The menu may have flipped a check mark on its own.
-        cx.global::<Shared>().tray.sync_settings(&old);
         return;
     }
     if let Err(e) = new.save(&file) {
