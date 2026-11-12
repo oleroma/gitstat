@@ -35,7 +35,7 @@
    - **CI**, when the PC was offline or Olex says CI: run `bash .agents/agent-build ci <branch>` from your session and post the CI run link as soon as it shows.
    - Every build is published as a pre-release on its `build/<n>` tag before its full checks. Watch the build's output: as soon as it shows the build is ready (a PC build's "Ready" lines, a CI build's "Published build" line), post it in one line, such as "📲📦 Build 334 installed and published, full checks still running." (see Status lines). Don't ask Olex to test it, or say it works, until the full checks pass. Then post the full checks' result: pass in one line, fail with the cause.
    - If checks fail in code this feature didn't change, tell Olex instead of fixing it in the feature.
-   - Run `agent-build` and `agent-install` in the background with output to a file, never through a pipe: the build daemons they start keep a pipe open, so the command would never return.
+   - Run `agent-build` and `agent-install` in the background with output to a file, never through a pipe: the build daemons they start keep a pipe open, so the command would never return. Watch that file with the Monitor tool on `tail -F <file>`, filtered to `Phone`, `CI run:`, `Ready`, `Published build` and `result:`, and post each status line as it shows.
    - Build only what the code needs to work: a branch that changes only files no build uses needs no build, and `agent-build` stops with `workflow-change`.
 4. **Check.** Wait for Olex. If he asks for changes, go back to 2. Merge only when he says "merge".
    - A new feature asked for while one is open: a small one goes on the open branch and PR, a big one gets its own branch and PR after the open one merges.
