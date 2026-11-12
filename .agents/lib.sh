@@ -20,6 +20,9 @@ exec 3>&1 >>"$LOG_FILE" 2>&1
 set -x
 
 FINISHED=0
+# Set by agent-build pc: the file its build window makes when Olex cancels the build there.
+CANCEL_FILE=""
+cancelled() { [ -n "$CANCEL_FILE" ] && [ -f "$CANCEL_FILE" ]; }
 
 # Scripts redefine this to undo things such as a lock; it runs on every exit.
 cleanup() { :; }
@@ -34,6 +37,10 @@ finish() {
   FINISHED=1
   local word="$1" out
   shift
+  if cancelled; then
+    word=cancelled
+    set -- "Olex cancelled the build in its window."
+  fi
   out="result: $word"
   if [ $# -gt 0 ]; then out="$out"$'\n'"$(printf '%s\n' "$@")"; fi
   out="$out"$'\n'"log: $LOG_FILE"
@@ -53,9 +60,11 @@ on_exit() {
   local code=$?
   set +x
   cleanup || true
+  if [ "$FINISHED" = 0 ] && cancelled; then finish cancelled; fi
   if [ "$FINISHED" = 0 ]; then
     local out
     out="$(printf 'result: failed\nUnexpected error (exit %s); the last command in the log failed.\nlog: %s' "$code" "$LOG_FILE")"
+    printf '%s\n' "$out"
     printf '%s\n' "$out" >&3
     FINISHED=1
     report "$out" || true

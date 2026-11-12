@@ -101,13 +101,55 @@ report_pr() {
   gh api -X POST "repos/$SLUG/issues/$pr/comments" -f body="$(printf 'PC build of %s finished:\n\n```\n%s\n```\n\n_Posted by agent-build pc._' "${sha:0:7}" "$1")" >/dev/null
 }
 
+# open_build_window: opens a Git Bash window in front on the PC that shows this build's log and the
+# build hook's output live
+# (.agents/build-window). Nothing happens where there's no Git Bash.
+open_build_window() {
+  [ -f /git-bash.exe ] && command -v cygpath >/dev/null 2>&1 || return 0
+  cmd //c start "" "$(cygpath -w /git-bash.exe)" -c \
+    "bash '$(cygpath -m "$AGENTS_DIR/build-window")' '$(cygpath -m "$LOG_FILE")' '$(cygpath -m "$CANCEL_FILE")' '$(cygpath -m "$BUILD_DIR/logs/build-output.txt")'" ||
+    echo "Couldn't open the build window."
+}
+
+# watch_cancel: runs in the background during a PC build. When Olex cancels in the build window,
+# it ends this script (its TERM trap exits once the running step stops) and kills the running
+# steps with everything they started, so the result is "cancelled".
+watch_cancel() {
+  set +x
+  local me=$BASHPID
+  while [ ! -f "$CANCEL_FILE" ]; do sleep 1; done
+  kill -TERM $$ 2>/dev/null || true
+  stop_children $$ "$me"
+}
+
+# stop_children <pid> <pid to skip>: kills the child processes of <pid> and their trees,
+# Windows programs (Gradle, cargo) included. Cygwin's ps may put a status letter before the PID.
+stop_children() {
+  local pid winpid
+  ps | awk -v p="$1" -v s="$2" 'NR > 1 { o = ($1 ~ /^[0-9]+$/) ? 0 : 1
+      if ($(2 + o) == p && $(1 + o) != s) print $(1 + o), $(4 + o) }' |
+    while read -r pid winpid; do
+      stop_children "$pid" "$2"
+      taskkill //F //T //PID "$winpid" >/dev/null 2>&1 || kill -9 "$pid" 2>/dev/null || true
+    done
+}
+
 build_pc() {
   report() { report_pr "$@"; }
   [ "$WORKTREE" -ef "$BUILD_DIR/src" ] || die "Run this from the build/src worktree, as in AGENTS.md step 3."
 
   local lock="$BUILD_DIR/.build-lock"
   mkdir "$lock" 2>/dev/null || die "Another build is running in build/src, or $lock was left behind. Ask Olex."
-  cleanup() { rmdir "$lock" 2>/dev/null || true; }
+  # The build window shows this log; Ctrl+C there makes the cancel file, and watch_cancel stops
+  # the build. The file stays until the next build, so the result can still see it.
+  CANCEL_FILE="$BUILD_DIR/.build-cancel"
+  local out_file="$BUILD_DIR/logs/build-output.txt"
+  rm -f "$CANCEL_FILE" "$out_file"
+  open_build_window
+  trap 'exit 130' TERM
+  watch_cancel &
+  local watcher=$!
+  cleanup() { kill "$watcher" 2>/dev/null || true; rmdir "$lock" 2>/dev/null || true; }
 
   local commit
   commit="$(git rev-parse --short=7 HEAD)"
@@ -140,7 +182,6 @@ build_pc() {
     BUILD_NUMBER="$(bash "$AGENTS_DIR/build-number")" || die "Couldn't get a build number from GitHub. Not built."
     export BUILD_NUMBER
 
-    local out_file="$BUILD_DIR/logs/build-output.txt"
     if ! bash "$HOOKS/build" >"$out_file"; then
       cat "$out_file"
       die "Build failed at $commit."

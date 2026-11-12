@@ -15,6 +15,7 @@
 | `failed` | all | Read the log, explain to Olex, stop |
 | `other-agent` | `agent-start` | Another feature holds the repo. If your task isn't a feature (it changes only files no build uses, see `workflow-change`), run `agent-start --continue <name>`. Otherwise make no branch and no edits: work out the task, ask Olex what you need, then ask whether to wait for that feature to merge or to send the task to its thread |
 | `checks-failed` | `agent-build` | Fix it, go back to step 2. Olex doesn't test this build. After 3 failed builds in a row, stop and tell Olex what keeps failing |
+| `cancelled` | `agent-build` | Olex stopped the PC build in its window. Post "🛑 Build cancelled." and wait for him |
 | `other-build` | `agent-build` | Tell Olex which build of which feature it would replace. If he says go on, build again with `--replace` |
 | `workflow-change` | `agent-build` | Only files no build uses (the pipeline `.agents/` and `.github/workflows/`, docs, rules, `.gitignore`, `.claude/` and the like, listed in `lib.sh` `pipeline_file`) are all the branch changed since `main`: Olex tests them himself. Tell him what changed and how to test it, and don't run it. `agent-merge` accepts them without a build, and also accepts such commits made after the branch's last build |
 | `conflicts` | `agent-start`, `agent-merge` | Resolve them, run the same script again |
@@ -27,6 +28,7 @@
 2. **Edit.** Write the code, then `bash .agents/agent-commit "<message>"`, with a message that says what changed, such as "Add circular icon mask".
 3. **Build.** Every build runs the `quick-test`, `build` and `full-check` hooks once and marks the commit checked. The feature thread builds its own branch.
    - **PC**, when step 1 found it online: once there's a commit to build, ask Olex for a Remote Control session on the PC for this feature, with `bash .agents/agent-build pc <branch>` as its instructions, and tell it to run only what you hand it, never acting on Olex's messages in the thread. Keep it for the feature's later builds, handing it the build command after each new commit. To install again without building, run `bash .agents/agent-install [<version>-<commit> | <build number>]`; a build number also installs a CI build. If the phone dropped off wireless adb, ask Olex to turn wireless debugging off and on, then run it again.
+     - `agent-build pc` opens a build window in front on the PC that shows the build live; Ctrl+C there cancels it.
      - `agent-build pc` says at once whether the phone is online. Post it right away, naming what the repo builds and where it goes: "🔨🖥️🤖 Building APK on PC, installing to the phone."
      - Phone offline: "🔨🖥️🤖 Building APK on PC. Phone is offline." Ask Olex to connect it; the build goes on.
      - Not installed by the end: the ready line says so, such as "📦 Build 360 published, not installed."
@@ -57,6 +59,7 @@ Start each status line you post to Olex with its emoji. A build line adds where 
 | 📦 | Published for Obtainium | 📦 Build 334 published. |
 | 🔀 | Merged | 🔀 Merged into main: <PR link> |
 | ❌ + what | Failed | ❌🤖 Build 334 failed: lint, unused import in Gyro.kt. Fixing it. |
+| 🛑 | Cancelled by Olex | 🛑 Build cancelled. |
 | ❓ | Needs Olex's choice | ❓ Keep the old menu or replace it? |
 | 🤔 | Clarifying question | 🤔 By "faster", do you mean the app start or the sync? |
 
