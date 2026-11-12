@@ -55,6 +55,8 @@ mod timeline;
 #[cfg(windows)]
 mod tray;
 #[cfg(windows)]
+mod turned_text;
+#[cfg(windows)]
 mod view;
 #[cfg(windows)]
 mod win;

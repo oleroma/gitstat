@@ -365,8 +365,10 @@ fn fold(section: crate::config::Section) -> OnClick {
     })
 }
 
+/// The spine's heading text height, logical px.
+const SPINE_TEXT: f32 = 12.0;
 /// A folded or open section's narrow column in big mode, its name
-/// running down it.
+/// running up it.
 pub(crate) const SPINE_WIDTH: f32 = 30.0;
 
 /// One cell of big mode's table, left to right.
@@ -496,24 +498,27 @@ fn spine(section: Section, count: usize, folded: bool, p: &Palette) -> AnyElemen
         .hover(|s| s.bg(p.hover))
         .text_xs()
         .text_color(color)
+        .child({
+            // The section's heading turned a quarter turn anticlockwise,
+            // reading upwards: its count nearest the arrow, as in the panel.
+            let label = format!("{count}  {name}");
+            let len = crate::turned_text::length(&label, SPINE_TEXT);
+            canvas(
+                |_, _, _| {},
+                move |bounds, _, window, _| {
+                    crate::turned_text::paint(window, bounds, &label, SPINE_TEXT, color)
+                },
+            )
+            .w_full()
+            .h(px(len))
+        })
+        // Open, its columns are to the right; folded, the arrow turns with
+        // the heading, as the panel's ▸ would.
         .child(
             div()
                 .text_color(p.muted)
-                .child(if folded { "▸" } else { "▾" }),
+                .child(if folded { "▴" } else { "▸" }),
         )
-        .child(
-            div()
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .child(count.to_string()),
-        )
-        // GPUI can't turn text, so the name's letters stack down the spine.
-        .children(name.chars().map(|c| {
-            div().h(px(13.)).font_family("Consolas").child(if c == ' ' {
-                String::new()
-            } else {
-                c.to_string()
-            })
-        }))
         .child(
             // Where the flip lands this section's spine.
             canvas(
