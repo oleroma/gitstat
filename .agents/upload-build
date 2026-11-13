@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Publishes a PC build's files as a pre-release on its build/<n> tag. agent-build pc runs it in
+# the background once the build is installed, so neither the build nor the agent waits for the
+# upload; when the build wasn't installed, it waits for it, since the phone then gets the build
+# from the pre-release. Its log is build/logs/upload-build-*.log. In the background, a failed
+# upload is also posted on the feature's PR.
+# Usage: .agents/upload-build <sha> <n> <version> <release notes> <file>...
+# All of it is one function, read whole before it runs, so the next build checking out build/src
+# can't change it halfway.
+main() {
+  source "$(dirname "$0")/lib.sh"
+  SHA="$1"
+  local n="$2" version="$3" notes="$4"
+  shift 4
+  if [ -n "${UPLOAD_BACKGROUND:-}" ]; then
+    report() {
+      case "$1" in
+        "result: done"*) ;;
+        *) report_pr "Background upload of build $n" "$1" ;;
+      esac
+    }
+  fi
+  gh release create "build/$n" "$@" -R "$SLUG" --verify-tag --prerelease --title "$version" --notes "$notes" >/dev/null ||
+    die "Publishing build $n failed: gh release create didn't finish."
+  finish done "Published build $n: https://github.com/$SLUG/releases/tag/build/$n"
+}
+main "$@"

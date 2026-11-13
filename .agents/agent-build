@@ -3,8 +3,8 @@
 # so the thread agent watching that PR wakes up. It runs agent-install on the build; a failed
 # install is reported in the summary but doesn't fail the build. Every PC build publishes its
 # build files as a pre-release on its build/<n> tag, as the CI fallback does, so Obtainium on the
-# phone can install it. Builds don't run the full checks: agent-check runs them once, before the
-# merge.
+# phone can install it; once the build is installed, that upload runs in the background
+# (upload-build). Builds don't run the full checks: agent-check runs them once, before the merge.
 # Before it builds, it stops with "other-build" when the repo's newest build came from another
 # branch whose PR is still open, since Olex may still be testing that build; --replace builds anyway.
 # It also stops with "workflow-change" when everything the branch changed since main is pipeline
@@ -262,14 +262,23 @@ build_pc() {
   done <<<"$out"
   echo "$out"
 
-  # Every build is published right after the install, as the CI fallback does.
+  # Every build is published right after the install, as the CI fallback does (upload-build).
+  # Once it's installed, the upload runs in the background, so the build ends right after the
+  # install. When it wasn't installed, the phone gets it from the pre-release, so this waits.
+  # The upload takes the copies in builds/, which the next build doesn't change.
   if [ "$built_here" = 1 ]; then
-    if gh release create "build/$BUILD_NUMBER" "${files[@]}" -R "$SLUG" --verify-tag --prerelease \
-      --title "$version" \
-      --notes "$(bash "$AGENTS_DIR/release-notes" "$SHA" "$BUILD_NUMBER" "PC build of $SHA")" >/dev/null; then
-      summary+=("Published: https://github.com/$SLUG/releases/tag/build/$BUILD_NUMBER")
+    local url="https://github.com/$SLUG/releases/tag/build/$BUILD_NUMBER"
+    local up=("$AGENTS_DIR/upload-build" "$SHA" "$BUILD_NUMBER" "$version"
+      "$(bash "$AGENTS_DIR/release-notes" "$SHA" "$BUILD_NUMBER" "PC build of $SHA")")
+    for name in "${names[@]}"; do up+=("$dest/$name"); done
+    if [ "$installed" = 1 ] && [ "${#away[@]}" = 0 ]; then
+      UPLOAD_BACKGROUND=1 nohup bash "${up[@]}" </dev/null >/dev/null 2>&1 3>&- &
+      disown
+      summary+=("Publishing in the background: $url" "A failed upload is posted on the PR; its log is $BUILD_DIR/logs/upload-build-*.log.")
+    elif bash "${up[@]}" >/dev/null; then
+      summary+=("Published: $url")
     else
-      summary+=("Publishing the build failed (see the log).")
+      summary+=("Publishing the build failed (see $BUILD_DIR/logs/upload-build-*.log).")
     fi
   else
     summary+=("CI already published this build.")
