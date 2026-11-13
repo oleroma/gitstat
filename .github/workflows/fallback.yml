@@ -1,15 +1,20 @@
 name: Fallback build
 
 # The fallback for a PC build (AGENTS.md step 3), started by agent-build ci on a feature branch:
-#   gh workflow run fallback.yml --ref <branch>
+#   gh workflow run fallback.yml --ref <branch> -f checks=false
 # It does what a PC build does, with the same hooks in .agents/hooks/: quick tests, build,
-# full checks. When they all pass it marks the commit checked, as PC builds do.
-# Each build is published as a pre-release on its build/<n> tag before the full checks, and
-# agent-build takes its links and files from there. It never runs on a push.
+# publish (a pre-release on its build/<n> tag, where agent-build takes its links and files),
+# then marks the commit ci-build. With checks=true (agent-check ci, before the merge) it only
+# runs the full checks and marks the commit checked, as agent-check pc does. It never runs on a push.
 # Every job has a timeout-minutes. Keep its actions on the Node 24 runtime.
 # gitstat.exe builds only on Windows, so everything runs there.
 on:
   workflow_dispatch:
+    inputs:
+      checks:
+        description: Run only the full checks (before the merge), no build
+        type: boolean
+        default: false
 
 permissions:
   contents: write # the build number step pushes a build/<n> tag
@@ -36,12 +41,15 @@ jobs:
           workspaces: ". -> build/target"
 
       - name: Quick tests
+        if: ${{ !inputs.checks }}
         run: bash .agents/hooks/quick-test
 
       - name: Build number
+        if: ${{ !inputs.checks }}
         run: n="$(bash .agents/build-number)" && echo "BUILD_NUMBER=$n" >> "$GITHUB_ENV"
 
       - name: Build
+        if: ${{ !inputs.checks }}
         id: build
         run: |
           set -o pipefail
@@ -51,9 +59,8 @@ jobs:
           echo "version=$(tr -d '\r' <"$RUNNER_TEMP/build.out" | sed -n 's/^build-file: [^ ]* \([^ ]*\)$/\1/p' | head -n 1)" >> "$GITHUB_OUTPUT"
           echo "$(basename "$file")  SHA-256 \`$(sha256sum "$file" | cut -d' ' -f1)\`" >> "$GITHUB_STEP_SUMMARY"
 
-      # Every build is published as a pre-release on its build/<n> tag, before the full checks
-      # so it's ready sooner; only the full checks mark the commit checked for agent-merge.
       - name: Publish the build
+        if: ${{ !inputs.checks }}
         env:
           GH_TOKEN: ${{ github.token }}
           FILE: ${{ steps.build.outputs.file }}
@@ -63,15 +70,26 @@ jobs:
           --title "$VERSION" --notes "$(bash .agents/release-notes "$GITHUB_SHA" "$BUILD_NUMBER" "CI fallback build of $GITHUB_REF_NAME ($GITHUB_SHA)")"
 
       - name: Full checks
+        if: ${{ inputs.checks }}
         run: bash .agents/hooks/full-check
 
-      # agent-build pc reuses this build's pre-release when this status says it passed in CI.
-      - name: Mark the commit checked
+      # agent-build pc reuses this build's pre-release when this status says CI built it.
+      - name: Mark the commit built
+        if: ${{ !inputs.checks }}
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.build.outputs.version }}
         run: >-
           test -n "$VERSION" &&
           gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA"
-          -f state=success -f context=full-check -f description="Passed in CI: version $VERSION"
+          -f state=success -f context=ci-build -f description="Built in CI: version $VERSION"
+          -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+      - name: Mark the commit checked
+        if: ${{ inputs.checks }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA"
+          -f state=success -f context=full-check -f description="Passed in CI"
           -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
