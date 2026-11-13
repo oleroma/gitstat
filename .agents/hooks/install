@@ -41,11 +41,11 @@ installed="$dest/gitstat.exe"
 new="$dest/gitstat.exe.new"
 # The installed gitstat. Windows keeps listing a running exe under its old name after a
 # rename, so this also finds one already renamed to .old.
-running="$(ps "@(Get-Process gitstat -ErrorAction SilentlyContinue | Where-Object { \$_.Path -like '$dest_win\\gitstat.exe*' }).Count")"
+running="$(ps "@(Get-Process gitstat -ErrorAction SilentlyContinue | Where-Object { \$_.Path -like '$dest_win\\gitstat.exe*' }).Count" || true)"
 running="$(tr -d '\r' <<<"$running")"
 
 # gitstat running from anywhere else, one exe path per line.
-elsewhere="$(ps "Get-Process gitstat -ErrorAction SilentlyContinue | Where-Object { \$_.Path -and \$_.Path -notlike '$dest_win\\gitstat.exe*' } | ForEach-Object { \$_.Path } | Sort-Object -Unique")"
+elsewhere="$(ps "Get-Process gitstat -ErrorAction SilentlyContinue | Where-Object { \$_.Path -and \$_.Path -notlike '$dest_win\\gitstat.exe*' } | ForEach-Object { \$_.Path } | Sort-Object -Unique" || true)"
 elsewhere="$(tr -d '\r' <<<"$elsewhere")"
 
 # Copied under another name first, so gitstat never sees half a file.
