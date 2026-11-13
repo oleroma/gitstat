@@ -41,6 +41,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// The phases at the default speed, 560 ms in all; `flip_ms` stretches
+/// all but the hold, which is the big window's time to draw.
 const FADE: Duration = Duration::from_millis(90);
 const TURN: Duration = Duration::from_millis(280);
 const HOLD: Duration = Duration::from_millis(80);
@@ -388,6 +390,11 @@ fn plan(
 /// Opens the flip's window for `plan`. False if it couldn't.
 fn launch(plan: Plan, direction: Direction, cx: &mut App) -> bool {
     let union = plan.union;
+    let ms = cx
+        .try_global::<Ui>()
+        .map_or(560, |ui| ui.state.read(cx).config.flip_ms);
+    let fixed = HOLD.as_millis() as f32;
+    let stretch = ((ms as f32 - fixed) / (560.0 - fixed)).clamp(0.2, 6.0);
     let Ok(handle) = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(crate::panel::logical(union))),
@@ -411,6 +418,7 @@ fn launch(plan: Plan, direction: Direction, cx: &mut App) -> bool {
             }
             cx.new(|_| MorphView {
                 start: Instant::now(),
+                stretch,
                 plan,
                 direction,
                 hwnd: win::hwnd(window),
@@ -427,6 +435,8 @@ fn launch(plan: Plan, direction: Direction, cx: &mut App) -> bool {
 
 pub struct MorphView {
     start: Instant,
+    /// `flip_ms` over the default.
+    stretch: f32,
     plan: Plan,
     direction: Direction,
     hwnd: Option<isize>,
@@ -465,10 +475,12 @@ fn lerp_bounds(a: Bounds<f32>, b: Bounds<f32>, e: f32, s: f32) -> Bounds<Pixels>
 impl Render for MorphView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let elapsed = self.start.elapsed();
-        let turn_at = FADE;
-        let hold_at = turn_at + TURN;
+        let k = self.stretch;
+        let (fade, turn, reveal_len) = (FADE.mul_f32(k), TURN.mul_f32(k), REVEAL.mul_f32(k));
+        let turn_at = fade;
+        let hold_at = turn_at + turn;
         let reveal_at = hold_at + HOLD;
-        let end = reveal_at + REVEAL;
+        let end = reveal_at + reveal_len;
         let open = self.direction == Direction::Open;
 
         if elapsed >= turn_at && !self.left {
@@ -505,11 +517,11 @@ impl Render for MorphView {
             return div();
         }
 
-        let sheet_alpha = ease(phase(elapsed, Duration::ZERO, FADE));
-        let turned = ease(phase(elapsed, turn_at, TURN));
+        let sheet_alpha = ease(phase(elapsed, Duration::ZERO, fade));
+        let turned = ease(phase(elapsed, turn_at, turn));
         // 0 is the panel's layout, 1 the big window's.
         let e = if open { turned } else { 1.0 - turned };
-        let reveal = 1.0 - ease(phase(elapsed, reveal_at, REVEAL));
+        let reveal = 1.0 - ease(phase(elapsed, reveal_at, reveal_len));
         let appearance = window.appearance();
         let dark = matches!(
             appearance,

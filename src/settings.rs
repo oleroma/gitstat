@@ -555,6 +555,22 @@ fn views(cfg: &Config, p: &Palette) -> Vec<AnyElement> {
                     p,
                 ),
                 setting_row(
+                    "Flip speed",
+                    "How long the panel takes to turn into the window, and back.",
+                    segmented(
+                        "flip-speed",
+                        [(350, "Fast"), (560, "Normal"), (900, "Slow")]
+                            .into_iter()
+                            .map(|(ms, label)| {
+                                (label, cfg.flip_ms == ms, TrayAction::SetFlipSpeed(ms))
+                            })
+                            .collect(),
+                        cfg.window && cfg.panel && cfg.flip_animation,
+                        p,
+                    ),
+                    p,
+                ),
+                setting_row(
                     "Clicking a repo opens",
                     "A repo not on GitHub always opens its folder.",
                     segmented(
