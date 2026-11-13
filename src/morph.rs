@@ -191,10 +191,12 @@ pub fn show_window(anchor: crate::panel::Anchor, cx: &mut App) {
     crate::panel::then_window(anchor, cx);
 }
 
-/// Closing the big window: starts the flip back into the panel and returns
+/// Closing the big window: starts the flip back into the panel (which then
+/// slides away, or stays when the window was minimised) and returns
 /// true, leaving the window for the flip to close; false when the flip is
 /// off or can't run, so the caller closes it.
 pub fn flip_back(big: &mut Window, cx: &mut App) -> bool {
+    let minimized = win::take_minimized();
     if running(cx) {
         // Mid-flip; the flip closes it.
         return true;
@@ -214,15 +216,22 @@ pub fn flip_back(big: &mut Window, cx: &mut App) -> bool {
     let Some(plan) = plan(panel_rect, ps, Some((big_rect, scroll)), None, cx) else {
         return false;
     };
-    launch(plan, Direction::Close, cx)
+    let direction = if minimized {
+        Direction::Minimize
+    } else {
+        Direction::Close
+    };
+    launch(plan, direction, cx)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Direction {
     /// Panel to big window.
     Open,
-    /// Big window to panel.
+    /// Big window to panel, which then slides away.
     Close,
+    /// Big window to panel, which stays.
+    Minimize,
 }
 
 /// One repo's tree in the flip.
@@ -510,7 +519,7 @@ impl Render for MorphView {
         }
         if elapsed >= end {
             window.remove_window();
-            if !open {
+            if self.direction == Direction::Close {
                 // Back in the panel, which then goes the way it came.
                 cx.defer(crate::panel::slide_away);
             }

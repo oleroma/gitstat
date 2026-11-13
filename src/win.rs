@@ -437,6 +437,14 @@ pub unsafe fn minimize_closes(h: isize) {
     }
 }
 
+/// The close under way came from minimising.
+static MINIMIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the close under way came from minimising; clears it.
+pub fn take_minimized() -> bool {
+    MINIMIZED.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
+
 unsafe extern "system" fn minimize_closes_proc(
     hwnd: HWND,
     msg: u32,
@@ -450,6 +458,7 @@ unsafe extern "system" fn minimize_closes_proc(
     let asked = msg == WM_SYSCOMMAND && (wparam & 0xFFF0) as u32 == SC_MINIMIZE;
     let button = msg == WM_NCLBUTTONUP && wparam as u32 == HTMINBUTTON;
     if asked || button {
+        MINIMIZED.store(true, std::sync::atomic::Ordering::Relaxed);
         unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
         return 0;
     }
