@@ -70,6 +70,8 @@ thread_local! {
     /// The big window's client area minus the bounds it was opened with,
     /// physical px per edge (left, top, right, bottom).
     static CLIENT_DELTA: Cell<(i32, i32, i32, i32)> = const { Cell::new((0, 0, 0, 0)) };
+    /// The same for a maximised big window, against its monitor's work area.
+    static MAXIMIZED_DELTA: Cell<(i32, i32, i32, i32)> = const { Cell::new((0, 0, 0, 0)) };
 }
 
 /// `Section` as a map key.
@@ -119,8 +121,13 @@ pub fn seen_spine(spine: Bounds<Pixels>, window: &Window) {
 
 /// Notes where the big window's client area came out for the bounds it
 /// was opened with, both physical px.
-pub fn seen_client(requested: Rect, client: Rect) {
-    CLIENT_DELTA.with(|d| {
+pub fn seen_client(requested: Rect, client: Rect, maximized: bool) {
+    let delta = if maximized {
+        &MAXIMIZED_DELTA
+    } else {
+        &CLIENT_DELTA
+    };
+    delta.with(|d| {
         d.set((
             client.left - requested.left,
             client.top - requested.top,
@@ -197,6 +204,8 @@ pub fn show_window(anchor: crate::panel::Anchor, cx: &mut App) {
 /// off or can't run, so the caller closes it.
 pub fn flip_back(big: &mut Window, cx: &mut App) -> bool {
     let minimized = win::take_minimized();
+    // Opens there again next time.
+    view::remember_place(big, cx);
     if running(cx) {
         // Mid-flip; the flip closes it.
         return true;
@@ -291,15 +300,31 @@ fn plan(
         Some((rect, _)) => (rect, ps),
         None => {
             // Where show_window will put it.
-            let (bounds, ws) = view::window_place(repos);
+            let (place, ws) = view::window_place(repos, cx);
+            let bounds = place.get_bounds();
             let at = |v: Pixels| (f32::from(v) * ws).round() as i32;
-            let (dl, dt, dr, db) = CLIENT_DELTA.with(Cell::get);
+            let (area, delta) = match place {
+                WindowBounds::Maximized(_) => (
+                    view::maximized_area(bounds, ws),
+                    MAXIMIZED_DELTA.with(Cell::get),
+                ),
+                _ => (
+                    Rect::new(
+                        at(bounds.origin.x),
+                        at(bounds.origin.y),
+                        at(bounds.origin.x + bounds.size.width),
+                        at(bounds.origin.y + bounds.size.height),
+                    ),
+                    CLIENT_DELTA.with(Cell::get),
+                ),
+            };
+            let (dl, dt, dr, db) = delta;
             (
                 Rect::new(
-                    at(bounds.origin.x) + dl,
-                    at(bounds.origin.y) + dt,
-                    at(bounds.origin.x + bounds.size.width) + dr,
-                    at(bounds.origin.y + bounds.size.height) + db,
+                    area.left + dl,
+                    area.top + dt,
+                    area.right + dr,
+                    area.bottom + db,
                 ),
                 ws,
             )

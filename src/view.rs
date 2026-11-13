@@ -75,15 +75,18 @@ pub fn show_window(cx: &mut App) {
     let Some(state) = cx.try_global::<Ui>().map(|ui| ui.state.clone()) else {
         return;
     };
+    let remembered = last_place(cx).is_some();
     let (repos, known) = {
         let s = state.read(cx);
         (s.statuses.len(), s.has_result)
     };
-    let (bounds, scale) = window_place(repos);
+    let (place, scale) = window_place(repos, cx);
+    let bounds = place.get_bounds();
+    let maximized = matches!(place, WindowBounds::Maximized(_));
     let handle = cx
         .open_window(
             WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_bounds: Some(place),
                 kind: WindowKind::Normal,
                 titlebar: Some(gpui::TitlebarOptions {
                     title: Some("gitstat".into()),
@@ -98,17 +101,21 @@ pub fn show_window(cx: &mut App) {
                 // Where the client area came out, so the flip lands on it.
                 if let Some(h) = win::hwnd(window) {
                     let at = |v: gpui::Pixels| (f32::from(v) * scale).round() as i32;
-                    let requested = crate::layout::Rect::new(
-                        at(bounds.origin.x),
-                        at(bounds.origin.y),
-                        at(bounds.origin.x + bounds.size.width),
-                        at(bounds.origin.y + bounds.size.height),
-                    );
+                    let requested = if maximized {
+                        maximized_area(bounds, scale)
+                    } else {
+                        crate::layout::Rect::new(
+                            at(bounds.origin.x),
+                            at(bounds.origin.y),
+                            at(bounds.origin.x + bounds.size.width),
+                            at(bounds.origin.y + bounds.size.height),
+                        )
+                    };
                     cx.spawn(async move |_| {
                         // Minimising goes the way closing does.
                         unsafe { win::minimize_closes(h) };
                         if let Some(client) = win::client_rect(h) {
-                            crate::morph::seen_client(requested, client);
+                            crate::morph::seen_client(requested, client, maximized);
                         }
                     })
                     .detach();
@@ -116,8 +123,9 @@ pub fn show_window(cx: &mut App) {
                 cx.new(|cx| {
                     let mut view = StatusView::new(state, Mode::Window, window, cx);
                     // Opened before the first check found the repos: fit
-                    // the columns once it has.
-                    if !known {
+                    // the columns once it has, unless it opens where it
+                    // was left.
+                    if !known && !remembered {
                         view.fit = Some(window.bounds());
                     }
                     view
@@ -145,7 +153,94 @@ pub fn window_open(cx: &App) -> bool {
 
 /// Where the window goes for `repos` columns, in logical px, at the
 /// bottom-right of the primary work area, and that monitor's scale.
-pub(crate) fn window_place(repos: usize) -> (Bounds<gpui::Pixels>, f32) {
+/// Where the big window was left: its restored bounds in logical px, and
+/// whether it was maximised.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Place {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    maximized: bool,
+}
+
+/// The last place, kept for this run and in window.json beside config.json.
+#[derive(Default)]
+struct LastPlace(Option<Option<Place>>);
+
+impl Global for LastPlace {}
+
+fn place_file(cx: &App) -> Option<PathBuf> {
+    let ui = cx.try_global::<Ui>()?;
+    Some(ui.state.read(cx).config_file.parent()?.join("window.json"))
+}
+
+fn last_place(cx: &App) -> Option<Place> {
+    if let Some(known) = cx.try_global::<LastPlace>().and_then(|l| l.0) {
+        return known;
+    }
+    // Not closed yet this run: as the last run left it.
+    place_file(cx)
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        .and_then(|text| serde_json::from_str::<Place>(&text).ok())
+        .filter(|p| p.w >= 100.0 && p.h >= 100.0 && p.x.is_finite() && p.y.is_finite())
+}
+
+/// Notes where the big window is, as it closes, so it opens there again.
+pub(crate) fn remember_place(window: &Window, cx: &mut App) {
+    let (b, maximized) = match window.window_bounds() {
+        WindowBounds::Maximized(b) => (b, true),
+        WindowBounds::Windowed(b) | WindowBounds::Fullscreen(b) => (b, false),
+    };
+    let place = Place {
+        x: f32::from(b.origin.x),
+        y: f32::from(b.origin.y),
+        w: f32::from(b.size.width),
+        h: f32::from(b.size.height),
+        maximized,
+    };
+    cx.default_global::<LastPlace>().0 = Some(Some(place));
+    if let (Some(file), Ok(text)) = (place_file(cx), serde_json::to_string(&place)) {
+        std::fs::write(file, text).ok();
+    }
+}
+
+/// A maximised window's area: the work area of the monitor its restored
+/// `bounds` (logical px at `scale`) centre on, physical px.
+pub(crate) fn maximized_area(bounds: Bounds<gpui::Pixels>, scale: f32) -> crate::layout::Rect {
+    let c = bounds.center();
+    let at = |v: gpui::Pixels| (f32::from(v) * scale).round() as i32;
+    win::monitor_at(at(c.x), at(c.y)).work
+}
+
+/// Where the big window opens: where it was left (maximised again if it
+/// was), else sized for `repos` columns at the primary monitor's corner.
+/// With the logical px' scale.
+pub(crate) fn window_place(repos: usize, cx: &App) -> (WindowBounds, f32) {
+    let mon = win::primary_monitor();
+    let scale = sane_scale(mon.scale);
+    if let Some(p) = last_place(cx) {
+        let b = Bounds::new(point(px(p.x), px(p.y)), size(px(p.w), px(p.h)));
+        // Still on a monitor: its centre is inside one's area.
+        let at = |v: f32| (v * scale).round() as i32;
+        let (cx_, cy_) = (at(p.x + p.w / 2.0), at(p.y + p.h / 2.0));
+        let on = win::monitor_at(cx_, cy_).rect;
+        if (on.left..on.right).contains(&cx_) && (on.top..on.bottom).contains(&cy_) {
+            return (
+                if p.maximized {
+                    WindowBounds::Maximized(b)
+                } else {
+                    WindowBounds::Windowed(b)
+                },
+                scale,
+            );
+        }
+    }
+    let (b, s) = default_place(repos);
+    (WindowBounds::Windowed(b), s)
+}
+
+fn default_place(repos: usize) -> (Bounds<gpui::Pixels>, f32) {
     let mon = win::primary_monitor();
     let scale = sane_scale(mon.scale);
     let (left, top) = (mon.work.left as f32 / scale, mon.work.top as f32 / scale);
@@ -299,7 +394,7 @@ impl StatusView {
             && near(now.origin.y, opened.origin.y)
             && near(now.size.width, opened.size.width)
             && near(now.size.height, opened.size.height);
-        let (want, scale) = window_place(s.statuses.len());
+        let (want, scale) = default_place(s.statuses.len());
         if !untouched || near(want.size.width, opened.size.width) {
             return;
         }
