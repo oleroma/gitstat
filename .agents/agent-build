@@ -283,7 +283,7 @@ build_pc() {
   else
     summary+=("CI already published this build.")
   fi
-  if [ "${#away[@]}" -gt 0 ]; then summary+=("Not installed: the phone wasn't connected; it can get the build from the pre-release."); fi
+  if [ "${#away[@]}" -gt 0 ]; then summary+=("Not installed on the phone (the reason is above); it can get the build from the pre-release."); fi
   # The full checks aren't run here: agent-check runs them once, before the merge.
   if [ "$built_here" = 1 ]; then summary+=("Full checks: before the merge (agent-check)."); fi
 
