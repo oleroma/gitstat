@@ -329,8 +329,8 @@ impl Timelines {
         }
     }
 
-    /// Forgets the repos gone from the list. Checks need nothing here: the
-    /// state change redraws the panel, and drawing reloads stale strips.
+    /// Forgets the repos gone from the list, and loads the trees of the
+    /// rest that are new or checked since.
     fn sync(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
         let s = state.read(cx);
         let listed: HashSet<&Path> = s
@@ -342,6 +342,17 @@ impl Timelines {
         self.slots.retain(|p, _| listed.contains(p.as_path()));
         self.prs.retain(|p, _| listed.contains(p.as_path()));
         self.queue.retain(|(p, _)| listed.contains(p.as_path()));
+        // Every tree loads, and reloads after each check, in the
+        // background, so the panel and the window open with them all
+        // drawn. GitHub-only repos only while their section is open: their
+        // history is fetched from GitHub.
+        let mut wanted: Vec<PathBuf> = s.statuses.iter().map(|s| s.path.clone()).collect();
+        if !s.folded(crate::config::Section::GithubOnly) {
+            wanted.extend(s.remote_statuses.iter().map(|s| s.path.clone()));
+        }
+        for path in wanted {
+            self.shown(&path, cx);
+        }
     }
 
     /// `path`'s strip is on screen: loads it if it never was, or reloads it

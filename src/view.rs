@@ -563,6 +563,22 @@ fn shown_columns(
 
 /// A section's spine in big mode: its fold arrow, count and name down a
 /// narrow column; a click folds or opens it.
+/// A section's colour: its heading's words in the panel and its spine's
+/// in the big window.
+pub(crate) fn section_color(section: Section, p: &Palette) -> Hsla {
+    match section {
+        Section::NeedsYou => p.red,
+        Section::Synced => p.green,
+        Section::GithubOnly | Section::PullRequests => p.muted,
+    }
+}
+
+/// The faint wash of its colour behind a section's heading in the panel
+/// and its spine in the big window, alike.
+pub(crate) fn section_tint(section: Section, p: &Palette) -> Hsla {
+    section_color(section, p).opacity(0.10)
+}
+
 fn spine(section: Section, count: usize, folded: bool, p: &Palette) -> AnyElement {
     let (name, color) = match section {
         Section::NeedsYou => ("NEED YOU", p.red),
@@ -588,7 +604,7 @@ fn spine(section: Section, count: usize, folded: bool, p: &Palette) -> AnyElemen
         .pt_2()
         .border_r_1()
         .border_color(p.border)
-        .bg(p.bg)
+        .bg(section_tint(section, p))
         .cursor_pointer()
         .hover(|s| s.bg(p.hover))
         .text_xs()
@@ -1254,6 +1270,7 @@ impl Render for StatusView {
                     rows.push(
                         div()
                             .id("needs-you")
+                            .bg(section_tint(Section::NeedsYou, &p))
                             .relative()
                             .child(seen_header(Section::NeedsYou))
                             .flex()
@@ -1305,6 +1322,7 @@ impl Render for StatusView {
                     rows.push(
                         div()
                             .id("synced")
+                            .bg(section_tint(Section::Synced, &p))
                             .relative()
                             .child(seen_header(Section::Synced))
                             .flex()
@@ -1364,6 +1382,7 @@ impl Render for StatusView {
                     rows.push(
                         div()
                             .id("remote")
+                            .bg(section_tint(Section::GithubOnly, &p))
                             .relative()
                             .child(seen_header(Section::GithubOnly))
                             .flex()

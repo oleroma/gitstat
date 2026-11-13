@@ -780,12 +780,10 @@ impl Render for MorphView {
             .spines
             .iter()
             .map(|sp| {
-                let color = match sp.section {
-                    Section::NeedsYou => p.red,
-                    Section::Synced => p.green,
-                    _ => p.muted,
-                };
-                (lerp_bounds(sp.from, sp.to, e, s), color)
+                (
+                    lerp_bounds(sp.from, sp.to, e, s),
+                    view::section_tint(sp.section, &p),
+                )
             })
             .collect();
 
@@ -832,20 +830,10 @@ impl Render for MorphView {
                     gpui::BorderStyle::Solid,
                 ));
                 window.with_content_mask(Some(gpui::ContentMask { bounds: sheet }), |window| {
-                    // A section's heading stretching into its spine: its
-                    // colour's edge on the side the name reads from.
-                    for (b, color) in &spines {
-                        window.paint_quad(quad(
-                            *b,
-                            px(4.0),
-                            p.bg.opacity(reveal),
-                            gpui::Edges {
-                                left: px(3.0),
-                                ..Default::default()
-                            },
-                            color.opacity(0.8 * reveal),
-                            gpui::BorderStyle::Solid,
-                        ));
+                    // A section's heading stretching into its spine.
+                    for (b, tint) in &spines {
+                        // Over the sheet, the same wash as both ends.
+                        window.paint_quad(gpui::fill(*b, tint.opacity(tint.a * reveal)));
                     }
                     for (graph, dirty, ends, alpha) in &trees {
                         crate::timeline::paint_tree(
