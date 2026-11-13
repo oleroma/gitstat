@@ -170,6 +170,8 @@ pub struct Config {
     /// How long the panel takes to slide in from the taskbar, in ms; 0
     /// shows it at once.
     pub panel_slide_ms: u32,
+    /// How long the flip between the panel and the window takes, in ms.
+    pub flip_ms: u32,
     /// Which sections of the repo list are folded, in the panel and the
     /// big window alike.
     pub folds: Folds,
@@ -261,6 +263,7 @@ impl Default for Config {
             scroll_together: true,
             flip_animation: true,
             panel_slide_ms: 150,
+            flip_ms: 560,
             folds: Folds::default(),
         }
     }
@@ -688,6 +691,7 @@ mod tests {
         assert!(parse("{}").unwrap().flip_animation);
         let off = parse(r#"{ "flip_animation": false }"#).unwrap();
         assert!(!off.flip_animation);
+        assert_eq!(parse("{}").unwrap().flip_ms, 560);
     }
 
     #[test]

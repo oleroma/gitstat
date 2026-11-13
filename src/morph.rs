@@ -17,9 +17,9 @@
 //! 4. Reveal: the sheet and the trees fade out, showing the big window
 //!    with its words, then the flip's window closes.
 //!
-//! Closing runs the same backwards: the sheet fades in over the big window,
-//! which then closes, everything turns back, the panel opens underneath
-//! and the sheet fades to show it.
+//! Closing or minimising runs the same backwards: the sheet fades in over
+//! the big window, which then closes, everything turns back, the panel
+//! opens underneath, the sheet fades to show it, and the panel slides away.
 //!
 //! Where things land comes from what each window drew last time (`seen_*`),
 //! so the first flip after starting gitstat may land a few px off; the
@@ -41,10 +41,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const FADE: Duration = Duration::from_millis(140);
-const TURN: Duration = Duration::from_millis(420);
-const HOLD: Duration = Duration::from_millis(90);
-const REVEAL: Duration = Duration::from_millis(170);
+/// The phases at the default speed, 560 ms in all; `flip_ms` stretches
+/// all but the hold, which is the big window's time to draw.
+const FADE: Duration = Duration::from_millis(90);
+const TURN: Duration = Duration::from_millis(280);
+const HOLD: Duration = Duration::from_millis(80);
+const REVEAL: Duration = Duration::from_millis(110);
 /// The panel's and the sheet's rounded corners, logical px.
 const RADIUS: f32 = 8.0;
 /// Until the big window has been drawn once: its column header's height,
@@ -176,10 +178,25 @@ pub fn open_window(panel: &mut Window, focus: Option<PathBuf>, cx: &mut App) {
     }
 }
 
-/// Closing the big window: starts the flip back into the panel and returns
+/// Opens the big window from the tray or the badge: through the panel at
+/// `anchor` when the flip is on, else straight away.
+pub fn show_window(anchor: crate::panel::Anchor, cx: &mut App) {
+    if !enabled(cx) || view::window_open(cx) || running(cx) {
+        if !view::window_open(cx) {
+            crate::panel::close(cx);
+        }
+        view::show_window(cx);
+        return;
+    }
+    crate::panel::then_window(anchor, cx);
+}
+
+/// Closing the big window: starts the flip back into the panel (which then
+/// slides away, or stays when the window was minimised) and returns
 /// true, leaving the window for the flip to close; false when the flip is
 /// off or can't run, so the caller closes it.
 pub fn flip_back(big: &mut Window, cx: &mut App) -> bool {
+    let minimized = win::take_minimized();
     if running(cx) {
         // Mid-flip; the flip closes it.
         return true;
@@ -199,15 +216,22 @@ pub fn flip_back(big: &mut Window, cx: &mut App) -> bool {
     let Some(plan) = plan(panel_rect, ps, Some((big_rect, scroll)), None, cx) else {
         return false;
     };
-    launch(plan, Direction::Close, cx)
+    let direction = if minimized {
+        Direction::Minimize
+    } else {
+        Direction::Close
+    };
+    launch(plan, direction, cx)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Direction {
     /// Panel to big window.
     Open,
-    /// Big window to panel.
+    /// Big window to panel, which then slides away.
     Close,
+    /// Big window to panel, which stays.
+    Minimize,
 }
 
 /// One repo's tree in the flip.
@@ -375,6 +399,11 @@ fn plan(
 /// Opens the flip's window for `plan`. False if it couldn't.
 fn launch(plan: Plan, direction: Direction, cx: &mut App) -> bool {
     let union = plan.union;
+    let ms = cx
+        .try_global::<Ui>()
+        .map_or(560, |ui| ui.state.read(cx).config.flip_ms);
+    let fixed = HOLD.as_millis() as f32;
+    let stretch = ((ms as f32 - fixed) / (560.0 - fixed)).clamp(0.2, 6.0);
     let Ok(handle) = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(crate::panel::logical(union))),
@@ -398,6 +427,7 @@ fn launch(plan: Plan, direction: Direction, cx: &mut App) -> bool {
             }
             cx.new(|_| MorphView {
                 start: Instant::now(),
+                stretch,
                 plan,
                 direction,
                 hwnd: win::hwnd(window),
@@ -414,6 +444,8 @@ fn launch(plan: Plan, direction: Direction, cx: &mut App) -> bool {
 
 pub struct MorphView {
     start: Instant,
+    /// `flip_ms` over the default.
+    stretch: f32,
     plan: Plan,
     direction: Direction,
     hwnd: Option<isize>,
@@ -452,10 +484,12 @@ fn lerp_bounds(a: Bounds<f32>, b: Bounds<f32>, e: f32, s: f32) -> Bounds<Pixels>
 impl Render for MorphView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let elapsed = self.start.elapsed();
-        let turn_at = FADE;
-        let hold_at = turn_at + TURN;
+        let k = self.stretch;
+        let (fade, turn, reveal_len) = (FADE.mul_f32(k), TURN.mul_f32(k), REVEAL.mul_f32(k));
+        let turn_at = fade;
+        let hold_at = turn_at + turn;
         let reveal_at = hold_at + HOLD;
-        let end = reveal_at + REVEAL;
+        let end = reveal_at + reveal_len;
         let open = self.direction == Direction::Open;
 
         if elapsed >= turn_at && !self.left {
@@ -485,14 +519,18 @@ impl Render for MorphView {
         }
         if elapsed >= end {
             window.remove_window();
+            if self.direction == Direction::Close {
+                // Back in the panel, which then goes the way it came.
+                cx.defer(crate::panel::slide_away);
+            }
             return div();
         }
 
-        let sheet_alpha = ease(phase(elapsed, Duration::ZERO, FADE));
-        let turned = ease(phase(elapsed, turn_at, TURN));
+        let sheet_alpha = ease(phase(elapsed, Duration::ZERO, fade));
+        let turned = ease(phase(elapsed, turn_at, turn));
         // 0 is the panel's layout, 1 the big window's.
         let e = if open { turned } else { 1.0 - turned };
-        let reveal = 1.0 - ease(phase(elapsed, reveal_at, REVEAL));
+        let reveal = 1.0 - ease(phase(elapsed, reveal_at, reveal_len));
         let appearance = window.appearance();
         let dark = matches!(
             appearance,

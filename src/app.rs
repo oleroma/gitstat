@@ -261,7 +261,10 @@ fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
                         let anchor = overlay::anchor(cx).unwrap_or(Anchor::Tray(None));
                         panel::toggle(anchor, cx);
                     }
-                    Some(ClickAction::Window) => view::show_window(cx),
+                    Some(ClickAction::Window) => {
+                        let anchor = overlay::anchor(cx).unwrap_or(Anchor::Tray(None));
+                        crate::morph::show_window(anchor, cx);
+                    }
                     Some(ClickAction::Menu) | None => {}
                 }
             }
@@ -415,14 +418,14 @@ fn on_action(action: TrayAction, cx: &mut App) -> bool {
     match action {
         TrayAction::LeftClick(rect) => match cfg.left_click() {
             ClickAction::Panel => panel::toggle(Anchor::Tray(rect), cx),
-            ClickAction::Window => view::show_window(cx),
+            ClickAction::Window => crate::morph::show_window(Anchor::Tray(rect), cx),
             // tray-icon shows the menu itself (`set_show_menu_on_left_click`).
             ClickAction::Menu => {}
         },
         TrayAction::DoubleClick => {
             if cfg.window {
-                panel::close(cx);
-                view::show_window(cx);
+                let rect = cx.global::<Shared>().tray.icon_rect();
+                crate::morph::show_window(Anchor::Tray(rect), cx);
             }
         }
         TrayAction::OpenPanel => {
@@ -431,7 +434,10 @@ fn on_action(action: TrayAction, cx: &mut App) -> bool {
                 panel::toggle(Anchor::Tray(rect), cx);
             }
         }
-        TrayAction::ShowWindow => view::show_window(cx),
+        TrayAction::ShowWindow => {
+            let rect = cx.global::<Shared>().tray.icon_rect();
+            crate::morph::show_window(Anchor::Tray(rect), cx);
+        }
         TrayAction::Refresh => {
             // The same as the panel's ↻: GitHub is asked again too.
             let shared = cx.global::<Shared>();
@@ -459,6 +465,7 @@ fn on_action(action: TrayAction, cx: &mut App) -> bool {
         TrayAction::SetBadgeNumber(n) => change_setting(|c| c.badge_number = n, cx),
         TrayAction::SetSort(s) => change_setting(|c| c.sort = s, cx),
         TrayAction::SetPanelSlide(ms) => change_setting(|c| c.panel_slide_ms = ms, cx),
+        TrayAction::SetFlipSpeed(ms) => change_setting(|c| c.flip_ms = ms, cx),
         TrayAction::Fold(section) => change_setting(|c| c.folds.toggle(section), cx),
         TrayAction::SetInterval(minutes) => change_setting(|c| c.interval_minutes = minutes, cx),
         TrayAction::SetDepth(depth) => change_setting(|c| c.depth = depth, cx),
