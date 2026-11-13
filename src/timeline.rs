@@ -912,24 +912,46 @@ impl Timelines {
                 .justify_center()
                 .w(px(ICON_LABEL_WIDTH))
                 .tooltip(crate::view::tip(lines, p))
-                .child(crate::repo_marks::global_mark(
-                    status,
-                    ICON_MARK,
-                    status_color,
-                    cx,
-                ))
+                .child(
+                    div()
+                        .relative()
+                        .flex_none()
+                        .child(crate::repo_marks::global_mark(
+                            status,
+                            ICON_MARK,
+                            status_color,
+                            cx,
+                        ))
+                        .child(crate::morph::tag(
+                            crate::morph::Side::Panel,
+                            &status.path,
+                            crate::morph::Part::Icon,
+                            None,
+                        )),
+                )
         } else {
             label
                 .gap_2()
                 .w(px(LABEL_WIDTH))
                 .pl_2()
                 .pr_4()
-                .child(crate::repo_marks::global_mark(
-                    status,
-                    MARK,
-                    status_color,
-                    cx,
-                ))
+                .child(
+                    div()
+                        .relative()
+                        .flex_none()
+                        .child(crate::repo_marks::global_mark(
+                            status,
+                            MARK,
+                            status_color,
+                            cx,
+                        ))
+                        .child(crate::morph::tag(
+                            crate::morph::Side::Panel,
+                            &status.path,
+                            crate::morph::Part::Icon,
+                            None,
+                        )),
+                )
                 .child(
                     div()
                         .flex()
@@ -939,10 +961,24 @@ impl Timelines {
                         .min_w_0()
                         .child(
                             div()
+                                .relative()
                                 .truncate()
                                 .text_sm()
                                 .text_color(p.text)
-                                .child(status.name.clone()),
+                                .child(status.name.clone())
+                                .child(crate::morph::tag(
+                                    crate::morph::Side::Panel,
+                                    &status.path,
+                                    crate::morph::Part::Name,
+                                    Some((
+                                        status.name.clone().into(),
+                                        crate::morph::Look {
+                                            color: p.text,
+                                            size: 14.0,
+                                            bold: false,
+                                        },
+                                    )),
+                                )),
                         )
                         .child(
                             div()
@@ -951,19 +987,47 @@ impl Timelines {
                                 .text_xs()
                                 .child(
                                     div()
+                                        .relative()
                                         .flex_shrink()
                                         .min_w_0()
                                         .truncate()
                                         .text_color(p.muted)
-                                        .child(checkout),
+                                        .child(checkout.clone())
+                                        .child(crate::morph::tag(
+                                            crate::morph::Side::Panel,
+                                            &status.path,
+                                            crate::morph::Part::Checkout,
+                                            Some((
+                                                checkout.into(),
+                                                crate::morph::Look {
+                                                    color: p.muted,
+                                                    size: 12.0,
+                                                    bold: false,
+                                                },
+                                            )),
+                                        )),
                                 )
                                 .child(
                                     div()
+                                        .relative()
                                         .flex_none()
                                         .max_w(px(LABEL_WIDTH * 0.6))
                                         .truncate()
                                         .text_color(status_color)
-                                        .child(status_text),
+                                        .child(status_text.clone())
+                                        .child(crate::morph::tag(
+                                            crate::morph::Side::Panel,
+                                            &status.path,
+                                            crate::morph::Part::Status,
+                                            Some((
+                                                status_text.into(),
+                                                crate::morph::Look {
+                                                    color: status_color,
+                                                    size: 12.0,
+                                                    bold: false,
+                                                },
+                                            )),
+                                        )),
                                 ),
                         ),
                 )

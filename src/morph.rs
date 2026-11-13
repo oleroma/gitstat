@@ -55,7 +55,45 @@ const HEADER_GUESS: f32 = 110.0;
 const TABLE_TOP_GUESS: f32 = 60.0;
 const TABLE_BOTTOM_GUESS: f32 = 40.0;
 
+/// A piece of a repo's row that its column header shows too, and the
+/// flip carries from one to the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Part {
+    Icon,
+    Name,
+    Checkout,
+    Status,
+}
+
+/// A part as one view last drew it: its bounds in that window's logical px
+/// and, for words, the words and how they look.
+#[derive(Clone, Debug)]
+struct Seen {
+    bounds: Bounds<Pixels>,
+    text: Option<Words>,
+}
+
+/// Where one view draws a part.
+#[derive(Clone, Copy)]
+pub enum Side {
+    Panel,
+    Column,
+}
+
+/// How a part's words look: size in px and whether bold.
+pub struct Look {
+    pub color: Hsla,
+    pub size: f32,
+    pub bold: bool,
+}
+
 thread_local! {
+    /// The panel's parts, by repo, as last drawn: panel logical px.
+    static PANEL_PARTS: RefCell<HashMap<(PathBuf, Part), Seen>> = RefCell::new(HashMap::new());
+    /// The big window's header parts, by repo, as last drawn: window
+    /// logical px, beside each header's own top-left corner.
+    static COLUMN_PARTS: RefCell<HashMap<(PathBuf, Part), Seen>> = RefCell::new(HashMap::new());
+    static HEADER_AT: RefCell<HashMap<PathBuf, gpui::Point<Pixels>>> = RefCell::new(HashMap::new());
     /// Each strip in view, by repo, as the panel last drew it: bounds in
     /// the panel's logical px.
     static STRIPS: RefCell<HashMap<PathBuf, Bounds<Pixels>>> = RefCell::new(HashMap::new());
@@ -93,6 +131,53 @@ pub fn seen_strip(path: &Path, bounds: Bounds<Pixels>) {
     });
 }
 
+/// An invisible layer, absolutely over its parent (which must be
+/// `relative`), that notes where `side` drew `path`'s `part`, and its words
+/// in `look` when it has words.
+pub fn tag(
+    side: Side,
+    path: &Path,
+    part: Part,
+    words: Option<(gpui::SharedString, Look)>,
+) -> impl IntoElement {
+    let path = path.to_path_buf();
+    let text = words.map(|(t, l)| (t, l.color, l.size, l.bold));
+    canvas(
+        |_, _, _| {},
+        move |bounds, _, _, _| {
+            let seen = Seen {
+                bounds,
+                text: text.clone(),
+            };
+            let map = match side {
+                Side::Panel => &PANEL_PARTS,
+                Side::Column => &COLUMN_PARTS,
+            };
+            map.with(|m| {
+                m.borrow_mut().insert((path.clone(), part), seen);
+            });
+        },
+    )
+    .absolute()
+    .inset_0()
+}
+
+/// An invisible layer over a column header noting where its top-left
+/// corner is, which its parts are placed beside.
+pub fn tag_header(path: &Path) -> impl IntoElement {
+    let path = path.to_path_buf();
+    canvas(
+        |_, _, _| {},
+        move |bounds, _, _, _| {
+            HEADER_AT.with(|m| {
+                m.borrow_mut().insert(path.clone(), bounds.origin);
+            });
+        },
+    )
+    .absolute()
+    .inset_0()
+}
+
 /// Notes a section heading the panel drew, for the flip.
 pub fn seen_header(section: Section, bounds: Bounds<Pixels>) {
     HEADERS.with(|h| {
@@ -103,6 +188,7 @@ pub fn seen_header(section: Section, bounds: Bounds<Pixels>) {
 /// Forgets the strips and headings; the panel is opening afresh.
 pub fn clear_strips() {
     STRIPS.with(|s| s.borrow_mut().clear());
+    PANEL_PARTS.with(|s| s.borrow_mut().clear());
     HEADERS.with(|h| h.borrow_mut().clear());
 }
 
@@ -261,6 +347,29 @@ struct Spine {
     to: Bounds<f32>,
 }
 
+/// A part's words: text, colour, size in px, and whether bold.
+type Words = (gpui::SharedString, Hsla, f32, bool);
+
+/// A carried part this frame: where, its picture or words, and alpha.
+type Drawn = (
+    Bounds<Pixels>,
+    Option<Arc<gpui::RenderImage>>,
+    Option<Words>,
+    f32,
+);
+
+/// A part carried from a panel row to a column header, physical px from
+/// the flip window's top-left corner.
+struct Carried {
+    from: Bounds<f32>,
+    to: Bounds<f32>,
+    /// The words at each end: text, colour, size and boldness.
+    words: Option<(Words, Words)>,
+    /// For the icon: its tone, to find its picture.
+    status: Option<crate::git::RepoStatus>,
+    gone: bool,
+}
+
 /// Everything a flip draws, laid out.
 struct Plan {
     /// The flip window's place, physical px.
@@ -271,6 +380,7 @@ struct Plan {
     to: Bounds<f32>,
     trees: Vec<Tree>,
     spines: Vec<Spine>,
+    parts: Vec<Carried>,
 }
 
 /// Lays out a flip between the panel at `panel_rect` (client area,
@@ -367,6 +477,10 @@ fn plan(
 
     let mut trees = Vec::new();
     let mut spines = Vec::new();
+    let mut parts = Vec::new();
+    let panel_parts = PANEL_PARTS.with(|m| m.borrow().clone());
+    let column_parts = COLUMN_PARTS.with(|m| m.borrow().clone());
+    let header_at = HEADER_AT.with(|m| m.borrow().clone());
     for (cell, left) in cells.iter().zip(&lefts) {
         let x = to.origin.x + left * ws - scroll;
         let gone = x + cell.width() * ws <= to.origin.x || x >= to.origin.x + to.size.width;
@@ -377,6 +491,35 @@ fn plan(
                 else {
                     continue;
                 };
+                // The parts both views show, where each last drew them.
+                if let Some(hat) = header_at.get(&status.path) {
+                    for part in [Part::Icon, Part::Name, Part::Checkout, Part::Status] {
+                        let key = (status.path.clone(), part);
+                        let (Some(a), Some(b)) = (panel_parts.get(&key), column_parts.get(&key))
+                        else {
+                            continue;
+                        };
+                        let dx = f32::from(b.bounds.origin.x - hat.x) * ws;
+                        let to_b = Bounds {
+                            origin: point(x + dx, to.origin.y + f32::from(b.bounds.origin.y) * ws),
+                            size: size(
+                                f32::from(b.bounds.size.width) * ws,
+                                f32::from(b.bounds.size.height) * ws,
+                            ),
+                        };
+                        let words = a.text.clone().zip(b.text.clone());
+                        if part != Part::Icon && words.is_none() {
+                            continue;
+                        }
+                        parts.push(Carried {
+                            from: in_panel(&a.bounds),
+                            to: to_b,
+                            words,
+                            status: (part == Part::Icon).then(|| status.clone()),
+                            gone,
+                        });
+                    }
+                }
                 let strip = in_panel(strip);
                 let newest = strip.origin.x + strip.size.width - crate::timeline::STRIP_PAD * ps;
                 trees.push(Tree {
@@ -418,6 +561,7 @@ fn plan(
         to,
         trees,
         spines,
+        parts,
     })
 }
 
@@ -594,9 +738,38 @@ impl Render for MorphView {
             })
             .collect();
 
+        // The parts both views show, moving and growing from one to the
+        // other, over the sheet: they never fade with the words.
+        let parts: Vec<Drawn> = self
+            .plan
+            .parts
+            .iter()
+            .map(|c| {
+                let b = lerp_bounds(c.from, c.to, e, s);
+                let alpha = reveal * if c.gone { 1.0 - e } else { 1.0 };
+                let image = c.status.as_ref().and_then(|st| {
+                    let a = c.from.size.width.round() as u32;
+                    let z = c.to.size.width.round() as u32;
+                    crate::repo_marks::picture(st, &[a.max(z), a.min(z)], cx)
+                });
+                let words = c.words.as_ref().map(|(a, z)| {
+                    let mix = |x: f32, y: f32| x + (y - x) * e;
+                    let color = Hsla {
+                        h: if e < 0.5 { a.1.h } else { z.1.h },
+                        s: mix(a.1.s, z.1.s),
+                        l: mix(a.1.l, z.1.l),
+                        a: mix(a.1.a, z.1.a),
+                    };
+                    let text = if e < 0.5 { a.0.clone() } else { z.0.clone() };
+                    (text, color, mix(a.2, z.2), if e < 0.5 { a.3 } else { z.3 })
+                });
+                (b, image, words, alpha)
+            })
+            .collect();
+
         let painter = canvas(
             |_, _, _| {},
-            move |_, _, window, _| {
+            move |_, _, window, cx| {
                 window.request_animation_frame();
                 let bg = p.surface.opacity(sheet_alpha * reveal);
                 window.paint_quad(quad(
@@ -627,6 +800,41 @@ impl Render for MorphView {
                         crate::timeline::paint_tree(
                             graph, *dirty, *ends, e, *alpha, dark, &p, window,
                         );
+                    }
+                    for (b, image, words, alpha) in &parts {
+                        if *alpha <= 0.0 {
+                            continue;
+                        }
+                        if let Some(image) = image {
+                            window
+                                .paint_image(*b, Default::default(), image.clone(), 0, false)
+                                .ok();
+                        }
+                        if let Some((text, color, size, bold)) = words {
+                            let mut font = window.text_style().font();
+                            if *bold {
+                                font.weight = gpui::FontWeight::SEMIBOLD;
+                            }
+                            let run = gpui::TextRun {
+                                len: text.len(),
+                                font,
+                                color: color.opacity(color.a * alpha),
+                                background_color: None,
+                                underline: None,
+                                strikethrough: None,
+                            };
+                            let line = window.text_system().shape_line(
+                                text.clone(),
+                                px(*size),
+                                &[run],
+                                None,
+                            );
+                            // Cut where the view would cut it.
+                            window.with_content_mask(
+                                Some(gpui::ContentMask { bounds: *b }),
+                                |window| line.paint(b.origin, b.size.height, window, cx).ok(),
+                            );
+                        }
                     }
                 });
             },
