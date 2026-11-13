@@ -461,7 +461,7 @@ fn fold(section: crate::config::Section) -> OnClick {
 }
 
 /// The spine's heading text height, logical px.
-const SPINE_TEXT: f32 = 12.0;
+pub(crate) const SPINE_TEXT: f32 = 12.0;
 /// A folded or open section's narrow column in big mode, its name
 /// running up it.
 pub(crate) const SPINE_WIDTH: f32 = 30.0;
@@ -573,6 +573,21 @@ pub(crate) fn section_color(section: Section, p: &Palette) -> Hsla {
     }
 }
 
+/// A panel section heading's words, noted for the flip, which turns them
+/// into the spine's.
+fn heading_label(section: Section, text: String, p: &Palette) -> gpui::Div {
+    let color = section_color(section, p);
+    let words = text.clone();
+    div().flex_1().relative().child(text).child(
+        canvas(
+            |_, _, _| {},
+            move |bounds, _, _, _| crate::morph::seen_heading_label(section, bounds, &words, color),
+        )
+        .absolute()
+        .inset_0(),
+    )
+}
+
 /// The faint wash of its colour behind a section's heading in the panel
 /// and its spine in the big window, alike.
 pub(crate) fn section_tint(section: Section, p: &Palette) -> Hsla {
@@ -617,6 +632,7 @@ fn spine(section: Section, count: usize, folded: bool, p: &Palette) -> AnyElemen
             canvas(
                 |_, _, _| {},
                 move |bounds, _, window, _| {
+                    crate::morph::seen_spine_label(section, bounds, &label, window);
                     crate::turned_text::paint(window, bounds, &label, SPINE_TEXT, color)
                 },
             )
@@ -1265,7 +1281,7 @@ impl Render for StatusView {
                                 }))
                             })
                     } else {
-                        div().flex_1().child(format!("● {} need you", bad.len()))
+                        heading_label(Section::NeedsYou, format!("● {} need you", bad.len()), &p)
                     };
                     rows.push(
                         div()
@@ -1317,7 +1333,7 @@ impl Render for StatusView {
                                     }))
                                 })
                         } else {
-                            div().flex_1().child(format!("✓ {} synced", good.len()))
+                            heading_label(Section::Synced, format!("✓ {} synced", good.len()), &p)
                         };
                     rows.push(
                         div()
@@ -1375,9 +1391,11 @@ impl Render for StatusView {
                                     }))
                                 })
                         } else {
-                            div()
-                                .flex_1()
-                                .child(format!("◌ {} on GitHub only", remote.len()))
+                            heading_label(
+                                Section::GithubOnly,
+                                format!("◌ {} on GitHub only", remote.len()),
+                                &p,
+                            )
                         };
                     rows.push(
                         div()

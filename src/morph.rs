@@ -106,6 +106,13 @@ thread_local! {
     /// The big window's header parts, by repo, as last drawn: window
     /// logical px, beside each header's own top-left corner.
     static COLUMN_PARTS: RefCell<HashMap<(PathBuf, Part), Seen>> = RefCell::new(HashMap::new());
+    /// The panel headings' words: bounds, text and colour.
+    static HEADING_LABELS: RefCell<HashMap<SectionKey, HeadingLabel>> =
+        RefCell::new(HashMap::new());
+    /// The spines' names: top and height in the big window's logical px,
+    /// and text.
+    static SPINE_LABELS: RefCell<HashMap<SectionKey, (f32, f32, String)>> =
+        RefCell::new(HashMap::new());
     static HEADER_AT: RefCell<HashMap<PathBuf, gpui::Point<Pixels>>> = RefCell::new(HashMap::new());
     /// Each strip in view, by repo, as the panel last drew it: bounds in
     /// the panel's logical px.
@@ -124,6 +131,9 @@ thread_local! {
     /// The same for a maximised big window, against its monitor's work area.
     static MAXIMIZED_DELTA: Cell<(i32, i32, i32, i32)> = const { Cell::new((0, 0, 0, 0)) };
 }
+
+/// A panel heading's words as drawn: bounds, text and colour.
+type HeadingLabel = (Bounds<Pixels>, String, Hsla);
 
 /// `Section` as a map key.
 type SectionKey = u8;
@@ -158,6 +168,9 @@ pub fn tag(
     canvas(
         |_, _, _| {},
         move |bounds, _, _, _| {
+            if part == Part::Bar {
+                LAST_PAINT.with(|t| t.set(Some(Instant::now())));
+            }
             let seen = Seen {
                 bounds,
                 text: text.clone(),
@@ -191,6 +204,28 @@ pub fn tag_header(path: &Path) -> impl IntoElement {
     .inset_0()
 }
 
+/// Notes the words of a panel section heading, for the flip.
+pub fn seen_heading_label(section: Section, bounds: Bounds<Pixels>, text: &str, color: Hsla) {
+    HEADING_LABELS.with(|m| {
+        m.borrow_mut()
+            .insert(key(section), (bounds, text.to_string(), color));
+    });
+}
+
+/// Notes a spine's name as the big window drew it, for the flip.
+pub fn seen_spine_label(section: Section, bounds: Bounds<Pixels>, text: &str, _: &Window) {
+    SPINE_LABELS.with(|m| {
+        m.borrow_mut().insert(
+            key(section),
+            (
+                f32::from(bounds.top()),
+                f32::from(bounds.size.height),
+                text.to_string(),
+            ),
+        );
+    });
+}
+
 /// Notes a section heading the panel drew, for the flip.
 pub fn seen_header(section: Section, bounds: Bounds<Pixels>) {
     HEADERS.with(|h| {
@@ -202,6 +237,7 @@ pub fn seen_header(section: Section, bounds: Bounds<Pixels>) {
 pub fn clear_strips() {
     STRIPS.with(|s| s.borrow_mut().clear());
     PANEL_PARTS.with(|s| s.borrow_mut().clear());
+    HEADING_LABELS.with(|s| s.borrow_mut().clear());
     HEADERS.with(|h| h.borrow_mut().clear());
 }
 
@@ -358,6 +394,19 @@ struct Spine {
     section: Section,
     from: Bounds<f32>,
     to: Bounds<f32>,
+    name: Option<Name>,
+}
+
+/// A section's name, from the panel heading's words to the spine's, which
+/// read upwards: centres and sizes in physical px, and the words at each end.
+struct Name {
+    from: (f32, f32),
+    to: (f32, f32),
+    from_size: f32,
+    to_size: f32,
+    from_text: String,
+    to_text: String,
+    color: Hsla,
 }
 
 /// A part's words: text, colour, size in px, and whether bold.
@@ -558,8 +607,33 @@ fn plan(
                 if gone {
                     continue;
                 }
+                let k = key(section);
+                let name = HEADING_LABELS
+                    .with(|m| m.borrow().get(&k).cloned())
+                    .zip(SPINE_LABELS.with(|m| m.borrow().get(&k).cloned()))
+                    .map(|((lb, from_text, color), (top, height, to_text))| {
+                        let from_size = 14.0;
+                        let len = crate::turned_text::length(&from_text, from_size);
+                        let lb = in_panel(&lb);
+                        Name {
+                            from: (
+                                lb.origin.x + len * ps / 2.0,
+                                lb.origin.y + lb.size.height / 2.0,
+                            ),
+                            to: (
+                                x + view::SPINE_WIDTH * ws / 2.0,
+                                to.origin.y + (top + height / 2.0) * ws,
+                            ),
+                            from_size: from_size * ps,
+                            to_size: view::SPINE_TEXT * ws,
+                            from_text,
+                            to_text,
+                            color,
+                        }
+                    });
                 spines.push(Spine {
                     section,
+                    name,
                     from: in_panel(header),
                     to: Bounds {
                         origin: point(x, to.origin.y + spine_top),
@@ -639,11 +713,10 @@ fn launch(plan: Plan, direction: Direction, cx: &mut App) -> bool {
         },
         |window, cx| {
             if let Some(h) = win::hwnd(window) {
-                cx.spawn(async move |_| unsafe {
-                    win::style_morph(h);
-                    win::place_morph(h, union);
-                })
-                .detach();
+                // Shown once it has drawn its first frame (see render), or
+                // an empty frame flashes.
+                cx.spawn(async move |_| unsafe { win::style_morph(h) })
+                    .detach();
             }
             cx.new(|_| MorphView {
                 start: Instant::now(),
@@ -652,7 +725,10 @@ fn launch(plan: Plan, direction: Direction, cx: &mut App) -> bool {
                 direction,
                 hwnd: win::hwnd(window),
                 left: false,
-                arrived: false,
+                arrived: None,
+                reveal_from: None,
+                frames: 0,
+                hiding: false,
             })
         },
     ) else {
@@ -671,9 +747,23 @@ pub struct MorphView {
     hwnd: Option<isize>,
     /// The window the flip starts from has closed.
     left: bool,
-    /// The window it ends in has opened.
-    arrived: bool,
+    /// When the window it ends in was opened.
+    arrived: Option<Instant>,
+    /// When the reveal began: once that window has drawn.
+    reveal_from: Option<Instant>,
+    /// Frames drawn; shown from the second.
+    frames: u32,
+    /// Hidden, to be removed next frame.
+    hiding: bool,
 }
+
+thread_local! {
+    /// When a panel or big window last drew its top bar.
+    static LAST_PAINT: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// The longest the flip waits for the window it ends in to draw.
+const DRAW_WAIT: Duration = Duration::from_millis(500);
 
 /// `t` eased in and out.
 fn ease(t: f32) -> f32 {
@@ -703,14 +793,44 @@ fn lerp_bounds(a: Bounds<f32>, b: Bounds<f32>, e: f32, s: f32) -> Bounds<Pixels>
 
 impl Render for MorphView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let elapsed = self.start.elapsed();
+        if self.hiding {
+            window.remove_window();
+            return div();
+        }
+        // Shown once its first frame is drawn; the clock starts then.
+        self.frames += 1;
+        if self.frames == 2 {
+            self.start = Instant::now();
+            if let Some(h) = self.hwnd {
+                let union = self.plan.union;
+                cx.spawn(async move |_, _| unsafe { win::place_morph(h, union) })
+                    .detach();
+            }
+        }
+        let elapsed = if self.frames < 2 {
+            Duration::ZERO
+        } else {
+            self.start.elapsed()
+        };
         let k = self.stretch;
         let (fade, turn, reveal_len) = (FADE.mul_f32(k), TURN.mul_f32(k), REVEAL.mul_f32(k));
         let turn_at = fade;
         let hold_at = turn_at + turn;
-        let reveal_at = hold_at + HOLD;
-        let end = reveal_at + reveal_len;
         let open = self.direction == Direction::Open;
+        // The reveal waits for the window underneath to have drawn, so it
+        // never shows that window empty.
+        if self.reveal_from.is_none()
+            && let Some(arrived) = self.arrived
+        {
+            let since = arrived.elapsed();
+            let drawn = LAST_PAINT
+                .with(Cell::get)
+                .is_some_and(|t| t > arrived + Duration::from_millis(30));
+            if since >= DRAW_WAIT || (since >= HOLD && drawn) {
+                self.reveal_from = Some(Instant::now());
+            }
+        }
+        let revealed = self.reveal_from.map_or(Duration::ZERO, |t| t.elapsed());
 
         if elapsed >= turn_at && !self.left {
             self.left = true;
@@ -720,8 +840,8 @@ impl Render for MorphView {
                 cx.defer(view::close_window);
             }
         }
-        if elapsed >= hold_at && !self.arrived {
-            self.arrived = true;
+        if elapsed >= hold_at && self.arrived.is_none() {
+            self.arrived = Some(Instant::now());
             if open {
                 cx.defer(view::show_window);
             } else {
@@ -737,12 +857,18 @@ impl Render for MorphView {
                 });
             }
         }
-        if elapsed >= end {
-            window.remove_window();
+        if self.reveal_from.is_some() && revealed >= reveal_len {
+            // Hidden first and removed a frame later, so its last frame
+            // never lingers as a flash.
+            self.hiding = true;
+            if let Some(h) = self.hwnd {
+                cx.spawn(async move |_, _| unsafe { win::hide(h) }).detach();
+            }
             if self.direction == Direction::Close {
                 // Back in the panel, which then goes the way it came.
                 cx.defer(crate::panel::slide_away);
             }
+            window.request_animation_frame();
             return div();
         }
 
@@ -750,7 +876,7 @@ impl Render for MorphView {
         let turned = ease(phase(elapsed, turn_at, turn));
         // 0 is the panel's layout, 1 the big window's.
         let e = if open { turned } else { 1.0 - turned };
-        let reveal = 1.0 - ease(phase(elapsed, reveal_at, reveal_len));
+        let reveal = 1.0 - ease(phase(revealed, Duration::ZERO, reveal_len));
         let appearance = window.appearance();
         let dark = matches!(
             appearance,
@@ -775,14 +901,31 @@ impl Render for MorphView {
                 (t.graph.clone(), t.dirty, ends, alpha * reveal)
             })
             .collect();
-        let spines: Vec<(Bounds<Pixels>, Hsla)> = self
+        // Each bar is drawn solid, its wash already laid on the panel's
+        // colour, so it never shows through to the bars beneath it.
+        type Named = (gpui::Point<Pixels>, String, f32, Hsla);
+        let spines: Vec<(Bounds<Pixels>, Hsla, Option<Named>)> = self
             .plan
             .spines
             .iter()
             .map(|sp| {
+                let mix = |a: f32, b: f32| a + (b - a) * e;
+                let name = sp.name.as_ref().map(|n| {
+                    (
+                        point(px(mix(n.from.0, n.to.0) / s), px(mix(n.from.1, n.to.1) / s)),
+                        if e < 0.5 {
+                            n.from_text.clone()
+                        } else {
+                            n.to_text.clone()
+                        },
+                        mix(n.from_size, n.to_size) / s,
+                        n.color,
+                    )
+                });
                 (
                     lerp_bounds(sp.from, sp.to, e, s),
-                    view::section_tint(sp.section, &p),
+                    p.surface.blend(view::section_tint(sp.section, &p)),
+                    name,
                 )
             })
             .collect();
@@ -831,9 +974,20 @@ impl Render for MorphView {
                 ));
                 window.with_content_mask(Some(gpui::ContentMask { bounds: sheet }), |window| {
                     // A section's heading stretching into its spine.
-                    for (b, tint) in &spines {
-                        // Over the sheet, the same wash as both ends.
-                        window.paint_quad(gpui::fill(*b, tint.opacity(tint.a * reveal)));
+                    for (b, bar, name) in &spines {
+                        window.paint_quad(gpui::fill(*b, bar.opacity(reveal)));
+                        // The name turns with its bar, from across to
+                        // reading upwards.
+                        if let Some((at, text, size, color)) = name {
+                            crate::turned_text::paint_turning(
+                                window,
+                                *at,
+                                text,
+                                *size,
+                                color.opacity(reveal),
+                                e,
+                            );
+                        }
                     }
                     for (graph, dirty, ends, alpha) in &trees {
                         crate::timeline::paint_tree(
