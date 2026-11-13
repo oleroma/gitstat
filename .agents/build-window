@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Runs in the build window that agent-build pc opens on the PC: shows the build's log and the
+# build hook's output live. Ctrl+C here cancels the build (agent-build sees the cancel file and
+# stops its steps). The window closes 10 s after the build ends.
+# Usage: build-window <log file> <cancel file> <build output file>
+log="$1"
+cancel="$2"
+out="$3"
+printf '\e]0;Build: %s\a' "$(basename "$(dirname "$(dirname "$(dirname "$log")")")")"
+echo "Ctrl+C cancels the build."
+echo
+trap 'touch "$cancel"; echo; echo "Cancelling the build..."' INT
+tail -q -n +1 -F "$log" "$out" 2>/dev/null &
+tail_pid=$!
+# The build is over once it lets go of its lock.
+lock="$(dirname "$(dirname "$log")")/.build-lock"
+while [ -d "$lock" ]; do sleep 1; done
+sleep 1
+kill "$tail_pid" 2>/dev/null
+echo
+grep '^result: ' "$log" | tail -n 1
+echo "This window closes in 10 s."
+sleep 10

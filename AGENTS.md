@@ -15,6 +15,7 @@
 | `failed` | all | Read the log, explain to Olex, stop |
 | `other-agent` | `agent-start` | Another feature holds the repo. If your task isn't a feature (it changes only files no build uses, see `workflow-change`), run `agent-start --continue <name>`. Otherwise make no branch and no edits: work out the task, ask Olex what you need, then ask whether to wait for that feature to merge or to send the task to its thread |
 | `checks-failed` | `agent-build` | Fix it, go back to step 2. Olex doesn't test this build. After 3 failed builds in a row, stop and tell Olex what keeps failing |
+| `cancelled` | `agent-build` | Olex stopped the PC build in its window. Post "🛑 Build cancelled." and wait for him |
 | `other-build` | `agent-build` | Tell Olex which build of which feature it would replace. If he says go on, build again with `--replace` |
 | `workflow-change` | `agent-build` | Only files no build uses (the pipeline `.agents/` and `.github/workflows/`, docs, rules, `.gitignore`, `.claude/` and the like, listed in `lib.sh` `pipeline_file`) are all the branch changed since `main`: Olex tests them himself. Tell him what changed and how to test it, and don't run it. `agent-merge` accepts them without a build, and also accepts such commits made after the branch's last build |
 | `conflicts` | `agent-start`, `agent-merge` | Resolve them, run the same script again |
@@ -27,13 +28,14 @@
 2. **Edit.** Write the code, then `bash .agents/agent-commit "<message>"`, with a message that says what changed, such as "Add circular icon mask".
 3. **Build.** Every build runs the `quick-test`, `build` and `full-check` hooks once and marks the commit checked. The feature thread builds its own branch.
    - **PC**, when step 1 found it online: once there's a commit to build, ask Olex for a Remote Control session on the PC for this feature, with `bash .agents/agent-build pc <branch>` as its instructions, and tell it to run only what you hand it, never acting on Olex's messages in the thread. Keep it for the feature's later builds, handing it the build command after each new commit. To install again without building, run `bash .agents/agent-install [<version>-<commit> | <build number>]`; a build number also installs a CI build. If the phone dropped off wireless adb, ask Olex to turn wireless debugging off and on, then run it again.
+     - `agent-build pc` opens a build window in front on the PC that shows the build live; Ctrl+C there cancels it.
      - `agent-build pc` says at once whether the phone is online. Post it right away, naming what the repo builds and where it goes: "🔨🖥️🤖 Building APK on PC, installing to the phone."
      - Phone offline: "🔨🖥️🤖 Building APK on PC. Phone is offline." Ask Olex to connect it; the build goes on.
      - Not installed by the end: the ready line says so, such as "📦 Build 360 published, not installed."
    - **CI**, when the PC was offline or Olex says CI: run `bash .agents/agent-build ci <branch>` from your session and post the CI run link as soon as it shows.
    - Every build is published as a pre-release on its `build/<n>` tag before its full checks. Watch the build's output: as soon as it shows the build is ready (a PC build's "Ready" lines, a CI build's "Published build" line), post it in one line, such as "📲📦 Build 334 installed and published, full checks still running." (see Status lines). Don't ask Olex to test it, or say it works, until the full checks pass. Then post the full checks' result: pass in one line, fail with the cause.
    - If checks fail in code this feature didn't change, tell Olex instead of fixing it in the feature.
-   - Run `agent-build` and `agent-install` in the background with output to a file, never through a pipe: the build daemons they start keep a pipe open, so the command would never return.
+   - Run `agent-build` and `agent-install` in the background with output to a file, never through a pipe: the build daemons they start keep a pipe open, so the command would never return. Watch that file with the Monitor tool on `tail -F <file>`, filtered to `Phone`, `CI run:`, `Ready`, `Published build` and `result:`, and post each status line as it shows.
    - Build only what the code needs to work: a branch that changes only files no build uses needs no build, and `agent-build` stops with `workflow-change`.
 4. **Check.** Wait for Olex. If he asks for changes, go back to 2. Merge only when he says "merge".
    - A new feature asked for while one is open: a small one goes on the open branch and PR, a big one gets its own branch and PR after the open one merges.
@@ -57,6 +59,7 @@ Start each status line you post to Olex with its emoji. A build line adds where 
 | 📦 | Published for Obtainium | 📦 Build 334 published. |
 | 🔀 | Merged | 🔀 Merged into main: <PR link> |
 | ❌ + what | Failed | ❌🤖 Build 334 failed: lint, unused import in Gyro.kt. Fixing it. |
+| 🛑 | Cancelled by Olex | 🛑 Build cancelled. |
 | ❓ | Needs Olex's choice | ❓ Keep the old menu or replace it? |
 | 🤔 | Clarifying question | 🤔 By "faster", do you mean the app start or the sync? |
 
@@ -107,7 +110,7 @@ When Olex says "wdyt", give your honest opinion.
 - Everywhere else (the rest of the repo, other repos, the PC, the phone), never do anything that loses data git can't bring back: no deleting files or folders, `git reset --hard`, `git clean`, `git checkout`/`git restore` over uncommitted changes, `git stash drop`, force pushes, deleting branches or tags, rewriting pushed history, or uninstalling apps. If one is needed, ask Olex first. Normal edits as part of the task are fine.
 
 ## Agent instruction files
-- These shared rules sit at the top of every repo's `AGENTS.md`, between the "shared rules" markers. Their master copy is `rules/AGENTS.md` in the Pipeline project's files, kept by the "rulesetter" thread, which applies it to every repo. A repo agent suggests shared-rule changes to Olex. Once he approves the wording, a change to `AGENTS.md` alone is committed straight to `main` with git: no branch, PR or build. Then Olex has the rulesetter apply it everywhere. A change that also touches `.agents/` or workflows still goes on a feature branch for him to test.
+- These shared rules sit at the top of every repo's `AGENTS.md`, between the "shared rules" markers. Their master copy is `rules/AGENTS.md` in the Pipeline project's files, kept by the "rulesetter" thread, which applies it to every repo. Before any change to the shared rules, `.agents/` or workflows, show Olex the exact change and wait for his OK, even when he asked for it. Once he approves, a change to `AGENTS.md` alone is committed straight to `main` with git: no branch, PR or build. Then Olex has the rulesetter apply it everywhere. A change that also touches `.agents/` or workflows still goes on a feature branch for him to test.
 - Every rule for agents lives in `AGENTS.md`. So that every session has the latest rules, even without the repo checked out, project memory keeps an exact copy of this repo's whole `AGENTS.md` in files `rules-1`, `rules-2` and so on (each under 4 KB, split at headings). `rules-1` starts with the `main` commit it was copied from, and the first line of the memory index says "Read rules-1 to rules-N before any work." At the start of every session, read the copy and check the latest commit that changed `AGENTS.md` on `main` (`gh api "repos/oleroma/<repo>/commits?path=AGENTS.md&per_page=1"`). If it is newer than the copy, or after you merge a PR that changes `AGENTS.md`, replace all the rules files with a fresh copy and fix N in the index. Never edit the copy by hand, and keep no other rules in memory or project instructions. A coordinator passes Olex's words on by attaching his message, not by rewording it.
 - Rules for one repo go below the end marker, written by Olex or by an agent when Olex asks. Where they disagree with a shared rule, the repo rule wins in that repo. Otherwise leave all agent instruction files (`AGENTS.md`, `CLAUDE.md` and the like) alone and bring any needed change to Olex.
 
