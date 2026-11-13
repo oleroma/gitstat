@@ -17,9 +17,9 @@
 //! 4. Reveal: the sheet and the trees fade out, showing the big window
 //!    with its words, then the flip's window closes.
 //!
-//! Closing runs the same backwards: the sheet fades in over the big window,
-//! which then closes, everything turns back, the panel opens underneath
-//! and the sheet fades to show it.
+//! Closing or minimising runs the same backwards: the sheet fades in over
+//! the big window, which then closes, everything turns back, the panel
+//! opens underneath, the sheet fades to show it, and the panel slides away.
 //!
 //! Where things land comes from what each window drew last time (`seen_*`),
 //! so the first flip after starting gitstat may land a few px off; the
@@ -41,10 +41,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const FADE: Duration = Duration::from_millis(140);
-const TURN: Duration = Duration::from_millis(420);
-const HOLD: Duration = Duration::from_millis(90);
-const REVEAL: Duration = Duration::from_millis(170);
+const FADE: Duration = Duration::from_millis(90);
+const TURN: Duration = Duration::from_millis(280);
+const HOLD: Duration = Duration::from_millis(80);
+const REVEAL: Duration = Duration::from_millis(110);
 /// The panel's and the sheet's rounded corners, logical px.
 const RADIUS: f32 = 8.0;
 /// Until the big window has been drawn once: its column header's height,
@@ -174,6 +174,19 @@ pub fn open_window(panel: &mut Window, focus: Option<PathBuf>, cx: &mut App) {
         crate::panel::dismiss(panel, cx);
         view::show_window(cx);
     }
+}
+
+/// Opens the big window from the tray or the badge: through the panel at
+/// `anchor` when the flip is on, else straight away.
+pub fn show_window(anchor: crate::panel::Anchor, cx: &mut App) {
+    if !enabled(cx) || view::window_open(cx) || running(cx) {
+        if !view::window_open(cx) {
+            crate::panel::close(cx);
+        }
+        view::show_window(cx);
+        return;
+    }
+    crate::panel::then_window(anchor, cx);
 }
 
 /// Closing the big window: starts the flip back into the panel and returns
@@ -485,6 +498,10 @@ impl Render for MorphView {
         }
         if elapsed >= end {
             window.remove_window();
+            if !open {
+                // Back in the panel, which then goes the way it came.
+                cx.defer(crate::panel::slide_away);
+            }
             return div();
         }
 

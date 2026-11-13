@@ -29,8 +29,9 @@ use windows_sys::Win32::UI::Shell::{
     SHQueryUserNotificationState, SetWindowSubclass,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CW_USEDEFAULT, CreateWindowExW, PostMessageW, SC_MINIMIZE, SendMessageW, WM_CLOSE,
-    WM_SYSCOMMAND, WS_EX_TOPMOST, WS_POPUP,
+    CW_USEDEFAULT, CreateWindowExW, HTMINBUTTON, IsIconic, PostMessageW, SC_MINIMIZE,
+    SIZE_MINIMIZED, SendMessageW, WM_CLOSE, WM_NCLBUTTONUP, WM_SIZE, WM_SYSCOMMAND, WS_EX_TOPMOST,
+    WS_POPUP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GWL_EXSTYLE, GetClientRect, GetCursorPos, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
@@ -275,6 +276,9 @@ pub unsafe fn place_window(h: isize, r: Rect) {
 /// A window's client area on screen, in physical px.
 pub fn client_rect(h: isize) -> Option<Rect> {
     let hwnd = live(h)?;
+    if unsafe { IsIconic(hwnd) } != 0 {
+        return None;
+    }
     let mut cr = RECT::default();
     let mut origin = POINT { x: 0, y: 0 };
     unsafe {
@@ -441,9 +445,18 @@ unsafe extern "system" fn minimize_closes_proc(
     _id: usize,
     _data: usize,
 ) -> LRESULT {
-    if msg == WM_SYSCOMMAND && (wparam & 0xFFF0) as u32 == SC_MINIMIZE {
+    // The taskbar button and Win+Down ask with SC_MINIMIZE; GPUI's own
+    // minimise button minimises on the button's release, never asking.
+    let asked = msg == WM_SYSCOMMAND && (wparam & 0xFFF0) as u32 == SC_MINIMIZE;
+    let button = msg == WM_NCLBUTTONUP && wparam as u32 == HTMINBUTTON;
+    if asked || button {
         unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
         return 0;
+    }
+    // Minimised some other way: close all the same (without the flip, as
+    // there's nothing on screen to flip from).
+    if msg == WM_SIZE && wparam as u32 == SIZE_MINIMIZED {
+        unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
     }
     unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
 }

@@ -46,6 +46,8 @@ pub struct PanelSlot {
     /// The slide in under way: when it began, how long it lasts, and the
     /// work area edge it comes from.
     slide: Option<Slide>,
+    /// It is sliding away to close.
+    leaving: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -71,7 +73,7 @@ impl Global for PanelSlot {}
 /// click is the tail of the one that just closed it.
 pub fn toggle(anchor: Anchor, cx: &mut App) {
     if is_open(cx) {
-        close(cx);
+        slide_away(cx);
         return;
     }
     if cx
@@ -104,6 +106,7 @@ pub fn reopen(cx: &mut App) -> bool {
 pub fn close(cx: &mut App) {
     let slot = cx.default_global::<PanelSlot>();
     slot.hwnd = None;
+    slot.leaving = false;
     if let Some(handle) = slot.handle.take() {
         slot.toggled_at = Some(Instant::now());
         view::remove(handle.into(), cx);
@@ -127,16 +130,15 @@ pub fn hwnd(cx: &App) -> Option<isize> {
 /// Closes the panel from inside one of its own handlers, where its window
 /// is borrowed and `close` could only defer.
 pub(crate) fn dismiss(window: &mut Window, cx: &mut App) {
-    let slot = cx.default_global::<PanelSlot>();
-    if slot
+    let ours = cx
+        .default_global::<PanelSlot>()
         .handle
-        .is_some_and(|h| gpui::AnyWindowHandle::from(h) == window.window_handle())
-    {
-        slot.handle = None;
-        slot.hwnd = None;
-        slot.toggled_at = Some(Instant::now());
+        .is_some_and(|h| gpui::AnyWindowHandle::from(h) == window.window_handle());
+    if ours {
+        slide_away(cx);
+    } else {
+        window.remove_window();
     }
-    window.remove_window();
 }
 
 fn open(anchor: Anchor, slide: bool, cx: &mut App) {
@@ -198,6 +200,7 @@ fn open(anchor: Anchor, slide: bool, cx: &mut App) {
         .ok();
     let slot = cx.default_global::<PanelSlot>();
     slot.handle = handle;
+    slot.leaving = false;
     slot.hwnd = handle.and(hwnd);
     slot.toggled_at = Some(Instant::now());
     slot.anchor = Some(anchor);
@@ -233,6 +236,104 @@ fn run_slide(slide: Slide, handle: WindowHandle<StatusView>, h: isize, cx: &mut 
                 break;
             }
             let (moved, shown) = layout::slide(rect, slide.work, slide.edge, t);
+            unsafe { win::slide_panel(h, moved, Some(shown)) };
+            cx.background_executor()
+                .timer(Duration::from_millis(7))
+                .await;
+        }
+    })
+    .detach();
+}
+
+/// Opens the big window through the panel: slides the panel in at
+/// `anchor` (or lets the open one finish sliding), then flips it into the
+/// window.
+pub fn then_window(anchor: Anchor, cx: &mut App) {
+    let open_now = is_open(cx);
+    let slot = cx.default_global::<PanelSlot>();
+    let settled = open_now && !slot.leaving;
+    let remaining = |s: &Slide| s.len.saturating_sub(s.start.elapsed());
+    let mut wait = slot.slide.as_ref().map_or(Duration::ZERO, remaining);
+    if !settled {
+        // Sliding away (a double click's second click toggled it): back
+        // at once, without sliding in again.
+        let leaving = open_now;
+        if leaving {
+            close(cx);
+        }
+        open(anchor, !leaving, cx);
+        wait = cx
+            .try_global::<PanelSlot>()
+            .and_then(|s| s.slide.as_ref().map(remaining))
+            .unwrap_or_default();
+    }
+    // A moment more for the panel to draw its strips, which the flip
+    // starts from.
+    let wait = wait + Duration::from_millis(60);
+    cx.spawn(async move |cx| {
+        cx.background_executor().timer(wait).await;
+        cx.update(|cx| {
+            let slot = cx.default_global::<PanelSlot>();
+            if slot.leaving {
+                return;
+            }
+            if let Some(handle) = slot.handle {
+                handle
+                    .update(cx, |_, window, cx| {
+                        crate::morph::open_window(window, None, cx)
+                    })
+                    .ok();
+            }
+        })
+        .ok();
+    })
+    .detach();
+}
+
+/// Slides the open panel back out the way it came in, then closes it; closes
+/// it at once when sliding is off.
+pub fn slide_away(cx: &mut App) {
+    let ms = cx
+        .try_global::<Ui>()
+        .map_or(0, |ui| ui.state.read(cx).config.panel_slide_ms);
+    let slot = cx.default_global::<PanelSlot>();
+    if slot.leaving && slot.handle.is_some() {
+        return;
+    }
+    let (Some(handle), Some(h), Some(rect), Some(anchor)) =
+        (slot.handle, slot.hwnd, slot.rect, slot.anchor)
+    else {
+        close(cx);
+        return;
+    };
+    if ms == 0 {
+        close(cx);
+        return;
+    }
+    let (edge, work) = slide_from(anchor);
+    let slide = Slide {
+        start: Instant::now(),
+        len: Duration::from_millis(u64::from(ms.min(2000))),
+        edge,
+        work,
+    };
+    // Keeps a refit from moving it back in.
+    slot.slide = Some(slide);
+    slot.leaving = true;
+    cx.spawn(async move |cx| {
+        loop {
+            let t = slide.progress();
+            let live = cx
+                .update(|cx| cx.default_global::<PanelSlot>().handle == Some(handle))
+                .unwrap_or(false);
+            if !live {
+                break;
+            }
+            if t >= 1.0 {
+                cx.update(close).ok();
+                break;
+            }
+            let (moved, shown) = layout::slide(rect, work, edge, 1.0 - t);
             unsafe { win::slide_panel(h, moved, Some(shown)) };
             cx.background_executor()
                 .timer(Duration::from_millis(7))
