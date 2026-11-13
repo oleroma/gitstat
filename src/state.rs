@@ -48,12 +48,6 @@ pub struct AppState {
     /// The same repos as statuses, by name, so the timeline can list them
     /// after the cloned ones. Never counted as unsynced.
     pub remote_statuses: Vec<RepoStatus>,
-    /// The list of those is folded: in the panel, in big mode. Folded at
-    /// first, since an account can have many.
-    remote_folded: [bool; 2],
-    /// The pull request list is folded to its heading: in the panel, in
-    /// big mode. Kept while gitstat runs, so the panel reopens the same.
-    prs_folded: [bool; 2],
 }
 
 impl AppState {
@@ -83,8 +77,6 @@ impl AppState {
             github_problem: None,
             remote_repos: Vec::new(),
             remote_statuses: Vec::new(),
-            remote_folded: [true; 2],
-            prs_folded: [false; 2],
         }
     }
 
@@ -327,28 +319,11 @@ impl AppState {
         self.remote_repos = remote;
     }
 
-    /// Whether the not-cloned repo list is folded, in big mode or the panel.
+    /// Whether `section` of the repo list is folded; the panel and big
+    /// mode share it, and config.json keeps it.
     #[cfg_attr(not(windows), allow(dead_code))]
-    pub fn remote_folded(&self, big: bool) -> bool {
-        self.remote_folded[usize::from(big)]
-    }
-
-    #[cfg_attr(not(windows), allow(dead_code))]
-    pub fn fold_remote(&mut self, big: bool) {
-        let f = &mut self.remote_folded[usize::from(big)];
-        *f = !*f;
-    }
-
-    /// Whether the pull request list is folded, in big mode or the panel.
-    #[cfg_attr(not(windows), allow(dead_code))]
-    pub fn prs_folded(&self, big: bool) -> bool {
-        self.prs_folded[usize::from(big)]
-    }
-
-    #[cfg_attr(not(windows), allow(dead_code))]
-    pub fn fold_prs(&mut self, big: bool) {
-        let f = &mut self.prs_folded[usize::from(big)];
-        *f = !*f;
+    pub fn folded(&self, section: crate::config::Section) -> bool {
+        self.config.folds.folded(section)
     }
 
     /// The listed repos' open pull requests, most pressing first.
@@ -666,7 +641,7 @@ mod tests {
     #[test]
     fn github_report_keeps_remote_repos_when_unread() {
         let mut s = state(Vec::new());
-        assert!(s.remote_folded(false) && s.remote_folded(true));
+        assert!(s.folded(crate::config::Section::GithubOnly));
         let repo = crate::github::RemoteRepo {
             slug: "o/a".into(),
             url: "https://github.com/o/a".into(),
@@ -694,8 +669,6 @@ mod tests {
             ..Default::default()
         });
         assert!(s.remote_repos.is_empty() && s.github_problem.is_none());
-        s.fold_remote(false);
-        assert!(!s.remote_folded(false) && s.remote_folded(true));
     }
 
     #[test]

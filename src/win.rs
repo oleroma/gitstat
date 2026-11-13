@@ -7,13 +7,13 @@
 //! lose the resulting `WM_SIZE`/`WM_MOVE`.
 
 use crate::layout::Rect;
-use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::{
     DWMNCRP_DISABLED, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_NCRENDERING_POLICY,
     DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND, DwmSetWindowAttribute,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    ClientToScreen, CreateEllipticRgn, DeleteObject, GetMonitorInfoW, HMONITOR,
+    ClientToScreen, CreateEllipticRgn, CreateRectRgn, DeleteObject, GetMonitorInfoW, HMONITOR,
     MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
     SetWindowRgn,
 };
@@ -25,10 +25,12 @@ use windows_sys::Win32::UI::Controls::{
 use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, GetSystemMetricsForDpi, MDT_EFFECTIVE_DPI};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON};
 use windows_sys::Win32::UI::Shell::{
-    QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState,
+    DefSubclassProc, QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
+    SHQueryUserNotificationState, SetWindowSubclass,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CW_USEDEFAULT, CreateWindowExW, SendMessageW, WS_EX_TOPMOST, WS_POPUP,
+    CW_USEDEFAULT, CreateWindowExW, PostMessageW, SC_MINIMIZE, SendMessageW, WM_CLOSE,
+    WM_SYSCOMMAND, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GWL_EXSTYLE, GetClientRect, GetCursorPos, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
@@ -270,6 +272,93 @@ pub unsafe fn place_window(h: isize, r: Rect) {
     }
 }
 
+/// A window's client area on screen, in physical px.
+pub fn client_rect(h: isize) -> Option<Rect> {
+    let hwnd = live(h)?;
+    let mut cr = RECT::default();
+    let mut origin = POINT { x: 0, y: 0 };
+    unsafe {
+        (GetClientRect(hwnd, &mut cr) != 0 && ClientToScreen(hwnd, &mut origin) != 0).then(|| {
+            Rect::new(
+                origin.x,
+                origin.y,
+                origin.x + cr.right,
+                origin.y + cr.bottom,
+            )
+        })
+    }
+}
+
+/// Styles the flip's window once: never activated, click-through, and no
+/// DWM border, rounded corners or shadow.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn style_morph(h: isize) {
+    let Some(hwnd) = live(h) else { return };
+    unsafe {
+        add_ex_style(hwnd, WS_EX_NOACTIVATE | WS_EX_TRANSPARENT);
+        dwm_set(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            DWMWCP_DONOTROUND as u32,
+        );
+        dwm_set(hwnd, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE);
+        dwm_set(hwnd, DWMWA_NCRENDERING_POLICY, DWMNCRP_DISABLED as u32);
+    }
+}
+
+/// Puts the flip's client area at `r`, topmost and shown without activation.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn place_morph(h: isize, r: Rect) {
+    let Some(hwnd) = live(h) else { return };
+    unsafe {
+        let (dx, dy, bw, bh) = frame(hwnd);
+        SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            r.left - dx,
+            r.top - dy,
+            r.width() + bw,
+            r.height() + bh,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+    }
+}
+
+/// Moves the panel's client area to `moved` without resizing it, showing
+/// only the part inside `shown` (screen px), for its slide in. `None`
+/// shows it whole again, with its rounded corners.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn slide_panel(h: isize, moved: Rect, shown: Option<Rect>) {
+    let Some(hwnd) = live(h) else { return };
+    unsafe {
+        let (dx, dy, bw, bh) = frame(hwnd);
+        let (wl, wt) = (moved.left - dx, moved.top - dy);
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            wl,
+            wt,
+            moved.width() + bw,
+            moved.height() + bh,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        let rgn = match shown {
+            // Region coordinates are relative to the window.
+            Some(r) => CreateRectRgn(r.left - wl, r.top - wt, r.right - wl, r.bottom - wt),
+            None => std::ptr::null_mut(),
+        };
+        if SetWindowRgn(hwnd, rgn, 1) == 0 && !rgn.is_null() {
+            DeleteObject(rgn);
+        }
+    }
+}
+
 /// Whether the primary (left, unless swapped) mouse button is down right now.
 pub fn left_button_down() -> bool {
     let vk = if unsafe { GetSystemMetrics(SM_SWAPBUTTON) } != 0 {
@@ -331,6 +420,34 @@ const PARKED: i32 = -32000;
 /// off-screen, click-through and never activated. `SW_SHOWNORMAL` restores
 /// the normal position, which is this one: it is never minimised or maximised.
 ///
+/// Makes minimising the window close it instead (the minimise button, the
+/// taskbar button, Win+Down), so it goes the same way as closing: through
+/// GPUI's should-close callback.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`, on the window's thread.
+pub unsafe fn minimize_closes(h: isize) {
+    let Some(hwnd) = live(h) else { return };
+    unsafe {
+        SetWindowSubclass(hwnd, Some(minimize_closes_proc), 1, 0);
+    }
+}
+
+unsafe extern "system" fn minimize_closes_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    if msg == WM_SYSCOMMAND && (wparam & 0xFFF0) as u32 == SC_MINIMIZE {
+        unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
+        return 0;
+    }
+    unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+}
+
 /// # Safety
 /// Call only from a spawned task outside `update`.
 pub unsafe fn harden_keepalive(h: isize) {

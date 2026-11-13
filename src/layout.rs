@@ -54,6 +54,39 @@ impl Rect {
     }
 }
 
+/// Where a flyout at `rect` is drawn `t` of the way (0 to 1) through
+/// sliding in from `edge` of `work`: moved toward that edge until it is
+/// just out of `work`, and the part of it inside `work`, which is all that
+/// shows. Eased out, so it arrives softly.
+pub fn slide(rect: Rect, work: Rect, edge: Edge, t: f32) -> (Rect, Rect) {
+    let t = t.clamp(0.0, 1.0);
+    // The share of the way still to go.
+    let left = (1.0 - t).powi(3);
+    let (dx, dy) = match edge {
+        Edge::Left => (work.left - rect.right, 0),
+        Edge::Right => (work.right - rect.left, 0),
+        Edge::Top => (0, work.top - rect.bottom),
+        Edge::Bottom => (0, work.bottom - rect.top),
+    };
+    let (dx, dy) = (
+        (dx as f32 * left).round() as i32,
+        (dy as f32 * left).round() as i32,
+    );
+    let moved = Rect::new(
+        rect.left + dx,
+        rect.top + dy,
+        rect.right + dx,
+        rect.bottom + dy,
+    );
+    let shown = Rect::new(
+        moved.left.max(work.left),
+        moved.top.max(work.top),
+        moved.right.min(work.right).max(moved.left.max(work.left)),
+        moved.bottom.min(work.bottom).max(moved.top.max(work.top)),
+    );
+    (moved, shown)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Edge {
     Left,
@@ -332,6 +365,41 @@ fn shift(start: i32, len: i32, lo: i32, hi: i32) -> i32 {
         lo
     } else {
         start.clamp(lo, hi - len)
+    }
+}
+
+#[cfg(test)]
+mod slide_tests {
+    use super::*;
+
+    const WORK: Rect = Rect::new(0, 0, 1920, 1040);
+    const PANEL: Rect = Rect::new(1400, 500, 1880, 1028);
+
+    #[test]
+    fn starts_hidden_past_the_taskbar_edge() {
+        let (moved, shown) = slide(PANEL, WORK, Edge::Bottom, 0.0);
+        assert_eq!(moved.top, WORK.bottom);
+        assert_eq!(shown.height(), 0);
+        let (moved, shown) = slide(PANEL, WORK, Edge::Left, 0.0);
+        assert_eq!(moved.right, WORK.left);
+        assert_eq!(shown.width(), 0);
+    }
+
+    #[test]
+    fn ends_in_place_whole() {
+        for edge in [Edge::Left, Edge::Top, Edge::Right, Edge::Bottom] {
+            assert_eq!(slide(PANEL, WORK, edge, 1.0), (PANEL, PANEL));
+        }
+    }
+
+    #[test]
+    fn shows_only_what_is_inside_the_work_area() {
+        let (moved, shown) = slide(PANEL, WORK, Edge::Bottom, 0.3);
+        assert!(moved.top > PANEL.top && moved.top < WORK.bottom);
+        assert_eq!(
+            shown,
+            Rect::new(moved.left, moved.top, moved.right, WORK.bottom)
+        );
     }
 }
 

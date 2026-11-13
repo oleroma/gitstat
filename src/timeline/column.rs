@@ -26,18 +26,18 @@ use std::time::{Duration, Instant};
 /// A column's width.
 pub const COLUMN_WIDTH: f32 = 380.0;
 /// Px between commits down a column.
-const ROW: f32 = 24.0;
+pub(super) const ROW: f32 = 24.0;
 /// Px between lanes across a column.
-const LANE: f32 = 12.0;
+pub(super) const LANE: f32 = 12.0;
 /// Lanes a column shows; the rest fold into a dimmed last lane.
-const LANES: usize = 8;
-const DOT: f32 = 4.0;
+pub(super) const LANES: usize = 8;
+pub(super) const DOT: f32 = 4.0;
 const DOT_HOVER: f32 = 5.5;
-const STROKE: f32 = 1.75;
+pub(super) const STROKE: f32 = 1.75;
 /// How wide the band under another worktree's line is.
-const BAND: f32 = 10.0;
+pub(super) const BAND: f32 = 10.0;
 /// Px from the column's left edge to lane 0.
-const PAD: f32 = 14.0;
+pub(super) const PAD: f32 = 14.0;
 /// Commits whose stats one git call reads.
 const STATS_BATCH: usize = 64;
 /// How long after a failed batch its line stats are asked for again.
@@ -267,6 +267,8 @@ impl Timelines {
                 window.insert_hitbox(bounds, HitboxBehavior::Normal)
             },
             move |bounds, hitbox, window, _cx| {
+                // Where the flip lands the trees next time.
+                crate::morph::seen_column(bounds, window);
                 if let Some(color) = row_lines {
                     paint_row_lines(bounds, top, color, window);
                 }
@@ -1108,9 +1110,4 @@ fn paint_column(
         }
     }
     dots
-}
-
-/// The repos in the table's order, for `ScrollHandle::scroll_to_item`.
-pub fn column_index(statuses: &[&RepoStatus], path: &Path) -> Option<usize> {
-    statuses.iter().position(|s| s.path == path)
 }

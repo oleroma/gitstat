@@ -41,6 +41,8 @@ mod app;
 #[cfg(windows)]
 mod autostart;
 #[cfg(windows)]
+mod morph;
+#[cfg(windows)]
 mod overlay;
 #[cfg(windows)]
 mod panel;
@@ -52,6 +54,8 @@ mod settings;
 mod timeline;
 #[cfg(windows)]
 mod tray;
+#[cfg(windows)]
+mod turned_text;
 #[cfg(windows)]
 mod view;
 #[cfg(windows)]
