@@ -104,16 +104,17 @@ wait_main_cache() {
   return 0
 }
 
-# run_fallback: runs fallback.yml on BRANCH (the same tests and build as a PC build) and waits
-# for it. Sets RUN (the run id) and RUN_URL. Shows the run link at once, and the release lines
-# (release_lines) as soon as every build job has published, before the full checks end.
-# Returns 1 if the run failed; stops if it can't be found.
+# run_fallback [checks]: runs fallback.yml on BRANCH and waits for it: the same quick tests and
+# build as a PC build, or with "checks" only the full checks (agent-check ci). Sets RUN (the run
+# id) and RUN_URL. Shows the run link at once, and a build's release lines (release_lines) as soon
+# as every build job has published. Returns 1 if the run failed; stops if it can't be found.
 run_fallback() {
-  local sha since i
+  local sha since i checks=false
+  if [ "${1:-}" = checks ]; then checks=true; fi
   sha="$(git -C "$WORKTREE" rev-parse HEAD)"
   wait_main_cache
   since="$(date -u -d '1 minute ago' +%Y-%m-%dT%H:%M:%SZ)"
-  gh workflow run fallback.yml -R "$SLUG" --ref "$BRANCH"
+  gh workflow run fallback.yml -R "$SLUG" --ref "$BRANCH" -f checks="$checks"
   RUN=""
   for i in $(seq 1 30); do
     sleep 4
@@ -161,8 +162,9 @@ release_lines() {
   gh api "repos/$SLUG/releases/tags/build/$1" --jq '.assets[] | "\(.name): direct download link \(.browser_download_url)"'
 }
 
-# Every build, on the PC or in CI, runs the full checks once. When they pass, the commit gets a
-# GitHub commit status named full-check, so nothing runs them again on that commit.
+# The full checks run once per feature, before the merge (agent-check on the PC; a CI build also
+# runs them). When they pass, the commit gets a GitHub commit status named full-check, so nothing
+# runs them again on that commit.
 
 # checked <sha>: true if the full checks already passed on <sha>.
 checked() {
@@ -173,6 +175,64 @@ checked() {
 # mark_checked <sha> <description>: records that the full checks passed on <sha>.
 mark_checked() {
   gh api -X POST "repos/$SLUG/statuses/$1" -f state=success -f context=full-check -f description="$2" >/dev/null
+}
+
+# report_pr <what> <result text>: posts a PC script's result, whatever it is, as a comment on the
+# open PR whose head is this commit ("PC build of <sha> finished: ..."). The thread agent watches
+# its PR, so the comment wakes it even when the Remote Control report never reaches it.
+report_pr() {
+  local sha pr
+  sha="${SHA:-$(git -C "$WORKTREE" rev-parse HEAD)}"
+  pr="$(gh api "repos/$SLUG/pulls?state=open&per_page=100" --jq ".[] | select(.head.sha == \"$sha\") | .number" | head -n 1)"
+  [ -n "$pr" ] || return 0
+  gh api -X POST "repos/$SLUG/issues/$pr/comments" -f body="$(printf '%s of %s finished:\n\n```\n%s\n```\n\n_Posted by %s._' "$1" "${sha:0:7}" "$2" "$SCRIPT_NAME pc")" >/dev/null
+}
+
+# One PC build or check at a time, across all repos: the lock is a file in D:\dev, next to the
+# repos, holding "<PID> <repo> <branch>" of the run that has it. A run waits while another one has
+# it, and takes it over when that process is gone.
+LOCK="$(dirname "$MAIN_REPO")/.build-lock"
+
+# take_lock <branch>: waits for the lock and takes it. When agent-build pc <branch> or
+# agent-check pc <branch> already took it before checking out build/src, the run there takes it over.
+take_lock() {
+  local owner pid shown=""
+  if [ -n "${AGENT_LOCKED:-}" ]; then
+    echo "$$ ${MAIN_REPO##*/} $AGENT_LOCKED" >"$LOCK"
+    return 0
+  fi
+  until (set -C; echo "$$ ${MAIN_REPO##*/} $1" >"$LOCK") 2>/dev/null; do
+    owner="$(cat "$LOCK" 2>/dev/null || true)"
+    pid="${owner%% *}"
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+      rm -f "$LOCK"
+      continue
+    fi
+    if [ -n "$owner" ] && [ "$owner" != "$shown" ]; then
+      echo "Waiting: another build is running (${owner#* })." >&3
+      shown="$owner"
+    fi
+    sleep 5
+  done
+}
+
+# release_lock: removes the lock if this run has it.
+release_lock() {
+  if [ "$(cut -d' ' -f1 "$LOCK" 2>/dev/null)" = "$$" ]; then rm -f "$LOCK"; fi
+}
+
+# checkout_src <branch>: takes the lock, then brings the build/src worktree (made the first time)
+# to <branch>. The run in build/src takes the lock over.
+checkout_src() {
+  local src="$MAIN_REPO/build/src"
+  take_lock "$1"
+  cleanup() { release_lock; }
+  export AGENT_LOCKED="$1"
+  if [ -e "$src/.git" ]; then
+    git -C "$src" checkout --detach "origin/$1" || die "Couldn't check out $1 in build/src."
+  else
+    git -C "$MAIN_REPO" worktree add --detach "$src" "origin/$1" || die "Couldn't make build/src."
+  fi
 }
 
 # Olex tests changes to the pipeline himself (AGENTS.md, "Scripts and hooks"), so a branch that

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Step 3: build the feature branch. A PC build posts its result on the feature's PR when it ends,
 # so the thread agent watching that PR wakes up. It runs agent-install on the build; a failed
-# install is reported in the summary but doesn't fail the build. Every PC build that passes its
-# full checks publishes its build files as a pre-release on its build/<n> tag, as the CI fallback
-# does, so Obtainium on the phone can install it.
+# install is reported in the summary but doesn't fail the build. Every PC build publishes its
+# build files as a pre-release on its build/<n> tag, as the CI fallback does, so Obtainium on the
+# phone can install it. Builds don't run the full checks: agent-check runs them once, before the
+# merge.
 # Before it builds, it stops with "other-build" when the repo's newest build came from another
 # branch whose PR is still open, since Olex may still be testing that build; --replace builds anyway.
 # It also stops with "workflow-change" when everything the branch changed since main is pipeline
@@ -18,13 +19,13 @@ cd "$WORKTREE"
 HOOKS="$WORKTREE/.agents/hooks"
 
 # ci_build_release <sha>: prints "<n> <version>" for the newest pre-release of <sha> that CI
-# built and checked (the commit's full-check status says "Passed in CI"), or nothing. The
-# release is on the build/<n> tag and its title is the version.
+# built (the commit's ci-build status, or an older CI build's full-check status "Passed in CI"),
+# or nothing. The release is on the build/<n> tag and its title is the version.
 ci_build_release() {
   local n version
   [ -n "$(gh api "repos/$SLUG/commits/$1/statuses?per_page=100" --jq '.[]
-    | select(.context == "full-check" and .state == "success")
-    | select((.description // "") | startswith("Passed in CI")) | .id' | head -n 1)" ] || return 0
+    | select(.state == "success")
+    | select(.context == "ci-build" or (.context == "full-check" and ((.description // "") | startswith("Passed in CI: version")))) | .id' | head -n 1)" ] || return 0
   while read -r n; do
     [ -n "$n" ] || continue
     version="$(gh api "repos/$SLUG/releases/tags/build/$n" --jq 'select((.assets | length) > 0) | .name' 2>/dev/null || true)"
@@ -90,24 +91,13 @@ guard_workflow_change() {
     "agent-merge accepts this branch without a new build."
 }
 
-# report_pr <result text>: posts a PC build's result, whatever it is, as a comment on the open PR
-# whose head is this commit. The thread agent watches its PR, so the comment wakes it even when
-# the Remote Control report never reaches it.
-report_pr() {
-  local sha pr
-  sha="$(git -C "$WORKTREE" rev-parse HEAD)"
-  pr="$(gh api "repos/$SLUG/pulls?state=open&per_page=100" --jq ".[] | select(.head.sha == \"$sha\") | .number" | head -n 1)"
-  [ -n "$pr" ] || return 0
-  gh api -X POST "repos/$SLUG/issues/$pr/comments" -f body="$(printf 'PC build of %s finished:\n\n```\n%s\n```\n\n_Posted by agent-build pc._' "${sha:0:7}" "$1")" >/dev/null
-}
-
 # open_build_window: opens a Git Bash window in front on the PC that shows this build's log and the
 # build hook's output live
 # (.agents/build-window). Nothing happens where there's no Git Bash.
 open_build_window() {
   [ -f /git-bash.exe ] && command -v cygpath >/dev/null 2>&1 || return 0
   cmd //c start "" "$(cygpath -w /git-bash.exe)" -c \
-    "bash '$(cygpath -m "$AGENTS_DIR/build-window")' '$(cygpath -m "$LOG_FILE")' '$(cygpath -m "$CANCEL_FILE")' '$(cygpath -m "$BUILD_DIR/logs/build-output.txt")'" ||
+    "bash '$(cygpath -m "$AGENTS_DIR/build-window")' '$(cygpath -m "$LOG_FILE")' '$(cygpath -m "$CANCEL_FILE")' '$(cygpath -m "$BUILD_DIR/logs/build-output.txt")' $$" ||
     echo "Couldn't open the build window."
 }
 
@@ -135,11 +125,12 @@ stop_children() {
 }
 
 build_pc() {
-  report() { report_pr "$@"; }
+  report() { report_pr "PC build" "$@"; }
   [ "$WORKTREE" -ef "$BUILD_DIR/src" ] || die "Run this from the build/src worktree, as in AGENTS.md step 3."
 
-  local lock="$BUILD_DIR/.build-lock"
-  mkdir "$lock" 2>/dev/null || die "Another build is running in build/src, or $lock was left behind. Ask Olex."
+  take_lock "$(git rev-parse --short=7 HEAD)"
+  # The commit is read once: everything below builds, publishes and reports this one.
+  SHA="$(git rev-parse HEAD)"
   # The build window shows this log; Ctrl+C there makes the cancel file, and watch_cancel stops
   # the build. The file stays until the next build, so the result can still see it.
   CANCEL_FILE="$BUILD_DIR/.build-cancel"
@@ -149,12 +140,12 @@ build_pc() {
   trap 'exit 130' TERM
   watch_cancel &
   local watcher=$!
-  cleanup() { kill "$watcher" 2>/dev/null || true; rmdir "$lock" 2>/dev/null || true; }
+  cleanup() { kill "$watcher" 2>/dev/null || true; release_lock; }
 
   local commit
   commit="$(git rev-parse --short=7 HEAD)"
   guard_workflow_change
-  guard_other_build "$(git rev-parse HEAD)"
+  guard_other_build "$SHA"
 
   # An Android repo: say at once whether the phone is on adb, so Olex can connect it while this
   # builds. The install runs after the build, so a phone connected by then still gets it.
@@ -169,7 +160,7 @@ build_pc() {
   # When CI already built this commit (agent-build ci while the PC was away), download and
   # install that build instead of building it again.
   local version="" line rel v files=() names=() ci_tag="" built_here=1
-  read -r ci_tag version < <(ci_build_release "$(git rev-parse HEAD)") || true
+  read -r ci_tag version < <(ci_build_release "$SHA") || true
   if [ -n "$ci_tag" ]; then
     built_here=0
     fetch_ci_build "$ci_tag" "$BUILD_DIR/logs/ci-build"
@@ -257,7 +248,7 @@ build_pc() {
   for name in "${names[@]}"; do summary+=("File: $BUILD_DIR/$name"); done
 
   # Install it. agent-install prints its own result and summary; keep the summary lines.
-  # A failed install doesn't fail the build: it was built (and is checked below); the summary
+  # A failed install doesn't fail the build: it was built; the summary
   # says why the phone didn't get it; the build is published below either way.
   local out away=() installed=1
   out="$(bash "$AGENTS_DIR/agent-install" "$version-$commit")" || installed=0
@@ -271,12 +262,11 @@ build_pc() {
   done <<<"$out"
   echo "$out"
 
-  # Every build is published right after the install, before the full checks, as the CI
-  # fallback does, and shown at once so Olex hears it's ready without waiting for the checks.
+  # Every build is published right after the install, as the CI fallback does.
   if [ "$built_here" = 1 ]; then
     if gh release create "build/$BUILD_NUMBER" "${files[@]}" -R "$SLUG" --verify-tag --prerelease \
       --title "$version" \
-      --notes "$(bash "$AGENTS_DIR/release-notes" "$(git rev-parse HEAD)" "$BUILD_NUMBER" "PC build of $(git rev-parse HEAD)")" >/dev/null; then
+      --notes "$(bash "$AGENTS_DIR/release-notes" "$SHA" "$BUILD_NUMBER" "PC build of $SHA")" >/dev/null; then
       summary+=("Published: https://github.com/$SLUG/releases/tag/build/$BUILD_NUMBER")
     else
       summary+=("Publishing the build failed (see the log).")
@@ -285,18 +275,8 @@ build_pc() {
     summary+=("CI already published this build.")
   fi
   if [ "${#away[@]}" -gt 0 ]; then summary+=("Not installed: the phone wasn't connected; it can get the build from the pre-release."); fi
-  printf 'Ready, full checks still running:\n%s\n' "$(printf '%s\n' "${summary[@]}")" >&3
-
-  # The full checks, after the install so the phone gets the build first. A CI build of this
-  # commit already ran them. When they pass, the commit is marked checked for agent-merge.
-  if [ "$built_here" = 1 ]; then
-    if ! bash "$HOOKS/full-check"; then
-      finish checks-failed "${summary[@]}" "Full checks failed at $commit (see the log). Fix them before Olex tests."
-    fi
-    mark_checked "$(git rev-parse HEAD)" "Passed on the PC" ||
-      die "${summary[@]}" "Full checks passed, but marking $commit checked on GitHub failed."
-    summary+=("Full checks passed.")
-  fi
+  # The full checks aren't run here: agent-check runs them once, before the merge.
+  if [ "$built_here" = 1 ]; then summary+=("Full checks: before the merge (agent-check)."); fi
 
   finish done "${summary[@]}"
 }
@@ -309,10 +289,10 @@ build_ci() {
   guard_workflow_change
   guard_other_build "$(git rev-parse HEAD)"
 
-  # The run does what a PC build does: quick tests, build, publish, full checks. run_fallback
-  # shows the release links as soon as the build is published.
-  run_fallback || die "The fallback run failed: $RUN_URL" "If the build was already published, the full checks failed."
-  local n summary=("Full checks passed in CI: $RUN_URL")
+  # The run does what a PC build does: quick tests, build, publish. run_fallback shows the
+  # release links as soon as the build is published. The full checks run before the merge.
+  run_fallback || die "The fallback run failed: $RUN_URL"
+  local n summary=("Built in CI: $RUN_URL" "Full checks: before the merge (agent-check).")
   n="$(newest_build_tag "$(git rev-parse HEAD)")"
   [ -n "$n" ] || die "The fallback run passed but no build/<n> tag is on this commit: $RUN_URL"
   mapfile -t -O 1 summary < <(release_lines "$n")
@@ -342,13 +322,8 @@ if [ -n "$BRANCH" ]; then
   git fetch origin "$BRANCH" || die "Couldn't fetch $BRANCH."
   case "$MODE" in
     pc)
-      src="$MAIN_REPO/build/src"
-      if [ -e "$src/.git" ]; then
-        git -C "$src" checkout --detach "origin/$BRANCH" || die "Couldn't check out $BRANCH in build/src."
-      else
-        git -C "$MAIN_REPO" worktree add --detach "$src" "origin/$BRANCH" || die "Couldn't make build/src."
-      fi
-      exec bash "$src/.agents/agent-build" pc "${FLAGS[@]}" >&3 2>&3 3>&-
+      checkout_src "$BRANCH"
+      exec bash "$MAIN_REPO/build/src/.agents/agent-build" pc "${FLAGS[@]}" >&3 2>&3 3>&-
       ;;
     ci)
       git checkout "$BRANCH" && git merge --ff-only "origin/$BRANCH" || die "Couldn't check out $BRANCH."

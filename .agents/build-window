@@ -2,19 +2,19 @@
 # Runs in the build window that agent-build pc opens on the PC: shows the build's log and the
 # build hook's output live. Ctrl+C here cancels the build (agent-build sees the cancel file and
 # stops its steps). The window closes 10 s after the build ends.
-# Usage: build-window <log file> <cancel file> <build output file>
+# Usage: build-window <log file> <cancel file> <build output file> <build PID>
 log="$1"
 cancel="$2"
 out="$3"
+pid="$4"
 printf '\e]0;Build: %s\a' "$(basename "$(dirname "$(dirname "$(dirname "$log")")")")"
 echo "Ctrl+C cancels the build."
 echo
 trap 'touch "$cancel"; echo; echo "Cancelling the build..."' INT
 tail -q -n +1 -F "$log" "$out" 2>/dev/null &
 tail_pid=$!
-# The build is over once it lets go of its lock.
-lock="$(dirname "$(dirname "$log")")/.build-lock"
-while [ -d "$lock" ]; do sleep 1; done
+# The build is over once its process is gone.
+while kill -0 "$pid" 2>/dev/null; do sleep 1; done
 sleep 1
 kill "$tail_pid" 2>/dev/null
 echo

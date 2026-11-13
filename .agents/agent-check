@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Before the merge (step 5), or when Olex says "check": runs the full checks (the full-check
+# hook) once on <branch>'s newest commit and marks the commit checked for agent-merge. Builds
+# don't run them. On the PC it runs in build/src and posts its result on the feature's PR, like
+# agent-build pc; in CI it runs fallback.yml with checks only.
+# Usage:
+#   .agents/agent-check pc <branch>   on the PC, in D:\dev\<repo>
+#   .agents/agent-check ci <branch>   in the cloud
+source "$(dirname "$0")/lib.sh"
+cd "$WORKTREE"
+
+USAGE="Usage: agent-check pc|ci <branch>"
+MODE="${1:-}"
+BRANCH="${2:-}"
+
+if [ "$MODE" = ci ]; then
+  [ -n "$BRANCH" ] || die "$USAGE"
+  git fetch origin "$BRANCH" || die "Couldn't fetch $BRANCH."
+  git checkout "$BRANCH" && git merge --ff-only "origin/$BRANCH" || die "Couldn't check out $BRANCH."
+  require_feature_branch
+  sha="$(git rev-parse HEAD)"
+  if checked "$sha"; then finish done "The full checks already passed at ${sha:0:7}."; fi
+  run_fallback checks || finish checks-failed "Full checks failed in CI at ${sha:0:7}: $RUN_URL" \
+    "Fix them, build again (step 3), then run agent-check again."
+  finish done "Full checks passed in CI at ${sha:0:7}: $RUN_URL" "agent-merge can merge it now."
+fi
+[ "$MODE" = pc ] || die "$USAGE"
+
+# First bring build/src to the branch, then run there (the build's own worktree, so the checks
+# reuse its build outputs).
+if [ -n "$BRANCH" ]; then
+  git fetch origin "$BRANCH" || die "Couldn't fetch $BRANCH."
+  checkout_src "$BRANCH"
+  exec bash "$MAIN_REPO/build/src/.agents/agent-check" pc >&3 2>&3 3>&-
+fi
+
+report() { report_pr "PC full checks" "$@"; }
+[ "$WORKTREE" -ef "$BUILD_DIR/src" ] || die "Run this as agent-check pc <branch>, as in AGENTS.md step 5."
+take_lock "$(git rev-parse --short=7 HEAD)"
+cleanup() { release_lock; }
+
+sha="$(git rev-parse HEAD)"
+SHA="$sha"
+commit="${sha:0:7}"
+if checked "$sha"; then finish done "The full checks already passed at $commit."; fi
+bash "$WORKTREE/.agents/hooks/full-check" || finish checks-failed "Full checks failed at $commit (see the log)." \
+  "Fix them, build again (step 3), then run agent-check again."
+mark_checked "$sha" "Passed on the PC" || die "Full checks passed, but marking $commit checked on GitHub failed."
+finish done "Full checks passed at $commit. agent-merge can merge it now."

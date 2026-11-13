@@ -36,23 +36,27 @@ merge_into_main() {
   finish done "Merged $BRANCH into main: https://github.com/$SLUG/pull/$n" "The feature branch is kept."
 }
 
-# built: true if the branch's last commit passed a build's full checks (on the PC or in CI).
-# A merge of main that changed nothing this feature changed counts as its feature commit.
+# has_build <sha>: true if <sha> was built (a build/<n> tag is on it) or its full checks passed.
+has_build() { checked "$1" || [ -n "$(newest_build_tag "$1")" ]; }
+
+# built <test>: true if the branch's last commit passes <test> (has_build: it was built; checked:
+# its full checks passed). A merge of main that changed nothing this feature changed counts as
+# its feature commit.
 built() {
-  checked "$(git rev-parse HEAD)" && return 0
+  "$1" "$(git rev-parse HEAD)" && return 0
   git rev-parse -q --verify HEAD^2 >/dev/null &&
     git merge-base --is-ancestor HEAD^2 origin/main &&
-    checked "$(git rev-parse HEAD^1)"
+    "$1" "$(git rev-parse HEAD^1)"
 }
 
-# built_but_pipeline: true if the branch's newest commit whose full checks passed is followed only
-# by commits that change pipeline files or documentation (lib.sh pipeline_file): those need no
-# new build, since Olex tests pipeline changes himself.
+# built_but_pipeline <test>: true if the branch's newest commit that passes <test> (as in built) is
+# followed only by commits that change pipeline files or documentation (lib.sh pipeline_file):
+# those need no new build or checks, since Olex tests pipeline changes himself.
 built_but_pipeline() {
   local c base last="" f
   base="$(git merge-base HEAD origin/main)"
   while read -r c; do
-    if checked "$c"; then last="$c"; break; fi
+    if "$1" "$c"; then last="$c"; break; fi
   done < <(git rev-list --first-parent "$base..HEAD")
   [ -n "$last" ] || return 1
   while IFS= read -r f; do
@@ -95,12 +99,15 @@ if [ -f "$(git rev-parse --git-path MERGE_HEAD)" ]; then
     "Build again (step 3). Once Olex says it still works, run agent-merge again."
 fi
 
-# Nothing is checked again here: the build Olex tested already ran the full checks.
-# A branch that changed only pipeline files or documentation since main needs no build, and
-# neither do such commits after the branch's last checked build: Olex tests pipeline changes
+# A branch that changed only pipeline files or documentation since main needs no build or full
+# checks, and neither do such commits after the branch's last build: Olex tests pipeline changes
 # himself (lib.sh only_pipeline_changes, built_but_pipeline).
-[ "$UNBUILT" = 1 ] || docs_only || built || only_pipeline_changes || built_but_pipeline || finish not-built "$(git rev-parse --short HEAD) has no build whose full checks passed." \
+[ "$UNBUILT" = 1 ] || docs_only || built has_build || only_pipeline_changes || built_but_pipeline has_build || finish not-built "$(git rev-parse --short HEAD) has no build." \
   "Build it (step 3) and have Olex test it, then run agent-merge again."
+# Builds don't run the full checks: they run once before the merge (agent-check), or earlier when
+# Olex says "check"; a check of this same commit counts.
+[ "$UNBUILT" = 1 ] || docs_only || built checked || only_pipeline_changes || built_but_pipeline checked || finish needs-checks "$(git rev-parse --short HEAD) is built but hasn't had its full checks." \
+  "Run them on the PC: agent-check pc $BRANCH (when the PC is offline: agent-check ci $BRANCH), then run agent-merge again."
 
 # main hasn't moved since the branch last took it in.
 if git merge-base --is-ancestor origin/main HEAD; then
