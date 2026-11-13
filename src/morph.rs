@@ -63,6 +63,19 @@ pub enum Part {
     Name,
     Checkout,
     Status,
+    /// The top bar both views have, and what's on it: the headline, the
+    /// line below it, and the settings and refresh buttons. Kept under an
+    /// empty path.
+    Bar,
+    Headline,
+    Subline,
+    Settings,
+    Refresh,
+}
+
+/// The path the top bar's parts are kept under.
+pub fn app() -> &'static Path {
+    Path::new("")
 }
 
 /// A part as one view last drew it: its bounds in that window's logical px
@@ -356,6 +369,7 @@ type Drawn = (
     Option<Arc<gpui::RenderImage>>,
     Option<Words>,
     f32,
+    bool,
 );
 
 /// A part carried from a panel row to a column header, physical px from
@@ -368,6 +382,8 @@ struct Carried {
     /// For the icon: its tone, to find its picture.
     status: Option<crate::git::RepoStatus>,
     gone: bool,
+    /// The top bar itself: its bottom edge is drawn.
+    bar: bool,
 }
 
 /// Everything a flip draws, laid out.
@@ -517,6 +533,7 @@ fn plan(
                             words,
                             status: (part == Part::Icon).then(|| status.clone()),
                             gone,
+                            bar: false,
                         });
                     }
                 }
@@ -554,6 +571,40 @@ fn plan(
                 });
             }
         }
+    }
+    // The top bar and what's on it, from the panel's to the window's.
+    for part in [
+        Part::Bar,
+        Part::Headline,
+        Part::Subline,
+        Part::Settings,
+        Part::Refresh,
+    ] {
+        let key = (app().to_path_buf(), part);
+        let (Some(a), Some(b)) = (panel_parts.get(&key), column_parts.get(&key)) else {
+            continue;
+        };
+        let words = a.text.clone().zip(b.text.clone());
+        if part != Part::Bar && words.is_none() {
+            continue;
+        }
+        parts.push(Carried {
+            from: in_panel(&a.bounds),
+            to: Bounds {
+                origin: point(
+                    to.origin.x + f32::from(b.bounds.origin.x) * ws,
+                    to.origin.y + f32::from(b.bounds.origin.y) * ws,
+                ),
+                size: size(
+                    f32::from(b.bounds.size.width) * ws,
+                    f32::from(b.bounds.size.height) * ws,
+                ),
+            },
+            words,
+            status: None,
+            gone: false,
+            bar: part == Part::Bar,
+        });
     }
     (!trees.is_empty() || !spines.is_empty()).then_some(Plan {
         union,
@@ -763,7 +814,7 @@ impl Render for MorphView {
                     let text = if e < 0.5 { a.0.clone() } else { z.0.clone() };
                     (text, color, mix(a.2, z.2), if e < 0.5 { a.3 } else { z.3 })
                 });
-                (b, image, words, alpha)
+                (b, image, words, alpha, c.bar)
             })
             .collect();
 
@@ -801,8 +852,17 @@ impl Render for MorphView {
                             graph, *dirty, *ends, e, *alpha, dark, &p, window,
                         );
                     }
-                    for (b, image, words, alpha) in &parts {
+                    for (b, image, words, alpha, bar) in &parts {
                         if *alpha <= 0.0 {
+                            continue;
+                        }
+                        if *bar {
+                            // Its bottom edge, the line under the header.
+                            let edge = Bounds::new(
+                                point(b.origin.x, b.bottom() - px(1.0)),
+                                size(b.size.width, px(1.0)),
+                            );
+                            window.paint_quad(gpui::fill(edge, p.border.opacity(*alpha)));
                             continue;
                         }
                         if let Some(image) = image {

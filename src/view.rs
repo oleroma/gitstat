@@ -1044,6 +1044,20 @@ impl Render for StatusView {
         }
         let open_prs = state.open_prs();
 
+        // The top bar's parts, which the flip carries between the views.
+        let side = match mode {
+            Mode::Panel => crate::morph::Side::Panel,
+            Mode::Window => crate::morph::Side::Column,
+        };
+        let bar_tag = |part, words: Option<(SharedString, Hsla, f32, bool)>| {
+            crate::morph::tag(
+                side,
+                crate::morph::app(),
+                part,
+                words.map(|(t, color, size, bold)| (t, crate::morph::Look { color, size, bold })),
+            )
+        };
+        let headline_size = if mode == Mode::Panel { 16.0 } else { 18.0 };
         let titles = div()
             .flex()
             .flex_col()
@@ -1051,19 +1065,34 @@ impl Render for StatusView {
             .min_w_0()
             .child(
                 div()
+                    .relative()
                     .when(mode == Mode::Panel, |d| d.text_base())
                     .when(mode == Mode::Window, |d| d.text_lg())
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(headline_color)
                     .truncate()
-                    .child(headline.clone()),
+                    .child(headline.clone())
+                    .child(bar_tag(
+                        crate::morph::Part::Headline,
+                        Some((
+                            headline.to_string().into(),
+                            headline_color,
+                            headline_size,
+                            true,
+                        )),
+                    )),
             )
             .child(
                 div()
+                    .relative()
                     .text_xs()
                     .text_color(p.muted)
                     .truncate()
-                    .child(subline.clone()),
+                    .child(subline.clone())
+                    .child(bar_tag(
+                        crate::morph::Part::Subline,
+                        Some((subline.clone().into(), p.muted, 12.0, false)),
+                    )),
             );
 
         let titles = if icons_only {
@@ -1088,6 +1117,8 @@ impl Render for StatusView {
             titles.into_any_element()
         };
         let header = div()
+            .relative()
+            .child(bar_tag(crate::morph::Part::Bar, None))
             .flex()
             .items_center()
             .gap_2()
@@ -1099,11 +1130,17 @@ impl Render for StatusView {
         let header = match mode {
             Mode::Panel => header
                 .child(
-                    icon_button("refresh", "↻", !sweeping, &p).on_click(move |_, _, cx| {
-                        if !sweeping {
-                            refresh(cx);
-                        }
-                    }),
+                    icon_button("refresh", "↻", !sweeping, &p)
+                        .relative()
+                        .child(bar_tag(
+                            crate::morph::Part::Refresh,
+                            Some(("↻".into(), p.text, 16.0, false)),
+                        ))
+                        .on_click(move |_, _, cx| {
+                            if !sweeping {
+                                refresh(cx);
+                            }
+                        }),
                 )
                 .when(state.config.window, |h| {
                     h.child(
@@ -1113,14 +1150,25 @@ impl Render for StatusView {
                     )
                 })
                 .child(
-                    icon_button("settings", "⚙", true, &p).on_click(|_, window, cx| {
-                        panel::dismiss(window, cx);
-                        crate::settings::show(cx);
-                    }),
+                    icon_button("settings", "⚙", true, &p)
+                        .relative()
+                        .child(bar_tag(
+                            crate::morph::Part::Settings,
+                            Some(("⚙".into(), p.text, 16.0, false)),
+                        ))
+                        .on_click(|_, window, cx| {
+                            panel::dismiss(window, cx);
+                            crate::settings::show(cx);
+                        }),
                 ),
             Mode::Window => header
                 .child(
                     icon_button("settings", "⚙", true, &p)
+                        .relative()
+                        .child(bar_tag(
+                            crate::morph::Part::Settings,
+                            Some(("⚙".into(), p.text, 16.0, false)),
+                        ))
                         .on_click(|_, _, cx| crate::settings::show(cx)),
                 )
                 .child(
@@ -1135,11 +1183,26 @@ impl Render for StatusView {
                         .text_color(p.button_text)
                         .when(sweeping, |b| b.opacity(0.6))
                         .when(!sweeping, |b| b.cursor_pointer().hover(|s| s.opacity(0.9)))
+                        .relative()
                         .child(if sweeping {
                             "Checking…"
                         } else {
                             "Refresh now"
                         })
+                        .child(bar_tag(
+                            crate::morph::Part::Refresh,
+                            Some((
+                                if sweeping {
+                                    "Checking…"
+                                } else {
+                                    "Refresh now"
+                                }
+                                .into(),
+                                p.button_text,
+                                14.0,
+                                false,
+                            )),
+                        ))
                         .on_click(move |_, _, cx| {
                             if !sweeping {
                                 refresh(cx);
