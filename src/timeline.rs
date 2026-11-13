@@ -864,25 +864,10 @@ impl Timelines {
             },
         )
         .size_full();
-        // A plain wheel over the graph scrolls every strip through time,
-        // as Shift+wheel does anywhere on the strip; over the name it
-        // still scrolls the panel's list.
-        let graph_entity = this.clone();
-        let graph_path = path.clone();
         let painter = div()
             .id(("strip-graph", index))
             .flex_1()
             .h_full()
-            .on_scroll_wheel(move |e: &ScrollWheelEvent, _, cx| {
-                let d = e.delta.pixel_delta(px(STEP * 3.0));
-                let (x, y) = (f32::from(d.x), f32::from(d.y));
-                // Shift and sideways swipes are the strip's own.
-                if e.modifiers.shift || x.abs() > y.abs() || y == 0.0 {
-                    return;
-                }
-                cx.stop_propagation();
-                graph_entity.update(cx, |t, cx| t.scroll(&graph_path, y, true, cx));
-            })
             .child(painter);
 
         let entity = this.clone();
@@ -1051,10 +1036,10 @@ impl Timelines {
             .on_scroll_wheel(move |e: &ScrollWheelEvent, _, cx| {
                 let d = e.delta.pixel_delta(px(STEP * 3.0));
                 let (x, y) = (f32::from(d.x), f32::from(d.y));
-                // A plain wheel over the name scrolls the panel's list (over
-                // the graph, see above). Shift+wheel, which Windows sends
-                // sideways, scrolls every strip; a sideways swipe or tilt
-                // scrolls this one. Up or left goes back in time.
+                // A plain wheel scrolls the panel's list, anywhere on the
+                // strip. Shift+wheel, which Windows sends sideways, scrolls
+                // every strip through time; a sideways swipe or tilt scrolls
+                // this one. Up or left goes back in time.
                 let (dx, all) = if e.modifiers.shift {
                     (if x != 0.0 { x } else { y }, true)
                 } else if x.abs() > y.abs() {
