@@ -1023,6 +1023,22 @@ impl Render for MorphView {
                             continue;
                         }
                         if *bar {
+                            // The header's own colour, darker than the
+                            // sheet's, under the sheet's rounded top.
+                            let round = px(RADIUS);
+                            window.paint_quad(quad(
+                                *b,
+                                gpui::Corners {
+                                    top_left: round,
+                                    top_right: round,
+                                    bottom_left: px(0.0),
+                                    bottom_right: px(0.0),
+                                },
+                                p.bg.opacity(sheet_alpha * reveal),
+                                px(0.0),
+                                gpui::transparent_black(),
+                                gpui::BorderStyle::Solid,
+                            ));
                             // Its bottom edge, the line under the header.
                             let edge = Bounds::new(
                                 point(b.origin.x, b.bottom() - px(1.0)),
