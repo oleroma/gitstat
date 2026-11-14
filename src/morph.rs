@@ -275,16 +275,23 @@ pub fn seen_client(requested: Rect, client: Rect, maximized: bool) {
 #[derive(Default)]
 struct MorphSlot {
     handle: Option<WindowHandle<MorphView>>,
+    /// When it opened.
+    since: Option<Instant>,
 }
 
 impl Global for MorphSlot {}
 
 /// Whether a flip is drawing now.
 pub fn running(cx: &App) -> bool {
-    cx.try_global::<MorphSlot>()
-        .and_then(|s| s.handle)
-        .is_some_and(|h| view::is_live(h.into(), cx))
+    cx.try_global::<MorphSlot>().is_some_and(|s| {
+        s.handle.is_some_and(|h| view::is_live(h.into(), cx))
+            && s.since.is_some_and(|t| t.elapsed() < STUCK)
+    })
 }
+
+/// Longer than any flip runs: one still around after this is stuck, and
+/// no longer holds up the windows.
+const STUCK: Duration = Duration::from_secs(8);
 
 fn enabled(cx: &App) -> bool {
     cx.try_global::<Ui>().is_some_and(|ui| {
@@ -713,10 +720,16 @@ fn launch(plan: Plan, direction: Direction, cx: &mut App) -> bool {
         },
         |window, cx| {
             if let Some(h) = win::hwnd(window) {
-                // Shown once it has drawn its first frame (see render), or
-                // an empty frame flashes.
-                cx.spawn(async move |_| unsafe { win::style_morph(h) })
-                    .detach();
+                // Shown a moment after it opens, from a timer: a hidden
+                // window may draw no frames, so it can't show itself.
+                cx.spawn(async move |cx| {
+                    unsafe { win::style_morph(h) };
+                    cx.background_executor()
+                        .timer(Duration::from_millis(20))
+                        .await;
+                    unsafe { win::place_morph(h, union) };
+                })
+                .detach();
             }
             cx.new(|_| MorphView {
                 start: Instant::now(),
@@ -734,7 +747,12 @@ fn launch(plan: Plan, direction: Direction, cx: &mut App) -> bool {
     ) else {
         return false;
     };
-    cx.default_global::<MorphSlot>().handle = Some(handle);
+    // A stuck flip from before goes.
+    let old = cx.default_global::<MorphSlot>().handle.replace(handle);
+    if let Some(old) = old {
+        old.update(cx, |_, window, _| window.remove_window()).ok();
+    }
+    cx.default_global::<MorphSlot>().since = Some(Instant::now());
     true
 }
 
@@ -801,11 +819,6 @@ impl Render for MorphView {
         self.frames += 1;
         if self.frames == 2 {
             self.start = Instant::now();
-            if let Some(h) = self.hwnd {
-                let union = self.plan.union;
-                cx.spawn(async move |_, _| unsafe { win::place_morph(h, union) })
-                    .detach();
-            }
         }
         let elapsed = if self.frames < 2 {
             Duration::ZERO
