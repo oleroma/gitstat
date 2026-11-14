@@ -24,6 +24,24 @@ FINISHED=0
 CANCEL_FILE=""
 cancelled() { [ -n "$CANCEL_FILE" ] && [ -f "$CANCEL_FILE" ]; }
 
+# status <line>: a status line for Olex, with its emoji and Markdown links (AGENTS.md "Status
+# lines"). The agent posts it, without "status: ", as soon as it shows.
+status() { echo "status: $*" >&3; echo "status: $*"; }
+
+# what_emoji: what this branch builds, as status lines show it: 🤖 an Android APK, 🪟 Windows
+# files, both when it builds both. From the repo's parts hook when it has one, else from gradlew.
+what_emoji() {
+  local parts="" e=""
+  if [ -f "$WORKTREE/.agents/hooks/parts" ]; then parts="$(bash "$WORKTREE/.agents/hooks/parts" 2>/dev/null || true)"; fi
+  if [ -z "$parts" ]; then
+    if [ -f "$WORKTREE/gradlew" ]; then echo 🤖; else echo 🪟; fi
+    return 0
+  fi
+  if grep -qx apk <<<"$parts"; then e+=🤖; fi
+  if grep -qvx apk <<<"$parts"; then e+=🪟; fi
+  echo "$e"
+}
+
 # Scripts redefine this to undo things such as a lock; it runs on every exit.
 cleanup() { :; }
 
@@ -40,6 +58,7 @@ finish() {
   if cancelled; then
     word=cancelled
     set -- "Olex cancelled the build in its window."
+    status "🛑 Build cancelled."
   fi
   out="result: $word"
   if [ $# -gt 0 ]; then out="$out"$'\n'"$(printf '%s\n' "$@")"; fi
@@ -126,14 +145,21 @@ run_fallback() {
   [ -n "$RUN" ] || die "Started the fallback workflow but couldn't find its run."
   RUN_URL="https://github.com/$SLUG/actions/runs/$RUN"
   # Shown right away (not only in the result), so the run can be followed while it builds.
-  echo "CI run: $RUN_URL" >&3
+  if [ "$checks" = true ]; then
+    status "🔎 Running the full checks in CI: [CI run]($RUN_URL)"
+  else
+    status "🔨☁️$(what_emoji) Building in CI: [CI run]($RUN_URL)"
+  fi
   local published=0 state="" n
   while :; do
     sleep 15
     if [ "$published" = 0 ] && [ "$(fallback_published "$RUN")" = true ]; then
       published=1
       n="$(newest_build_tag "$sha")"
-      if [ -n "$n" ]; then release_lines "$n" >&3; fi
+      if [ -n "$n" ]; then
+        status "📦 Build $n published: [build $n](https://github.com/$SLUG/releases/tag/build/$n)"
+        release_lines "$n" >&3
+      fi
     fi
     state="$(gh api "repos/$SLUG/actions/runs/$RUN" --jq '"\(.status) \(.conclusion // "")"')"
     case "$state" in completed*) break ;; esac
@@ -209,7 +235,7 @@ take_lock() {
       continue
     fi
     if [ -n "$owner" ] && [ "$owner" != "$shown" ]; then
-      echo "Waiting: another build is running (${owner#* })." >&3
+      status "⏳ Waiting: ${owner#* } is building."
       shown="$owner"
     fi
     sleep 5

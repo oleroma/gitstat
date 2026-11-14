@@ -124,6 +124,16 @@ stop_children() {
     done
 }
 
+# installed_emoji: where a build was installed, for its ready line: 📲 the phone when it has an
+# APK, else 🪟 Windows.
+installed_emoji() {
+  local name
+  for name in "${names[@]}"; do
+    case "$name" in *.apk) echo 📲; return 0 ;; esac
+  done
+  echo 🪟
+}
+
 build_pc() {
   report() { report_pr "PC build" "$@"; }
   [ "$WORKTREE" -ef "$BUILD_DIR/src" ] || die "Run this from the build/src worktree, as in AGENTS.md step 3."
@@ -149,12 +159,14 @@ build_pc() {
 
   # An Android repo: say at once whether the phone is on adb, so Olex can connect it while this
   # builds. The install runs after the build, so a phone connected by then still gets it.
-  if [ -f "$WORKTREE/gradlew" ]; then
-    if command -v adb >/dev/null 2>&1 && [ "$(adb devices | awk -F'\t' 'NR > 1 && $2 == "device"' | wc -l)" -gt 0 ]; then
-      echo "Phone online: the build will be installed on it." >&3
-    else
-      echo "Phone offline: connect it before the build ends to have it installed." >&3
-    fi
+  local what
+  what="$(what_emoji)"
+  if [[ "$what" != *🤖* ]]; then
+    status "🔨🖥️$what Building on the PC."
+  elif command -v adb >/dev/null 2>&1 && [ "$(adb devices | awk -F'\t' 'NR > 1 && $2 == "device"' | wc -l)" -gt 0 ]; then
+    status "🔨🖥️$what Building on the PC, installing to the phone."
+  else
+    status "🔨🖥️$what Building on the PC. Phone is offline: connect it before the build ends to have it installed."
   fi
 
   # When CI already built this commit (agent-build ci while the PC was away), download and
@@ -166,7 +178,7 @@ build_pc() {
     fetch_ci_build "$ci_tag" "$BUILD_DIR/logs/ci-build"
   else
     if [ -f "$HOOKS/quick-test" ]; then
-      bash "$HOOKS/quick-test" || die "Quick tests failed at $commit. Not built."
+      bash "$HOOKS/quick-test" || { status "❌$what Quick tests failed at $commit."; die "Quick tests failed at $commit. Not built."; }
     fi
 
     # The repo's next build number, claimed on GitHub; the build hook makes the version from it.
@@ -175,6 +187,7 @@ build_pc() {
 
     if ! bash "$HOOKS/build" >"$out_file"; then
       cat "$out_file"
+      status "❌$what Build failed at $commit."
       die "Build failed at $commit."
     fi
     cat "$out_file"
@@ -254,7 +267,7 @@ build_pc() {
   out="$(bash "$AGENTS_DIR/agent-install" "$version-$commit")" || installed=0
   while IFS= read -r line; do
     case "$line" in
-      "result: "* | "Installed build "* | "Install of build "*) ;;
+      "result: "* | "status: "* | "Installed build "* | "Install of build "*) ;;
       "log: "*) if [ "$installed" = 0 ]; then summary+=("Install log: ${line#log: }"); fi ;;
       "phone-away: "*) away+=("${line#phone-away: }") ;;
       *) summary+=("$line") ;;
@@ -275,13 +288,21 @@ build_pc() {
       UPLOAD_BACKGROUND=1 nohup bash "${up[@]}" </dev/null >/dev/null 2>&1 3>&- &
       disown
       summary+=("Publishing in the background: $url" "A failed upload is posted on the PR; its log is $BUILD_DIR/logs/upload-build-*.log.")
+      status "$(installed_emoji)📦 Build $BUILD_NUMBER installed, publishing: [build $BUILD_NUMBER]($url)"
     elif bash "${up[@]}" >/dev/null; then
       summary+=("Published: $url")
+      status "📦 Build $BUILD_NUMBER published, not installed: [build $BUILD_NUMBER]($url)"
     else
       summary+=("Publishing the build failed (see $BUILD_DIR/logs/upload-build-*.log).")
+      status "❌ Build $BUILD_NUMBER built but not published (see the log)."
     fi
   else
     summary+=("CI already published this build.")
+    if [ "$installed" = 1 ] && [ "${#away[@]}" = 0 ]; then
+      status "$(installed_emoji) Build $ci_tag installed from CI: [build $ci_tag](https://github.com/$SLUG/releases/tag/build/$ci_tag)"
+    else
+      status "📦 Build $ci_tag not installed; it's published: [build $ci_tag](https://github.com/$SLUG/releases/tag/build/$ci_tag)"
+    fi
   fi
   if [ "${#away[@]}" -gt 0 ]; then summary+=("Not installed on the phone (the reason is above); it can get the build from the pre-release."); fi
   # The full checks aren't run here: agent-check runs them once, before the merge.

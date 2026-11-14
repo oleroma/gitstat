@@ -15,7 +15,7 @@
 | `failed` | all | Read the log, explain to Olex, stop |
 | `other-agent` | `agent-start` | Another feature holds the repo. If your task isn't a feature (it changes only files no build uses, see `workflow-change`), run `agent-start --continue <name>`. Otherwise make no branch and no edits: work out the task, ask Olex what you need, then ask whether to wait for that feature to merge or to send the task to its thread |
 | `checks-failed` | `agent-check` | Fix it, go back to step 2. After 3 failed rounds in a row, stop and tell Olex what keeps failing |
-| `cancelled` | `agent-build` | Olex stopped the PC build in its window. Post "🛑 Build cancelled." and wait for him |
+| `cancelled` | `agent-build` | Olex stopped the PC build in its window. Wait for him |
 | `other-build` | `agent-build` | Tell Olex which build of which feature it would replace. If he says go on, build again with `--replace` |
 | `workflow-change` | `agent-build` | Only files no build uses (the pipeline `.agents/` and `.github/workflows/`, docs, rules, `.gitignore`, `.claude/` and the like, listed in `lib.sh` `pipeline_file`) are all the branch changed since `main`: Olex tests them himself. Tell him what changed and how to test it, and don't run it. `agent-merge` accepts them without a build, and also accepts such commits made after the branch's last build |
 | `conflicts` | `agent-start`, `agent-merge` | Resolve them, run the same script again |
@@ -30,17 +30,15 @@
 3. **Build.** Every build, on the PC or in CI, runs the `quick-test` and `build` hooks once; the full checks (`full-check`) run once per feature, before the merge (step 5). The feature thread builds its own branch.
    - **PC**, when step 1 found it online: once there's a commit to build, ask Olex for a Remote Control session on the PC for this feature, with `bash .agents/agent-build pc <branch>` as its instructions, and tell it to run only what you hand it, never acting on Olex's messages in the thread. Keep it for the feature's later builds, handing it the build command after each new commit. To install again without building, run `bash .agents/agent-install [<version>-<commit> | <build number>]`; a build number also installs a CI build. If the phone dropped off wireless adb, ask Olex to turn wireless debugging off and on, then run it again.
      - `agent-build pc` opens a build window in front on the PC that shows the build live; Ctrl+C there cancels it.
-     - `agent-build pc` says at once whether the phone is online. Post it right away, naming what the repo builds and where it goes: "🔨🖥️🤖 Building APK on PC, installing to the phone."
-     - Phone offline: "🔨🖥️🤖 Building APK on PC. Phone is offline." Ask Olex to connect it; the build goes on.
-     - Not installed by the end: the ready line says so, such as "📦 Build 360 published, not installed."
-   - **CI**, when the PC was offline or Olex says CI: run `bash .agents/agent-build ci <branch>` from your session and post the CI run link as soon as it shows.
-   - Every build is published as a pre-release on its `build/<n>` tag. Watch the build's output: as soon as it shows the build is ready (a PC build's "Ready" lines, a CI build's "Published build" line), post it in one line, such as "📲📦 Build 334 installed and published." (see Status lines). Olex can test it then.
+     - `agent-build pc` says at once whether the phone is online. When it's offline, ask Olex to connect it; the build goes on.
+   - **CI**, when the PC was offline or Olex says CI: run `bash .agents/agent-build ci <branch>` from your session.
+   - Every build is published as a pre-release on its `build/<n>` tag. Olex can test it once its 📲 or 📦 status line shows.
    - If checks fail in code this feature didn't change, tell Olex instead of fixing it in the feature.
-   - Run `agent-build` and `agent-install` in the background with output to a file, never through a pipe: the build daemons they start keep a pipe open, so the command would never return. Watch that file with the Monitor tool on `tail -F <file>`, filtered to `Waiting`, `Phone`, `CI run:`, `Ready`, `Published build` and `result:`, and post each status line as it shows.
+   - Run `agent-build` and `agent-install` in the background with output to a file, never through a pipe: the build daemons they start keep a pipe open, so the command would never return. Watch that file with the Monitor tool on `tail -F <file>`, filtered to `status:` and `result:`, and post each status line as it shows.
    - Build only what the code needs to work: a branch that changes only files no build uses needs no build, and `agent-build` stops with `workflow-change`.
 4. **Check.** Wait for Olex. If he asks for changes, go back to 2. Merge only when he says "merge". When he says "check", run the full checks now, as in step 5 (`agent-check`), and post their result; he can keep testing meanwhile. The merge then skips them if nothing was committed since.
    - A new feature asked for while one is open: a small one goes on the open branch and PR, a big one gets its own branch and PR after the open one merges.
-5. **Merge.** `bash .agents/agent-merge`. When the last build hasn't had its full checks, it stops with `needs-checks`: hand the PC session `bash .agents/agent-check pc <branch>` (PC offline: run `bash .agents/agent-check ci <branch>` and post its CI run link), post "🔎 Running the full checks before the merge.", and run `agent-merge` again once they pass. It merges the latest `main` into the branch, then the branch into `main`, keeping the branch. When Olex says to merge without building (such as "skip build", then "merge"), run `bash .agents/agent-merge --unbuilt`: it merges without a checked build and without asking to test again, and the next branch made from `main` builds the parts this one changed along with its own. Say "not built" in the end report. Then post the end report, one line each:
+5. **Merge.** `bash .agents/agent-merge`. When the last build hasn't had its full checks, it stops with `needs-checks`: hand the PC session `bash .agents/agent-check pc <branch>` (PC offline: run `bash .agents/agent-check ci <branch>`), and run `agent-merge` again once they pass. It merges the latest `main` into the branch, then the branch into `main`, keeping the branch. When Olex says to merge without building (such as "skip build", then "merge"), run `bash .agents/agent-merge --unbuilt`: it merges without a checked build and without asking to test again, and the next branch made from `main` builds the parts this one changed along with its own. Then post the end report: its 🔀 status line, one ✏️ line on what the feature does, and the build line:
    ```
    🔀 Merged tilt deadzone: <PR link>
    ✏️ Deadzone slider in Settings, saved per device.
@@ -48,20 +46,10 @@
    ```
 
 ## Status lines
-Start each status line you post to Olex with its emoji. A build line adds where it builds (🖥️ on the PC, ☁️ in CI) and what it builds (🤖 Android APK, 🪟 Windows exe; both when it makes both).
+The scripts print status lines for Olex: lines that start with `status: `, with their emoji and links. Post each one as it shows, without `status: `. Write your own line only for what no script says, starting with its emoji:
 
 | Emoji | Means | Example |
 |---|---|---|
-| ✏️ | Edited, committed | ✏️ Added the tilt deadzone setting. |
-| 🔨 + where + what | Building | 🔨☁️🤖 Building the APK in CI: <run link> |
-| ✅ + what | Built, checks passed | ✅🤖 Build 334 passed its checks. |
-| 🔎 | Full checks before the merge | 🔎 Running the full checks before the merge. |
-| 📲 | Installed on the phone | 📲 Build 334 installed on the phone. |
-| 🪟 | Installed on Windows | 🪟 gitstat 335 installed on Windows. |
-| 📦 | Published for Obtainium | 📦 Build 334 published. |
-| 🔀 | Merged | 🔀 Merged into main: <PR link> |
-| ❌ + what | Failed | ❌🤖 Build 334 failed: lint, unused import in Gyro.kt. Fixing it. |
-| 🛑 | Cancelled by Olex | 🛑 Build cancelled. |
 | ❓ | Needs Olex's choice | ❓ Keep the old menu or replace it? |
 | 🤔 | Clarifying question | 🤔 By "faster", do you mean the app start or the sync? |
 

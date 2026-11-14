@@ -139,5 +139,9 @@ if [ -f "$HOOKS/install" ]; then
   done <"$hook_out"
 fi
 
-if [ "$FAILED" = 1 ]; then finish failed "Install of build $build_id failed:" "${NOTES[@]}"; fi
+if [ "$FAILED" = 1 ]; then
+  status "❌ Install of build $build_id failed."
+  finish failed "Install of build $build_id failed:" "${NOTES[@]}"
+fi
+if grep -q "Installed on the phone" <<<"${NOTES[*]}"; then status "📲 Build $build_id installed on the phone."; fi
 finish done "Installed build $build_id:" "${NOTES[@]}"

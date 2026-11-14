@@ -89,6 +89,7 @@ else
   gh release create "$tag" "${files[@]}" -R "$SLUG" --verify-tag --prerelease --title "$version" --notes "$body" ||
     die "Creating the pre-release $tag failed."
   summary=("Published build $version as a pre-release: $url")
+  status "📦 Build $version published: [build $version]($url)"
   for f in "${files[@]}"; do summary+=("File: $(basename "$f")"); done
 fi
 summary+=("${notes[@]}")

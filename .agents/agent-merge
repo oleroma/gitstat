@@ -30,9 +30,11 @@ merge_into_main() {
     die "GitHub refused to merge PR #$n, most likely because main moved meanwhile. Run agent-merge again."
   rm -f "$attempts_file" "$files_file"
   if [ "$UNBUILT" = 1 ]; then
+    status "🔀 Merged $BRANCH, not built: [PR #$n](https://github.com/$SLUG/pull/$n)"
     finish done "Merged $BRANCH into main unbuilt: https://github.com/$SLUG/pull/$n" \
       "The next build of a branch made from main after this builds its parts too." "The feature branch is kept."
   fi
+  status "🔀 Merged $BRANCH: [PR #$n](https://github.com/$SLUG/pull/$n)"
   finish done "Merged $BRANCH into main: https://github.com/$SLUG/pull/$n" "The feature branch is kept."
 }
 

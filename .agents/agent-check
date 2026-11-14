@@ -19,9 +19,12 @@ if [ "$MODE" = ci ]; then
   git checkout "$BRANCH" && git merge --ff-only "origin/$BRANCH" || die "Couldn't check out $BRANCH."
   require_feature_branch
   sha="$(git rev-parse HEAD)"
-  if checked "$sha"; then finish done "The full checks already passed at ${sha:0:7}."; fi
-  run_fallback checks || finish checks-failed "Full checks failed in CI at ${sha:0:7}: $RUN_URL" \
-    "Fix them, build again (step 3), then run agent-check again."
+  if checked "$sha"; then status "✅ Full checks already passed at ${sha:0:7}."; finish done "The full checks already passed at ${sha:0:7}."; fi
+  if ! run_fallback checks; then
+    status "❌ Full checks failed in CI at ${sha:0:7}: [CI run]($RUN_URL)"
+    finish checks-failed "Full checks failed in CI at ${sha:0:7}: $RUN_URL" "Fix them, build again (step 3), then run agent-check again."
+  fi
+  status "✅ Full checks passed in CI at ${sha:0:7}."
   finish done "Full checks passed in CI at ${sha:0:7}: $RUN_URL" "agent-merge can merge it now."
 fi
 [ "$MODE" = pc ] || die "$USAGE"
@@ -42,8 +45,12 @@ cleanup() { release_lock; }
 sha="$(git rev-parse HEAD)"
 SHA="$sha"
 commit="${sha:0:7}"
-if checked "$sha"; then finish done "The full checks already passed at $commit."; fi
-bash "$WORKTREE/.agents/hooks/full-check" || finish checks-failed "Full checks failed at $commit (see the log)." \
-  "Fix them, build again (step 3), then run agent-check again."
+if checked "$sha"; then status "✅ Full checks already passed at $commit."; finish done "The full checks already passed at $commit."; fi
+status "🔎 Running the full checks before the merge."
+if ! bash "$WORKTREE/.agents/hooks/full-check"; then
+  status "❌ Full checks failed at $commit."
+  finish checks-failed "Full checks failed at $commit (see the log)." "Fix them, build again (step 3), then run agent-check again."
+fi
 mark_checked "$sha" "Passed on the PC" || die "Full checks passed, but marking $commit checked on GitHub failed."
+status "✅ Full checks passed at $commit."
 finish done "Full checks passed at $commit. agent-merge can merge it now."
