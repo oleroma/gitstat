@@ -858,12 +858,23 @@ impl Render for MorphView {
             }
         }
         if self.reveal_from.is_some() && revealed >= reveal_len {
-            // Hidden first and removed a frame later, so its last frame
-            // never lingers as a flash.
+            // Hidden first and removed a moment later, so its last frame
+            // never lingers as a flash. Removed from a timer: a hidden
+            // window draws no more frames, so it can't remove itself.
             self.hiding = true;
-            if let Some(h) = self.hwnd {
-                cx.spawn(async move |_, _| unsafe { win::hide(h) }).detach();
-            }
+            let me = window.window_handle();
+            let hwnd = self.hwnd;
+            cx.spawn(async move |_, cx| {
+                if let Some(h) = hwnd {
+                    unsafe { win::hide(h) };
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(40))
+                    .await;
+                cx.update_window(me, |_, window, _| window.remove_window())
+                    .ok();
+            })
+            .detach();
             if self.direction == Direction::Close {
                 // Back in the panel, which then goes the way it came.
                 cx.defer(crate::panel::slide_away);
