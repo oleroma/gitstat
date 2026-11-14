@@ -75,15 +75,18 @@ pub fn show_window(cx: &mut App) {
     let Some(state) = cx.try_global::<Ui>().map(|ui| ui.state.clone()) else {
         return;
     };
+    let remembered = last_place(cx).is_some();
     let (repos, known) = {
         let s = state.read(cx);
         (s.statuses.len(), s.has_result)
     };
-    let (bounds, scale) = window_place(repos);
+    let (place, scale) = window_place(repos, cx);
+    let bounds = place.get_bounds();
+    let maximized = matches!(place, WindowBounds::Maximized(_));
     let handle = cx
         .open_window(
             WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_bounds: Some(place),
                 kind: WindowKind::Normal,
                 titlebar: Some(gpui::TitlebarOptions {
                     title: Some("gitstat".into()),
@@ -98,17 +101,21 @@ pub fn show_window(cx: &mut App) {
                 // Where the client area came out, so the flip lands on it.
                 if let Some(h) = win::hwnd(window) {
                     let at = |v: gpui::Pixels| (f32::from(v) * scale).round() as i32;
-                    let requested = crate::layout::Rect::new(
-                        at(bounds.origin.x),
-                        at(bounds.origin.y),
-                        at(bounds.origin.x + bounds.size.width),
-                        at(bounds.origin.y + bounds.size.height),
-                    );
+                    let requested = if maximized {
+                        maximized_area(bounds, scale)
+                    } else {
+                        crate::layout::Rect::new(
+                            at(bounds.origin.x),
+                            at(bounds.origin.y),
+                            at(bounds.origin.x + bounds.size.width),
+                            at(bounds.origin.y + bounds.size.height),
+                        )
+                    };
                     cx.spawn(async move |_| {
                         // Minimising goes the way closing does.
                         unsafe { win::minimize_closes(h) };
                         if let Some(client) = win::client_rect(h) {
-                            crate::morph::seen_client(requested, client);
+                            crate::morph::seen_client(requested, client, maximized);
                         }
                     })
                     .detach();
@@ -116,8 +123,9 @@ pub fn show_window(cx: &mut App) {
                 cx.new(|cx| {
                     let mut view = StatusView::new(state, Mode::Window, window, cx);
                     // Opened before the first check found the repos: fit
-                    // the columns once it has.
-                    if !known {
+                    // the columns once it has, unless it opens where it
+                    // was left.
+                    if !known && !remembered {
                         view.fit = Some(window.bounds());
                     }
                     view
@@ -145,7 +153,94 @@ pub fn window_open(cx: &App) -> bool {
 
 /// Where the window goes for `repos` columns, in logical px, at the
 /// bottom-right of the primary work area, and that monitor's scale.
-pub(crate) fn window_place(repos: usize) -> (Bounds<gpui::Pixels>, f32) {
+/// Where the big window was left: its restored bounds in logical px, and
+/// whether it was maximised.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Place {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    maximized: bool,
+}
+
+/// The last place, kept for this run and in window.json beside config.json.
+#[derive(Default)]
+struct LastPlace(Option<Option<Place>>);
+
+impl Global for LastPlace {}
+
+fn place_file(cx: &App) -> Option<PathBuf> {
+    let ui = cx.try_global::<Ui>()?;
+    Some(ui.state.read(cx).config_file.parent()?.join("window.json"))
+}
+
+fn last_place(cx: &App) -> Option<Place> {
+    if let Some(known) = cx.try_global::<LastPlace>().and_then(|l| l.0) {
+        return known;
+    }
+    // Not closed yet this run: as the last run left it.
+    place_file(cx)
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        .and_then(|text| serde_json::from_str::<Place>(&text).ok())
+        .filter(|p| p.w >= 100.0 && p.h >= 100.0 && p.x.is_finite() && p.y.is_finite())
+}
+
+/// Notes where the big window is, as it closes, so it opens there again.
+pub(crate) fn remember_place(window: &Window, cx: &mut App) {
+    let (b, maximized) = match window.window_bounds() {
+        WindowBounds::Maximized(b) => (b, true),
+        WindowBounds::Windowed(b) | WindowBounds::Fullscreen(b) => (b, false),
+    };
+    let place = Place {
+        x: f32::from(b.origin.x),
+        y: f32::from(b.origin.y),
+        w: f32::from(b.size.width),
+        h: f32::from(b.size.height),
+        maximized,
+    };
+    cx.default_global::<LastPlace>().0 = Some(Some(place));
+    if let (Some(file), Ok(text)) = (place_file(cx), serde_json::to_string(&place)) {
+        std::fs::write(file, text).ok();
+    }
+}
+
+/// A maximised window's area: the work area of the monitor its restored
+/// `bounds` (logical px at `scale`) centre on, physical px.
+pub(crate) fn maximized_area(bounds: Bounds<gpui::Pixels>, scale: f32) -> crate::layout::Rect {
+    let c = bounds.center();
+    let at = |v: gpui::Pixels| (f32::from(v) * scale).round() as i32;
+    win::monitor_at(at(c.x), at(c.y)).work
+}
+
+/// Where the big window opens: where it was left (maximised again if it
+/// was), else sized for `repos` columns at the primary monitor's corner.
+/// With the logical px' scale.
+pub(crate) fn window_place(repos: usize, cx: &App) -> (WindowBounds, f32) {
+    let mon = win::primary_monitor();
+    let scale = sane_scale(mon.scale);
+    if let Some(p) = last_place(cx) {
+        let b = Bounds::new(point(px(p.x), px(p.y)), size(px(p.w), px(p.h)));
+        // Still on a monitor: its centre is inside one's area.
+        let at = |v: f32| (v * scale).round() as i32;
+        let (cx_, cy_) = (at(p.x + p.w / 2.0), at(p.y + p.h / 2.0));
+        let on = win::monitor_at(cx_, cy_).rect;
+        if (on.left..on.right).contains(&cx_) && (on.top..on.bottom).contains(&cy_) {
+            return (
+                if p.maximized {
+                    WindowBounds::Maximized(b)
+                } else {
+                    WindowBounds::Windowed(b)
+                },
+                scale,
+            );
+        }
+    }
+    let (b, s) = default_place(repos);
+    (WindowBounds::Windowed(b), s)
+}
+
+fn default_place(repos: usize) -> (Bounds<gpui::Pixels>, f32) {
     let mon = win::primary_monitor();
     let scale = sane_scale(mon.scale);
     let (left, top) = (mon.work.left as f32 / scale, mon.work.top as f32 / scale);
@@ -299,7 +394,7 @@ impl StatusView {
             && near(now.origin.y, opened.origin.y)
             && near(now.size.width, opened.size.width)
             && near(now.size.height, opened.size.height);
-        let (want, scale) = window_place(s.statuses.len());
+        let (want, scale) = default_place(s.statuses.len());
         if !untouched || near(want.size.width, opened.size.width) {
             return;
         }
@@ -366,7 +461,7 @@ fn fold(section: crate::config::Section) -> OnClick {
 }
 
 /// The spine's heading text height, logical px.
-const SPINE_TEXT: f32 = 12.0;
+pub(crate) const SPINE_TEXT: f32 = 12.0;
 /// A folded or open section's narrow column in big mode, its name
 /// running up it.
 pub(crate) const SPINE_WIDTH: f32 = 30.0;
@@ -468,6 +563,37 @@ fn shown_columns(
 
 /// A section's spine in big mode: its fold arrow, count and name down a
 /// narrow column; a click folds or opens it.
+/// A section's colour: its heading's words in the panel and its spine's
+/// in the big window.
+pub(crate) fn section_color(section: Section, p: &Palette) -> Hsla {
+    match section {
+        Section::NeedsYou => p.red,
+        Section::Synced => p.green,
+        Section::GithubOnly | Section::PullRequests => p.muted,
+    }
+}
+
+/// A panel section heading's words, noted for the flip, which turns them
+/// into the spine's.
+fn heading_label(section: Section, text: String, p: &Palette) -> gpui::Div {
+    let color = section_color(section, p);
+    let words = text.clone();
+    div().flex_1().relative().child(text).child(
+        canvas(
+            |_, _, _| {},
+            move |bounds, _, _, _| crate::morph::seen_heading_label(section, bounds, &words, color),
+        )
+        .absolute()
+        .inset_0(),
+    )
+}
+
+/// The faint wash of its colour behind a section's heading in the panel
+/// and its spine in the big window, alike.
+pub(crate) fn section_tint(section: Section, p: &Palette) -> Hsla {
+    section_color(section, p).opacity(0.10)
+}
+
 fn spine(section: Section, count: usize, folded: bool, p: &Palette) -> AnyElement {
     let (name, color) = match section {
         Section::NeedsYou => ("NEED YOU", p.red),
@@ -493,7 +619,7 @@ fn spine(section: Section, count: usize, folded: bool, p: &Palette) -> AnyElemen
         .pt_2()
         .border_r_1()
         .border_color(p.border)
-        .bg(p.bg)
+        .bg(section_tint(section, p))
         .cursor_pointer()
         .hover(|s| s.bg(p.hover))
         .text_xs()
@@ -506,6 +632,7 @@ fn spine(section: Section, count: usize, folded: bool, p: &Palette) -> AnyElemen
             canvas(
                 |_, _, _| {},
                 move |bounds, _, window, _| {
+                    crate::morph::seen_spine_label(section, bounds, &label, window);
                     crate::turned_text::paint(window, bounds, &label, SPINE_TEXT, color)
                 },
             )
@@ -949,6 +1076,20 @@ impl Render for StatusView {
         }
         let open_prs = state.open_prs();
 
+        // The top bar's parts, which the flip carries between the views.
+        let side = match mode {
+            Mode::Panel => crate::morph::Side::Panel,
+            Mode::Window => crate::morph::Side::Column,
+        };
+        let bar_tag = |part, words: Option<(SharedString, Hsla, f32, bool)>| {
+            crate::morph::tag(
+                side,
+                crate::morph::app(),
+                part,
+                words.map(|(t, color, size, bold)| (t, crate::morph::Look { color, size, bold })),
+            )
+        };
+        let headline_size = if mode == Mode::Panel { 16.0 } else { 18.0 };
         let titles = div()
             .flex()
             .flex_col()
@@ -956,19 +1097,34 @@ impl Render for StatusView {
             .min_w_0()
             .child(
                 div()
+                    .relative()
                     .when(mode == Mode::Panel, |d| d.text_base())
                     .when(mode == Mode::Window, |d| d.text_lg())
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(headline_color)
                     .truncate()
-                    .child(headline.clone()),
+                    .child(headline.clone())
+                    .child(bar_tag(
+                        crate::morph::Part::Headline,
+                        Some((
+                            headline.to_string().into(),
+                            headline_color,
+                            headline_size,
+                            true,
+                        )),
+                    )),
             )
             .child(
                 div()
+                    .relative()
                     .text_xs()
                     .text_color(p.muted)
                     .truncate()
-                    .child(subline.clone()),
+                    .child(subline.clone())
+                    .child(bar_tag(
+                        crate::morph::Part::Subline,
+                        Some((subline.clone().into(), p.muted, 12.0, false)),
+                    )),
             );
 
         let titles = if icons_only {
@@ -993,6 +1149,8 @@ impl Render for StatusView {
             titles.into_any_element()
         };
         let header = div()
+            .relative()
+            .child(bar_tag(crate::morph::Part::Bar, None))
             .flex()
             .items_center()
             .gap_2()
@@ -1004,11 +1162,17 @@ impl Render for StatusView {
         let header = match mode {
             Mode::Panel => header
                 .child(
-                    icon_button("refresh", "↻", !sweeping, &p).on_click(move |_, _, cx| {
-                        if !sweeping {
-                            refresh(cx);
-                        }
-                    }),
+                    icon_button("refresh", "↻", !sweeping, &p)
+                        .relative()
+                        .child(bar_tag(
+                            crate::morph::Part::Refresh,
+                            Some(("↻".into(), p.text, 16.0, false)),
+                        ))
+                        .on_click(move |_, _, cx| {
+                            if !sweeping {
+                                refresh(cx);
+                            }
+                        }),
                 )
                 .when(state.config.window, |h| {
                     h.child(
@@ -1018,14 +1182,25 @@ impl Render for StatusView {
                     )
                 })
                 .child(
-                    icon_button("settings", "⚙", true, &p).on_click(|_, window, cx| {
-                        panel::dismiss(window, cx);
-                        crate::settings::show(cx);
-                    }),
+                    icon_button("settings", "⚙", true, &p)
+                        .relative()
+                        .child(bar_tag(
+                            crate::morph::Part::Settings,
+                            Some(("⚙".into(), p.text, 16.0, false)),
+                        ))
+                        .on_click(|_, window, cx| {
+                            panel::dismiss(window, cx);
+                            crate::settings::show(cx);
+                        }),
                 ),
             Mode::Window => header
                 .child(
                     icon_button("settings", "⚙", true, &p)
+                        .relative()
+                        .child(bar_tag(
+                            crate::morph::Part::Settings,
+                            Some(("⚙".into(), p.text, 16.0, false)),
+                        ))
                         .on_click(|_, _, cx| crate::settings::show(cx)),
                 )
                 .child(
@@ -1040,11 +1215,26 @@ impl Render for StatusView {
                         .text_color(p.button_text)
                         .when(sweeping, |b| b.opacity(0.6))
                         .when(!sweeping, |b| b.cursor_pointer().hover(|s| s.opacity(0.9)))
+                        .relative()
                         .child(if sweeping {
                             "Checking…"
                         } else {
                             "Refresh now"
                         })
+                        .child(bar_tag(
+                            crate::morph::Part::Refresh,
+                            Some((
+                                if sweeping {
+                                    "Checking…"
+                                } else {
+                                    "Refresh now"
+                                }
+                                .into(),
+                                p.button_text,
+                                14.0,
+                                false,
+                            )),
+                        ))
                         .on_click(move |_, _, cx| {
                             if !sweeping {
                                 refresh(cx);
@@ -1091,11 +1281,12 @@ impl Render for StatusView {
                                 }))
                             })
                     } else {
-                        div().flex_1().child(format!("● {} need you", bad.len()))
+                        heading_label(Section::NeedsYou, format!("● {} need you", bad.len()), &p)
                     };
                     rows.push(
                         div()
                             .id("needs-you")
+                            .bg(section_tint(Section::NeedsYou, &p))
                             .relative()
                             .child(seen_header(Section::NeedsYou))
                             .flex()
@@ -1142,11 +1333,12 @@ impl Render for StatusView {
                                     }))
                                 })
                         } else {
-                            div().flex_1().child(format!("✓ {} synced", good.len()))
+                            heading_label(Section::Synced, format!("✓ {} synced", good.len()), &p)
                         };
                     rows.push(
                         div()
                             .id("synced")
+                            .bg(section_tint(Section::Synced, &p))
                             .relative()
                             .child(seen_header(Section::Synced))
                             .flex()
@@ -1199,13 +1391,16 @@ impl Render for StatusView {
                                     }))
                                 })
                         } else {
-                            div()
-                                .flex_1()
-                                .child(format!("◌ {} on GitHub only", remote.len()))
+                            heading_label(
+                                Section::GithubOnly,
+                                format!("◌ {} on GitHub only", remote.len()),
+                                &p,
+                            )
                         };
                     rows.push(
                         div()
                             .id("remote")
+                            .bg(section_tint(Section::GithubOnly, &p))
                             .relative()
                             .child(seen_header(Section::GithubOnly))
                             .flex()
