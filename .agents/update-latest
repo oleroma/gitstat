@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Keeps the "latest" release holding the newest file of every part: for each part, the file from
+# Keeps the "latest" pre-release holding the newest file of every part: for each part, the file from
 # the newest build pre-release whose commit is on main. Its notes list the build of each file.
 # A part is a file name without its digits, dots, dashes and underscores, so oryx.apk, gyrophone-0.1.440.apk and gyrophone-0.1.446.apk
 # are one part. Uses git and GitHub only; prune.yml runs it in CI, daily and when agent-publish
@@ -10,6 +10,19 @@ cd "$(dirname "$0")/.."
 slug="${GITHUB_REPOSITORY:-$(git remote get-url origin | sed -E 's#\.git$##; s#.*[:/]([^/]+/[^/]+)$#\1#')}"
 git fetch -q origin main --tags
 part_key() { sed -E 's/[0-9._-]//g' <<<"$1"; }
+# excluded <name>: true if the file matches a pattern in .agents/hooks/latest-exclude (one shell
+# glob per line, # for comments): parts that stay on the build pre-releases but never go on
+# "latest", such as GyroPhone's drivers.
+excluded() {
+  local p
+  [ -f .agents/hooks/latest-exclude ] || return 1
+  while read -r p; do
+    case "$p" in '' | '#'*) continue ;; esac
+    # shellcheck disable=SC2254
+    case "$1" in $p) return 0 ;; esac
+  done <.agents/hooks/latest-exclude
+  return 1
+}
 
 # The newest file of each part, from main's builds, newest first.
 declare -A want=()
@@ -18,6 +31,7 @@ while read -r n sha; do
   names="$(gh api "repos/$slug/releases/tags/build/$n" --jq '.assets[].name' 2>/dev/null)" || continue
   while IFS= read -r name; do
     [ -n "$name" ] || continue
+    excluded "$name" && continue
     k="$(part_key "$name")"
     [ -n "${want[$k]:-}" ] || want[$k]="$n $name"
   done <<<"$names"
@@ -25,12 +39,24 @@ done < <(git ls-remote --tags origin 'refs/tags/build/*' | sed -nE 's#^([0-9a-f]
 [ "${#want[@]}" -gt 0 ] || { echo "No build on main has a pre-release yet."; exit 0; }
 
 if ! gh api "repos/$slug/releases/tags/latest" >/dev/null 2>&1; then
-  gh release create latest -R "$slug" --target main --title Latest --notes "Filling in."
+  gh release create latest -R "$slug" --target main --title Latest --prerelease --notes "Filling in."
+fi
+# A pre-release, like the builds: nothing here is a release yet.
+if [ "$(gh api "repos/$slug/releases/tags/latest" --jq .prerelease)" != true ]; then
+  gh release edit latest -R "$slug" --prerelease --latest=false
 fi
 body="$(gh release view latest -R "$slug" --json body --jq .body)"
 on_latest="$(gh release view latest -R "$slug" --json assets --jq '.assets[].name')"
 dir="$(mktemp -d)"
 changed=0
+# Files of excluded parts come off "latest".
+while IFS= read -r old; do
+  if [ -n "$old" ] && excluded "$old"; then
+    gh release delete-asset latest "$old" -R "$slug" -y
+    echo "latest: removed $old (latest-exclude)"
+    changed=1
+  fi
+done <<<"$on_latest"
 for k in "${!want[@]}"; do
   read -r n name <<<"${want[$k]}"
   # Already there from that build.
@@ -50,6 +76,7 @@ done
 lines="$(for k in "${!want[@]}"; do read -r n name <<<"${want[$k]}"; echo "- $name: build $n"; done)"
 while IFS= read -r old; do
   [ -n "$old" ] || continue
+  excluded "$old" && continue
   [ -n "${want[$(part_key "$old")]:-}" ] && continue
   lines+=$'\n'"$(grep -F -- "- $old: build" <<<"$body" || echo "- $old: an older build")"
 done < <(gh release view latest -R "$slug" --json assets --jq '.assets[].name')
