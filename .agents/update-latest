@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Keeps the "latest" pre-release holding the newest file of every part: for each part, the file from
-# the newest build pre-release whose commit is on main. Its notes list the build of each file.
-# A part is a file name without its digits, dots, dashes and underscores, so oryx.apk, gyrophone-0.1.440.apk and gyrophone-0.1.446.apk
-# are one part. Uses git and GitHub only; prune.yml runs it in CI, daily and when agent-publish
-# starts it.
+# Keeps the "latest" release (titled "Development build") holding the newest file of every part:
+# for each part, the file from the newest build pre-release whose commit is on main. Its notes
+# list the build of each file. A part is a file name without its digits, dots, dashes and
+# underscores, so oryx.apk and gyrophone-0.1.440.apk / gyrophone-0.1.446.apk match their parts.
+# Parts matching .agents/hooks/latest-exclude never go on it. Uses git and GitHub only; prune.yml
+# runs it in CI after each push to main, daily, and when agent-publish starts it.
 # Usage: .agents/update-latest
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -39,11 +40,12 @@ done < <(git ls-remote --tags origin 'refs/tags/build/*' | sed -nE 's#^([0-9a-f]
 [ "${#want[@]}" -gt 0 ] || { echo "No build on main has a pre-release yet."; exit 0; }
 
 if ! gh api "repos/$slug/releases/tags/latest" >/dev/null 2>&1; then
-  gh release create latest -R "$slug" --target main --title Latest --prerelease --notes "Filling in."
+  gh release create latest -R "$slug" --target main --title "Development build" --latest --notes "Filling in."
 fi
-# A pre-release, like the builds: nothing here is a release yet.
-if [ "$(gh api "repos/$slug/releases/tags/latest" --jq .prerelease)" != true ]; then
-  gh release edit latest -R "$slug" --prerelease --latest=false
+# A full release marked Latest, so the repo's sidebar links it; its title and notes say it's a
+# development build (the versions are below 1.0 too).
+if [ "$(gh api "repos/$slug/releases/tags/latest" --jq '"\(.prerelease) \(.name)"')" != "false Development build" ]; then
+  gh release edit latest -R "$slug" --prerelease=false --latest --title "Development build"
 fi
 body="$(gh release view latest -R "$slug" --json body --jq .body)"
 on_latest="$(gh release view latest -R "$slug" --json assets --jq '.assets[].name')"
@@ -71,6 +73,7 @@ for k in "${!want[@]}"; do
   echo "latest: $name from build $n"
   changed=1
 done
+if [ "$changed" = 0 ] && ! grep -q "^Still in development" <<<"$body"; then changed=1; fi
 [ "$changed" = 1 ] || { echo "latest is up to date."; exit 0; }
 # The notes: each file and its build; files of parts no kept build has keep their old line.
 lines="$(for k in "${!want[@]}"; do read -r n name <<<"${want[$k]}"; echo "- $name: build $n"; done)"
@@ -80,6 +83,6 @@ while IFS= read -r old; do
   [ -n "${want[$(part_key "$old")]:-}" ] && continue
   lines+=$'\n'"$(grep -F -- "- $old: build" <<<"$body" || echo "- $old: an older build")"
 done < <(gh release view latest -R "$slug" --json assets --jq '.assets[].name')
-gh release edit latest -R "$slug" --notes "The newest build of every part, from main. Older builds are on the build/<n> pre-releases.
+gh release edit latest -R "$slug" --latest --notes "Still in development, no stable release yet. Each file is the newest build from main; older builds are on the build/<n> pre-releases.
 
 $(sort <<<"$lines")"
