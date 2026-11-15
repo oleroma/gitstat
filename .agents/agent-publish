@@ -9,6 +9,7 @@
 # build's version taken out, so gyrophone-0.1.440.apk and gyrophone-0.1.446.apk are one part.
 # The build's full checks must have passed. When the release already exists (a build that
 # couldn't reach the phone publishes its APK there), only the files it lacks are added.
+# Then it puts the files on the "latest" release, replacing each part's older file there.
 source "$(dirname "$0")/lib.sh"
 cd "$WORKTREE"
 
@@ -93,4 +94,27 @@ else
   for f in "${files[@]}"; do summary+=("File: $(basename "$f")"); done
 fi
 summary+=("${notes[@]}")
+
+# The "latest" release always holds the newest published file of every part: each file
+# published here replaces that part's older file there. Its tag stays where it was made.
+latest_url="https://github.com/$SLUG/releases/tag/latest"
+if ! gh api "repos/$SLUG/releases/tags/latest" >/dev/null 2>&1; then
+  gh release create latest -R "$SLUG" --target "$sha" --title "Latest" \
+    --notes "The newest published build of every part. Each file's name has its version; older builds are on the build/<n> pre-releases." ||
+    die "Published $tag, but creating the latest release failed."
+fi
+# part_key <name>: the file name without any numbers or versions, the same for every build of a part.
+part_key() { sed -E 's/[0-9]+(\.[0-9]+)*//g' <<<"$1"; }
+on_latest="$(gh release view latest -R "$SLUG" --json assets --jq '.assets[].name')" ||
+  die "Published $tag, but reading the latest release failed."
+for f in "${files[@]}"; do
+  while IFS= read -r old; do
+    [ -n "$old" ] && [ "$old" != "$(basename "$f")" ] || continue
+    if [ "$(part_key "$old")" = "$(part_key "$(basename "$f")")" ]; then
+      gh release delete-asset latest "$old" -R "$SLUG" -y || die "Published $tag, but removing $old from the latest release failed."
+    fi
+  done <<<"$on_latest"
+done
+gh release upload latest "${files[@]}" -R "$SLUG" --clobber || die "Published $tag, but updating the latest release failed."
+summary+=("Updated the latest release: $latest_url")
 finish done "${summary[@]}"

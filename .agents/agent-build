@@ -332,7 +332,9 @@ build_ci() {
   local n summary=("Built in CI: $RUN_URL" "Full checks: before the merge (agent-check).")
   n="$(newest_build_tag "$(git rev-parse HEAD)")"
   [ -n "$n" ] || die "The fallback run passed but no build/<n> tag is on this commit: $RUN_URL"
-  mapfile -t -O 1 summary < <(release_lines "$n")
+  mapfile -t -O "${#summary[@]}" summary < <(release_lines "$n")
+  # Old builds' pre-releases go, as after a PC build's upload (lib.sh prune_releases).
+  prune_releases || summary+=("Couldn't remove the pre-releases of older builds; the next build tries again.")
 
   finish done "${summary[@]}"
 }

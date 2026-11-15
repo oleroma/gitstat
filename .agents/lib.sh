@@ -378,3 +378,33 @@ warn_unbuilt() {
   done < <(unbuilt_lines origin/main)
   [ -z "$left" ] || status "⚠️ Merged without a build and not in this one: $left"
 }
+
+# prune_releases: keeps the newest KEEP_BUILDS build/<n> pre-releases, plus every build on an open
+# PR's branch that main doesn't have yet, and deletes the older ones with their files. The
+# build/<n> tags stay: the scripts read them. Anything it can't read keeps every release.
+KEEP_BUILDS=20
+prune_releases() {
+  local page=1 rels="" more pr heads=() id n sha h keep
+  git fetch -q origin main --tags || return 1
+  while read -r pr; do
+    [ -n "$pr" ] || continue
+    git fetch -q origin "refs/pull/$pr/head" || return 1
+    heads+=("$(git rev-parse FETCH_HEAD)")
+  done < <(gh api "repos/$SLUG/pulls?state=open&per_page=100" --jq '.[].number') || return 1
+  while :; do
+    more="$(gh api "repos/$SLUG/releases?per_page=100&page=$page" --jq '.[] | select(.tag_name | test("^build/[0-9]+$")) | "\(.tag_name | ltrimstr("build/")) \(.id)"')" || return 1
+    [ -n "$more" ] || break
+    rels+="$more"$'\n'
+    page=$((page + 1))
+  done
+  while read -r n id; do
+    sha="$(git rev-parse -q --verify "refs/tags/build/$n^{commit}")" || continue
+    keep=0
+    if ! git merge-base --is-ancestor "$sha" origin/main; then
+      for h in "${heads[@]}"; do
+        if git merge-base --is-ancestor "$sha" "$h"; then keep=1; fi
+      done
+    fi
+    [ "$keep" = 1 ] || gh api -X DELETE "repos/$SLUG/releases/$id" >/dev/null || return 1
+  done < <(grep -v '^$' <<<"$rels" | sort -rn | tail -n +$((KEEP_BUILDS + 1)))
+}
