@@ -161,6 +161,7 @@ build_pc() {
   # builds. The install runs after the build, so a phone connected by then still gets it.
   local what
   what="$(what_emoji)"
+  warn_unbuilt "$SHA"
   if [[ "$what" != *🤖* ]]; then
     status "🔨🖥️$what Building on the PC."
   elif command -v adb >/dev/null 2>&1 && [ "$(adb devices | awk -F'\t' 'NR > 1 && $2 == "device"' | wc -l)" -gt 0 ]; then
@@ -318,6 +319,7 @@ build_ci() {
     die "HEAD isn't what's pushed on origin/$BRANCH. Run agent-commit first."
   guard_workflow_change
   guard_other_build "$(git rev-parse HEAD)"
+  warn_unbuilt "$(git rev-parse HEAD)"
 
   # The run does what a PC build does: quick tests, build, publish. run_fallback shows the
   # release links as soon as the build is published. The full checks run before the merge.

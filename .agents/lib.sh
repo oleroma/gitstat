@@ -336,3 +336,45 @@ conflict_markers() {
     if [ -f "$f" ] && grep -qE '^(<<<<<<<|>>>>>>>)( |$)' "$f"; then echo "$f"; fi
   done
 }
+
+# Merges made with "agent-merge --unbuilt" are listed in .agents/unbuilt, one per line:
+# "<commit> <parts> <PR number> <PR title>", where <commit> is the branch's last commit and
+# <parts> the parts it changed, comma-separated ("all" in a repo without hooks/parts). Every
+# build warns about the lines it doesn't build; a later feature's merge removes the lines its
+# build covered.
+
+# build_parts: the parts a build of this branch builds, comma-separated (hooks/parts), or "all".
+build_parts() {
+  if [ -f "$WORKTREE/.agents/hooks/parts" ]; then
+    bash "$WORKTREE/.agents/hooks/parts" | paste -sd, -
+  else
+    echo all
+  fi
+}
+
+# covers <commit> <parts> <unbuilt commit> <unbuilt parts>: true if a build of <commit> with
+# <parts> built that unbuilt merge: <commit> has its changes, and <parts> has every part it changed.
+covers() {
+  local p
+  git merge-base --is-ancestor "$3" "$1" 2>/dev/null || return 1
+  for p in ${4//,/ }; do
+    case ",$2," in *",$p,"*) ;; *) return 1 ;; esac
+  done
+}
+
+# unbuilt_lines <ref>: the lines of .agents/unbuilt at <ref>.
+unbuilt_lines() { git show "$1:.agents/unbuilt" 2>/dev/null | sed 's/[[:space:]]*$//' | grep -v '^$' || true; }
+
+# warn_unbuilt <commit>: before a build of <commit>, a ⚠️ status line lists the unbuilt merges on
+# main that this build doesn't build.
+warn_unbuilt() {
+  local c p n title parts left=""
+  git fetch -q origin main || true
+  parts="$(build_parts)"
+  while read -r c p n title; do
+    [ -n "$c" ] || continue
+    covers "$1" "$parts" "$c" "$p" && continue
+    left+="${left:+, }[PR #$n](https://github.com/$SLUG/pull/$n) $title ($p)"
+  done < <(unbuilt_lines origin/main)
+  [ -z "$left" ] || status "⚠️ Merged without a build and not in this one: $left"
+}

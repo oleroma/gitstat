@@ -2,8 +2,9 @@
 # Step 5: bring the latest main into the feature branch, then merge the branch into main.
 # Usage: .agents/agent-merge [--unbuilt]   (run it again after resolving conflicts)
 #   --unbuilt: only when Olex says to merge without a build. Merges without a checked build and
-#   without asking to test again; the merge commit's title ends in "(unbuilt)", so the next
-#   branch's build also builds the parts this one changed (hooks/parts).
+#   without asking to test again; the merge commit's title ends in "(unbuilt)", and the branch is
+#   listed in .agents/unbuilt (lib.sh), so every build warns about it until a later feature's
+#   build covers it.
 UNBUILT=0
 if [ "${1:-}" = --unbuilt ]; then UNBUILT=1; shift; fi
 source "$(dirname "$0")/lib.sh"
@@ -16,13 +17,53 @@ attempts_file="$(git rev-parse --path-format=absolute --git-path "agent-merge-at
 files_file="$attempts_file.files"
 attempts="$(cat "$attempts_file" 2>/dev/null || echo 0)"
 
-merge_into_main() {
-  if [ "$(git rev-parse HEAD)" != "$(git rev-parse "origin/$BRANCH")" ]; then
-    git push origin "$BRANCH"
+# last_built: the branch's newest commit since main that was built, or nothing.
+last_built() {
+  local c
+  while read -r c; do
+    if has_build "$c"; then echo "$c"; return 0; fi
+  done < <(git rev-list --first-parent "$(git merge-base HEAD origin/main)..HEAD")
+}
+
+# track_unbuilt <pr>: before the merge, updates .agents/unbuilt (lib.sh) and commits it on the
+# branch: --unbuilt adds this branch; a built merge removes the lines its last build covered.
+# HEAD has the latest main here, so its copy is main's plus this branch's.
+track_unbuilt() {
+  local n="$1" file="$WORKTREE/.agents/unbuilt" parts c p m title built lines
+  parts="$(build_parts)"
+  if [ "$UNBUILT" = 1 ]; then
+    lines="$(unbuilt_lines HEAD)"
+    if ! awk -v n="$n" '$3 == n { found = 1 } END { exit !found }' <<<"$lines"; then
+      title="$(gh api "repos/$SLUG/pulls/$n" --jq .title)"
+      title="${title//[$'\t\n']/ }"
+      lines+="${lines:+$'\n'}$(git rev-parse HEAD) $parts $n $title"
+    fi
+  else
+    built="$(last_built)"
+    lines="$(while read -r c p m title; do
+      [ -n "$c" ] || continue
+      if [ -n "$built" ] && covers "$built" "$parts" "$c" "$p"; then continue; fi
+      echo "$c $p $m $title"
+    done < <(unbuilt_lines HEAD))"
   fi
+  [ "$lines" != "$(unbuilt_lines HEAD)" ] || return 0
+  if [ -n "$lines" ]; then
+    printf '%s\n' "$lines" >"$file"
+    git add "$file"
+  else
+    git rm -q "$file"
+  fi
+  git commit -q -m "Update the list of merges without a build (.agents/unbuilt)"
+}
+
+merge_into_main() {
   local n
   n="$(pr_number "$BRANCH")"
   [ -n "$n" ] || die "No open PR from $BRANCH into main."
+  track_unbuilt "$n"
+  if [ "$(git rev-parse HEAD)" != "$(git rev-parse "origin/$BRANCH")" ]; then
+    git push origin "$BRANCH"
+  fi
   pr_ready "$n"
   local title=()
   if [ "$UNBUILT" = 1 ]; then title=(-f "commit_title=Merge pull request #$n from $BRANCH (unbuilt)"); fi
@@ -32,7 +73,7 @@ merge_into_main() {
   if [ "$UNBUILT" = 1 ]; then
     status "🔀 Merged $BRANCH, not built: [PR #$n](https://github.com/$SLUG/pull/$n)"
     finish done "Merged $BRANCH into main unbuilt: https://github.com/$SLUG/pull/$n" \
-      "The next build of a branch made from main after this builds its parts too." "The feature branch is kept."
+      "Listed in .agents/unbuilt: every build warns about it until a later feature's build covers it." "The feature branch is kept."
   fi
   status "🔀 Merged $BRANCH: [PR #$n](https://github.com/$SLUG/pull/$n)"
   finish done "Merged $BRANCH into main: https://github.com/$SLUG/pull/$n" "The feature branch is kept."
