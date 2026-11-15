@@ -231,7 +231,7 @@ build_pc() {
   echo "$version-$commit" >"$BUILD_DIR/builds/.newest-build"
 
   # Keep the last 4 builds, plus the newest build of each part (and the newest one on main) that
-  # they don't have, so agent-publish still finds a part that hasn't been rebuilt for a while.
+  # they don't have, so agent-install still finds a part that hasn't been rebuilt for a while.
   # A part is a file name without its build's version. Old-style build folders may hold a
   # worktree; prune forgets those.
   local seen=" " seen_main=" " i=0 d dv dc f p keep
