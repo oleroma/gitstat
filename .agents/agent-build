@@ -178,7 +178,7 @@ build_pc() {
     fetch_ci_build "$ci_tag" "$BUILD_DIR/logs/ci-build"
   else
     if [ -f "$HOOKS/quick-test" ]; then
-      bash "$HOOKS/quick-test" || { status "❌$what Quick tests failed at $commit."; die "Quick tests failed at $commit. Not built."; }
+      bash "$HOOKS/quick-test" || { status "❌$what Quick tests failed at $commit."; finish checks-failed "Quick tests failed at $commit (see the log). Not built."; }
     fi
 
     # The repo's next build number, claimed on GitHub; the build hook makes the version from it.
@@ -188,7 +188,7 @@ build_pc() {
     if ! bash "$HOOKS/build" >"$out_file"; then
       cat "$out_file"
       status "❌$what Build failed at $commit."
-      die "Build failed at $commit."
+      finish checks-failed "Build failed at $commit (see the log)."
     fi
     cat "$out_file"
 
@@ -321,7 +321,12 @@ build_ci() {
 
   # The run does what a PC build does: quick tests, build, publish. run_fallback shows the
   # release links as soon as the build is published. The full checks run before the merge.
-  run_fallback || die "The fallback run failed: $RUN_URL"
+  if ! run_fallback; then
+    status "❌$(what_emoji) CI build failed: [CI run]($RUN_URL)"
+    failed="$(failed_steps "$RUN" | paste -sd ';' -)"
+    finish checks-failed "The CI build failed: $RUN_URL" "Failed: ${failed:-(see the run)}" \
+      "The cause is in that job's step log in the CI run."
+  fi
   local n summary=("Built in CI: $RUN_URL" "Full checks: before the merge (agent-check).")
   n="$(newest_build_tag "$(git rev-parse HEAD)")"
   [ -n "$n" ] || die "The fallback run passed but no build/<n> tag is on this commit: $RUN_URL"

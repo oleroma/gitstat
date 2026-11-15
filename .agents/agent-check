@@ -22,7 +22,9 @@ if [ "$MODE" = ci ]; then
   if checked "$sha"; then status "✅ Full checks already passed at ${sha:0:7}."; finish done "The full checks already passed at ${sha:0:7}."; fi
   if ! run_fallback checks; then
     status "❌ Full checks failed in CI at ${sha:0:7}: [CI run]($RUN_URL)"
-    finish checks-failed "Full checks failed in CI at ${sha:0:7}: $RUN_URL" "Fix them, build again (step 3), then run agent-check again."
+    failed="$(failed_steps "$RUN" | paste -sd ';' -)"
+    finish checks-failed "Full checks failed in CI at ${sha:0:7}: $RUN_URL" "Failed: ${failed:-(see the run)}" \
+      "The cause is in that job's step log in the CI run. Fix them, build again (step 3), then run agent-check again."
   fi
   status "✅ Full checks passed in CI at ${sha:0:7}."
   finish done "Full checks passed in CI at ${sha:0:7}: $RUN_URL" "agent-merge can merge it now."

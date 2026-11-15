@@ -110,6 +110,16 @@ pr_ready() {
   gh api -X POST "repos/$SLUG/pulls/$1/ccr/ready_for_review" >/dev/null || gh pr ready "$1" -R "$SLUG"
 }
 
+# gh_retry <gh args>: runs gh, trying again up to 4 times, 10 s apart, when it fails.
+gh_retry() {
+  local i
+  for i in 1 2 3 4 5; do
+    gh "$@" && return 0
+    sleep 10
+  done
+  return 1
+}
+
 # wait_main_cache: when cache.yml is still compiling main, waits for it (at most 30 minutes),
 # so the fallback run starts from main's warm caches instead of building cold. Never fails.
 wait_main_cache() {
@@ -117,7 +127,7 @@ wait_main_cache() {
   for i in $(seq 1 60); do
     [ -n "$(gh run list -R "$SLUG" --workflow cache.yml --branch main --limit 5 --json status \
       --jq '[.[] | select(.status != "completed")][0].status // empty' 2>/dev/null)" ] || return 0
-    if [ "$i" = 1 ]; then echo "Waiting for the main cache run to finish first." >&2; fi
+    if [ "$i" = 1 ]; then status "⏳ Waiting for main's cache run to finish first (up to 30 min)."; fi
     sleep 30
   done
   return 0
@@ -161,10 +171,18 @@ run_fallback() {
         release_lines "$n" >&3
       fi
     fi
-    state="$(gh api "repos/$SLUG/actions/runs/$RUN" --jq '"\(.status) \(.conclusion // "")"')"
+    # A failed poll is tried again: one lost answer from GitHub doesn't end the build.
+    state="$(gh_retry api "repos/$SLUG/actions/runs/$RUN" --jq '"\(.status) \(.conclusion // "")"')" ||
+      die "Lost contact with GitHub while CI was running: $RUN_URL (the run goes on)."
     case "$state" in completed*) break ;; esac
   done
   [ "$state" = "completed success" ]
+}
+
+# failed_steps <run>: the run's failed jobs and steps, one "job: step" per line.
+failed_steps() {
+  gh api "repos/$SLUG/actions/runs/$1/jobs" --jq '.jobs[] | select(.conclusion == "failure")
+    | "\(.name): \([.steps[]? | select(.conclusion == "failure") | .name] | join(", "))"' 2>/dev/null || true
 }
 
 # fallback_published <run>: prints true once every build job of the run that isn't skipped has
