@@ -2,9 +2,12 @@ name: Prune old builds
 
 # Deletes old builds' build/<n> tags and pre-releases (.agents/prune-releases): keeps the newest
 # 20 and every build on an open PR's branch. Then puts the newest file of every part from main's
-# builds on the "latest" release (.agents/update-latest). Runs daily, and agent-publish starts it.
+# builds on the "latest" release (.agents/update-latest). Runs after each push to main, daily,
+# and when agent-publish starts it.
 # PC builds also prune after each upload.
 on:
+  push:
+    branches: [main]
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
