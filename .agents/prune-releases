@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Deletes the pre-releases of old builds: keeps the newest 20 build/<n> pre-releases, plus every
+# build on an open PR's branch that main doesn't have yet. The build/<n> tags stay: the scripts
+# read them. Anything it can't read keeps every release. Uses git and GitHub only, so it works on
+# the PC (upload-build runs it after each upload) and in CI (prune.yml runs it daily).
+# Usage: .agents/prune-releases [--dry-run]
+set -euo pipefail
+cd "$(dirname "$0")/.."
+KEEP=20
+dry=0
+if [ "${1:-}" = --dry-run ]; then dry=1; fi
+slug="${GITHUB_REPOSITORY:-$(git remote get-url origin | sed -E 's#\.git$##; s#.*[:/]([^/]+/[^/]+)$#\1#')}"
+git fetch -q origin main --tags
+heads=()
+while read -r pr; do
+  [ -n "$pr" ] || continue
+  git fetch -q origin "refs/pull/$pr/head"
+  heads+=("$(git rev-parse FETCH_HEAD)")
+done < <(gh api "repos/$slug/pulls?state=open&per_page=100" --jq '.[].number')
+rels="" page=1
+while :; do
+  more="$(gh api "repos/$slug/releases?per_page=100&page=$page" \
+    --jq '.[] | select(.tag_name | test("^build/[0-9]+$")) | "\(.tag_name | ltrimstr("build/")) \(.id)"')"
+  [ -n "$more" ] || break
+  rels+="$more"$'\n'
+  page=$((page + 1))
+done
+gone=0
+while read -r n id; do
+  sha="$(git rev-parse -q --verify "refs/tags/build/$n^{commit}")" || continue
+  keep=0
+  if ! git merge-base --is-ancestor "$sha" origin/main; then
+    for h in "${heads[@]}"; do
+      if git merge-base --is-ancestor "$sha" "$h"; then keep=1; fi
+    done
+  fi
+  [ "$keep" = 0 ] || continue
+  if [ "$dry" = 1 ]; then echo "Would delete the build/$n pre-release."; else gh api -X DELETE "repos/$slug/releases/$id" >/dev/null; fi
+  gone=$((gone + 1))
+done < <(grep -v '^$' <<<"$rels" | sort -rn | tail -n +$((KEEP + 1)))
+if [ "$dry" = 1 ]; then echo "Would delete $gone old build pre-releases."; else echo "Deleted $gone old build pre-releases."; fi
