@@ -1,7 +1,7 @@
 name: Prune old builds
 
-# Deletes the pre-releases of old builds daily (.agents/prune-releases): keeps the newest 20 and
-# every build on an open PR's branch, and keeps all build/<n> tags. PC builds also run it after
+# Deletes old builds' build/<n> tags and pre-releases daily (.agents/prune-releases): keeps the
+# newest 20 and every build on an open PR's branch. PC builds also run it after
 # each upload; this covers CI builds. Run it by hand from the Actions tab too.
 on:
   schedule:
@@ -23,7 +23,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
-      - name: Delete old build pre-releases
+      - name: Delete old builds
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash .agents/prune-releases
