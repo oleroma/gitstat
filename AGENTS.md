@@ -46,7 +46,7 @@
    ```
 
 ## Status lines
-The scripts print status lines for Olex: lines that start with `status: `, with their emoji and links. Post each one as it shows, without `status: `. Write your own line only for what no script says, starting with its emoji:
+The scripts print status lines for Olex: lines that start with `status: `, with their emoji and links. Post each one as it shows, without `status: `. Write your own line only for what no script says (a question, a failure's cause, the end report), starting with its emoji:
 
 | Emoji | Means | Example |
 |---|---|---|
@@ -91,8 +91,8 @@ When Olex says "wdyt", give your honest opinion.
 ## Builds
 - Everything made by building, testing or running the program (outputs, logs, screenshots, caches, downloads) goes in the repo's gitignored `build/` folder, nowhere else in the repo. Leave files other tools keep in the repo (such as `.delta/` and `.gitstat/`) alone.
 - `build/src` is the one PC build worktree, reused so builds stay incremental. Nothing is ever edited in it.
-- Every build gets the repo's next build number, pushed as a `build/<n>` tag by `.agents/build-number`. Only the newest 20 builds are kept, plus the builds of open PRs; `.agents/prune-releases` deletes older builds' tags and pre-releases after each PC build and daily in CI (`prune.yml`). Their commits stay, so an old build can be made again. The version is the hand-bumped version name plus the number, `<name>-<n>` (or `0.1.<n>` where the name holds it), and Android's `versionCode` is the number. A repo may start its count at the number in `.agents/hooks/first-build-number`.
-- When Olex asks to publish, run `bash .agents/agent-publish` from your session, with `main` checked out. It builds `main` in CI with every part, publishes it as a pre-release, and puts its files on the `latest` release, titled "Development build", which the repo's sidebar shows as Latest. `prune.yml` also refreshes `latest` daily, so it always holds the newest file of every part from `main`.
+- Every build gets the repo's next build number, pushed as a `build/<n>` tag by `.agents/build-number`. Only the newest 20 builds are kept, plus the builds of open PRs; `.agents/prune-releases` deletes older builds' tags and pre-releases in CI (`prune.yml`), after each push to `main` and daily. Their commits stay, so an old build can be made again. The version is the hand-bumped version name plus the number, `<name>-<n>` (or `0.1.<n>` where the name holds it), and Android's `versionCode` is the number. A repo may start its count at the number in `.agents/hooks/first-build-number`.
+- When Olex asks to publish, run `bash .agents/agent-publish` from your session, with `main` checked out. It builds `main` in CI with every part, publishes it as a pre-release, and puts its files on the `latest` release, titled "Development build", which the repo's sidebar shows as Latest. `prune.yml` also refreshes `latest` after each push to `main` and daily, from the newest build of each part on `main`. That build can predate a merge (a feature merged without a new build, or `--unbuilt`), so `latest` can lag `main` until the next publish.
 - Keep builds fast: build caches on and never cleaned, build daemons kept running on the PC, quicker settings for branch builds as long as the build file runs the same way.
 - When bumping Gradle, run `./gradlew wrapper --gradle-version <v> --gradle-distribution-sha256-sum <sum>`, with the sum from gradle.org, so the wrapper keeps checking its download.
 

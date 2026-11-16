@@ -199,6 +199,32 @@ newest_build_tag() {
     sed -nE "s#^$1\s+refs/tags/build/([0-9]+)\$#\1#p" | sort -n | tail -n 1
 }
 
+# published_build <sha>: true if a build of <sha> was published: a build/<n> tag is on it and
+# its pre-release has files. The tag alone isn't enough: build-number pushes it before the build
+# runs, so a failed build leaves one too.
+published_build() {
+  local n
+  while read -r n; do
+    [ -n "$n" ] || continue
+    [ "$(gh api "repos/$SLUG/releases/tags/build/$n" --jq '.assets | length' 2>/dev/null || echo 0)" -gt 0 ] && return 0
+  done < <(git -C "$WORKTREE" ls-remote --tags origin 'refs/tags/build/*' |
+    sed -nE "s#^$1\s+refs/tags/build/([0-9]+)\$#\1#p" | sort -rn)
+  return 1
+}
+
+# main_build: the commit of the newest published build of main itself (agent-publish builds main
+# with every part), or nothing. Those commits are on main's first-parent line; feature builds
+# are on their branches' commits.
+main_build() {
+  local first sha
+  first="$(git -C "$WORKTREE" rev-list --first-parent -n 200 origin/main)"
+  while read -r sha; do
+    grep -qxF "$sha" <<<"$first" || continue
+    if published_build "$sha"; then echo "$sha"; return 0; fi
+  done < <(git -C "$WORKTREE" ls-remote --tags origin 'refs/tags/build/*' |
+    sed -nE 's#^([0-9a-f]+)\s+refs/tags/build/([0-9]+)$#\2 \1#p' | sort -rn | awk '{print $2}' | awk '!seen[$0]++')
+}
+
 # release_lines <n>: the build/<n> pre-release's link and a direct download link for each file.
 release_lines() {
   local url="https://github.com/$SLUG/releases/tag/build/$1"
@@ -206,8 +232,7 @@ release_lines() {
   gh api "repos/$SLUG/releases/tags/build/$1" --jq '.assets[] | "\(.name): direct download link \(.browser_download_url)"'
 }
 
-# The full checks run once per feature, before the merge (agent-check on the PC; a CI build also
-# runs them). When they pass, the commit gets a GitHub commit status named full-check, so nothing
+# The full checks run once per feature, before the merge (agent-check, on the PC or in CI). When they pass, the commit gets a GitHub commit status named full-check, so nothing
 # runs them again on that commit.
 
 # checked <sha>: true if the full checks already passed on <sha>.
@@ -366,14 +391,17 @@ covers() {
 unbuilt_lines() { git show "$1:.agents/unbuilt" 2>/dev/null | sed 's/[[:space:]]*$//' | grep -v '^$' || true; }
 
 # warn_unbuilt <commit>: before a build of <commit>, a ⚠️ status line lists the unbuilt merges on
-# main that this build doesn't build.
+# main that this build doesn't build, and that no published build of main (agent-publish, every
+# part) has built since.
 warn_unbuilt() {
-  local c p n title parts left=""
+  local c p n title parts left="" pub
   git fetch -q origin main || true
   parts="$(build_parts)"
+  pub="$(main_build)"
   while read -r c p n title; do
     [ -n "$c" ] || continue
     covers "$1" "$parts" "$c" "$p" && continue
+    if [ -n "$pub" ] && git merge-base --is-ancestor "$c" "$pub" 2>/dev/null; then continue; fi
     left+="${left:+, }[PR #$n](https://github.com/$SLUG/pull/$n) $title ($p)"
   done < <(unbuilt_lines origin/main)
   [ -z "$left" ] || status "⚠️ Merged without a build and not in this one: $left"

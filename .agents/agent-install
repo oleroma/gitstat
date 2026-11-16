@@ -28,7 +28,6 @@ fi
 build_id="${1:-}"
 if [ -z "$build_id" ]; then
   newest="$BUILD_DIR/builds/.newest-build"
-  if [ ! -f "$newest" ]; then newest="$BUILD_DIR/.newest-build"; fi
   [ -f "$newest" ] || die "No build to install yet: run agent-build pc first."
   build_id="$(head -n 1 "$newest")"
 fi

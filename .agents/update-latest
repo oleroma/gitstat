@@ -47,6 +47,13 @@ fi
 if [ "$(gh api "repos/$slug/releases/tags/latest" --jq '"\(.prerelease) \(.name)"')" != "false Development build" ]; then
   gh release edit latest -R "$slug" --prerelease=false --latest --title "Development build"
 fi
+# The tag follows main, so the page's source-code downloads are main's code too. Only CI can
+# move it (the cloud can't write refs).
+main_sha="$(git rev-parse origin/main)"
+if [ "$(git ls-remote origin refs/tags/latest | cut -f1)" != "$main_sha" ]; then
+  gh api -X PATCH "repos/$slug/git/refs/tags/latest" -f sha="$main_sha" -F force=true >/dev/null ||
+    echo "Couldn't move the latest tag to main."
+fi
 body="$(gh release view latest -R "$slug" --json body --jq .body)"
 on_latest="$(gh release view latest -R "$slug" --json assets --jq '.assets[].name')"
 dir="$(mktemp -d)"

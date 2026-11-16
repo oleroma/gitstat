@@ -26,10 +26,11 @@ last_built() {
 }
 
 # track_unbuilt <pr>: before the merge, updates .agents/unbuilt (lib.sh) and commits it on the
-# branch: --unbuilt adds this branch; a built merge removes the lines its last build covered.
+# branch: --unbuilt adds this branch; a built merge removes the lines its last build covered, and
+# the lines a published build of main (agent-publish) covered.
 # HEAD has the latest main here, so its copy is main's plus this branch's.
 track_unbuilt() {
-  local n="$1" file="$WORKTREE/.agents/unbuilt" parts c p m title built lines
+  local n="$1" file="$WORKTREE/.agents/unbuilt" parts c p m title built pub lines
   parts="$(build_parts)"
   if [ "$UNBUILT" = 1 ]; then
     lines="$(unbuilt_lines HEAD)"
@@ -40,9 +41,11 @@ track_unbuilt() {
     fi
   else
     built="$(last_built)"
+    pub="$(main_build)"
     lines="$(while read -r c p m title; do
       [ -n "$c" ] || continue
       if [ -n "$built" ] && covers "$built" "$parts" "$c" "$p"; then continue; fi
+      if [ -n "$pub" ] && git merge-base --is-ancestor "$c" "$pub" 2>/dev/null; then continue; fi
       echo "$c $p $m $title"
     done < <(unbuilt_lines HEAD))"
   fi
@@ -79,8 +82,9 @@ merge_into_main() {
   finish done "Merged $BRANCH into main: https://github.com/$SLUG/pull/$n" "The feature branch is kept."
 }
 
-# has_build <sha>: true if <sha> was built (a build/<n> tag is on it) or its full checks passed.
-has_build() { checked "$1" || [ -n "$(newest_build_tag "$1")" ]; }
+# has_build <sha>: true if <sha> was built (its build/<n> pre-release has files) or its full checks
+# passed.
+has_build() { checked "$1" || published_build "$1"; }
 
 # clean_merge <commit>: true if <commit> merged main into the branch without touching what the
 # feature changed: none of the files it changed (outside pipeline files and docs) differ from the
@@ -129,17 +133,6 @@ built_but_pipeline() {
   done < <(git rev-list --first-parent "$last..HEAD")
 }
 
-# docs_only: true if everything the branch changed since main is documentation (*.md files
-# and docs/), which no build uses, so such a branch merges without a build.
-docs_only() {
-  local f any=0
-  while IFS= read -r f; do
-    any=1
-    case "$f" in *.md | docs/*) ;; *) return 1 ;; esac
-  done < <(git diff --name-only "$(git merge-base HEAD origin/main)" HEAD)
-  [ "$any" = 1 ]
-}
-
 git fetch origin
 
 # A merge is in progress: this is the run after the agent resolved conflicts.
@@ -167,11 +160,11 @@ fi
 # A branch that changed only pipeline files or documentation since main needs no build or full
 # checks, and neither do such commits after the branch's last build: Olex tests pipeline changes
 # himself (lib.sh only_pipeline_changes, built_but_pipeline).
-[ "$UNBUILT" = 1 ] || docs_only || built has_build || only_pipeline_changes || built_but_pipeline has_build || finish not-built "$(git rev-parse --short HEAD) has no build." \
+[ "$UNBUILT" = 1 ] || built has_build || only_pipeline_changes || built_but_pipeline has_build || finish not-built "$(git rev-parse --short HEAD) has no published build (a PC build's upload may still be running)." \
   "Build it (step 3) and have Olex test it, then run agent-merge again."
 # Builds don't run the full checks: they run once before the merge (agent-check), or earlier when
 # Olex says "check"; a check of this same commit counts.
-[ "$UNBUILT" = 1 ] || docs_only || built checked || only_pipeline_changes || built_but_pipeline checked || finish needs-checks "$(git rev-parse --short HEAD) is built but hasn't had its full checks." \
+[ "$UNBUILT" = 1 ] || built checked || only_pipeline_changes || built_but_pipeline checked || finish needs-checks "$(git rev-parse --short HEAD) is built but hasn't had its full checks." \
   "Run them on the PC: agent-check pc $BRANCH (when the PC is offline: agent-check ci $BRANCH), then run agent-merge again."
 
 # main hasn't moved since the branch last took it in.
@@ -190,7 +183,7 @@ done <<<"$overlap")"
 
 if git merge --no-edit origin/main; then
   git push origin "$BRANCH"
-  if [ -n "$overlap" ] && [ "$UNBUILT" = 0 ] && ! docs_only; then
+  if [ -n "$overlap" ] && [ "$UNBUILT" = 0 ]; then
     finish needs-testing "Merged the latest main. It changed files this feature also changed:" "$overlap" \
       "Build again (step 3). Once Olex says it still works, run agent-merge again."
   fi

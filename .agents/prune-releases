@@ -3,8 +3,8 @@
 # main doesn't have yet, and deletes the others' build/<n> tags and pre-releases with their files.
 # The commits stay in git, so an old build can be made again from its commit. The newest builds'
 # tags stay, so build-number keeps counting up. Anything it can't read keeps everything.
-# Uses git and GitHub only, so it works on the PC (upload-build runs it after each upload) and in
-# CI (prune.yml runs it daily).
+# Uses git and GitHub only; prune.yml runs it in CI after each push to main, daily, and when
+# agent-publish starts it.
 # Usage: .agents/prune-releases [--dry-run]
 set -euo pipefail
 cd "$(dirname "$0")/.."

@@ -19,13 +19,12 @@ cd "$WORKTREE"
 HOOKS="$WORKTREE/.agents/hooks"
 
 # ci_build_release <sha>: prints "<n> <version>" for the newest pre-release of <sha> that CI
-# built (the commit's ci-build status, or an older CI build's full-check status "Passed in CI"),
-# or nothing. The release is on the build/<n> tag and its title is the version.
+# built (the commit's ci-build status), or nothing. The release is on the build/<n> tag and its title is the version.
 ci_build_release() {
   local n version
   [ -n "$(gh api "repos/$SLUG/commits/$1/statuses?per_page=100" --jq '.[]
     | select(.state == "success")
-    | select(.context == "ci-build" or (.context == "full-check" and ((.description // "") | startswith("Passed in CI: version")))) | .id' | head -n 1)" ] || return 0
+    | select(.context == "ci-build") | .id' | head -n 1)" ] || return 0
   while read -r n; do
     [ -n "$n" ] || continue
     version="$(gh api "repos/$SLUG/releases/tags/build/$n" --jq 'select((.assets | length) > 0) | .name' 2>/dev/null || true)"
@@ -216,16 +215,11 @@ build_pc() {
   mkdir -p "$dest"
   cp "${files[@]}" "$dest/"
   # builds/.newest lists the build files last copied to build/, removed before the new ones come.
-  # (Older scripts kept these two files directly in build/; those are read once and removed.)
-  local list
-  for list in "$BUILD_DIR/builds/.newest" "$BUILD_DIR/.newest"; do
-    if [ -f "$list" ]; then
-      while IFS= read -r old; do
-        if [ -n "$old" ]; then rm -f "$BUILD_DIR/$old"; fi
-      done <"$list"
-    fi
-  done
-  rm -f "$BUILD_DIR/.newest" "$BUILD_DIR/.newest-build"
+  if [ -f "$BUILD_DIR/builds/.newest" ]; then
+    while IFS= read -r old; do
+      if [ -n "$old" ]; then rm -f "$BUILD_DIR/$old"; fi
+    done <"$BUILD_DIR/builds/.newest"
+  fi
   cp "${files[@]}" "$BUILD_DIR/"
   printf '%s\n' "${names[@]}" >"$BUILD_DIR/builds/.newest"
   echo "$version-$commit" >"$BUILD_DIR/builds/.newest-build"
