@@ -329,8 +329,8 @@ impl Timelines {
         }
     }
 
-    /// Forgets the repos gone from the list. Checks need nothing here: the
-    /// state change redraws the panel, and drawing reloads stale strips.
+    /// Forgets the repos gone from the list, and loads the trees of the
+    /// rest that are new or checked since.
     fn sync(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
         let s = state.read(cx);
         let listed: HashSet<&Path> = s
@@ -342,6 +342,17 @@ impl Timelines {
         self.slots.retain(|p, _| listed.contains(p.as_path()));
         self.prs.retain(|p, _| listed.contains(p.as_path()));
         self.queue.retain(|(p, _)| listed.contains(p.as_path()));
+        // Every tree loads, and reloads after each check, in the
+        // background, so the panel and the window open with them all
+        // drawn. GitHub-only repos only while their section is open: their
+        // history is fetched from GitHub.
+        let mut wanted: Vec<PathBuf> = s.statuses.iter().map(|s| s.path.clone()).collect();
+        if !s.folded(crate::config::Section::GithubOnly) {
+            wanted.extend(s.remote_statuses.iter().map(|s| s.path.clone()));
+        }
+        for path in wanted {
+            self.shown(&path, cx);
+        }
     }
 
     /// `path`'s strip is on screen: loads it if it never was, or reloads it
@@ -853,25 +864,10 @@ impl Timelines {
             },
         )
         .size_full();
-        // A plain wheel over the graph scrolls every strip through time,
-        // as Shift+wheel does anywhere on the strip; over the name it
-        // still scrolls the panel's list.
-        let graph_entity = this.clone();
-        let graph_path = path.clone();
         let painter = div()
             .id(("strip-graph", index))
             .flex_1()
             .h_full()
-            .on_scroll_wheel(move |e: &ScrollWheelEvent, _, cx| {
-                let d = e.delta.pixel_delta(px(STEP * 3.0));
-                let (x, y) = (f32::from(d.x), f32::from(d.y));
-                // Shift and sideways swipes are the strip's own.
-                if e.modifiers.shift || x.abs() > y.abs() || y == 0.0 {
-                    return;
-                }
-                cx.stop_propagation();
-                graph_entity.update(cx, |t, cx| t.scroll(&graph_path, y, true, cx));
-            })
             .child(painter);
 
         let entity = this.clone();
@@ -912,24 +908,46 @@ impl Timelines {
                 .justify_center()
                 .w(px(ICON_LABEL_WIDTH))
                 .tooltip(crate::view::tip(lines, p))
-                .child(crate::repo_marks::global_mark(
-                    status,
-                    ICON_MARK,
-                    status_color,
-                    cx,
-                ))
+                .child(
+                    div()
+                        .relative()
+                        .flex_none()
+                        .child(crate::repo_marks::global_mark(
+                            status,
+                            ICON_MARK,
+                            status_color,
+                            cx,
+                        ))
+                        .child(crate::morph::tag(
+                            crate::morph::Side::Panel,
+                            &status.path,
+                            crate::morph::Part::Icon,
+                            None,
+                        )),
+                )
         } else {
             label
                 .gap_2()
                 .w(px(LABEL_WIDTH))
                 .pl_2()
                 .pr_4()
-                .child(crate::repo_marks::global_mark(
-                    status,
-                    MARK,
-                    status_color,
-                    cx,
-                ))
+                .child(
+                    div()
+                        .relative()
+                        .flex_none()
+                        .child(crate::repo_marks::global_mark(
+                            status,
+                            MARK,
+                            status_color,
+                            cx,
+                        ))
+                        .child(crate::morph::tag(
+                            crate::morph::Side::Panel,
+                            &status.path,
+                            crate::morph::Part::Icon,
+                            None,
+                        )),
+                )
                 .child(
                     div()
                         .flex()
@@ -939,10 +957,24 @@ impl Timelines {
                         .min_w_0()
                         .child(
                             div()
+                                .relative()
                                 .truncate()
                                 .text_sm()
                                 .text_color(p.text)
-                                .child(status.name.clone()),
+                                .child(status.name.clone())
+                                .child(crate::morph::tag(
+                                    crate::morph::Side::Panel,
+                                    &status.path,
+                                    crate::morph::Part::Name,
+                                    Some((
+                                        status.name.clone().into(),
+                                        crate::morph::Look {
+                                            color: p.text,
+                                            size: 14.0,
+                                            bold: false,
+                                        },
+                                    )),
+                                )),
                         )
                         .child(
                             div()
@@ -951,19 +983,47 @@ impl Timelines {
                                 .text_xs()
                                 .child(
                                     div()
+                                        .relative()
                                         .flex_shrink()
                                         .min_w_0()
                                         .truncate()
                                         .text_color(p.muted)
-                                        .child(checkout),
+                                        .child(checkout.clone())
+                                        .child(crate::morph::tag(
+                                            crate::morph::Side::Panel,
+                                            &status.path,
+                                            crate::morph::Part::Checkout,
+                                            Some((
+                                                checkout.into(),
+                                                crate::morph::Look {
+                                                    color: p.muted,
+                                                    size: 12.0,
+                                                    bold: false,
+                                                },
+                                            )),
+                                        )),
                                 )
                                 .child(
                                     div()
+                                        .relative()
                                         .flex_none()
                                         .max_w(px(LABEL_WIDTH * 0.6))
                                         .truncate()
                                         .text_color(status_color)
-                                        .child(status_text),
+                                        .child(status_text.clone())
+                                        .child(crate::morph::tag(
+                                            crate::morph::Side::Panel,
+                                            &status.path,
+                                            crate::morph::Part::Status,
+                                            Some((
+                                                status_text.into(),
+                                                crate::morph::Look {
+                                                    color: status_color,
+                                                    size: 12.0,
+                                                    bold: false,
+                                                },
+                                            )),
+                                        )),
                                 ),
                         ),
                 )
@@ -976,10 +1036,10 @@ impl Timelines {
             .on_scroll_wheel(move |e: &ScrollWheelEvent, _, cx| {
                 let d = e.delta.pixel_delta(px(STEP * 3.0));
                 let (x, y) = (f32::from(d.x), f32::from(d.y));
-                // A plain wheel over the name scrolls the panel's list (over
-                // the graph, see above). Shift+wheel, which Windows sends
-                // sideways, scrolls every strip; a sideways swipe or tilt
-                // scrolls this one. Up or left goes back in time.
+                // A plain wheel scrolls the panel's list, anywhere on the
+                // strip. Shift+wheel, which Windows sends sideways, scrolls
+                // every strip through time; a sideways swipe or tilt scrolls
+                // this one. Up or left goes back in time.
                 let (dx, all) = if e.modifiers.shift {
                     (if x != 0.0 { x } else { y }, true)
                 } else if x.abs() > y.abs() {

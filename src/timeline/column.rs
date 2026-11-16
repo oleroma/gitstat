@@ -535,19 +535,44 @@ fn header(
                 .flex()
                 .items_center()
                 .gap_2()
-                .child(crate::repo_marks::global_mark(
-                    status,
-                    20.0,
-                    crate::view::status_color(status, p),
-                    cx,
-                ))
                 .child(
                     div()
+                        .relative()
+                        .flex_none()
+                        .child(crate::repo_marks::global_mark(
+                            status,
+                            20.0,
+                            crate::view::status_color(status, p),
+                            cx,
+                        ))
+                        .child(crate::morph::tag(
+                            crate::morph::Side::Column,
+                            path,
+                            crate::morph::Part::Icon,
+                            None,
+                        )),
+                )
+                .child(
+                    div()
+                        .relative()
                         .min_w_0()
                         .truncate()
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(p.text)
-                        .child(status.name.clone()),
+                        .child(status.name.clone())
+                        .child(crate::morph::tag(
+                            crate::morph::Side::Column,
+                            path,
+                            crate::morph::Part::Name,
+                            Some((
+                                status.name.clone().into(),
+                                crate::morph::Look {
+                                    color: p.text,
+                                    size: 16.0,
+                                    bold: true,
+                                },
+                            )),
+                        )),
                 ),
         )
         .child(
@@ -557,19 +582,49 @@ fn header(
                 .text_sm()
                 .child(
                     div()
+                        .relative()
                         .min_w_0()
                         .truncate()
                         .text_color(p.text)
-                        .child(checkout),
+                        .child(checkout.clone())
+                        .child(crate::morph::tag(
+                            crate::morph::Side::Column,
+                            path,
+                            crate::morph::Part::Checkout,
+                            Some((
+                                checkout.into(),
+                                crate::morph::Look {
+                                    color: p.text,
+                                    size: 14.0,
+                                    bold: false,
+                                },
+                            )),
+                        )),
                 )
                 .child(
                     div()
+                        .relative()
                         .flex_none()
                         .text_color(crate::view::status_color(status, p))
-                        .child(label),
+                        .child(label.clone())
+                        .child(crate::morph::tag(
+                            crate::morph::Side::Column,
+                            path,
+                            crate::morph::Part::Status,
+                            Some((
+                                label.into(),
+                                crate::morph::Look {
+                                    color: crate::view::status_color(status, p),
+                                    size: 14.0,
+                                    bold: false,
+                                },
+                            )),
+                        )),
                 ),
         );
     let head = div()
+        .relative()
+        .child(crate::morph::tag_header(path))
         .flex()
         .flex_col()
         .flex_none()

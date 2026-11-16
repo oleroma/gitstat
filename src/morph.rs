@@ -55,7 +55,65 @@ const HEADER_GUESS: f32 = 110.0;
 const TABLE_TOP_GUESS: f32 = 60.0;
 const TABLE_BOTTOM_GUESS: f32 = 40.0;
 
+/// A piece of a repo's row that its column header shows too, and the
+/// flip carries from one to the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Part {
+    Icon,
+    Name,
+    Checkout,
+    Status,
+    /// The top bar both views have, and what's on it: the headline, the
+    /// line below it, and the settings and refresh buttons. Kept under an
+    /// empty path.
+    Bar,
+    Headline,
+    Subline,
+    Settings,
+    Refresh,
+}
+
+/// The path the top bar's parts are kept under.
+pub fn app() -> &'static Path {
+    Path::new("")
+}
+
+/// A part as one view last drew it: its bounds in that window's logical px
+/// and, for words, the words and how they look.
+#[derive(Clone, Debug)]
+struct Seen {
+    bounds: Bounds<Pixels>,
+    text: Option<Words>,
+}
+
+/// Where one view draws a part.
+#[derive(Clone, Copy)]
+pub enum Side {
+    Panel,
+    Column,
+}
+
+/// How a part's words look: size in px and whether bold.
+pub struct Look {
+    pub color: Hsla,
+    pub size: f32,
+    pub bold: bool,
+}
+
 thread_local! {
+    /// The panel's parts, by repo, as last drawn: panel logical px.
+    static PANEL_PARTS: RefCell<HashMap<(PathBuf, Part), Seen>> = RefCell::new(HashMap::new());
+    /// The big window's header parts, by repo, as last drawn: window
+    /// logical px, beside each header's own top-left corner.
+    static COLUMN_PARTS: RefCell<HashMap<(PathBuf, Part), Seen>> = RefCell::new(HashMap::new());
+    /// The panel headings' words: bounds, text and colour.
+    static HEADING_LABELS: RefCell<HashMap<SectionKey, HeadingLabel>> =
+        RefCell::new(HashMap::new());
+    /// The spines' names: top and height in the big window's logical px,
+    /// and text.
+    static SPINE_LABELS: RefCell<HashMap<SectionKey, (f32, f32, String)>> =
+        RefCell::new(HashMap::new());
+    static HEADER_AT: RefCell<HashMap<PathBuf, gpui::Point<Pixels>>> = RefCell::new(HashMap::new());
     /// Each strip in view, by repo, as the panel last drew it: bounds in
     /// the panel's logical px.
     static STRIPS: RefCell<HashMap<PathBuf, Bounds<Pixels>>> = RefCell::new(HashMap::new());
@@ -70,7 +128,12 @@ thread_local! {
     /// The big window's client area minus the bounds it was opened with,
     /// physical px per edge (left, top, right, bottom).
     static CLIENT_DELTA: Cell<(i32, i32, i32, i32)> = const { Cell::new((0, 0, 0, 0)) };
+    /// The same for a maximised big window, against its monitor's work area.
+    static MAXIMIZED_DELTA: Cell<(i32, i32, i32, i32)> = const { Cell::new((0, 0, 0, 0)) };
 }
+
+/// A panel heading's words as drawn: bounds, text and colour.
+type HeadingLabel = (Bounds<Pixels>, String, Hsla);
 
 /// `Section` as a map key.
 type SectionKey = u8;
@@ -91,6 +154,78 @@ pub fn seen_strip(path: &Path, bounds: Bounds<Pixels>) {
     });
 }
 
+/// An invisible layer, absolutely over its parent (which must be
+/// `relative`), that notes where `side` drew `path`'s `part`, and its words
+/// in `look` when it has words.
+pub fn tag(
+    side: Side,
+    path: &Path,
+    part: Part,
+    words: Option<(gpui::SharedString, Look)>,
+) -> impl IntoElement {
+    let path = path.to_path_buf();
+    let text = words.map(|(t, l)| (t, l.color, l.size, l.bold));
+    canvas(
+        |_, _, _| {},
+        move |bounds, _, _, _| {
+            if part == Part::Bar {
+                LAST_PAINT.with(|t| t.set(Some(Instant::now())));
+            }
+            let seen = Seen {
+                bounds,
+                text: text.clone(),
+            };
+            let map = match side {
+                Side::Panel => &PANEL_PARTS,
+                Side::Column => &COLUMN_PARTS,
+            };
+            map.with(|m| {
+                m.borrow_mut().insert((path.clone(), part), seen);
+            });
+        },
+    )
+    .absolute()
+    .inset_0()
+}
+
+/// An invisible layer over a column header noting where its top-left
+/// corner is, which its parts are placed beside.
+pub fn tag_header(path: &Path) -> impl IntoElement {
+    let path = path.to_path_buf();
+    canvas(
+        |_, _, _| {},
+        move |bounds, _, _, _| {
+            HEADER_AT.with(|m| {
+                m.borrow_mut().insert(path.clone(), bounds.origin);
+            });
+        },
+    )
+    .absolute()
+    .inset_0()
+}
+
+/// Notes the words of a panel section heading, for the flip.
+pub fn seen_heading_label(section: Section, bounds: Bounds<Pixels>, text: &str, color: Hsla) {
+    HEADING_LABELS.with(|m| {
+        m.borrow_mut()
+            .insert(key(section), (bounds, text.to_string(), color));
+    });
+}
+
+/// Notes a spine's name as the big window drew it, for the flip.
+pub fn seen_spine_label(section: Section, bounds: Bounds<Pixels>, text: &str, _: &Window) {
+    SPINE_LABELS.with(|m| {
+        m.borrow_mut().insert(
+            key(section),
+            (
+                f32::from(bounds.top()),
+                f32::from(bounds.size.height),
+                text.to_string(),
+            ),
+        );
+    });
+}
+
 /// Notes a section heading the panel drew, for the flip.
 pub fn seen_header(section: Section, bounds: Bounds<Pixels>) {
     HEADERS.with(|h| {
@@ -101,6 +236,8 @@ pub fn seen_header(section: Section, bounds: Bounds<Pixels>) {
 /// Forgets the strips and headings; the panel is opening afresh.
 pub fn clear_strips() {
     STRIPS.with(|s| s.borrow_mut().clear());
+    PANEL_PARTS.with(|s| s.borrow_mut().clear());
+    HEADING_LABELS.with(|s| s.borrow_mut().clear());
     HEADERS.with(|h| h.borrow_mut().clear());
 }
 
@@ -119,8 +256,13 @@ pub fn seen_spine(spine: Bounds<Pixels>, window: &Window) {
 
 /// Notes where the big window's client area came out for the bounds it
 /// was opened with, both physical px.
-pub fn seen_client(requested: Rect, client: Rect) {
-    CLIENT_DELTA.with(|d| {
+pub fn seen_client(requested: Rect, client: Rect, maximized: bool) {
+    let delta = if maximized {
+        &MAXIMIZED_DELTA
+    } else {
+        &CLIENT_DELTA
+    };
+    delta.with(|d| {
         d.set((
             client.left - requested.left,
             client.top - requested.top,
@@ -133,16 +275,23 @@ pub fn seen_client(requested: Rect, client: Rect) {
 #[derive(Default)]
 struct MorphSlot {
     handle: Option<WindowHandle<MorphView>>,
+    /// When it opened.
+    since: Option<Instant>,
 }
 
 impl Global for MorphSlot {}
 
 /// Whether a flip is drawing now.
 pub fn running(cx: &App) -> bool {
-    cx.try_global::<MorphSlot>()
-        .and_then(|s| s.handle)
-        .is_some_and(|h| view::is_live(h.into(), cx))
+    cx.try_global::<MorphSlot>().is_some_and(|s| {
+        s.handle.is_some_and(|h| view::is_live(h.into(), cx))
+            && s.since.is_some_and(|t| t.elapsed() < STUCK)
+    })
 }
+
+/// Longer than any flip runs: one still around after this is stuck, and
+/// no longer holds up the windows.
+const STUCK: Duration = Duration::from_secs(8);
 
 fn enabled(cx: &App) -> bool {
     cx.try_global::<Ui>().is_some_and(|ui| {
@@ -197,6 +346,8 @@ pub fn show_window(anchor: crate::panel::Anchor, cx: &mut App) {
 /// off or can't run, so the caller closes it.
 pub fn flip_back(big: &mut Window, cx: &mut App) -> bool {
     let minimized = win::take_minimized();
+    // Opens there again next time.
+    view::remember_place(big, cx);
     if running(cx) {
         // Mid-flip; the flip closes it.
         return true;
@@ -250,6 +401,45 @@ struct Spine {
     section: Section,
     from: Bounds<f32>,
     to: Bounds<f32>,
+    name: Option<Name>,
+}
+
+/// A section's name, from the panel heading's words to the spine's, which
+/// read upwards: centres and sizes in physical px, and the words at each end.
+struct Name {
+    from: (f32, f32),
+    to: (f32, f32),
+    from_size: f32,
+    to_size: f32,
+    from_text: String,
+    to_text: String,
+    color: Hsla,
+}
+
+/// A part's words: text, colour, size in px, and whether bold.
+type Words = (gpui::SharedString, Hsla, f32, bool);
+
+/// A carried part this frame: where, its picture or words, and alpha.
+type Drawn = (
+    Bounds<Pixels>,
+    Option<Arc<gpui::RenderImage>>,
+    Option<Words>,
+    f32,
+    bool,
+);
+
+/// A part carried from a panel row to a column header, physical px from
+/// the flip window's top-left corner.
+struct Carried {
+    from: Bounds<f32>,
+    to: Bounds<f32>,
+    /// The words at each end: text, colour, size and boldness.
+    words: Option<(Words, Words)>,
+    /// For the icon: its tone, to find its picture.
+    status: Option<crate::git::RepoStatus>,
+    gone: bool,
+    /// The top bar itself: its bottom edge is drawn.
+    bar: bool,
 }
 
 /// Everything a flip draws, laid out.
@@ -262,6 +452,7 @@ struct Plan {
     to: Bounds<f32>,
     trees: Vec<Tree>,
     spines: Vec<Spine>,
+    parts: Vec<Carried>,
 }
 
 /// Lays out a flip between the panel at `panel_rect` (client area,
@@ -291,15 +482,31 @@ fn plan(
         Some((rect, _)) => (rect, ps),
         None => {
             // Where show_window will put it.
-            let (bounds, ws) = view::window_place(repos);
+            let (place, ws) = view::window_place(repos, cx);
+            let bounds = place.get_bounds();
             let at = |v: Pixels| (f32::from(v) * ws).round() as i32;
-            let (dl, dt, dr, db) = CLIENT_DELTA.with(Cell::get);
+            let (area, delta) = match place {
+                WindowBounds::Maximized(_) => (
+                    view::maximized_area(bounds, ws),
+                    MAXIMIZED_DELTA.with(Cell::get),
+                ),
+                _ => (
+                    Rect::new(
+                        at(bounds.origin.x),
+                        at(bounds.origin.y),
+                        at(bounds.origin.x + bounds.size.width),
+                        at(bounds.origin.y + bounds.size.height),
+                    ),
+                    CLIENT_DELTA.with(Cell::get),
+                ),
+            };
+            let (dl, dt, dr, db) = delta;
             (
                 Rect::new(
-                    at(bounds.origin.x) + dl,
-                    at(bounds.origin.y) + dt,
-                    at(bounds.origin.x + bounds.size.width) + dr,
-                    at(bounds.origin.y + bounds.size.height) + db,
+                    area.left + dl,
+                    area.top + dt,
+                    area.right + dr,
+                    area.bottom + db,
                 ),
                 ws,
             )
@@ -342,6 +549,10 @@ fn plan(
 
     let mut trees = Vec::new();
     let mut spines = Vec::new();
+    let mut parts = Vec::new();
+    let panel_parts = PANEL_PARTS.with(|m| m.borrow().clone());
+    let column_parts = COLUMN_PARTS.with(|m| m.borrow().clone());
+    let header_at = HEADER_AT.with(|m| m.borrow().clone());
     for (cell, left) in cells.iter().zip(&lefts) {
         let x = to.origin.x + left * ws - scroll;
         let gone = x + cell.width() * ws <= to.origin.x || x >= to.origin.x + to.size.width;
@@ -352,6 +563,36 @@ fn plan(
                 else {
                     continue;
                 };
+                // The parts both views show, where each last drew them.
+                if let Some(hat) = header_at.get(&status.path) {
+                    for part in [Part::Icon, Part::Name, Part::Checkout, Part::Status] {
+                        let key = (status.path.clone(), part);
+                        let (Some(a), Some(b)) = (panel_parts.get(&key), column_parts.get(&key))
+                        else {
+                            continue;
+                        };
+                        let dx = f32::from(b.bounds.origin.x - hat.x) * ws;
+                        let to_b = Bounds {
+                            origin: point(x + dx, to.origin.y + f32::from(b.bounds.origin.y) * ws),
+                            size: size(
+                                f32::from(b.bounds.size.width) * ws,
+                                f32::from(b.bounds.size.height) * ws,
+                            ),
+                        };
+                        let words = a.text.clone().zip(b.text.clone());
+                        if part != Part::Icon && words.is_none() {
+                            continue;
+                        }
+                        parts.push(Carried {
+                            from: in_panel(&a.bounds),
+                            to: to_b,
+                            words,
+                            status: (part == Part::Icon).then(|| status.clone()),
+                            gone,
+                            bar: false,
+                        });
+                    }
+                }
                 let strip = in_panel(strip);
                 let newest = strip.origin.x + strip.size.width - crate::timeline::STRIP_PAD * ps;
                 trees.push(Tree {
@@ -373,8 +614,33 @@ fn plan(
                 if gone {
                     continue;
                 }
+                let k = key(section);
+                let name = HEADING_LABELS
+                    .with(|m| m.borrow().get(&k).cloned())
+                    .zip(SPINE_LABELS.with(|m| m.borrow().get(&k).cloned()))
+                    .map(|((lb, from_text, color), (top, height, to_text))| {
+                        let from_size = 14.0;
+                        let len = crate::turned_text::length(&from_text, from_size);
+                        let lb = in_panel(&lb);
+                        Name {
+                            from: (
+                                lb.origin.x + len * ps / 2.0,
+                                lb.origin.y + lb.size.height / 2.0,
+                            ),
+                            to: (
+                                x + view::SPINE_WIDTH * ws / 2.0,
+                                to.origin.y + (top + height / 2.0) * ws,
+                            ),
+                            from_size: from_size * ps,
+                            to_size: view::SPINE_TEXT * ws,
+                            from_text,
+                            to_text,
+                            color,
+                        }
+                    });
                 spines.push(Spine {
                     section,
+                    name,
                     from: in_panel(header),
                     to: Bounds {
                         origin: point(x, to.origin.y + spine_top),
@@ -387,12 +653,47 @@ fn plan(
             }
         }
     }
+    // The top bar and what's on it, from the panel's to the window's.
+    for part in [
+        Part::Bar,
+        Part::Headline,
+        Part::Subline,
+        Part::Settings,
+        Part::Refresh,
+    ] {
+        let key = (app().to_path_buf(), part);
+        let (Some(a), Some(b)) = (panel_parts.get(&key), column_parts.get(&key)) else {
+            continue;
+        };
+        let words = a.text.clone().zip(b.text.clone());
+        if part != Part::Bar && words.is_none() {
+            continue;
+        }
+        parts.push(Carried {
+            from: in_panel(&a.bounds),
+            to: Bounds {
+                origin: point(
+                    to.origin.x + f32::from(b.bounds.origin.x) * ws,
+                    to.origin.y + f32::from(b.bounds.origin.y) * ws,
+                ),
+                size: size(
+                    f32::from(b.bounds.size.width) * ws,
+                    f32::from(b.bounds.size.height) * ws,
+                ),
+            },
+            words,
+            status: None,
+            gone: false,
+            bar: part == Part::Bar,
+        });
+    }
     (!trees.is_empty() || !spines.is_empty()).then_some(Plan {
         union,
         from,
         to,
         trees,
         spines,
+        parts,
     })
 }
 
@@ -419,9 +720,14 @@ fn launch(plan: Plan, direction: Direction, cx: &mut App) -> bool {
         },
         |window, cx| {
             if let Some(h) = win::hwnd(window) {
-                cx.spawn(async move |_| unsafe {
-                    win::style_morph(h);
-                    win::place_morph(h, union);
+                // Shown a moment after it opens, from a timer: a hidden
+                // window may draw no frames, so it can't show itself.
+                cx.spawn(async move |cx| {
+                    unsafe { win::style_morph(h) };
+                    cx.background_executor()
+                        .timer(Duration::from_millis(20))
+                        .await;
+                    unsafe { win::place_morph(h, union) };
                 })
                 .detach();
             }
@@ -432,13 +738,21 @@ fn launch(plan: Plan, direction: Direction, cx: &mut App) -> bool {
                 direction,
                 hwnd: win::hwnd(window),
                 left: false,
-                arrived: false,
+                arrived: None,
+                reveal_from: None,
+                frames: 0,
+                hiding: false,
             })
         },
     ) else {
         return false;
     };
-    cx.default_global::<MorphSlot>().handle = Some(handle);
+    // A stuck flip from before goes.
+    let old = cx.default_global::<MorphSlot>().handle.replace(handle);
+    if let Some(old) = old {
+        old.update(cx, |_, window, _| window.remove_window()).ok();
+    }
+    cx.default_global::<MorphSlot>().since = Some(Instant::now());
     true
 }
 
@@ -451,9 +765,23 @@ pub struct MorphView {
     hwnd: Option<isize>,
     /// The window the flip starts from has closed.
     left: bool,
-    /// The window it ends in has opened.
-    arrived: bool,
+    /// When the window it ends in was opened.
+    arrived: Option<Instant>,
+    /// When the reveal began: once that window has drawn.
+    reveal_from: Option<Instant>,
+    /// Frames drawn; shown from the second.
+    frames: u32,
+    /// Hidden, to be removed next frame.
+    hiding: bool,
 }
+
+thread_local! {
+    /// When a panel or big window last drew its top bar.
+    static LAST_PAINT: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// The longest the flip waits for the window it ends in to draw.
+const DRAW_WAIT: Duration = Duration::from_millis(500);
 
 /// `t` eased in and out.
 fn ease(t: f32) -> f32 {
@@ -483,14 +811,39 @@ fn lerp_bounds(a: Bounds<f32>, b: Bounds<f32>, e: f32, s: f32) -> Bounds<Pixels>
 
 impl Render for MorphView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let elapsed = self.start.elapsed();
+        if self.hiding {
+            window.remove_window();
+            return div();
+        }
+        // Shown once its first frame is drawn; the clock starts then.
+        self.frames += 1;
+        if self.frames == 2 {
+            self.start = Instant::now();
+        }
+        let elapsed = if self.frames < 2 {
+            Duration::ZERO
+        } else {
+            self.start.elapsed()
+        };
         let k = self.stretch;
         let (fade, turn, reveal_len) = (FADE.mul_f32(k), TURN.mul_f32(k), REVEAL.mul_f32(k));
         let turn_at = fade;
         let hold_at = turn_at + turn;
-        let reveal_at = hold_at + HOLD;
-        let end = reveal_at + reveal_len;
         let open = self.direction == Direction::Open;
+        // The reveal waits for the window underneath to have drawn, so it
+        // never shows that window empty.
+        if self.reveal_from.is_none()
+            && let Some(arrived) = self.arrived
+        {
+            let since = arrived.elapsed();
+            let drawn = LAST_PAINT
+                .with(Cell::get)
+                .is_some_and(|t| t > arrived + Duration::from_millis(30));
+            if since >= DRAW_WAIT || (since >= HOLD && drawn) {
+                self.reveal_from = Some(Instant::now());
+            }
+        }
+        let revealed = self.reveal_from.map_or(Duration::ZERO, |t| t.elapsed());
 
         if elapsed >= turn_at && !self.left {
             self.left = true;
@@ -500,8 +853,8 @@ impl Render for MorphView {
                 cx.defer(view::close_window);
             }
         }
-        if elapsed >= hold_at && !self.arrived {
-            self.arrived = true;
+        if elapsed >= hold_at && self.arrived.is_none() {
+            self.arrived = Some(Instant::now());
             if open {
                 cx.defer(view::show_window);
             } else {
@@ -517,12 +870,29 @@ impl Render for MorphView {
                 });
             }
         }
-        if elapsed >= end {
-            window.remove_window();
+        if self.reveal_from.is_some() && revealed >= reveal_len {
+            // Hidden first and removed a moment later, so its last frame
+            // never lingers as a flash. Removed from a timer: a hidden
+            // window draws no more frames, so it can't remove itself.
+            self.hiding = true;
+            let me = window.window_handle();
+            let hwnd = self.hwnd;
+            cx.spawn(async move |_, cx| {
+                if let Some(h) = hwnd {
+                    unsafe { win::hide(h) };
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(40))
+                    .await;
+                cx.update_window(me, |_, window, _| window.remove_window())
+                    .ok();
+            })
+            .detach();
             if self.direction == Direction::Close {
                 // Back in the panel, which then goes the way it came.
                 cx.defer(crate::panel::slide_away);
             }
+            window.request_animation_frame();
             return div();
         }
 
@@ -530,7 +900,7 @@ impl Render for MorphView {
         let turned = ease(phase(elapsed, turn_at, turn));
         // 0 is the panel's layout, 1 the big window's.
         let e = if open { turned } else { 1.0 - turned };
-        let reveal = 1.0 - ease(phase(elapsed, reveal_at, reveal_len));
+        let reveal = 1.0 - ease(phase(revealed, Duration::ZERO, reveal_len));
         let appearance = window.appearance();
         let dark = matches!(
             appearance,
@@ -555,23 +925,67 @@ impl Render for MorphView {
                 (t.graph.clone(), t.dirty, ends, alpha * reveal)
             })
             .collect();
-        let spines: Vec<(Bounds<Pixels>, Hsla)> = self
+        // Each bar is drawn solid, its wash already laid on the panel's
+        // colour, so it never shows through to the bars beneath it.
+        type Named = (gpui::Point<Pixels>, String, f32, Hsla);
+        let spines: Vec<(Bounds<Pixels>, Hsla, Option<Named>)> = self
             .plan
             .spines
             .iter()
             .map(|sp| {
-                let color = match sp.section {
-                    Section::NeedsYou => p.red,
-                    Section::Synced => p.green,
-                    _ => p.muted,
-                };
-                (lerp_bounds(sp.from, sp.to, e, s), color)
+                let mix = |a: f32, b: f32| a + (b - a) * e;
+                let name = sp.name.as_ref().map(|n| {
+                    (
+                        point(px(mix(n.from.0, n.to.0) / s), px(mix(n.from.1, n.to.1) / s)),
+                        if e < 0.5 {
+                            n.from_text.clone()
+                        } else {
+                            n.to_text.clone()
+                        },
+                        mix(n.from_size, n.to_size) / s,
+                        n.color,
+                    )
+                });
+                (
+                    lerp_bounds(sp.from, sp.to, e, s),
+                    p.surface.blend(view::section_tint(sp.section, &p)),
+                    name,
+                )
+            })
+            .collect();
+
+        // The parts both views show, moving and growing from one to the
+        // other, over the sheet: they never fade with the words.
+        let parts: Vec<Drawn> = self
+            .plan
+            .parts
+            .iter()
+            .map(|c| {
+                let b = lerp_bounds(c.from, c.to, e, s);
+                let alpha = reveal * if c.gone { 1.0 - e } else { 1.0 };
+                let image = c.status.as_ref().and_then(|st| {
+                    let a = c.from.size.width.round() as u32;
+                    let z = c.to.size.width.round() as u32;
+                    crate::repo_marks::picture(st, &[a.max(z), a.min(z)], cx)
+                });
+                let words = c.words.as_ref().map(|(a, z)| {
+                    let mix = |x: f32, y: f32| x + (y - x) * e;
+                    let color = Hsla {
+                        h: if e < 0.5 { a.1.h } else { z.1.h },
+                        s: mix(a.1.s, z.1.s),
+                        l: mix(a.1.l, z.1.l),
+                        a: mix(a.1.a, z.1.a),
+                    };
+                    let text = if e < 0.5 { a.0.clone() } else { z.0.clone() };
+                    (text, color, mix(a.2, z.2), if e < 0.5 { a.3 } else { z.3 })
+                });
+                (b, image, words, alpha, c.bar)
             })
             .collect();
 
         let painter = canvas(
             |_, _, _| {},
-            move |_, _, window, _| {
+            move |_, _, window, cx| {
                 window.request_animation_frame();
                 let bg = p.surface.opacity(sheet_alpha * reveal);
                 window.paint_quad(quad(
@@ -583,25 +997,86 @@ impl Render for MorphView {
                     gpui::BorderStyle::Solid,
                 ));
                 window.with_content_mask(Some(gpui::ContentMask { bounds: sheet }), |window| {
-                    // A section's heading stretching into its spine: its
-                    // colour's edge on the side the name reads from.
-                    for (b, color) in &spines {
-                        window.paint_quad(quad(
-                            *b,
-                            px(4.0),
-                            p.bg.opacity(reveal),
-                            gpui::Edges {
-                                left: px(3.0),
-                                ..Default::default()
-                            },
-                            color.opacity(0.8 * reveal),
-                            gpui::BorderStyle::Solid,
-                        ));
+                    // A section's heading stretching into its spine.
+                    for (b, bar, name) in &spines {
+                        window.paint_quad(gpui::fill(*b, bar.opacity(reveal)));
+                        // The name turns with its bar, from across to
+                        // reading upwards.
+                        if let Some((at, text, size, color)) = name {
+                            crate::turned_text::paint_turning(
+                                window,
+                                *at,
+                                text,
+                                *size,
+                                color.opacity(reveal),
+                                e,
+                            );
+                        }
                     }
                     for (graph, dirty, ends, alpha) in &trees {
                         crate::timeline::paint_tree(
                             graph, *dirty, *ends, e, *alpha, dark, &p, window,
                         );
+                    }
+                    for (b, image, words, alpha, bar) in &parts {
+                        if *alpha <= 0.0 {
+                            continue;
+                        }
+                        if *bar {
+                            // The header's own colour, darker than the
+                            // sheet's, under the sheet's rounded top.
+                            let round = px(RADIUS);
+                            window.paint_quad(quad(
+                                *b,
+                                gpui::Corners {
+                                    top_left: round,
+                                    top_right: round,
+                                    bottom_left: px(0.0),
+                                    bottom_right: px(0.0),
+                                },
+                                p.bg.opacity(sheet_alpha * reveal),
+                                px(0.0),
+                                gpui::transparent_black(),
+                                gpui::BorderStyle::Solid,
+                            ));
+                            // Its bottom edge, the line under the header.
+                            let edge = Bounds::new(
+                                point(b.origin.x, b.bottom() - px(1.0)),
+                                size(b.size.width, px(1.0)),
+                            );
+                            window.paint_quad(gpui::fill(edge, p.border.opacity(*alpha)));
+                            continue;
+                        }
+                        if let Some(image) = image {
+                            window
+                                .paint_image(*b, Default::default(), image.clone(), 0, false)
+                                .ok();
+                        }
+                        if let Some((text, color, size, bold)) = words {
+                            let mut font = window.text_style().font();
+                            if *bold {
+                                font.weight = gpui::FontWeight::SEMIBOLD;
+                            }
+                            let run = gpui::TextRun {
+                                len: text.len(),
+                                font,
+                                color: color.opacity(color.a * alpha),
+                                background_color: None,
+                                underline: None,
+                                strikethrough: None,
+                            };
+                            let line = window.text_system().shape_line(
+                                text.clone(),
+                                px(*size),
+                                &[run],
+                                None,
+                            );
+                            // Cut where the view would cut it.
+                            window.with_content_mask(
+                                Some(gpui::ContentMask { bounds: *b }),
+                                |window| line.paint(b.origin, b.size.height, window, cx).ok(),
+                            );
+                        }
                     }
                 });
             },

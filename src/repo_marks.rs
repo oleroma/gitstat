@@ -238,6 +238,20 @@ pub fn mark(marks: &Entity<RepoMarks>, status: &RepoStatus, side: f32, dot: Hsla
     .into_any_element()
 }
 
+/// `status`'s icon picture at the first of `sides` (device px) that is
+/// drawn, for the flip.
+pub fn picture(status: &RepoStatus, sides: &[u32], cx: &App) -> Option<Arc<RenderImage>> {
+    let ui = cx.try_global::<crate::view::Ui>()?;
+    let marks = ui.marks.read(cx);
+    let tone = FolderState::of(status).tone();
+    sides
+        .iter()
+        .find_map(|&n| match marks.look(&status.path, (tone, n)) {
+            Look::Image(image) => Some(image),
+            _ => None,
+        })
+}
+
 fn device_px(side: f32, window: &Window) -> u32 {
     (side * window.scale_factor()).round().max(1.0) as u32
 }
