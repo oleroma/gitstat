@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Full checks, run once by every build (PC and fallback) after the build. The quick tests
-# already ran before it, so they aren't repeated here.
+# Full checks, run once per feature before the merge by agent-check (on the PC, or the fallback
+# with checks), not by builds. The quick tests already ran in the builds, so
+# they aren't repeated here.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 export CARGO_TARGET_DIR=build/target

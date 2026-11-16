@@ -24,6 +24,24 @@ FINISHED=0
 CANCEL_FILE=""
 cancelled() { [ -n "$CANCEL_FILE" ] && [ -f "$CANCEL_FILE" ]; }
 
+# status <line>: a status line for Olex, with its emoji and Markdown links (AGENTS.md "Status
+# lines"). The agent posts it, without "status: ", as soon as it shows.
+status() { echo "status: $*" >&3; echo "status: $*"; }
+
+# what_emoji: what this branch builds, as status lines show it: 🤖 an Android APK, 🪟 Windows
+# files, both when it builds both. From the repo's parts hook when it has one, else from gradlew.
+what_emoji() {
+  local parts="" e=""
+  if [ -f "$WORKTREE/.agents/hooks/parts" ]; then parts="$(bash "$WORKTREE/.agents/hooks/parts" 2>/dev/null || true)"; fi
+  if [ -z "$parts" ]; then
+    if [ -f "$WORKTREE/gradlew" ]; then echo 🤖; else echo 🪟; fi
+    return 0
+  fi
+  if grep -qx apk <<<"$parts"; then e+=🤖; fi
+  if grep -qvx apk <<<"$parts"; then e+=🪟; fi
+  echo "$e"
+}
+
 # Scripts redefine this to undo things such as a lock; it runs on every exit.
 cleanup() { :; }
 
@@ -40,6 +58,7 @@ finish() {
   if cancelled; then
     word=cancelled
     set -- "Olex cancelled the build in its window."
+    status "🛑 Build cancelled."
   fi
   out="result: $word"
   if [ $# -gt 0 ]; then out="$out"$'\n'"$(printf '%s\n' "$@")"; fi
@@ -91,6 +110,16 @@ pr_ready() {
   gh api -X POST "repos/$SLUG/pulls/$1/ccr/ready_for_review" >/dev/null || gh pr ready "$1" -R "$SLUG"
 }
 
+# gh_retry <gh args>: runs gh, trying again up to 4 times, 10 s apart, when it fails.
+gh_retry() {
+  local i
+  for i in 1 2 3 4 5; do
+    gh "$@" && return 0
+    sleep 10
+  done
+  return 1
+}
+
 # wait_main_cache: when cache.yml is still compiling main, waits for it (at most 30 minutes),
 # so the fallback run starts from main's warm caches instead of building cold. Never fails.
 wait_main_cache() {
@@ -98,22 +127,23 @@ wait_main_cache() {
   for i in $(seq 1 60); do
     [ -n "$(gh run list -R "$SLUG" --workflow cache.yml --branch main --limit 5 --json status \
       --jq '[.[] | select(.status != "completed")][0].status // empty' 2>/dev/null)" ] || return 0
-    if [ "$i" = 1 ]; then echo "Waiting for the main cache run to finish first." >&2; fi
+    if [ "$i" = 1 ]; then status "⏳ Waiting for main's cache run to finish first (up to 30 min)."; fi
     sleep 30
   done
   return 0
 }
 
-# run_fallback: runs fallback.yml on BRANCH (the same tests and build as a PC build) and waits
-# for it. Sets RUN (the run id) and RUN_URL. Shows the run link at once, and the release lines
-# (release_lines) as soon as every build job has published, before the full checks end.
-# Returns 1 if the run failed; stops if it can't be found.
+# run_fallback [checks]: runs fallback.yml on BRANCH and waits for it: the same quick tests and
+# build as a PC build, or with "checks" only the full checks (agent-check ci). Sets RUN (the run
+# id) and RUN_URL. Shows the run link at once, and a build's release lines (release_lines) as soon
+# as every build job has published. Returns 1 if the run failed; stops if it can't be found.
 run_fallback() {
-  local sha since i
+  local sha since i checks=false
+  if [ "${1:-}" = checks ]; then checks=true; fi
   sha="$(git -C "$WORKTREE" rev-parse HEAD)"
   wait_main_cache
   since="$(date -u -d '1 minute ago' +%Y-%m-%dT%H:%M:%SZ)"
-  gh workflow run fallback.yml -R "$SLUG" --ref "$BRANCH"
+  gh workflow run fallback.yml -R "$SLUG" --ref "$BRANCH" -f checks="$checks"
   RUN=""
   for i in $(seq 1 30); do
     sleep 4
@@ -125,19 +155,34 @@ run_fallback() {
   [ -n "$RUN" ] || die "Started the fallback workflow but couldn't find its run."
   RUN_URL="https://github.com/$SLUG/actions/runs/$RUN"
   # Shown right away (not only in the result), so the run can be followed while it builds.
-  echo "CI run: $RUN_URL" >&3
+  if [ "$checks" = true ]; then
+    status "🔎 Running the full checks in CI: [CI run]($RUN_URL)"
+  else
+    status "🔨☁️$(what_emoji) Building in CI: [CI run]($RUN_URL)"
+  fi
   local published=0 state="" n
   while :; do
     sleep 15
     if [ "$published" = 0 ] && [ "$(fallback_published "$RUN")" = true ]; then
       published=1
       n="$(newest_build_tag "$sha")"
-      if [ -n "$n" ]; then release_lines "$n" >&3; fi
+      if [ -n "$n" ]; then
+        status "📦 Build $n published: [build $n](https://github.com/$SLUG/releases/tag/build/$n)"
+        release_lines "$n" >&3
+      fi
     fi
-    state="$(gh api "repos/$SLUG/actions/runs/$RUN" --jq '"\(.status) \(.conclusion // "")"')"
+    # A failed poll is tried again: one lost answer from GitHub doesn't end the build.
+    state="$(gh_retry api "repos/$SLUG/actions/runs/$RUN" --jq '"\(.status) \(.conclusion // "")"')" ||
+      die "Lost contact with GitHub while CI was running: $RUN_URL (the run goes on)."
     case "$state" in completed*) break ;; esac
   done
   [ "$state" = "completed success" ]
+}
+
+# failed_steps <run>: the run's failed jobs and steps, one "job: step" per line.
+failed_steps() {
+  gh api "repos/$SLUG/actions/runs/$1/jobs" --jq '.jobs[] | select(.conclusion == "failure")
+    | "\(.name): \([.steps[]? | select(.conclusion == "failure") | .name] | join(", "))"' 2>/dev/null || true
 }
 
 # fallback_published <run>: prints true once every build job of the run that isn't skipped has
@@ -161,8 +206,9 @@ release_lines() {
   gh api "repos/$SLUG/releases/tags/build/$1" --jq '.assets[] | "\(.name): direct download link \(.browser_download_url)"'
 }
 
-# Every build, on the PC or in CI, runs the full checks once. When they pass, the commit gets a
-# GitHub commit status named full-check, so nothing runs them again on that commit.
+# The full checks run once per feature, before the merge (agent-check on the PC; a CI build also
+# runs them). When they pass, the commit gets a GitHub commit status named full-check, so nothing
+# runs them again on that commit.
 
 # checked <sha>: true if the full checks already passed on <sha>.
 checked() {
@@ -173,6 +219,64 @@ checked() {
 # mark_checked <sha> <description>: records that the full checks passed on <sha>.
 mark_checked() {
   gh api -X POST "repos/$SLUG/statuses/$1" -f state=success -f context=full-check -f description="$2" >/dev/null
+}
+
+# report_pr <what> <result text>: posts a PC script's result, whatever it is, as a comment on the
+# open PR whose head is this commit ("PC build of <sha> finished: ..."). The thread agent watches
+# its PR, so the comment wakes it even when the Remote Control report never reaches it.
+report_pr() {
+  local sha pr
+  sha="${SHA:-$(git -C "$WORKTREE" rev-parse HEAD)}"
+  pr="$(gh api "repos/$SLUG/pulls?state=open&per_page=100" --jq ".[] | select(.head.sha == \"$sha\") | .number" | head -n 1)"
+  [ -n "$pr" ] || return 0
+  gh api -X POST "repos/$SLUG/issues/$pr/comments" -f body="$(printf '%s of %s finished:\n\n```\n%s\n```\n\n_Posted by %s._' "$1" "${sha:0:7}" "$2" "$SCRIPT_NAME pc")" >/dev/null
+}
+
+# One PC build or check at a time, across all repos: the lock is a file in D:\dev, next to the
+# repos, holding "<PID> <repo> <branch>" of the run that has it. A run waits while another one has
+# it, and takes it over when that process is gone.
+LOCK="$(dirname "$MAIN_REPO")/.build-lock"
+
+# take_lock <branch>: waits for the lock and takes it. When agent-build pc <branch> or
+# agent-check pc <branch> already took it before checking out build/src, the run there takes it over.
+take_lock() {
+  local owner pid shown=""
+  if [ -n "${AGENT_LOCKED:-}" ]; then
+    echo "$$ ${MAIN_REPO##*/} $AGENT_LOCKED" >"$LOCK"
+    return 0
+  fi
+  until (set -C; echo "$$ ${MAIN_REPO##*/} $1" >"$LOCK") 2>/dev/null; do
+    owner="$(cat "$LOCK" 2>/dev/null || true)"
+    pid="${owner%% *}"
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+      rm -f "$LOCK"
+      continue
+    fi
+    if [ -n "$owner" ] && [ "$owner" != "$shown" ]; then
+      status "⏳ Waiting: ${owner#* } is building."
+      shown="$owner"
+    fi
+    sleep 5
+  done
+}
+
+# release_lock: removes the lock if this run has it.
+release_lock() {
+  if [ "$(cut -d' ' -f1 "$LOCK" 2>/dev/null)" = "$$" ]; then rm -f "$LOCK"; fi
+}
+
+# checkout_src <branch>: takes the lock, then brings the build/src worktree (made the first time)
+# to <branch>. The run in build/src takes the lock over.
+checkout_src() {
+  local src="$MAIN_REPO/build/src"
+  take_lock "$1"
+  cleanup() { release_lock; }
+  export AGENT_LOCKED="$1"
+  if [ -e "$src/.git" ]; then
+    git -C "$src" checkout --detach "origin/$1" || die "Couldn't check out $1 in build/src."
+  else
+    git -C "$MAIN_REPO" worktree add --detach "$src" "origin/$1" || die "Couldn't make build/src."
+  fi
 }
 
 # Olex tests changes to the pipeline himself (AGENTS.md, "Scripts and hooks"), so a branch that
@@ -231,4 +335,46 @@ conflict_markers() {
   for f in "$@"; do
     if [ -f "$f" ] && grep -qE '^(<<<<<<<|>>>>>>>)( |$)' "$f"; then echo "$f"; fi
   done
+}
+
+# Merges made with "agent-merge --unbuilt" are listed in .agents/unbuilt, one per line:
+# "<commit> <parts> <PR number> <PR title>", where <commit> is the branch's last commit and
+# <parts> the parts it changed, comma-separated ("all" in a repo without hooks/parts). Every
+# build warns about the lines it doesn't build; a later feature's merge removes the lines its
+# build covered.
+
+# build_parts: the parts a build of this branch builds, comma-separated (hooks/parts), or "all".
+build_parts() {
+  if [ -f "$WORKTREE/.agents/hooks/parts" ]; then
+    bash "$WORKTREE/.agents/hooks/parts" | paste -sd, -
+  else
+    echo all
+  fi
+}
+
+# covers <commit> <parts> <unbuilt commit> <unbuilt parts>: true if a build of <commit> with
+# <parts> built that unbuilt merge: <commit> has its changes, and <parts> has every part it changed.
+covers() {
+  local p
+  git merge-base --is-ancestor "$3" "$1" 2>/dev/null || return 1
+  for p in ${4//,/ }; do
+    case ",$2," in *",$p,"*) ;; *) return 1 ;; esac
+  done
+}
+
+# unbuilt_lines <ref>: the lines of .agents/unbuilt at <ref>.
+unbuilt_lines() { git show "$1:.agents/unbuilt" 2>/dev/null | sed 's/[[:space:]]*$//' | grep -v '^$' || true; }
+
+# warn_unbuilt <commit>: before a build of <commit>, a ⚠️ status line lists the unbuilt merges on
+# main that this build doesn't build.
+warn_unbuilt() {
+  local c p n title parts left=""
+  git fetch -q origin main || true
+  parts="$(build_parts)"
+  while read -r c p n title; do
+    [ -n "$c" ] || continue
+    covers "$1" "$parts" "$c" "$p" && continue
+    left+="${left:+, }[PR #$n](https://github.com/$SLUG/pull/$n) $title ($p)"
+  done < <(unbuilt_lines origin/main)
+  [ -z "$left" ] || status "⚠️ Merged without a build and not in this one: $left"
 }

@@ -1,0 +1,37 @@
+name: Prune old builds
+
+# Deletes old builds' build/<n> tags and pre-releases (.agents/prune-releases): keeps the newest
+# 20 and every build on an open PR's branch. Then puts the newest file of every part from main's
+# builds on the "latest" release (.agents/update-latest). Runs after each push to main, daily,
+# and when agent-publish starts it.
+# PC builds also prune after each upload.
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: prune-releases
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - name: Delete old builds
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .agents/prune-releases
+      - name: Update the latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .agents/update-latest

@@ -2,8 +2,9 @@
 # Step 5: bring the latest main into the feature branch, then merge the branch into main.
 # Usage: .agents/agent-merge [--unbuilt]   (run it again after resolving conflicts)
 #   --unbuilt: only when Olex says to merge without a build. Merges without a checked build and
-#   without asking to test again; the merge commit's title ends in "(unbuilt)", so the next
-#   branch's build also builds the parts this one changed (hooks/parts).
+#   without asking to test again; the merge commit's title ends in "(unbuilt)", and the branch is
+#   listed in .agents/unbuilt (lib.sh), so every build warns about it until a later feature's
+#   build covers it.
 UNBUILT=0
 if [ "${1:-}" = --unbuilt ]; then UNBUILT=1; shift; fi
 source "$(dirname "$0")/lib.sh"
@@ -16,13 +17,53 @@ attempts_file="$(git rev-parse --path-format=absolute --git-path "agent-merge-at
 files_file="$attempts_file.files"
 attempts="$(cat "$attempts_file" 2>/dev/null || echo 0)"
 
-merge_into_main() {
-  if [ "$(git rev-parse HEAD)" != "$(git rev-parse "origin/$BRANCH")" ]; then
-    git push origin "$BRANCH"
+# last_built: the branch's newest commit since main that was built, or nothing.
+last_built() {
+  local c
+  while read -r c; do
+    if has_build "$c"; then echo "$c"; return 0; fi
+  done < <(git rev-list --first-parent "$(git merge-base HEAD origin/main)..HEAD")
+}
+
+# track_unbuilt <pr>: before the merge, updates .agents/unbuilt (lib.sh) and commits it on the
+# branch: --unbuilt adds this branch; a built merge removes the lines its last build covered.
+# HEAD has the latest main here, so its copy is main's plus this branch's.
+track_unbuilt() {
+  local n="$1" file="$WORKTREE/.agents/unbuilt" parts c p m title built lines
+  parts="$(build_parts)"
+  if [ "$UNBUILT" = 1 ]; then
+    lines="$(unbuilt_lines HEAD)"
+    if ! awk -v n="$n" '$3 == n { found = 1 } END { exit !found }' <<<"$lines"; then
+      title="$(gh api "repos/$SLUG/pulls/$n" --jq .title)"
+      title="${title//[$'\t\n']/ }"
+      lines+="${lines:+$'\n'}$(git rev-parse HEAD) $parts $n $title"
+    fi
+  else
+    built="$(last_built)"
+    lines="$(while read -r c p m title; do
+      [ -n "$c" ] || continue
+      if [ -n "$built" ] && covers "$built" "$parts" "$c" "$p"; then continue; fi
+      echo "$c $p $m $title"
+    done < <(unbuilt_lines HEAD))"
   fi
+  [ "$lines" != "$(unbuilt_lines HEAD)" ] || return 0
+  if [ -n "$lines" ]; then
+    printf '%s\n' "$lines" >"$file"
+    git add "$file"
+  else
+    git rm -q "$file"
+  fi
+  git commit -q -m "Update the list of merges without a build (.agents/unbuilt)"
+}
+
+merge_into_main() {
   local n
   n="$(pr_number "$BRANCH")"
   [ -n "$n" ] || die "No open PR from $BRANCH into main."
+  track_unbuilt "$n"
+  if [ "$(git rev-parse HEAD)" != "$(git rev-parse "origin/$BRANCH")" ]; then
+    git push origin "$BRANCH"
+  fi
   pr_ready "$n"
   local title=()
   if [ "$UNBUILT" = 1 ]; then title=(-f "commit_title=Merge pull request #$n from $BRANCH (unbuilt)"); fi
@@ -30,34 +71,62 @@ merge_into_main() {
     die "GitHub refused to merge PR #$n, most likely because main moved meanwhile. Run agent-merge again."
   rm -f "$attempts_file" "$files_file"
   if [ "$UNBUILT" = 1 ]; then
+    status "🔀 Merged $BRANCH, not built: [PR #$n](https://github.com/$SLUG/pull/$n)"
     finish done "Merged $BRANCH into main unbuilt: https://github.com/$SLUG/pull/$n" \
-      "The next build of a branch made from main after this builds its parts too." "The feature branch is kept."
+      "Listed in .agents/unbuilt: every build warns about it until a later feature's build covers it." "The feature branch is kept."
   fi
+  status "🔀 Merged $BRANCH: [PR #$n](https://github.com/$SLUG/pull/$n)"
   finish done "Merged $BRANCH into main: https://github.com/$SLUG/pull/$n" "The feature branch is kept."
 }
 
-# built: true if the branch's last commit passed a build's full checks (on the PC or in CI).
-# A merge of main that changed nothing this feature changed counts as its feature commit.
-built() {
-  checked "$(git rev-parse HEAD)" && return 0
-  git rev-parse -q --verify HEAD^2 >/dev/null &&
-    git merge-base --is-ancestor HEAD^2 origin/main &&
-    checked "$(git rev-parse HEAD^1)"
+# has_build <sha>: true if <sha> was built (a build/<n> tag is on it) or its full checks passed.
+has_build() { checked "$1" || [ -n "$(newest_build_tag "$1")" ]; }
+
+# clean_merge <commit>: true if <commit> merged main into the branch without touching what the
+# feature changed: none of the files it changed (outside pipeline files and docs) differ from the
+# branch before the merge in a file the feature had changed. A merge that overlapped or resolved
+# conflicts changed such a file, so it needs a new build.
+clean_merge() {
+  local m="$1" f
+  git rev-parse -q --verify "$m^2" >/dev/null || return 1
+  git merge-base --is-ancestor "$m^2" origin/main || return 1
+  local feature
+  feature="$(git diff --name-only "$(git merge-base "$m^1" "$m^2")" "$m^1")"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    pipeline_file "$f" && continue
+    if grep -qxF "$f" <<<"$feature"; then return 1; fi
+  done < <(git diff --name-only "$m^1" "$m")
 }
 
-# built_but_pipeline: true if the branch's newest commit whose full checks passed is followed only
-# by commits that change pipeline files or documentation (lib.sh pipeline_file): those need no
-# new build, since Olex tests pipeline changes himself.
+# built <test>: true if the branch's last commit passes <test> (has_build: it was built; checked:
+# its full checks passed). A merge of main that changed nothing this feature changed (clean_merge)
+# counts as its feature commit.
+built() {
+  "$1" "$(git rev-parse HEAD)" && return 0
+  clean_merge HEAD && "$1" "$(git rev-parse HEAD^1)"
+}
+
+# built_but_pipeline <test>: true if the branch's newest commit that passes <test> (as in built) is
+# followed only by commits that change pipeline files or documentation (lib.sh pipeline_file), and
+# by merges of main that didn't touch the feature (clean_merge): those need no new build or checks,
+# since Olex tests pipeline changes himself.
 built_but_pipeline() {
   local c base last="" f
   base="$(git merge-base HEAD origin/main)"
   while read -r c; do
-    if checked "$c"; then last="$c"; break; fi
+    if "$1" "$c"; then last="$c"; break; fi
   done < <(git rev-list --first-parent "$base..HEAD")
   [ -n "$last" ] || return 1
-  while IFS= read -r f; do
-    if [ -n "$f" ] && ! pipeline_file "$f"; then return 1; fi
-  done < <(git log --first-parent --no-merges --format= --name-only "$last..HEAD")
+  while read -r c; do
+    if git rev-parse -q --verify "$c^2" >/dev/null; then
+      clean_merge "$c" || return 1
+      continue
+    fi
+    while IFS= read -r f; do
+      if [ -n "$f" ] && ! pipeline_file "$f"; then return 1; fi
+    done < <(git diff-tree --no-commit-id --name-only -r "$c")
+  done < <(git rev-list --first-parent "$last..HEAD")
 }
 
 # docs_only: true if everything the branch changed since main is documentation (*.md files
@@ -95,12 +164,15 @@ if [ -f "$(git rev-parse --git-path MERGE_HEAD)" ]; then
     "Build again (step 3). Once Olex says it still works, run agent-merge again."
 fi
 
-# Nothing is checked again here: the build Olex tested already ran the full checks.
-# A branch that changed only pipeline files or documentation since main needs no build, and
-# neither do such commits after the branch's last checked build: Olex tests pipeline changes
+# A branch that changed only pipeline files or documentation since main needs no build or full
+# checks, and neither do such commits after the branch's last build: Olex tests pipeline changes
 # himself (lib.sh only_pipeline_changes, built_but_pipeline).
-[ "$UNBUILT" = 1 ] || docs_only || built || only_pipeline_changes || built_but_pipeline || finish not-built "$(git rev-parse --short HEAD) has no build whose full checks passed." \
+[ "$UNBUILT" = 1 ] || docs_only || built has_build || only_pipeline_changes || built_but_pipeline has_build || finish not-built "$(git rev-parse --short HEAD) has no build." \
   "Build it (step 3) and have Olex test it, then run agent-merge again."
+# Builds don't run the full checks: they run once before the merge (agent-check), or earlier when
+# Olex says "check"; a check of this same commit counts.
+[ "$UNBUILT" = 1 ] || docs_only || built checked || only_pipeline_changes || built_but_pipeline checked || finish needs-checks "$(git rev-parse --short HEAD) is built but hasn't had its full checks." \
+  "Run them on the PC: agent-check pc $BRANCH (when the PC is offline: agent-check ci $BRANCH), then run agent-merge again."
 
 # main hasn't moved since the branch last took it in.
 if git merge-base --is-ancestor origin/main HEAD; then

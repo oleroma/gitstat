@@ -18,5 +18,6 @@ else
   committed="Committed $(git rev-parse --short HEAD)."
 fi
 git push origin "$BRANCH"
+if [ -n "$staged" ]; then status "✏️ ${message%%$'\n'*}"; fi
 
 finish done "$committed Pushed $BRANCH."
