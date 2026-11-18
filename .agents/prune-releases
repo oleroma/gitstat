@@ -14,11 +14,14 @@ if [ "${1:-}" = --dry-run ]; then dry=1; fi
 slug="${GITHUB_REPOSITORY:-$(git remote get-url origin | sed -E 's#\.git$##; s#.*[:/]([^/]+/[^/]+)$#\1#')}"
 git fetch -q origin main
 heads=()
+# Read the list first: a failing gh api inside a process substitution wouldn't stop the script, and
+# an empty list would delete open PRs' builds.
+prs="$(gh api "repos/$slug/pulls?state=open&per_page=100" --jq '.[].number')"
 while read -r pr; do
   [ -n "$pr" ] || continue
   git fetch -q origin "refs/pull/$pr/head"
   heads+=("$(git rev-parse FETCH_HEAD)")
-done < <(gh api "repos/$slug/pulls?state=open&per_page=100" --jq '.[].number')
+done <<<"$prs"
 # The pre-releases by build number.
 declare -A rel=()
 page=1

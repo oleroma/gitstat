@@ -82,9 +82,9 @@ merge_into_main() {
   finish done "Merged $BRANCH into main: https://github.com/$SLUG/pull/$n" "The feature branch is kept."
 }
 
-# has_build <sha>: true if <sha> was built (its build/<n> pre-release has files) or its full checks
-# passed.
-has_build() { checked "$1" || published_build "$1"; }
+# has_build <sha>: true if <sha> was built (its build/<n> pre-release has files). Passed full checks
+# alone don't count: they run no quick tests or build for every part.
+has_build() { published_build "$1"; }
 
 # clean_merge <commit>: true if <commit> merged main into the branch without touching what the
 # feature changed: none of the files it changed (outside pipeline files and docs) differ from the

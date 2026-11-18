@@ -274,7 +274,15 @@ take_lock() {
     owner="$(cat "$LOCK" 2>/dev/null || true)"
     pid="${owner%% *}"
     if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
-      rm -f "$LOCK"
+      # Move the dead owner's lock aside before removing it: only one waiter's mv succeeds, so a
+      # waiter that read the same dead owner can't remove a lock another waiter just took.
+      if [ "$(cat "$LOCK" 2>/dev/null || true)" = "$owner" ] && mv "$LOCK" "$LOCK.stale.$$" 2>/dev/null; then
+        if [ "$(cat "$LOCK.stale.$$" 2>/dev/null || true)" = "$owner" ]; then
+          rm -f "$LOCK.stale.$$"
+        else
+          mv -n "$LOCK.stale.$$" "$LOCK" 2>/dev/null || rm -f "$LOCK.stale.$$"
+        fi
+      fi
       continue
     fi
     if [ -n "$owner" ] && [ "$owner" != "$shown" ]; then

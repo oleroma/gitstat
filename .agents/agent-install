@@ -88,6 +88,7 @@ install_apk() { # install_apk <apk> <name>; sets INSTALL_NOTE
     serials="$(while read -r d; do "$adb" -s "$d" shell getprop ro.serialno | tr -d '\r'; done <<<"$ids" | sort -u)"
     if [ "$(wc -l <<<"$serials")" != 1 ] || [ -z "$serials" ]; then
       INSTALL_NOTE="Not installed: more than one device connected."
+      PHONE_AWAY=1
       return
     fi
     export ANDROID_SERIAL="$(head -n 1 <<<"$ids")"
