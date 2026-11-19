@@ -430,7 +430,7 @@ pub fn sync(cx: &mut App) {
         cx.spawn(async move |_| unsafe {
             win::place_overlay(h, window);
             if let Some(p) = panel {
-                win::reassert_topmost(p);
+                win::panel_restack(p);
             }
         })
         .detach();
@@ -641,7 +641,7 @@ fn tick(id: u64, cx: &mut App) -> bool {
             win::reassert_topmost(h);
             // Topmost puts the badge above the panel; put the panel back.
             if let Some(p) = panel {
-                win::reassert_topmost(p);
+                win::panel_restack(p);
             }
         })
         .detach();

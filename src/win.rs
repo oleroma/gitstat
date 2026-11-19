@@ -10,20 +10,23 @@ use crate::layout::Rect;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::{
     DWMNCRP_DISABLED, DWMNCRP_USEWINDOWSTYLE, DWMWA_BORDER_COLOR, DWMWA_COLOR_DEFAULT,
-    DWMWA_COLOR_NONE, DWMWA_NCRENDERING_POLICY, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
-    DWMWCP_ROUND, DwmSetWindowAttribute,
+    DWMWA_COLOR_NONE, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_NCRENDERING_POLICY,
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND, DwmGetWindowAttribute,
+    DwmSetWindowAttribute,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    ClientToScreen, CreateEllipticRgn, CreateRectRgn, DeleteObject, GetMonitorInfoW, HMONITOR,
-    MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
-    SetWindowRgn,
+    ClientToScreen, CombineRgn, CreateEllipticRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject,
+    GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
+    MonitorFromPoint, RGN_AND, SetWindowRgn,
 };
 use windows_sys::Win32::UI::Controls::{
     ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, TOOLTIPS_CLASSW, TTDT_AUTOPOP,
     TTF_IDISHWND, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_SETDELAYTIME, TTM_SETMAXTIPWIDTH,
     TTM_UPDATETIPTEXTW, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW,
 };
-use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, GetSystemMetricsForDpi, MDT_EFFECTIVE_DPI};
+use windows_sys::Win32::UI::HiDpi::{
+    GetDpiForMonitor, GetDpiForWindow, GetSystemMetricsForDpi, MDT_EFFECTIVE_DPI,
+};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON};
 use windows_sys::Win32::UI::Shell::{
     DefSubclassProc, QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
@@ -333,6 +336,59 @@ pub unsafe fn place_morph(h: isize, r: Rect) {
     }
 }
 
+/// The panel's rounded corners, logical px (Windows 11's own).
+pub const PANEL_RADIUS: f32 = 8.0;
+
+/// How far past a window its shadow reaches, physical px.
+const SHADOW_REACH: i32 = 24;
+
+/// Puts the panel back on top of the topmost band, or, beside a taskbar,
+/// just below that taskbar, where it slid in from.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn panel_restack(h: isize) {
+    let Some(hwnd) = live(h) else { return };
+    let after = client_rect(h)
+        .and_then(|r| taskbar_over(r.outset(SHADOW_REACH)))
+        .unwrap_or(HWND_TOPMOST);
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            after,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        )
+    };
+}
+
+/// Whether a slide from `hidden` (the panel's place out of sight, screen
+/// px) is clipped rather than from behind a taskbar.
+pub fn slide_clips(hidden: Rect) -> bool {
+    taskbar_over(hidden).is_none()
+}
+
+/// How far the window's client area starts below its visible top edge
+/// (the title bar), physical px.
+pub fn caption_height(h: isize) -> Option<i32> {
+    let hwnd = live(h)?;
+    let client = client_rect(h)?;
+    let mut r = RECT::default();
+    let ok = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS as u32,
+            (&raw mut r).cast(),
+            size_of::<RECT>() as u32,
+        )
+    } == 0;
+    ok.then(|| client.top - r.top)
+        .filter(|c| (0..200).contains(c))
+}
+
 /// The panel whose DWM border and shadow are off for its slide.
 static BARE_PANEL: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
@@ -411,9 +467,11 @@ pub unsafe fn slide_panel(h: isize, moved: Rect, shown: Option<Rect>) {
         }
         let (dx, dy, bw, bh) = frame(hwnd);
         let (wl, wt) = (moved.left - dx, moved.top - dy);
-        // Behind a taskbar: placed after it, below it but still topmost.
-        // Clipped, or whole again: on top, over the taskbar.
-        let after = behind.unwrap_or(HWND_TOPMOST);
+        // Behind a taskbar, or whole again beside one: placed after it,
+        // below it but still topmost, so its shadow never jumps over the
+        // taskbar. Clipped, or away from taskbars: on top.
+        let after = behind.or_else(|| taskbar_over(moved.outset(SHADOW_REACH)));
+        let after = after.unwrap_or(HWND_TOPMOST);
         SetWindowPos(
             hwnd,
             after,
@@ -425,7 +483,26 @@ pub unsafe fn slide_panel(h: isize, moved: Rect, shown: Option<Rect>) {
         );
         let rgn = match clip {
             // Region coordinates are relative to the window.
-            Some(r) => CreateRectRgn(r.left - wl, r.top - wt, r.right - wl, r.bottom - wt),
+            // The part shown, with the panel's own rounded corners, which
+            // the panel draws its rim along (`panel::drawn_rim`).
+            Some(r) => {
+                let shown = CreateRectRgn(r.left - wl, r.top - wt, r.right - wl, r.bottom - wt);
+                let d = (2.0 * PANEL_RADIUS * GetDpiForWindow(hwnd).max(96) as f32 / 96.0).round()
+                    as i32;
+                let round = CreateRoundRectRgn(
+                    dx,
+                    dy,
+                    dx + moved.width() + 1,
+                    dy + moved.height() + 1,
+                    d,
+                    d,
+                );
+                if !round.is_null() {
+                    CombineRgn(shown, shown, round, RGN_AND);
+                    DeleteObject(round);
+                }
+                shown
+            }
             None => std::ptr::null_mut(),
         };
         // Cleared only when one is set: setting none again would still
@@ -517,7 +594,7 @@ pub unsafe fn panel_topmost(h: isize, under: Option<isize>, sliding: bool) {
                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
                 );
             }
-            None => reassert_topmost(h),
+            None => panel_restack(h),
         }
     }
 }

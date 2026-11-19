@@ -56,6 +56,9 @@ const HOLD: Duration = Duration::from_millis(80);
 const REVEAL: Duration = Duration::from_millis(110);
 /// The panel's and the sheet's rounded corners, logical px.
 const RADIUS: f32 = 8.0;
+/// Until the big window has been measured: its title bar's height,
+/// logical px.
+const CAPTION_GUESS: f32 = 32.0;
 /// Room left around the sheet for its shadow, logical px.
 const SHADOW_ROOM: f32 = 40.0;
 /// Until the big window has been drawn once: its column header's height,
@@ -139,6 +142,10 @@ thread_local! {
     static CLIENT_DELTA: Cell<Option<Delta>> = const { Cell::new(None) };
     /// The same for a maximised big window, against its monitor's work area.
     static MAXIMIZED_DELTA: Cell<Option<Delta>> = const { Cell::new(None) };
+    /// The big window's title bar height, physical px, normal and
+    /// maximised, once measured.
+    static CAPTION: Cell<Option<i32>> = const { Cell::new(None) };
+    static MAXIMIZED_CAPTION: Cell<Option<i32>> = const { Cell::new(None) };
     /// When the big window last reached the place and state it opened
     /// with (a maximised one shows at its normal size first).
     static SETTLED: Cell<Option<Instant>> = const { Cell::new(None) };
@@ -274,12 +281,21 @@ pub type Delta = (i32, i32, i32, i32);
 /// opened with (or, maximised, its monitor's work area), both physical px.
 /// Only once the window has settled into that state: a maximised window
 /// measured before it maximises would send the flip to its normal size.
-pub fn seen_client(requested: Rect, client: Rect, maximized: bool) {
+/// With its title bar's height, physical px, when known.
+pub fn seen_client(requested: Rect, client: Rect, maximized: bool, caption: Option<i32>) {
     let delta = if maximized {
         &MAXIMIZED_DELTA
     } else {
         &CLIENT_DELTA
     };
+    if caption.is_some() {
+        let cell = if maximized {
+            &MAXIMIZED_CAPTION
+        } else {
+            &CAPTION
+        };
+        cell.with(|c| c.set(caption));
+    }
     let d = (
         client.left - requested.left,
         client.top - requested.top,
@@ -300,6 +316,22 @@ pub fn deltas() -> (Option<Delta>, Option<Delta>) {
         CLIENT_DELTA.with(Cell::get),
         MAXIMIZED_DELTA.with(Cell::get),
     )
+}
+
+/// Both title bar heights as measured, (normal, maximised), for window.json.
+pub fn captions() -> (Option<i32>, Option<i32>) {
+    (CAPTION.with(Cell::get), MAXIMIZED_CAPTION.with(Cell::get))
+}
+
+/// Title bar heights kept from an earlier run, where none is measured yet.
+pub fn learn_captions(normal: Option<i32>, maximized: Option<i32>) {
+    for (cell, kept) in [(&CAPTION, normal), (&MAXIMIZED_CAPTION, maximized)] {
+        cell.with(|c| {
+            if c.get().is_none() {
+                c.set(kept);
+            }
+        });
+    }
 }
 
 /// Frames kept from an earlier run, where none is measured yet this run.
@@ -507,6 +539,9 @@ struct Plan {
     /// flip window's top-left corner.
     from: Bounds<f32>,
     to: Bounds<f32>,
+    /// The big window's title bar height, physical px: the sheet grows
+    /// over it too, so the bar never pops in at the end.
+    caption: f32,
     trees: Vec<Tree>,
     spines: Vec<Spine>,
     parts: Vec<Carried>,
@@ -570,11 +605,19 @@ fn plan(
         }
     };
 
+    // The big window's title bar, above its client area.
+    let maximized = matches!(view::window_place(0, cx).0, WindowBounds::Maximized(_));
+    let caption = if maximized {
+        MAXIMIZED_CAPTION.with(Cell::get)
+    } else {
+        CAPTION.with(Cell::get)
+    }
+    .unwrap_or((CAPTION_GUESS * ws).round() as i32);
     // Room around both for the sheet's shadow.
     let m = (SHADOW_ROOM * ps).ceil() as i32;
     let union = Rect::new(
         panel_rect.left.min(target.left) - m,
-        panel_rect.top.min(target.top) - m,
+        panel_rect.top.min(target.top - caption) - m,
         panel_rect.right.max(target.right) + m,
         panel_rect.bottom.max(target.bottom) + m,
     );
@@ -750,6 +793,7 @@ fn plan(
         union,
         from,
         to,
+        caption: caption as f32,
         trees,
         spines,
         parts,
@@ -993,7 +1037,20 @@ impl Render for MorphView {
         );
         let p = Palette::for_appearance(appearance);
         let s = window.scale_factor();
-        let sheet = lerp_bounds(self.plan.from, self.plan.to, e, s);
+        // The sheet grows over the title bar too; that part takes its
+        // colour, as wide as the sheet and as tall as the turn has gone.
+        let cap = self.plan.caption;
+        let to_sheet = Bounds {
+            origin: point(self.plan.to.origin.x, self.plan.to.origin.y - cap),
+            size: size(self.plan.to.size.width, self.plan.to.size.height + cap),
+        };
+        let sheet = lerp_bounds(self.plan.from, to_sheet, e, s);
+        let title = Bounds::new(sheet.origin, size(sheet.size.width, px(cap * e / s)));
+        let title_color: Hsla = if dark {
+            gpui::rgb(0x202020).into()
+        } else {
+            gpui::rgb(0xf3f3f3).into()
+        };
         let trees: Vec<(Arc<crate::repo_graph::RepoGraph>, bool, Ends, f32)> = self
             .plan
             .trees
@@ -1118,6 +1175,22 @@ impl Render for MorphView {
                     gpui::transparent_black(),
                     gpui::BorderStyle::Solid,
                 ));
+                if title.size.height > px(0.5) {
+                    let round = px(RADIUS);
+                    window.paint_quad(quad(
+                        title,
+                        gpui::Corners {
+                            top_left: round,
+                            top_right: round,
+                            bottom_left: px(0.0),
+                            bottom_right: px(0.0),
+                        },
+                        title_color.opacity(sheet_alpha * reveal),
+                        px(0.0),
+                        gpui::transparent_black(),
+                        gpui::BorderStyle::Solid,
+                    ));
+                }
                 window.with_content_mask(Some(gpui::ContentMask { bounds: sheet }), |window| {
                     // A section's heading stretching into its spine.
                     for (b, bar, name) in &spines {
@@ -1211,11 +1284,8 @@ impl Render for MorphView {
                 });
                 // The rim: one physical px, light over dark, dark over light.
                 if framed > 0.0 {
-                    let rim = if dark {
-                        gpui::white().opacity(0.16 * framed)
-                    } else {
-                        gpui::black().opacity(0.16 * framed)
-                    };
+                    let rim = view::rim(dark);
+                    let rim = rim.opacity(rim.a * framed);
                     window.paint_quad(quad(
                         sheet,
                         px(RADIUS),

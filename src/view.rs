@@ -128,7 +128,12 @@ pub fn show_window(cx: &mut App) {
                         if maximized == win::is_zoomed(h)
                             && let Some(client) = win::client_rect(h)
                         {
-                            crate::morph::seen_client(requested, client, maximized);
+                            crate::morph::seen_client(
+                                requested,
+                                client,
+                                maximized,
+                                win::caption_height(h),
+                            );
                         }
                         crate::morph::big_settled();
                     })
@@ -182,6 +187,11 @@ struct Place {
     frame: Option<crate::morph::Delta>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     maximized_frame: Option<crate::morph::Delta>,
+    /// Its title bar's height, normal and maximised, physical px.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    caption: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    maximized_caption: Option<i32>,
 }
 
 /// The last place, kept for this run and in window.json beside config.json.
@@ -206,6 +216,7 @@ fn last_place(cx: &App) -> Option<Place> {
         .filter(|p| p.w >= 100.0 && p.h >= 100.0 && p.x.is_finite() && p.y.is_finite());
     if let Some(p) = place {
         crate::morph::learn_deltas(p.frame, p.maximized_frame);
+        crate::morph::learn_captions(p.caption, p.maximized_caption);
     }
     place
 }
@@ -233,9 +244,10 @@ pub(crate) fn remember_place(window: &Window, cx: &mut App) {
                 at(b.origin.y + b.size.height),
             )
         };
-        crate::morph::seen_client(requested, client, maximized);
+        crate::morph::seen_client(requested, client, maximized, win::caption_height(h));
     }
     let (frame, maximized_frame) = crate::morph::deltas();
+    let (caption, maximized_caption) = crate::morph::captions();
     let place = Place {
         x: f32::from(b.origin.x),
         y: f32::from(b.origin.y),
@@ -244,6 +256,8 @@ pub(crate) fn remember_place(window: &Window, cx: &mut App) {
         maximized,
         frame,
         maximized_frame,
+        caption,
+        maximized_caption,
     };
     cx.default_global::<LastPlace>().0 = Some(Some(place));
     if let (Some(file), Ok(text)) = (place_file(cx), serde_json::to_string(&place)) {
@@ -1718,6 +1732,27 @@ impl Render for StatusView {
             })
             .children(window_prs)
             .when(!icons_only, |d| d.child(sideways(footer, mode, cx)))
+            // Windows draws no rim while the panel slides clipped (the
+            // badge's slide): drawn here meanwhile, along the panel's edge.
+            .when(mode == Mode::Panel && panel::drawn_rim(cx), |d| {
+                d.relative().child(
+                    canvas(
+                        |_, _, _| {},
+                        move |bounds, _, window, _| {
+                            window.paint_quad(gpui::quad(
+                                bounds,
+                                px(win::PANEL_RADIUS),
+                                gpui::transparent_black(),
+                                px(1.0 / window.scale_factor()),
+                                rim(dark),
+                                gpui::BorderStyle::Solid,
+                            ));
+                        },
+                    )
+                    .absolute()
+                    .inset_0(),
+                )
+            })
             .children(
                 self.timelines
                     .as_ref()
@@ -1749,6 +1784,16 @@ fn sideways(part: impl IntoElement, mode: Mode, cx: &mut Context<StatusView>) ->
             }
         }))
         .into_any_element()
+}
+
+/// The light rim Windows 11 draws around a window, for where gitstat
+/// draws it itself (the flip, a clipped slide).
+pub(crate) fn rim(dark: bool) -> Hsla {
+    if dark {
+        gpui::white().opacity(0.16)
+    } else {
+        gpui::black().opacity(0.16)
+    }
 }
 
 /// A bar of the repos' tones: green synced, amber local work, red needs
