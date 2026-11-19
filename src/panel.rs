@@ -191,7 +191,8 @@ fn open(anchor: Anchor, slide: bool, cx: &mut App) {
                 hwnd = win::hwnd(window);
                 if let Some(h) = hwnd {
                     // Native z-order calls must run outside this update.
-                    cx.spawn(async move |_| unsafe { win::panel_topmost(h) })
+                    let under = crate::morph::flip_hwnd(cx);
+                    cx.spawn(async move |_| unsafe { win::panel_topmost(h, under) })
                         .detach();
                 }
                 cx.new(|cx| StatusView::new(state, Mode::Panel, window, cx))

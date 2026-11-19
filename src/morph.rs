@@ -23,7 +23,14 @@
 //!
 //! Where things land comes from what each window drew last time (`seen_*`),
 //! so the first flip after starting gitstat may land a few px off; the
-//! reveal's fade hides that.
+//! reveal's fade hides that. The big window's frame (how far its client
+//! area sits inside the bounds it was opened with, maximised or not) is
+//! measured once the window has settled and kept in window.json, so the
+//! sheet lands on it from the first flip.
+//!
+//! Words that differ between the two views (a short and a long checkout,
+//! bold and plain) cross-fade over the middle of the turn rather than
+//! swapping at once.
 
 use crate::config::Section;
 use crate::layout::Rect;
@@ -126,10 +133,13 @@ thread_local! {
     /// physical px, as last drawn.
     static SPINE: Cell<Option<(f32, f32)>> = const { Cell::new(None) };
     /// The big window's client area minus the bounds it was opened with,
-    /// physical px per edge (left, top, right, bottom).
-    static CLIENT_DELTA: Cell<(i32, i32, i32, i32)> = const { Cell::new((0, 0, 0, 0)) };
+    /// physical px per edge (left, top, right, bottom), once measured.
+    static CLIENT_DELTA: Cell<Option<Delta>> = const { Cell::new(None) };
     /// The same for a maximised big window, against its monitor's work area.
-    static MAXIMIZED_DELTA: Cell<(i32, i32, i32, i32)> = const { Cell::new((0, 0, 0, 0)) };
+    static MAXIMIZED_DELTA: Cell<Option<Delta>> = const { Cell::new(None) };
+    /// When the big window last reached the place and state it opened
+    /// with (a maximised one shows at its normal size first).
+    static SETTLED: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
 /// A panel heading's words as drawn: bounds, text and colour.
@@ -254,27 +264,63 @@ pub fn seen_spine(spine: Bounds<Pixels>, window: &Window) {
     SPINE.with(|t| t.set(Some((f32::from(spine.top()) * s, below))));
 }
 
-/// Notes where the big window's client area came out for the bounds it
-/// was opened with, both physical px.
+/// A client area minus the bounds asked for, physical px per edge (left,
+/// top, right, bottom).
+pub type Delta = (i32, i32, i32, i32);
+
+/// Notes where the big window's client area is for the bounds it was
+/// opened with (or, maximised, its monitor's work area), both physical px.
+/// Only once the window has settled into that state: a maximised window
+/// measured before it maximises would send the flip to its normal size.
 pub fn seen_client(requested: Rect, client: Rect, maximized: bool) {
     let delta = if maximized {
         &MAXIMIZED_DELTA
     } else {
         &CLIENT_DELTA
     };
-    delta.with(|d| {
-        d.set((
-            client.left - requested.left,
-            client.top - requested.top,
-            client.right - requested.right,
-            client.bottom - requested.bottom,
-        ))
-    });
+    let d = (
+        client.left - requested.left,
+        client.top - requested.top,
+        client.right - requested.right,
+        client.bottom - requested.bottom,
+    );
+    // A frame is a few dozen px at most; anything more is a window caught
+    // between states.
+    let sane = [d.0, d.1, d.2, d.3].iter().all(|v| v.abs() <= 120);
+    if sane {
+        delta.with(|c| c.set(Some(d)));
+    }
+}
+
+/// Both frames as measured, (normal, maximised), for window.json.
+pub fn deltas() -> (Option<Delta>, Option<Delta>) {
+    (
+        CLIENT_DELTA.with(Cell::get),
+        MAXIMIZED_DELTA.with(Cell::get),
+    )
+}
+
+/// Frames kept from an earlier run, where none is measured yet this run.
+pub fn learn_deltas(normal: Option<Delta>, maximized: Option<Delta>) {
+    for (cell, kept) in [(&CLIENT_DELTA, normal), (&MAXIMIZED_DELTA, maximized)] {
+        cell.with(|c| {
+            if c.get().is_none() {
+                c.set(kept);
+            }
+        });
+    }
+}
+
+/// The big window has reached the place and state it was opened with.
+pub fn big_settled() {
+    SETTLED.with(|s| s.set(Some(Instant::now())));
 }
 
 #[derive(Default)]
 struct MorphSlot {
     handle: Option<WindowHandle<MorphView>>,
+    /// Its HWND, which a window opening under it is placed below.
+    hwnd: Option<isize>,
     /// When it opened.
     since: Option<Instant>,
 }
@@ -287,6 +333,14 @@ pub fn running(cx: &App) -> bool {
         s.handle.is_some_and(|h| view::is_live(h.into(), cx))
             && s.since.is_some_and(|t| t.elapsed() < STUCK)
     })
+}
+
+/// The flip's HWND while it draws.
+pub fn flip_hwnd(cx: &App) -> Option<isize> {
+    if !running(cx) {
+        return None;
+    }
+    cx.try_global::<MorphSlot>()?.hwnd
 }
 
 /// Longer than any flip runs: one still around after this is stuck, and
@@ -419,11 +473,12 @@ struct Name {
 /// A part's words: text, colour, size in px, and whether bold.
 type Words = (gpui::SharedString, Hsla, f32, bool);
 
-/// A carried part this frame: where, its picture or words, and alpha.
+/// A carried part this frame: where, its picture, its words (two while
+/// they cross-fade), alpha, and whether it is the top bar.
 type Drawn = (
     Bounds<Pixels>,
     Option<Arc<gpui::RenderImage>>,
-    Option<Words>,
+    Vec<Words>,
     f32,
     bool,
 );
@@ -488,7 +543,7 @@ fn plan(
             let (area, delta) = match place {
                 WindowBounds::Maximized(_) => (
                     view::maximized_area(bounds, ws),
-                    MAXIMIZED_DELTA.with(Cell::get),
+                    MAXIMIZED_DELTA.with(Cell::get).unwrap_or_default(),
                 ),
                 _ => (
                     Rect::new(
@@ -497,7 +552,7 @@ fn plan(
                         at(bounds.origin.x + bounds.size.width),
                         at(bounds.origin.y + bounds.size.height),
                     ),
-                    CLIENT_DELTA.with(Cell::get),
+                    CLIENT_DELTA.with(Cell::get).unwrap_or_default(),
                 ),
             };
             let (dl, dt, dr, db) = delta;
@@ -705,6 +760,7 @@ fn launch(plan: Plan, direction: Direction, cx: &mut App) -> bool {
         .map_or(560, |ui| ui.state.read(cx).config.flip_ms);
     let fixed = HOLD.as_millis() as f32;
     let stretch = ((ms as f32 - fixed) / (560.0 - fixed)).clamp(0.2, 6.0);
+    let mut flip_hwnd = None;
     let Ok(handle) = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(crate::panel::logical(union))),
@@ -719,7 +775,8 @@ fn launch(plan: Plan, direction: Direction, cx: &mut App) -> bool {
             ..Default::default()
         },
         |window, cx| {
-            if let Some(h) = win::hwnd(window) {
+            flip_hwnd = win::hwnd(window);
+            if let Some(h) = flip_hwnd {
                 // Shown a moment after it opens, from a timer: a hidden
                 // window may draw no frames, so it can't show itself.
                 cx.spawn(async move |cx| {
@@ -752,7 +809,9 @@ fn launch(plan: Plan, direction: Direction, cx: &mut App) -> bool {
     if let Some(old) = old {
         old.update(cx, |_, window, _| window.remove_window()).ok();
     }
-    cx.default_global::<MorphSlot>().since = Some(Instant::now());
+    let slot = cx.default_global::<MorphSlot>();
+    slot.since = Some(Instant::now());
+    slot.hwnd = flip_hwnd;
     true
 }
 
@@ -836,9 +895,16 @@ impl Render for MorphView {
             && let Some(arrived) = self.arrived
         {
             let since = arrived.elapsed();
-            let drawn = LAST_PAINT
-                .with(Cell::get)
-                .is_some_and(|t| t > arrived + Duration::from_millis(30));
+            // Opening, the big window must also have settled (a maximised
+            // one maximises a moment after it shows) and drawn since.
+            let ready = if open {
+                SETTLED.with(Cell::get).filter(|&t| t >= arrived)
+            } else {
+                Some(arrived)
+            };
+            let drawn = ready
+                .zip(LAST_PAINT.with(Cell::get))
+                .is_some_and(|(r, t)| t > r.max(arrived + Duration::from_millis(30)));
             if since >= DRAW_WAIT || (since >= HOLD && drawn) {
                 self.reveal_from = Some(Instant::now());
             }
@@ -927,7 +993,9 @@ impl Render for MorphView {
             .collect();
         // Each bar is drawn solid, its wash already laid on the panel's
         // colour, so it never shows through to the bars beneath it.
-        type Named = (gpui::Point<Pixels>, String, f32, Hsla);
+        // Words that differ cross-fade over the turn's middle.
+        let blend = ease((e - 0.3) / 0.4);
+        type Named = (gpui::Point<Pixels>, Vec<(String, f32)>, f32, Hsla);
         let spines: Vec<(Bounds<Pixels>, Hsla, Option<Named>)> = self
             .plan
             .spines
@@ -937,10 +1005,13 @@ impl Render for MorphView {
                 let name = sp.name.as_ref().map(|n| {
                     (
                         point(px(mix(n.from.0, n.to.0) / s), px(mix(n.from.1, n.to.1) / s)),
-                        if e < 0.5 {
-                            n.from_text.clone()
+                        if n.from_text == n.to_text {
+                            vec![(n.from_text.clone(), 1.0)]
                         } else {
-                            n.to_text.clone()
+                            vec![
+                                (n.from_text.clone(), 1.0 - blend),
+                                (n.to_text.clone(), blend),
+                            ]
                         },
                         mix(n.from_size, n.to_size) / s,
                         n.color,
@@ -968,16 +1039,27 @@ impl Render for MorphView {
                     let z = c.to.size.width.round() as u32;
                     crate::repo_marks::picture(st, &[a.max(z), a.min(z)], cx)
                 });
-                let words = c.words.as_ref().map(|(a, z)| {
+                let words = c.words.as_ref().map_or_else(Vec::new, |(a, z)| {
                     let mix = |x: f32, y: f32| x + (y - x) * e;
-                    let color = Hsla {
-                        h: if e < 0.5 { a.1.h } else { z.1.h },
-                        s: mix(a.1.s, z.1.s),
-                        l: mix(a.1.l, z.1.l),
-                        a: mix(a.1.a, z.1.a),
-                    };
-                    let text = if e < 0.5 { a.0.clone() } else { z.0.clone() };
-                    (text, color, mix(a.2, z.2), if e < 0.5 { a.3 } else { z.3 })
+                    let size = mix(a.2, z.2);
+                    if a.0 == z.0 && a.3 == z.3 {
+                        // The same words: one line, its colour moving.
+                        let color = Hsla {
+                            h: if e < 0.5 { a.1.h } else { z.1.h },
+                            s: mix(a.1.s, z.1.s),
+                            l: mix(a.1.l, z.1.l),
+                            a: mix(a.1.a, z.1.a),
+                        };
+                        vec![(a.0.clone(), color, size, a.3)]
+                    } else {
+                        // Different words: each in its own colour, one
+                        // fading out as the other fades in.
+                        let fade = |c: Hsla, k: f32| Hsla { a: c.a * k, ..c };
+                        vec![
+                            (a.0.clone(), fade(a.1, 1.0 - blend), size, a.3),
+                            (z.0.clone(), fade(z.1, blend), size, z.3),
+                        ]
+                    }
                 });
                 (b, image, words, alpha, c.bar)
             })
@@ -1002,15 +1084,20 @@ impl Render for MorphView {
                         window.paint_quad(gpui::fill(*b, bar.opacity(reveal)));
                         // The name turns with its bar, from across to
                         // reading upwards.
-                        if let Some((at, text, size, color)) = name {
-                            crate::turned_text::paint_turning(
-                                window,
-                                *at,
-                                text,
-                                *size,
-                                color.opacity(reveal),
-                                e,
-                            );
+                        if let Some((at, texts, size, color)) = name {
+                            for (text, a) in texts {
+                                if *a <= 0.0 {
+                                    continue;
+                                }
+                                crate::turned_text::paint_turning(
+                                    window,
+                                    *at,
+                                    text,
+                                    *size,
+                                    color.opacity(color.a * reveal * a),
+                                    e,
+                                );
+                            }
                         }
                     }
                     for (graph, dirty, ends, alpha) in &trees {
@@ -1052,7 +1139,10 @@ impl Render for MorphView {
                                 .paint_image(*b, Default::default(), image.clone(), 0, false)
                                 .ok();
                         }
-                        if let Some((text, color, size, bold)) = words {
+                        for (text, color, size, bold) in words {
+                            if color.a <= 0.0 {
+                                continue;
+                            }
                             let mut font = window.text_style().font();
                             if *bold {
                                 font.weight = gpui::FontWeight::SEMIBOLD;

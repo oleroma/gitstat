@@ -29,7 +29,7 @@ use windows_sys::Win32::UI::Shell::{
     SHQueryUserNotificationState, SetWindowSubclass,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CW_USEDEFAULT, CreateWindowExW, HTMINBUTTON, IsIconic, PostMessageW, SC_MINIMIZE,
+    CW_USEDEFAULT, CreateWindowExW, HTMINBUTTON, IsIconic, IsZoomed, PostMessageW, SC_MINIMIZE,
     SIZE_MINIMIZED, SendMessageW, WM_CLOSE, WM_NCLBUTTONUP, WM_SIZE, WM_SYSCOMMAND, WS_EX_TOPMOST,
     WS_POPUP,
 };
@@ -408,11 +408,28 @@ pub unsafe fn reassert_topmost(h: isize) {
 ///
 /// # Safety
 /// Call only from a spawned task outside `update`.
-pub unsafe fn panel_topmost(h: isize) {
+///
+/// With `under` (a flip drawing over it), it goes just below that one
+/// instead, so it never shows above the flip for a frame.
+pub unsafe fn panel_topmost(h: isize, under: Option<isize>) {
     let Some(hwnd) = live(h) else { return };
     unsafe {
         dwm_set(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND as u32);
-        reassert_topmost(h);
+        match under.and_then(live) {
+            // Placed after a topmost window, it becomes topmost too.
+            Some(over) => {
+                SetWindowPos(
+                    hwnd,
+                    over,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+            None => reassert_topmost(h),
+        }
     }
 }
 
@@ -486,6 +503,11 @@ pub unsafe fn harden_keepalive(h: isize) {
             SWP_NOZORDER | SWP_NOACTIVATE,
         );
     }
+}
+
+/// Whether the window is maximised.
+pub fn is_zoomed(h: isize) -> bool {
+    live(h).is_some_and(|hwnd| unsafe { IsZoomed(hwnd) } != 0)
 }
 
 pub fn is_visible(h: isize) -> bool {
