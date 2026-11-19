@@ -9,8 +9,9 @@
 use crate::layout::Rect;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::{
-    DWMNCRP_DISABLED, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_NCRENDERING_POLICY,
-    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND, DwmSetWindowAttribute,
+    DWMNCRP_DISABLED, DWMNCRP_USEWINDOWSTYLE, DWMWA_BORDER_COLOR, DWMWA_COLOR_DEFAULT,
+    DWMWA_COLOR_NONE, DWMWA_NCRENDERING_POLICY, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
+    DWMWCP_ROUND, DwmSetWindowAttribute,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     ClientToScreen, CreateEllipticRgn, CreateRectRgn, DeleteObject, GetMonitorInfoW, HMONITOR,
@@ -332,15 +333,34 @@ pub unsafe fn place_morph(h: isize, r: Rect) {
     }
 }
 
+/// The panel whose DWM border and shadow are off for its slide.
+static BARE_PANEL: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
 /// Moves the panel's client area to `moved` without resizing it, showing
-/// only the part inside `shown` (screen px), for its slide in. `None`
-/// shows it whole again, with its rounded corners.
+/// only the part inside `shown` (screen px), for its slide in or out.
+/// `None` shows it whole again, with its rounded corners.
+///
+/// While it slides, DWM's border, rounded corners and shadow are off: they
+/// follow the whole window, not the part shown, so they'd draw a frame
+/// around the panel's hidden part.
 ///
 /// # Safety
 /// Call only from a spawned task outside `update`.
 pub unsafe fn slide_panel(h: isize, moved: Rect, shown: Option<Rect>) {
+    use std::sync::atomic::Ordering::Relaxed;
     let Some(hwnd) = live(h) else { return };
     unsafe {
+        let bare = BARE_PANEL.load(Relaxed) == h;
+        if shown.is_some() && !bare {
+            BARE_PANEL.store(h, Relaxed);
+            dwm_set(hwnd, DWMWA_NCRENDERING_POLICY, DWMNCRP_DISABLED as u32);
+            dwm_set(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                DWMWCP_DONOTROUND as u32,
+            );
+            dwm_set(hwnd, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE);
+        }
         let (dx, dy, bw, bh) = frame(hwnd);
         let (wl, wt) = (moved.left - dx, moved.top - dy);
         SetWindowPos(
@@ -359,6 +379,16 @@ pub unsafe fn slide_panel(h: isize, moved: Rect, shown: Option<Rect>) {
         };
         if SetWindowRgn(hwnd, rgn, 1) == 0 && !rgn.is_null() {
             DeleteObject(rgn);
+        }
+        if shown.is_none() && bare {
+            BARE_PANEL.store(0, Relaxed);
+            dwm_set(
+                hwnd,
+                DWMWA_NCRENDERING_POLICY,
+                DWMNCRP_USEWINDOWSTYLE as u32,
+            );
+            dwm_set(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND as u32);
+            dwm_set(hwnd, DWMWA_BORDER_COLOR, DWMWA_COLOR_DEFAULT);
         }
     }
 }
