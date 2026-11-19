@@ -30,9 +30,9 @@ use windows_sys::Win32::UI::Shell::{
     SHQueryUserNotificationState, SetWindowSubclass,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CW_USEDEFAULT, CreateWindowExW, HTMINBUTTON, IsIconic, IsZoomed, PostMessageW, SC_MINIMIZE,
-    SIZE_MINIMIZED, SendMessageW, WM_CLOSE, WM_NCLBUTTONUP, WM_SIZE, WM_SYSCOMMAND, WS_EX_TOPMOST,
-    WS_POPUP,
+    CW_USEDEFAULT, CreateWindowExW, FindWindowExW, FindWindowW, HTMINBUTTON, IsIconic, IsZoomed,
+    PostMessageW, SC_MINIMIZE, SIZE_MINIMIZED, SendMessageW, WM_CLOSE, WM_NCLBUTTONUP, WM_SIZE,
+    WM_SYSCOMMAND, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GWL_EXSTYLE, GetClientRect, GetCursorPos, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
@@ -336,22 +336,70 @@ pub unsafe fn place_morph(h: isize, r: Rect) {
 /// The panel whose DWM border and shadow are off for its slide.
 static BARE_PANEL: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
+/// `s` as a NUL-ended UTF-16 string.
+fn w(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(Some(0)).collect()
+}
+
+/// The taskbar (any monitor's) overlapping `r`, screen px.
+fn taskbar_over(r: Rect) -> Option<HWND> {
+    let main = w("Shell_TrayWnd");
+    let other = w("Shell_SecondaryTrayWnd");
+    let overlaps = |hwnd: HWND| {
+        let mut wr = RECT::default();
+        !hwnd.is_null()
+            && unsafe { IsWindowVisible(hwnd) } != 0
+            && unsafe { GetWindowRect(hwnd, &mut wr) } != 0
+            && wr.left < r.right
+            && r.left < wr.right
+            && wr.top < r.bottom
+            && r.top < wr.bottom
+    };
+    let tray = unsafe { FindWindowW(main.as_ptr(), std::ptr::null()) };
+    if overlaps(tray) {
+        return Some(tray);
+    }
+    let mut after: HWND = std::ptr::null_mut();
+    loop {
+        after = unsafe {
+            FindWindowExW(
+                std::ptr::null_mut(),
+                after,
+                other.as_ptr(),
+                std::ptr::null(),
+            )
+        };
+        if after.is_null() {
+            return None;
+        }
+        if overlaps(after) {
+            return Some(after);
+        }
+    }
+}
+
 /// Moves the panel's client area to `moved` without resizing it, showing
 /// only the part inside `shown` (screen px), for its slide in or out.
-/// `None` shows it whole again, with its rounded corners.
+/// `None` shows it whole again, on top.
 ///
-/// While it slides, DWM's border, rounded corners and shadow are off: they
-/// follow the whole window, not the part shown, so they'd draw a frame
-/// around the panel's hidden part.
+/// Sliding from a taskbar, it slides from behind it: just below it in the
+/// z-order, keeping its own rim and shadow. Elsewhere (the badge, a hidden
+/// taskbar) it is clipped to `shown`, with DWM's border, rounded corners
+/// and shadow off meanwhile: they follow the whole window, not the part
+/// shown, so they'd draw a frame around the hidden part.
 ///
 /// # Safety
 /// Call only from a spawned task outside `update`.
 pub unsafe fn slide_panel(h: isize, moved: Rect, shown: Option<Rect>) {
     use std::sync::atomic::Ordering::Relaxed;
     let Some(hwnd) = live(h) else { return };
+    let behind = shown
+        .filter(|s| *s != moved)
+        .and_then(|_| taskbar_over(moved));
+    let clip = shown.filter(|_| behind.is_none());
     unsafe {
         let bare = BARE_PANEL.load(Relaxed) == h;
-        if shown.is_some() && !bare {
+        if clip.is_some() && !bare {
             BARE_PANEL.store(h, Relaxed);
             dwm_set(hwnd, DWMWA_NCRENDERING_POLICY, DWMNCRP_DISABLED as u32);
             dwm_set(
@@ -363,16 +411,19 @@ pub unsafe fn slide_panel(h: isize, moved: Rect, shown: Option<Rect>) {
         }
         let (dx, dy, bw, bh) = frame(hwnd);
         let (wl, wt) = (moved.left - dx, moved.top - dy);
+        // Behind a taskbar: placed after it, below it but still topmost.
+        // Clipped, or whole again: on top, over the taskbar.
+        let after = behind.unwrap_or(HWND_TOPMOST);
         SetWindowPos(
             hwnd,
-            std::ptr::null_mut(),
+            after,
             wl,
             wt,
             moved.width() + bw,
             moved.height() + bh,
-            SWP_NOZORDER | SWP_NOACTIVATE,
+            SWP_NOACTIVATE,
         );
-        let rgn = match shown {
+        let rgn = match clip {
             // Region coordinates are relative to the window.
             Some(r) => CreateRectRgn(r.left - wl, r.top - wt, r.right - wl, r.bottom - wt),
             None => std::ptr::null_mut(),
@@ -380,7 +431,7 @@ pub unsafe fn slide_panel(h: isize, moved: Rect, shown: Option<Rect>) {
         if SetWindowRgn(hwnd, rgn, 1) == 0 && !rgn.is_null() {
             DeleteObject(rgn);
         }
-        if shown.is_none() && bare {
+        if clip.is_none() && bare {
             BARE_PANEL.store(0, Relaxed);
             dwm_set(
                 hwnd,
@@ -441,10 +492,16 @@ pub unsafe fn reassert_topmost(h: isize) {
 ///
 /// With `under` (a flip drawing over it), it goes just below that one
 /// instead, so it never shows above the flip for a frame.
-pub unsafe fn panel_topmost(h: isize, under: Option<isize>) {
+///
+/// `None` for `under` and `sliding` leaves the z-order to the slide
+/// (`slide_panel`), which may start it behind the taskbar.
+pub unsafe fn panel_topmost(h: isize, under: Option<isize>, sliding: bool) {
     let Some(hwnd) = live(h) else { return };
     unsafe {
         dwm_set(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND as u32);
+        if sliding && under.is_none() {
+            return;
+        }
         match under.and_then(live) {
             // Placed after a topmost window, it becomes topmost too.
             Some(over) => {

@@ -56,6 +56,8 @@ const HOLD: Duration = Duration::from_millis(80);
 const REVEAL: Duration = Duration::from_millis(110);
 /// The panel's and the sheet's rounded corners, logical px.
 const RADIUS: f32 = 8.0;
+/// Room left around the sheet for its shadow, logical px.
+const SHADOW_ROOM: f32 = 40.0;
 /// Until the big window has been drawn once: its column header's height,
 /// and the table's top and bottom margins, logical px.
 const HEADER_GUESS: f32 = 110.0;
@@ -568,11 +570,13 @@ fn plan(
         }
     };
 
+    // Room around both for the sheet's shadow.
+    let m = (SHADOW_ROOM * ps).ceil() as i32;
     let union = Rect::new(
-        panel_rect.left.min(target.left),
-        panel_rect.top.min(target.top),
-        panel_rect.right.max(target.right),
-        panel_rect.bottom.max(target.bottom),
+        panel_rect.left.min(target.left) - m,
+        panel_rect.top.min(target.top) - m,
+        panel_rect.right.max(target.right) + m,
+        panel_rect.bottom.max(target.bottom) + m,
     );
     let local = |r: Rect| Bounds {
         origin: point((r.left - union.left) as f32, (r.top - union.top) as f32),
@@ -967,6 +971,9 @@ impl Render for MorphView {
         // 0 is the panel's layout, 1 the big window's.
         let e = if open { turned } else { 1.0 - turned };
         let reveal = 1.0 - ease(phase(revealed, Duration::ZERO, reveal_len));
+        // The windows' own rim and shadow, drawn around the sheet once the
+        // window it starts from has gone, until the one it ends in shows.
+        let framed = if elapsed >= turn_at { reveal } else { 0.0 };
         let appearance = window.appearance();
         let dark = matches!(
             appearance,
@@ -1070,6 +1077,27 @@ impl Render for MorphView {
             move |_, _, window, cx| {
                 window.request_animation_frame();
                 let bg = p.surface.opacity(sheet_alpha * reveal);
+                if framed > 0.0 {
+                    window.paint_shadows(
+                        sheet,
+                        gpui::Corners::all(px(RADIUS)),
+                        &[
+                            gpui::BoxShadow {
+                                color: gpui::black().opacity(0.14 * framed),
+                                offset: point(px(0.0), px(2.0)),
+                                blur_radius: px(4.0),
+                                spread_radius: px(0.0),
+                            },
+                            gpui::BoxShadow {
+                                color: gpui::black()
+                                    .opacity(if dark { 0.40 } else { 0.26 } * framed),
+                                offset: point(px(0.0), px(8.0)),
+                                blur_radius: px(24.0),
+                                spread_radius: px(0.0),
+                            },
+                        ],
+                    );
+                }
                 window.paint_quad(quad(
                     sheet,
                     px(RADIUS),
@@ -1169,6 +1197,22 @@ impl Render for MorphView {
                         }
                     }
                 });
+                // The rim: one physical px, light over dark, dark over light.
+                if framed > 0.0 {
+                    let rim = if dark {
+                        gpui::white().opacity(0.16 * framed)
+                    } else {
+                        gpui::black().opacity(0.16 * framed)
+                    };
+                    window.paint_quad(quad(
+                        sheet,
+                        px(RADIUS),
+                        gpui::transparent_black(),
+                        px(1.0 / window.scale_factor()),
+                        rim,
+                        gpui::BorderStyle::Solid,
+                    ));
+                }
             },
         )
         .size_full();

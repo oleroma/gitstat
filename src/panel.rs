@@ -170,6 +170,7 @@ fn open(anchor: Anchor, slide: bool, cx: &mut App) {
     });
     // Opened where the slide starts, out of sight.
     let first = slide.map_or(rect, |s| layout::slide(rect, s.work, s.edge, 0.0).0);
+    let sliding = slide.is_some();
     let bounds = logical(first);
     let mut hwnd = None;
     let handle = cx
@@ -192,7 +193,7 @@ fn open(anchor: Anchor, slide: bool, cx: &mut App) {
                 if let Some(h) = hwnd {
                     // Native z-order calls must run outside this update.
                     let under = crate::morph::flip_hwnd(cx);
-                    cx.spawn(async move |_| unsafe { win::panel_topmost(h, under) })
+                    cx.spawn(async move |_| unsafe { win::panel_topmost(h, under, sliding) })
                         .detach();
                 }
                 cx.new(|cx| StatusView::new(state, Mode::Panel, window, cx))
