@@ -428,7 +428,9 @@ pub unsafe fn slide_panel(h: isize, moved: Rect, shown: Option<Rect>) {
             Some(r) => CreateRectRgn(r.left - wl, r.top - wt, r.right - wl, r.bottom - wt),
             None => std::ptr::null_mut(),
         };
-        if SetWindowRgn(hwnd, rgn, 1) == 0 && !rgn.is_null() {
+        // Cleared only when one is set: setting none again would still
+        // redraw the whole panel every frame.
+        if (clip.is_some() || bare) && SetWindowRgn(hwnd, rgn, 1) == 0 && !rgn.is_null() {
             DeleteObject(rgn);
         }
         if clip.is_none() && bare {

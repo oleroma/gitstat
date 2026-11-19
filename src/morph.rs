@@ -802,6 +802,7 @@ fn launch(plan: Plan, direction: Direction, cx: &mut App) -> bool {
                 arrived: None,
                 reveal_from: None,
                 frames: 0,
+                framed: (u32::MAX, u32::MAX),
                 hiding: false,
             })
         },
@@ -834,6 +835,11 @@ pub struct MorphView {
     reveal_from: Option<Instant>,
     /// Frames drawn; shown from the second.
     frames: u32,
+    /// The frames between which the sheet draws the windows' rim and
+    /// shadow: from the one after the starting window closed until the one
+    /// after the ending window showed, so the real and the drawn one hand
+    /// over without both showing, or neither.
+    framed: (u32, u32),
     /// Hidden, to be removed next frame.
     hiding: bool,
 }
@@ -917,6 +923,7 @@ impl Render for MorphView {
 
         if elapsed >= turn_at && !self.left {
             self.left = true;
+            self.framed.0 = self.frames + 1;
             if open {
                 cx.defer(crate::panel::close);
             } else {
@@ -925,6 +932,7 @@ impl Render for MorphView {
         }
         if elapsed >= hold_at && self.arrived.is_none() {
             self.arrived = Some(Instant::now());
+            self.framed.1 = self.frames + 1;
             if open {
                 cx.defer(view::show_window);
             } else {
@@ -971,9 +979,13 @@ impl Render for MorphView {
         // 0 is the panel's layout, 1 the big window's.
         let e = if open { turned } else { 1.0 - turned };
         let reveal = 1.0 - ease(phase(revealed, Duration::ZERO, reveal_len));
-        // The windows' own rim and shadow, drawn around the sheet once the
-        // window it starts from has gone, until the one it ends in shows.
-        let framed = if elapsed >= turn_at { reveal } else { 0.0 };
+        // The windows' own rim and shadow, drawn around the sheet while
+        // neither window is on screen to show its own.
+        let framed = if (self.framed.0..self.framed.1).contains(&self.frames) {
+            1.0
+        } else {
+            0.0
+        };
         let appearance = window.appearance();
         let dark = matches!(
             appearance,
