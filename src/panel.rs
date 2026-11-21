@@ -56,6 +56,9 @@ struct Slide {
     len: Duration,
     edge: layout::Edge,
     work: Rect,
+    /// Clipped to the work area rather than sliding from behind a
+    /// taskbar: Windows draws no rim then, so the panel draws its own.
+    clips: bool,
 }
 
 impl Slide {
@@ -113,6 +116,13 @@ pub fn close(cx: &mut App) {
     }
 }
 
+/// Whether the panel draws its own rim: while it slides clipped.
+pub fn drawn_rim(cx: &App) -> bool {
+    cx.try_global::<PanelSlot>()
+        .and_then(|s| s.slide)
+        .is_some_and(|s| s.clips)
+}
+
 pub fn is_open(cx: &App) -> bool {
     cx.try_global::<PanelSlot>()
         .and_then(|slot| slot.handle)
@@ -166,10 +176,12 @@ fn open(anchor: Anchor, slide: bool, cx: &mut App) {
             len: Duration::from_millis(u64::from(ms.min(2000))),
             edge,
             work,
+            clips: win::slide_clips(layout::slide(rect, work, edge, 0.0).0),
         }
     });
     // Opened where the slide starts, out of sight.
     let first = slide.map_or(rect, |s| layout::slide(rect, s.work, s.edge, 0.0).0);
+    let sliding = slide.is_some();
     let bounds = logical(first);
     let mut hwnd = None;
     let handle = cx
@@ -191,7 +203,8 @@ fn open(anchor: Anchor, slide: bool, cx: &mut App) {
                 hwnd = win::hwnd(window);
                 if let Some(h) = hwnd {
                     // Native z-order calls must run outside this update.
-                    cx.spawn(async move |_| unsafe { win::panel_topmost(h) })
+                    let under = crate::morph::flip_hwnd(cx);
+                    cx.spawn(async move |_| unsafe { win::panel_topmost(h, under, sliding) })
                         .detach();
                 }
                 cx.new(|cx| StatusView::new(state, Mode::Panel, window, cx))
@@ -233,6 +246,8 @@ fn run_slide(slide: Slide, handle: WindowHandle<StatusView>, h: isize, cx: &mut 
             let Ok(Some((rect, t))) = step else { break };
             if t >= 1.0 {
                 unsafe { win::slide_panel(h, rect, None) };
+                // Windows draws its rim again: the panel's own goes.
+                handle.update(cx, |_, _, cx| cx.notify()).ok();
                 break;
             }
             let (moved, shown) = layout::slide(rect, slide.work, slide.edge, t);
@@ -316,10 +331,16 @@ pub fn slide_away(cx: &mut App) {
         len: Duration::from_millis(u64::from(ms.min(2000))),
         edge,
         work,
+        clips: win::slide_clips(layout::slide(rect, work, edge, 0.0).0),
     };
+
     // Keeps a refit from moving it back in.
     slot.slide = Some(slide);
     slot.leaving = true;
+    // Its rim, drawn by the panel while it slides clipped.
+    if slide.clips {
+        handle.update(cx, |_, _, cx| cx.notify()).ok();
+    }
     cx.spawn(async move |cx| {
         loop {
             let t = slide.progress();

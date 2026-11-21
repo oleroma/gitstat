@@ -111,12 +111,31 @@ pub fn show_window(cx: &mut App) {
                             at(bounds.origin.y + bounds.size.height),
                         )
                     };
-                    cx.spawn(async move |_| {
+                    cx.spawn(async move |cx| {
                         // Minimising goes the way closing does.
                         unsafe { win::minimize_closes(h) };
-                        if let Some(client) = win::client_rect(h) {
-                            crate::morph::seen_client(requested, client, maximized);
+                        // A maximised window shows at its normal size and
+                        // maximises a moment later: measure it, and let
+                        // the flip reveal it, once it has.
+                        for _ in 0..50 {
+                            if !maximized || win::is_zoomed(h) {
+                                break;
+                            }
+                            cx.background_executor()
+                                .timer(std::time::Duration::from_millis(8))
+                                .await;
                         }
+                        if maximized == win::is_zoomed(h)
+                            && let Some(client) = win::client_rect(h)
+                        {
+                            crate::morph::seen_client(
+                                requested,
+                                client,
+                                maximized,
+                                win::caption_height(h),
+                            );
+                        }
+                        crate::morph::big_settled();
                     })
                     .detach();
                 }
@@ -162,6 +181,17 @@ struct Place {
     w: f32,
     h: f32,
     maximized: bool,
+    /// The window's frame, normal and maximised, for the flip to land on
+    /// (`morph::Delta`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    frame: Option<crate::morph::Delta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    maximized_frame: Option<crate::morph::Delta>,
+    /// Its title bar's height, normal and maximised, physical px.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    caption: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    maximized_caption: Option<i32>,
 }
 
 /// The last place, kept for this run and in window.json beside config.json.
@@ -180,24 +210,54 @@ fn last_place(cx: &App) -> Option<Place> {
         return known;
     }
     // Not closed yet this run: as the last run left it.
-    place_file(cx)
+    let place = place_file(cx)
         .and_then(|f| std::fs::read_to_string(f).ok())
         .and_then(|text| serde_json::from_str::<Place>(&text).ok())
-        .filter(|p| p.w >= 100.0 && p.h >= 100.0 && p.x.is_finite() && p.y.is_finite())
+        .filter(|p| p.w >= 100.0 && p.h >= 100.0 && p.x.is_finite() && p.y.is_finite());
+    if let Some(p) = place {
+        crate::morph::learn_deltas(p.frame, p.maximized_frame);
+        crate::morph::learn_captions(p.caption, p.maximized_caption);
+    }
+    place
 }
 
 /// Notes where the big window is, as it closes, so it opens there again.
+/// Its frame too, as it is now: settled, so the next flip lands on it.
 pub(crate) fn remember_place(window: &Window, cx: &mut App) {
     let (b, maximized) = match window.window_bounds() {
         WindowBounds::Maximized(b) => (b, true),
         WindowBounds::Windowed(b) | WindowBounds::Fullscreen(b) => (b, false),
     };
+    if let Some(h) = win::hwnd(window)
+        && maximized == win::is_zoomed(h)
+        && let Some(client) = win::client_rect(h)
+    {
+        let scale = sane_scale(window.scale_factor());
+        let requested = if maximized {
+            maximized_area(b, scale)
+        } else {
+            let at = |v: gpui::Pixels| (f32::from(v) * scale).round() as i32;
+            crate::layout::Rect::new(
+                at(b.origin.x),
+                at(b.origin.y),
+                at(b.origin.x + b.size.width),
+                at(b.origin.y + b.size.height),
+            )
+        };
+        crate::morph::seen_client(requested, client, maximized, win::caption_height(h));
+    }
+    let (frame, maximized_frame) = crate::morph::deltas();
+    let (caption, maximized_caption) = crate::morph::captions();
     let place = Place {
         x: f32::from(b.origin.x),
         y: f32::from(b.origin.y),
         w: f32::from(b.size.width),
         h: f32::from(b.size.height),
         maximized,
+        frame,
+        maximized_frame,
+        caption,
+        maximized_caption,
     };
     cx.default_global::<LastPlace>().0 = Some(Some(place));
     if let (Some(file), Ok(text)) = (place_file(cx), serde_json::to_string(&place)) {
@@ -1672,6 +1732,27 @@ impl Render for StatusView {
             })
             .children(window_prs)
             .when(!icons_only, |d| d.child(sideways(footer, mode, cx)))
+            // Windows draws no rim while the panel slides clipped (the
+            // badge's slide): drawn here meanwhile, along the panel's edge.
+            .when(mode == Mode::Panel && panel::drawn_rim(cx), |d| {
+                d.relative().child(
+                    canvas(
+                        |_, _, _| {},
+                        move |bounds, _, window, _| {
+                            window.paint_quad(gpui::quad(
+                                bounds,
+                                px(win::PANEL_RADIUS),
+                                gpui::transparent_black(),
+                                px(1.0 / window.scale_factor()),
+                                rim(dark),
+                                gpui::BorderStyle::Solid,
+                            ));
+                        },
+                    )
+                    .absolute()
+                    .inset_0(),
+                )
+            })
             .children(
                 self.timelines
                     .as_ref()
@@ -1703,6 +1784,16 @@ fn sideways(part: impl IntoElement, mode: Mode, cx: &mut Context<StatusView>) ->
             }
         }))
         .into_any_element()
+}
+
+/// The light rim Windows 11 draws around a window, for where gitstat
+/// draws it itself (the flip, a clipped slide).
+pub(crate) fn rim(dark: bool) -> Hsla {
+    if dark {
+        gpui::white().opacity(0.16)
+    } else {
+        gpui::black().opacity(0.16)
+    }
 }
 
 /// A bar of the repos' tones: green synced, amber local work, red needs
