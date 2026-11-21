@@ -75,6 +75,9 @@ pub fn show_window(cx: &mut App) {
     let Some(state) = cx.try_global::<Ui>().map(|ui| ui.state.clone()) else {
         return;
     };
+    if let Some(t) = cx.try_global::<Ui>().map(|ui| ui.timelines.clone()) {
+        t.update(cx, |t, cx| t.show_newest(cx));
+    }
     let remembered = last_place(cx).is_some();
     let (repos, known) = {
         let s = state.read(cx);

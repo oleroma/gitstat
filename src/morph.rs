@@ -542,6 +542,10 @@ struct Plan {
     /// The big window's title bar height, physical px: the sheet grows
     /// over it too, so the bar never pops in at the end.
     caption: f32,
+    /// The work areas the flip may draw in, physical px from its top-left
+    /// corner: never over a taskbar, which the windows' own shadows stay
+    /// under.
+    work: Bounds<f32>,
     trees: Vec<Tree>,
     spines: Vec<Spine>,
     parts: Vec<Carried>,
@@ -626,6 +630,19 @@ fn plan(
         size: size(r.width() as f32, r.height() as f32),
     };
     let (from, to) = (local(panel_rect), local(target));
+    let work = {
+        let (a, b) = (panel_rect.centre(), target.centre());
+        let (a, b) = (
+            win::monitor_at(a.0, a.1).work,
+            win::monitor_at(b.0, b.1).work,
+        );
+        local(Rect::new(
+            a.left.min(b.left),
+            a.top.min(b.top),
+            a.right.max(b.right),
+            a.bottom.max(b.bottom),
+        ))
+    };
     // In the panel, logical px to the flip window's physical px.
     let in_panel = |b: &Bounds<Pixels>| Bounds {
         origin: point(
@@ -794,6 +811,7 @@ fn plan(
         from,
         to,
         caption: caption as f32,
+        work,
         trees,
         spines,
         parts,
@@ -1045,6 +1063,7 @@ impl Render for MorphView {
             size: size(self.plan.to.size.width, self.plan.to.size.height + cap),
         };
         let sheet = lerp_bounds(self.plan.from, to_sheet, e, s);
+        let work = lerp_bounds(self.plan.work, self.plan.work, 0.0, s);
         let title = Bounds::new(sheet.origin, size(sheet.size.width, px(cap * e / s)));
         let title_color: Hsla = if dark {
             gpui::rgb(0x202020).into()
@@ -1144,157 +1163,160 @@ impl Render for MorphView {
         let painter = canvas(
             |_, _, _| {},
             move |_, _, window, cx| {
-                window.request_animation_frame();
-                let bg = p.surface.opacity(sheet_alpha * reveal);
-                if framed > 0.0 {
-                    window.paint_shadows(
-                        sheet,
-                        gpui::Corners::all(px(RADIUS)),
-                        &[
-                            gpui::BoxShadow {
-                                color: gpui::black().opacity(0.14 * framed),
-                                offset: point(px(0.0), px(2.0)),
-                                blur_radius: px(4.0),
-                                spread_radius: px(0.0),
-                            },
-                            gpui::BoxShadow {
-                                color: gpui::black()
-                                    .opacity(if dark { 0.40 } else { 0.26 } * framed),
-                                offset: point(px(0.0), px(8.0)),
-                                blur_radius: px(24.0),
-                                spread_radius: px(0.0),
-                            },
-                        ],
-                    );
-                }
-                window.paint_quad(quad(
-                    sheet,
-                    px(RADIUS),
-                    bg,
-                    px(0.0),
-                    gpui::transparent_black(),
-                    gpui::BorderStyle::Solid,
-                ));
-                if title.size.height > px(0.5) {
-                    let round = px(RADIUS);
+                // Never over a taskbar.
+                window.with_content_mask(Some(gpui::ContentMask { bounds: work }), |window| {
+                    window.request_animation_frame();
+                    let bg = p.surface.opacity(sheet_alpha * reveal);
+                    if framed > 0.0 {
+                        window.paint_shadows(
+                            sheet,
+                            gpui::Corners::all(px(RADIUS)),
+                            &[
+                                gpui::BoxShadow {
+                                    color: gpui::black().opacity(0.14 * framed),
+                                    offset: point(px(0.0), px(2.0)),
+                                    blur_radius: px(4.0),
+                                    spread_radius: px(0.0),
+                                },
+                                gpui::BoxShadow {
+                                    color: gpui::black()
+                                        .opacity(if dark { 0.40 } else { 0.26 } * framed),
+                                    offset: point(px(0.0), px(8.0)),
+                                    blur_radius: px(24.0),
+                                    spread_radius: px(0.0),
+                                },
+                            ],
+                        );
+                    }
                     window.paint_quad(quad(
-                        title,
-                        gpui::Corners {
-                            top_left: round,
-                            top_right: round,
-                            bottom_left: px(0.0),
-                            bottom_right: px(0.0),
-                        },
-                        title_color.opacity(sheet_alpha * reveal),
+                        sheet,
+                        px(RADIUS),
+                        bg,
                         px(0.0),
                         gpui::transparent_black(),
                         gpui::BorderStyle::Solid,
                     ));
-                }
-                window.with_content_mask(Some(gpui::ContentMask { bounds: sheet }), |window| {
-                    // A section's heading stretching into its spine.
-                    for (b, bar, name) in &spines {
-                        window.paint_quad(gpui::fill(*b, bar.opacity(reveal)));
-                        // The name turns with its bar, from across to
-                        // reading upwards.
-                        if let Some((at, texts, size, color)) = name {
-                            for (text, a) in texts {
-                                if *a <= 0.0 {
+                    if title.size.height > px(0.5) {
+                        let round = px(RADIUS);
+                        window.paint_quad(quad(
+                            title,
+                            gpui::Corners {
+                                top_left: round,
+                                top_right: round,
+                                bottom_left: px(0.0),
+                                bottom_right: px(0.0),
+                            },
+                            title_color.opacity(sheet_alpha * reveal),
+                            px(0.0),
+                            gpui::transparent_black(),
+                            gpui::BorderStyle::Solid,
+                        ));
+                    }
+                    window.with_content_mask(Some(gpui::ContentMask { bounds: sheet }), |window| {
+                        // A section's heading stretching into its spine.
+                        for (b, bar, name) in &spines {
+                            window.paint_quad(gpui::fill(*b, bar.opacity(reveal)));
+                            // The name turns with its bar, from across to
+                            // reading upwards.
+                            if let Some((at, texts, size, color)) = name {
+                                for (text, a) in texts {
+                                    if *a <= 0.0 {
+                                        continue;
+                                    }
+                                    crate::turned_text::paint_turning(
+                                        window,
+                                        *at,
+                                        text,
+                                        *size,
+                                        color.opacity(color.a * reveal * a),
+                                        e,
+                                    );
+                                }
+                            }
+                        }
+                        for (graph, dirty, ends, alpha) in &trees {
+                            crate::timeline::paint_tree(
+                                graph, *dirty, *ends, e, *alpha, dark, &p, window,
+                            );
+                        }
+                        for (b, image, words, alpha, bar) in &parts {
+                            if *alpha <= 0.0 {
+                                continue;
+                            }
+                            if *bar {
+                                // The header's own colour, darker than the
+                                // sheet's, under the sheet's rounded top.
+                                let round = px(RADIUS);
+                                window.paint_quad(quad(
+                                    *b,
+                                    gpui::Corners {
+                                        top_left: round,
+                                        top_right: round,
+                                        bottom_left: px(0.0),
+                                        bottom_right: px(0.0),
+                                    },
+                                    p.bg.opacity(sheet_alpha * reveal),
+                                    px(0.0),
+                                    gpui::transparent_black(),
+                                    gpui::BorderStyle::Solid,
+                                ));
+                                // Its bottom edge, the line under the header.
+                                let edge = Bounds::new(
+                                    point(b.origin.x, b.bottom() - px(1.0)),
+                                    size(b.size.width, px(1.0)),
+                                );
+                                window.paint_quad(gpui::fill(edge, p.border.opacity(*alpha)));
+                                continue;
+                            }
+                            if let Some(image) = image {
+                                window
+                                    .paint_image(*b, Default::default(), image.clone(), 0, false)
+                                    .ok();
+                            }
+                            for (text, color, size, bold) in words {
+                                if color.a <= 0.0 {
                                     continue;
                                 }
-                                crate::turned_text::paint_turning(
-                                    window,
-                                    *at,
-                                    text,
-                                    *size,
-                                    color.opacity(color.a * reveal * a),
-                                    e,
+                                let mut font = window.text_style().font();
+                                if *bold {
+                                    font.weight = gpui::FontWeight::SEMIBOLD;
+                                }
+                                let run = gpui::TextRun {
+                                    len: text.len(),
+                                    font,
+                                    color: color.opacity(color.a * alpha),
+                                    background_color: None,
+                                    underline: None,
+                                    strikethrough: None,
+                                };
+                                let line = window.text_system().shape_line(
+                                    text.clone(),
+                                    px(*size),
+                                    &[run],
+                                    None,
+                                );
+                                // Cut where the view would cut it.
+                                window.with_content_mask(
+                                    Some(gpui::ContentMask { bounds: *b }),
+                                    |window| line.paint(b.origin, b.size.height, window, cx).ok(),
                                 );
                             }
                         }
-                    }
-                    for (graph, dirty, ends, alpha) in &trees {
-                        crate::timeline::paint_tree(
-                            graph, *dirty, *ends, e, *alpha, dark, &p, window,
-                        );
-                    }
-                    for (b, image, words, alpha, bar) in &parts {
-                        if *alpha <= 0.0 {
-                            continue;
-                        }
-                        if *bar {
-                            // The header's own colour, darker than the
-                            // sheet's, under the sheet's rounded top.
-                            let round = px(RADIUS);
-                            window.paint_quad(quad(
-                                *b,
-                                gpui::Corners {
-                                    top_left: round,
-                                    top_right: round,
-                                    bottom_left: px(0.0),
-                                    bottom_right: px(0.0),
-                                },
-                                p.bg.opacity(sheet_alpha * reveal),
-                                px(0.0),
-                                gpui::transparent_black(),
-                                gpui::BorderStyle::Solid,
-                            ));
-                            // Its bottom edge, the line under the header.
-                            let edge = Bounds::new(
-                                point(b.origin.x, b.bottom() - px(1.0)),
-                                size(b.size.width, px(1.0)),
-                            );
-                            window.paint_quad(gpui::fill(edge, p.border.opacity(*alpha)));
-                            continue;
-                        }
-                        if let Some(image) = image {
-                            window
-                                .paint_image(*b, Default::default(), image.clone(), 0, false)
-                                .ok();
-                        }
-                        for (text, color, size, bold) in words {
-                            if color.a <= 0.0 {
-                                continue;
-                            }
-                            let mut font = window.text_style().font();
-                            if *bold {
-                                font.weight = gpui::FontWeight::SEMIBOLD;
-                            }
-                            let run = gpui::TextRun {
-                                len: text.len(),
-                                font,
-                                color: color.opacity(color.a * alpha),
-                                background_color: None,
-                                underline: None,
-                                strikethrough: None,
-                            };
-                            let line = window.text_system().shape_line(
-                                text.clone(),
-                                px(*size),
-                                &[run],
-                                None,
-                            );
-                            // Cut where the view would cut it.
-                            window.with_content_mask(
-                                Some(gpui::ContentMask { bounds: *b }),
-                                |window| line.paint(b.origin, b.size.height, window, cx).ok(),
-                            );
-                        }
+                    });
+                    // The rim: one physical px, light over dark, dark over light.
+                    if framed > 0.0 {
+                        let rim = view::rim(dark);
+                        let rim = rim.opacity(rim.a * framed);
+                        window.paint_quad(quad(
+                            sheet,
+                            px(RADIUS),
+                            gpui::transparent_black(),
+                            px(1.0 / window.scale_factor()),
+                            rim,
+                            gpui::BorderStyle::Solid,
+                        ));
                     }
                 });
-                // The rim: one physical px, light over dark, dark over light.
-                if framed > 0.0 {
-                    let rim = view::rim(dark);
-                    let rim = rim.opacity(rim.a * framed);
-                    window.paint_quad(quad(
-                        sheet,
-                        px(RADIUS),
-                        gpui::transparent_black(),
-                        px(1.0 / window.scale_factor()),
-                        rim,
-                        gpui::BorderStyle::Solid,
-                    ));
-                }
             },
         )
         .size_full();

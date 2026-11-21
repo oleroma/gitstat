@@ -165,6 +165,9 @@ fn open(anchor: Anchor, slide: bool, cx: &mut App) {
         a => a,
     };
     crate::morph::clear_strips();
+    if let Some(t) = cx.try_global::<Ui>().map(|ui| ui.timelines.clone()) {
+        t.update(cx, |t, cx| t.show_newest(cx));
+    }
     let rows = view::panel_rows(state.read(cx));
     let rect = place(anchor, Height::Rows(rows), cx);
     // Slides in from the taskbar's side, or the badge's top or bottom.
