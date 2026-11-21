@@ -581,7 +581,10 @@ pub unsafe fn panel_topmost(h: isize, under: Option<isize>, sliding: bool) {
         if sliding && under.is_none() {
             return;
         }
-        match under.and_then(live) {
+        // Beside a taskbar it goes under the taskbar, which is under the
+        // flip, so its shadow stays where it will be after the flip.
+        let beside = client_rect(h).and_then(|r| taskbar_over(r.outset(SHADOW_REACH)));
+        match beside.or(under.and_then(live)) {
             // Placed after a topmost window, it becomes topmost too.
             Some(over) => {
                 SetWindowPos(

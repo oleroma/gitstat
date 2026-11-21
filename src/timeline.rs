@@ -452,9 +452,10 @@ impl Timelines {
                 slot.loading = false;
                 // Rows shift under a reload; the view keeps its commit.
                 let at = slot.scroll / STEP;
+                // A first load starts at the newest commits.
                 let row = match &slot.graph {
                     Some(old) => g.carry_scroll(old, at),
-                    None => g.home(),
+                    None => 0.0,
                 };
                 slot.scroll = row * STEP;
                 slot.glide = None;
@@ -541,6 +542,20 @@ impl Timelines {
         self.hover = None;
         self.card = false;
         self.hover_generation += 1;
+    }
+
+    /// Every strip and column back at its newest commits, as the panel or
+    /// the big window opens: neither ever opens scrolled into the past.
+    pub fn show_newest(&mut self, cx: &mut Context<Self>) {
+        for slot in self.slots.values_mut() {
+            slot.scroll = 0.0;
+            slot.glide = None;
+            slot.top = 0.0;
+            slot.top_glide = None;
+        }
+        self.table_top = 0.0;
+        self.unhover();
+        cx.notify();
     }
 
     fn scroll_home(&mut self, path: &Path, cx: &mut Context<Self>) {
