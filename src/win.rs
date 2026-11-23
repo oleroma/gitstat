@@ -16,8 +16,9 @@ use windows_sys::Win32::Graphics::Dwm::{
 };
 use windows_sys::Win32::Graphics::Gdi::{
     ClientToScreen, CombineRgn, CreateEllipticRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject,
-    GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
-    MonitorFromPoint, RGN_AND, SetWindowRgn,
+    GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL,
+    MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, MonitorFromRect, RGN_AND,
+    SetWindowRgn,
 };
 use windows_sys::Win32::UI::Controls::{
     ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, TOOLTIPS_CLASSW, TTDT_AUTOPOP,
@@ -368,7 +369,35 @@ pub unsafe fn panel_restack(h: isize) {
 /// Whether a slide from `hidden` (the panel's place out of sight, screen
 /// px) is clipped rather than from behind a taskbar.
 pub fn slide_clips(hidden: Rect) -> bool {
-    taskbar_over(hidden).is_none()
+    taskbar_over(hidden).is_none() && on_a_monitor(hidden)
+}
+
+/// Whether any of `r` (screen px) is on a monitor; past every screen's
+/// edge, a sliding panel needs no clip.
+fn on_a_monitor(r: Rect) -> bool {
+    let rc = RECT {
+        left: r.left,
+        top: r.top,
+        right: r.right,
+        bottom: r.bottom,
+    };
+    r.width() > 0
+        && r.height() > 0
+        && !unsafe { MonitorFromRect(&rc, MONITOR_DEFAULTTONULL) }.is_null()
+}
+
+/// The part of `moved` outside `shown`: the strip past the edge it
+/// slides from.
+fn hidden_part(moved: Rect, shown: Rect) -> Rect {
+    if shown.top > moved.top {
+        Rect::new(moved.left, moved.top, moved.right, shown.top)
+    } else if shown.bottom < moved.bottom {
+        Rect::new(moved.left, shown.bottom, moved.right, moved.bottom)
+    } else if shown.left > moved.left {
+        Rect::new(moved.left, moved.top, shown.left, moved.bottom)
+    } else {
+        Rect::new(shown.right, moved.top, moved.right, moved.bottom)
+    }
 }
 
 /// How far the window's client area starts below its visible top edge
@@ -452,7 +481,11 @@ pub unsafe fn slide_panel(h: isize, moved: Rect, shown: Option<Rect>) {
     let behind = shown
         .filter(|s| *s != moved)
         .and_then(|_| taskbar_over(moved));
-    let clip = shown.filter(|_| behind.is_none());
+    // Past a screen's edge with nothing beyond, it needs no clip either:
+    // Windows keeps its own rim and shadow on all the way.
+    let clip = shown
+        .filter(|_| behind.is_none())
+        .filter(|s| *s != moved && on_a_monitor(hidden_part(moved, *s)));
     unsafe {
         let bare = BARE_PANEL.load(Relaxed) == h;
         if clip.is_some() && !bare {

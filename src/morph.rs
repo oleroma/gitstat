@@ -943,6 +943,14 @@ fn lerp_bounds(a: Bounds<f32>, b: Bounds<f32>, e: f32, s: f32) -> Bounds<Pixels>
     )
 }
 
+/// `b` (logical px at `s`) with its edges on whole physical px.
+fn snapped(b: Bounds<Pixels>, s: f32) -> Bounds<Pixels> {
+    let r = |v: Pixels| (f32::from(v) * s).round() / s;
+    let (l, t) = (r(b.left()), r(b.top()));
+    let (rt, bt) = (r(b.right()), r(b.bottom()));
+    Bounds::new(point(px(l), px(t)), size(px(rt - l), px(bt - t)))
+}
+
 impl Render for MorphView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.hiding {
@@ -1065,7 +1073,9 @@ impl Render for MorphView {
             origin: point(self.plan.to.origin.x, self.plan.to.origin.y - cap),
             size: size(self.plan.to.size.width, self.plan.to.size.height + cap),
         };
-        let sheet = lerp_bounds(self.plan.from, to_sheet, e, s);
+        // On whole physical px, so its 1 px rim stays crisp and even
+        // rather than smearing across two px as it moves.
+        let sheet = snapped(lerp_bounds(self.plan.from, to_sheet, e, s), s);
         let work = lerp_bounds(self.plan.work, self.plan.work, 0.0, s);
         let title = Bounds::new(sheet.origin, size(sheet.size.width, px(cap * e / s)));
         let title_color = view::title_bar(dark);
