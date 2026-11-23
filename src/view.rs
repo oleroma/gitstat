@@ -1640,9 +1640,14 @@ impl Render for StatusView {
             _ => None,
         };
         let list_h = content_h.clone();
+        let measured = self.list.clone();
         let list = div()
-            .on_children_prepainted(move |rows, _, _| {
-                let h = match (rows.first(), rows.last()) {
+            .on_children_prepainted(move |_, _, _| {
+                // A list tracked by a scroll handle passes no bounds here:
+                // the handle has them.
+                let first = measured.bounds_for_item(0);
+                let last = (0..).map_while(|i| measured.bounds_for_item(i)).last();
+                let h = match (first, last) {
                     (Some(first), Some(last)) => f32::from(last.bottom()) - f32::from(first.top()),
                     _ => 0.0,
                 };
