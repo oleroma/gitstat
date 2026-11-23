@@ -400,9 +400,10 @@ fn hidden_part(moved: Rect, shown: Rect) -> Rect {
     }
 }
 
-/// How far the window's client area starts below its visible top edge
-/// (the title bar), physical px.
-pub fn caption_height(h: isize) -> Option<i32> {
+/// How far the window's visible frame (where Windows draws its rim)
+/// reaches past its client area on each side, physical px (left, top:
+/// the title bar, right, bottom).
+pub fn frame_insets(h: isize) -> Option<(i32, i32, i32, i32)> {
     let hwnd = live(h)?;
     let client = client_rect(h)?;
     let mut r = RECT::default();
@@ -414,8 +415,13 @@ pub fn caption_height(h: isize) -> Option<i32> {
             size_of::<RECT>() as u32,
         )
     } == 0;
-    ok.then(|| client.top - r.top)
-        .filter(|c| (0..200).contains(c))
+    let d = (
+        client.left - r.left,
+        client.top - r.top,
+        r.right - client.right,
+        r.bottom - client.bottom,
+    );
+    (ok && [d.0, d.1, d.2, d.3].iter().all(|v| (0..200).contains(v))).then_some(d)
 }
 
 /// The panel whose DWM border and shadow are off for its slide.

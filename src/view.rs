@@ -143,7 +143,7 @@ pub fn show_window(cx: &mut App) {
                                 requested,
                                 client,
                                 maximized,
-                                win::caption_height(h),
+                                win::frame_insets(h),
                             );
                         }
                         crate::morph::big_settled();
@@ -200,9 +200,11 @@ struct Place {
     maximized_frame: Option<crate::morph::Delta>,
     /// Its title bar's height, normal and maximised, physical px.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    caption: Option<i32>,
+    #[serde(rename = "frame_insets")]
+    caption: Option<crate::morph::Delta>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    maximized_caption: Option<i32>,
+    #[serde(rename = "maximized_frame_insets")]
+    maximized_caption: Option<crate::morph::Delta>,
 }
 
 /// The last place, kept for this run and in window.json beside config.json.
@@ -255,7 +257,7 @@ pub(crate) fn remember_place(window: &Window, cx: &mut App) {
                 at(b.origin.y + b.size.height),
             )
         };
-        crate::morph::seen_client(requested, client, maximized, win::caption_height(h));
+        crate::morph::seen_client(requested, client, maximized, win::frame_insets(h));
     }
     let (frame, maximized_frame) = crate::morph::deltas();
     let (caption, maximized_caption) = crate::morph::captions();

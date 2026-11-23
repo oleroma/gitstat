@@ -144,8 +144,8 @@ thread_local! {
     static MAXIMIZED_DELTA: Cell<Option<Delta>> = const { Cell::new(None) };
     /// The big window's title bar height, physical px, normal and
     /// maximised, once measured.
-    static CAPTION: Cell<Option<i32>> = const { Cell::new(None) };
-    static MAXIMIZED_CAPTION: Cell<Option<i32>> = const { Cell::new(None) };
+    static CAPTION: Cell<Option<Delta>> = const { Cell::new(None) };
+    static MAXIMIZED_CAPTION: Cell<Option<Delta>> = const { Cell::new(None) };
     /// When the big window last reached the place and state it opened
     /// with (a maximised one shows at its normal size first).
     static SETTLED: Cell<Option<Instant>> = const { Cell::new(None) };
@@ -282,7 +282,7 @@ pub type Delta = (i32, i32, i32, i32);
 /// Only once the window has settled into that state: a maximised window
 /// measured before it maximises would send the flip to its normal size.
 /// With its title bar's height, physical px, when known.
-pub fn seen_client(requested: Rect, client: Rect, maximized: bool, caption: Option<i32>) {
+pub fn seen_client(requested: Rect, client: Rect, maximized: bool, caption: Option<Delta>) {
     let delta = if maximized {
         &MAXIMIZED_DELTA
     } else {
@@ -319,12 +319,12 @@ pub fn deltas() -> (Option<Delta>, Option<Delta>) {
 }
 
 /// Both title bar heights as measured, (normal, maximised), for window.json.
-pub fn captions() -> (Option<i32>, Option<i32>) {
+pub fn captions() -> (Option<Delta>, Option<Delta>) {
     (CAPTION.with(Cell::get), MAXIMIZED_CAPTION.with(Cell::get))
 }
 
 /// Title bar heights kept from an earlier run, where none is measured yet.
-pub fn learn_captions(normal: Option<i32>, maximized: Option<i32>) {
+pub fn learn_captions(normal: Option<Delta>, maximized: Option<Delta>) {
     for (cell, kept) in [(&CAPTION, normal), (&MAXIMIZED_CAPTION, maximized)] {
         cell.with(|c| {
             if c.get().is_none() {
@@ -541,7 +541,9 @@ struct Plan {
     to: Bounds<f32>,
     /// The big window's title bar height, physical px: the sheet grows
     /// over it too, so the bar never pops in at the end.
-    caption: f32,
+    /// How far its visible frame reaches past its client area: left,
+    /// top (the title bar), right, bottom, physical px.
+    caption: (f32, f32, f32, f32),
     /// The big window is maximised (or will be): it has no rim.
     maximized: bool,
     /// The work areas the flip may draw in, physical px from its top-left
@@ -618,14 +620,14 @@ fn plan(
     } else {
         CAPTION.with(Cell::get)
     }
-    .unwrap_or((CAPTION_GUESS * ws).round() as i32);
+    .unwrap_or((0, (CAPTION_GUESS * ws).round() as i32, 0, 0));
     // Room around both for the sheet's shadow.
     let m = (SHADOW_ROOM * ps).ceil() as i32;
     let union = Rect::new(
-        panel_rect.left.min(target.left) - m,
-        panel_rect.top.min(target.top - caption) - m,
-        panel_rect.right.max(target.right) + m,
-        panel_rect.bottom.max(target.bottom) + m,
+        panel_rect.left.min(target.left - caption.0) - m,
+        panel_rect.top.min(target.top - caption.1) - m,
+        panel_rect.right.max(target.right + caption.2) + m,
+        panel_rect.bottom.max(target.bottom + caption.3) + m,
     );
     let local = |r: Rect| Bounds {
         origin: point((r.left - union.left) as f32, (r.top - union.top) as f32),
@@ -812,7 +814,12 @@ fn plan(
         union,
         from,
         to,
-        caption: caption as f32,
+        caption: (
+            caption.0 as f32,
+            caption.1 as f32,
+            caption.2 as f32,
+            caption.3 as f32,
+        ),
         maximized,
         work,
         trees,
@@ -1066,12 +1073,17 @@ impl Render for MorphView {
         );
         let p = Palette::for_appearance(appearance);
         let s = window.scale_factor();
-        // The sheet grows over the title bar too; that part takes its
-        // colour, as wide as the sheet and as tall as the turn has gone.
-        let cap = self.plan.caption;
+        // The sheet grows to the big window's whole visible frame, title
+        // bar and border too, so its rim lands where Windows draws that
+        // window's own. The title bar part takes its colour, as tall as
+        // the turn has gone.
+        let (fl, cap, fr, fb) = self.plan.caption;
         let to_sheet = Bounds {
-            origin: point(self.plan.to.origin.x, self.plan.to.origin.y - cap),
-            size: size(self.plan.to.size.width, self.plan.to.size.height + cap),
+            origin: point(self.plan.to.origin.x - fl, self.plan.to.origin.y - cap),
+            size: size(
+                self.plan.to.size.width + fl + fr,
+                self.plan.to.size.height + cap + fb,
+            ),
         };
         // On whole physical px, so its 1 px rim stays crisp and even
         // rather than smearing across two px as it moves.
