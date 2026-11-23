@@ -117,6 +117,9 @@ pub fn app() -> &'static Path {
 struct Seen {
     bounds: Bounds<Pixels>,
     text: Option<Words>,
+    /// The window's height then, logical px: a part kept to the bottom
+    /// (the bottom bar, the pull requests) is placed from there.
+    height: f32,
 }
 
 /// Where one view draws a part.
@@ -180,13 +183,24 @@ pub fn tag(
     let text = words.map(|(t, l)| (t, l.color, l.size, l.bold));
     canvas(
         |_, _, _| {},
-        move |bounds, _, _, _| {
+        move |bounds, _, window, cx| {
+            // The flip draws some of the views' own elements as they
+            // slide: those aren't where the views draw them.
+            let id = window.window_handle().window_id();
+            if cx
+                .try_global::<MorphSlot>()
+                .and_then(|m| m.handle)
+                .is_some_and(|h| h.window_id() == id)
+            {
+                return;
+            }
             if part == Part::Bar {
                 LAST_PAINT.with(|t| t.set(Some(Instant::now())));
             }
             let seen = Seen {
                 bounds,
                 text: text.clone(),
+                height: f32::from(window.viewport_size().height),
             };
             let map = match side {
                 Side::Panel => &PANEL_PARTS,
@@ -702,9 +716,14 @@ fn plan(
             view::Cell::Spine(section, n) => {
                 let key = (app().to_path_buf(), Part::Spine(section));
                 if let Some(b) = column_parts.get(&key) {
+                    // From under the top bar to its distance above the
+                    // window's bottom then.
+                    let top = to.origin.y + f32::from(b.bounds.origin.y) * ws;
+                    let bottom = to.origin.y + to.size.height
+                        - (b.height - f32::from(b.bounds.bottom())) * ws;
                     let at = Bounds {
-                        origin: point(x, to.origin.y + f32::from(b.bounds.origin.y) * ws),
-                        size: size(view::SPINE_WIDTH * ws, f32::from(b.bounds.size.height) * ws),
+                        origin: point(x, top),
+                        size: size(view::SPINE_WIDTH * ws, (bottom - top).max(0.0)),
                     };
                     // Out of the nearer side.
                     let middle = to.origin.x + to.size.width / 2.0;
@@ -735,8 +754,16 @@ fn plan(
         let key = (app().to_path_buf(), part);
         panel_parts.get(&key).zip(column_parts.get(&key))
     };
+    // Kept to the window's bottom: placed by its distance from there then,
+    // should the window be taller or shorter now.
+    let from_bottom = |seen: &Seen| {
+        let mut b = in_window(&seen.bounds);
+        b.origin.y =
+            to.origin.y + to.size.height - (seen.height - f32::from(seen.bounds.origin.y)) * ws;
+        b
+    };
     let bar = both(Part::Bar).map(|(a, b)| (in_panel(&a.bounds), in_window(&b.bounds)));
-    let footer = both(Part::Footer).map(|(a, b)| (in_panel(&a.bounds), in_window(&b.bounds)));
+    let footer = both(Part::Footer).map(|(a, b)| (in_panel(&a.bounds), from_bottom(b)));
     let health = view::tone_counts(&state.statuses);
     for part in [
         Part::Headline,
@@ -784,14 +811,14 @@ fn plan(
         ),
     ];
     for (mode, seen, top, bottom) in bodies {
-        let place = |b: &Bounds<Pixels>| match mode {
-            view::Mode::Panel => in_panel(b),
-            view::Mode::Window => in_window(b),
+        let place = |b: &Seen| match mode {
+            view::Mode::Panel => in_panel(&b.bounds),
+            view::Mode::Window => from_bottom(b),
         };
         let key = |part| (app().to_path_buf(), part);
         // The pull requests, down into the bottom bar.
         if let Some(b) = seen.get(&key(Part::Prs)) {
-            let at = place(&b.bounds);
+            let at = place(b);
             sliders.push(Slider {
                 what: Slid::Prs(mode),
                 at,
@@ -804,7 +831,7 @@ fn plan(
                 let Some(b) = seen.get(&key(Part::Heading(section))) else {
                     continue;
                 };
-                let at = place(&b.bounds);
+                let at = place(b);
                 let away = if at.origin.y + at.size.height / 2.0 < (top + bottom) / 2.0 {
                     top - (at.origin.y + at.size.height)
                 } else {
