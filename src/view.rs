@@ -1207,7 +1207,10 @@ impl Render for StatusView {
                         crate::morph::Part::Subline,
                         Some((subline.clone().into(), p.muted, 12.0, false)),
                     )),
-            );
+            )
+            .when(state.has_result && !state.statuses.is_empty(), |d| {
+                d.child(health_row(&state.statuses, sweeping, &p))
+            });
 
         let titles = if icons_only {
             let mut lines = vec![
@@ -1728,6 +1731,16 @@ impl Render for StatusView {
                 })
             })
             .id("root")
+            // Digits of one width, so counts and ⬆⬇ numbers line up.
+            .map(|mut d| {
+                d.text_style()
+                    .get_or_insert_with(Default::default)
+                    .font_features = Some(gpui::FontFeatures(std::sync::Arc::new(vec![(
+                    "tnum".to_string(),
+                    1,
+                )])));
+                d
+            })
             .track_focus(&self.focus)
             .key_context("StatusView")
             .on_key_down(move |event, window, cx| {
@@ -1880,7 +1893,8 @@ pub(crate) fn rim(dark: bool) -> Hsla {
 
 /// A bar of the repos' tones: green synced, amber local work, red needs
 /// action, each as wide as its share; dimmed while a check runs.
-fn summary_bar(statuses: &[RepoStatus], checking: bool, p: &Palette) -> gpui::Div {
+/// Repos synced, with local work, and needing a look.
+fn tone_counts(statuses: &[RepoStatus]) -> [usize; 3] {
     let mut counts = [0usize; 3];
     for s in statuses {
         let i = match crate::icon::FolderState::of(s).tone() {
@@ -1890,6 +1904,33 @@ fn summary_bar(statuses: &[RepoStatus], checking: bool, p: &Palette) -> gpui::Di
         };
         counts[i] += 1;
     }
+    counts
+}
+
+/// The header's health: a thin bar of synced, local-work and
+/// needs-a-look repos, and their counts.
+fn health_row(statuses: &[RepoStatus], checking: bool, p: &Palette) -> gpui::Div {
+    let counts = tone_counts(statuses);
+    let count = |n: usize, mark: &str, color: Hsla| {
+        div()
+            .flex_none()
+            .text_color(if n > 0 { color } else { p.muted.opacity(0.6) })
+            .child(format!("{mark}{n}"))
+    };
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .pt_1()
+        .text_xs()
+        .child(summary_bar(statuses, checking, p).h(px(4.)))
+        .child(count(counts[0], "✓ ", p.green))
+        .child(count(counts[1], "● ", p.amber))
+        .child(count(counts[2], "! ", p.red))
+}
+
+fn summary_bar(statuses: &[RepoStatus], checking: bool, p: &Palette) -> gpui::Div {
+    let counts = tone_counts(statuses);
     let total = statuses.len().max(1) as f32;
     let bar = div()
         .flex()

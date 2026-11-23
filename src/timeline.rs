@@ -1088,8 +1088,22 @@ impl Timelines {
                 cx.stop_propagation();
                 entity.update(cx, |t, cx| t.scroll(&wheel_path, dx, all, cx));
             })
+            .relative()
             .child(painter)
             .child(label)
+            // An edge in the status colour on a repo that needs something.
+            .when(!status.is_synced() && !status.remote_only, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top(px(3.))
+                        .bottom(px(3.))
+                        .w(px(3.))
+                        .rounded_r_sm()
+                        .bg(crate::view::status_color(status, p)),
+                )
+            })
             .into_any_element()
     }
 
