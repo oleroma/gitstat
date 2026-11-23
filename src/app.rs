@@ -239,6 +239,16 @@ fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
             Input::Github(report) => {
                 let c = &state.read(cx).config;
                 if c.github_prs || c.github_repos {
+                    let lines = {
+                        let s = state.read(cx);
+                        let names = s
+                            .statuses
+                            .iter()
+                            .map(|r| (r.path.clone(), r.name.clone()))
+                            .collect();
+                        crate::notify::pr_changes(&s.config.notify, &names, &s.prs, &report.prs)
+                    };
+                    notify(&lines, cx);
                     state.update(cx, |s, _| {
                         let (prs, repos) = (s.config.github_prs, s.config.github_repos);
                         s.github_report(report);
@@ -353,12 +363,22 @@ fn on_update(slot: usize, update: Update, cx: &mut App) -> (bool, bool) {
             state.update(cx, |s, _| s.in_flight.insert(repo));
             (false, false)
         }
-        Update::Status(status) => state.update(cx, |s, _| {
-            s.in_flight.remove(&status.path);
-            s.checked(&status.path);
-            let changed = s.merge_status(status);
-            (changed, changed)
-        }),
+        Update::Status(status) => {
+            let line = {
+                let s = state.read(cx);
+                let old = s.statuses.iter().find(|o| o.path == status.path);
+                crate::notify::behind(&s.config.notify, old, &status)
+            };
+            if let Some(line) = line {
+                notify(&[line], cx);
+            }
+            state.update(cx, |s, _| {
+                s.in_flight.remove(&status.path);
+                s.checked(&status.path);
+                let changed = s.merge_status(status);
+                (changed, changed)
+            })
+        }
         Update::SweepStarted => {
             state.update(cx, |s, _| s.set_sweeping(slot, true));
             (true, false)
@@ -727,6 +747,13 @@ impl Render for Keepalive {
 }
 
 /// The current local time as HH:MM.
+/// Shows `lines` as one Windows notification from the tray icon.
+fn notify(lines: &[String], cx: &mut App) {
+    if let Some(note) = crate::notify::note(lines) {
+        crate::notify::show(cx.global::<Shared>().tray.hwnd(), &note);
+    }
+}
+
 fn local_time() -> String {
     let mut t = unsafe { std::mem::zeroed::<windows_sys::Win32::Foundation::SYSTEMTIME>() };
     unsafe { windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut t) };

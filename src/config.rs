@@ -180,6 +180,20 @@ pub struct Config {
     /// `*` matches any run of characters, `/` and `\` are the same, and
     /// case doesn't matter.
     pub ignore: Vec<String>,
+    /// Windows notifications, each kind off until turned on.
+    pub notify: NotifyConfig,
+}
+
+/// Which changes pop up a Windows notification.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotifyConfig {
+    /// A pull request asks for your review.
+    pub review_requested: bool,
+    /// An open pull request's checks fail.
+    pub checks_failed: bool,
+    /// A fetch finds a repo behind its remote.
+    pub behind: bool,
 }
 
 /// The sections the panel lists, and the big window shows as groups of
@@ -271,6 +285,7 @@ impl Default for Config {
             flip_ms: 560,
             folds: Folds::default(),
             ignore: Vec::new(),
+            notify: NotifyConfig::default(),
         }
     }
 }
@@ -596,8 +611,10 @@ mod tests {
         assert!(!glob_match("dev/gitstat", "dev/gitstat/build/src"));
         assert!(!glob_match("", "x"));
         assert!(!glob_match("*/src", "dev/srcs"));
-        let mut c = Config::default();
-        c.ignore = vec!["*\\build\\src".into()];
+        let c = Config {
+            ignore: vec!["*\\build\\src".into()],
+            ..Config::default()
+        };
         assert!(c.is_ignored("dev\\gitstat\\build\\src"));
         assert!(!c.is_ignored("dev\\gitstat"));
     }

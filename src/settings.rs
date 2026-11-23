@@ -33,6 +33,9 @@ pub enum Setting {
     GithubRepos,
     ScrollTogether,
     FlipAnimation,
+    NotifyReview,
+    NotifyChecks,
+    NotifyBehind,
 }
 
 impl Setting {
@@ -50,6 +53,9 @@ impl Setting {
             Setting::GithubRepos => cfg.github_repos,
             Setting::ScrollTogether => cfg.scroll_together,
             Setting::FlipAnimation => cfg.flip_animation,
+            Setting::NotifyReview => cfg.notify.review_requested,
+            Setting::NotifyChecks => cfg.notify.checks_failed,
+            Setting::NotifyBehind => cfg.notify.behind,
         }
     }
 
@@ -67,6 +73,9 @@ impl Setting {
             Setting::GithubRepos => &mut cfg.github_repos,
             Setting::ScrollTogether => &mut cfg.scroll_together,
             Setting::FlipAnimation => &mut cfg.flip_animation,
+            Setting::NotifyReview => &mut cfg.notify.review_requested,
+            Setting::NotifyChecks => &mut cfg.notify.checks_failed,
+            Setting::NotifyBehind => &mut cfg.notify.behind,
         };
         *field = !*field;
     }
@@ -629,6 +638,40 @@ fn badges(cfg: &Config, p: &Palette) -> Vec<AnyElement> {
         .map(|&(c, label)| (label, c == cfg.overlay.corner, TrayAction::SetCorner(c)))
         .collect();
     vec![
+        group_with_note(
+            "Notifications",
+            "Shown by Windows, which holds them back in Do not disturb.",
+            vec![
+                flag(
+                    "notify-review",
+                    "A review is asked of you",
+                    "When a pull request in your repos asks for your review.",
+                    Setting::NotifyReview,
+                    cfg.github_prs,
+                    cfg,
+                    p,
+                ),
+                flag(
+                    "notify-checks",
+                    "Checks fail",
+                    "When an open pull request's checks turn red.",
+                    Setting::NotifyChecks,
+                    cfg.github_prs,
+                    cfg,
+                    p,
+                ),
+                flag(
+                    "notify-behind",
+                    "A repo falls behind",
+                    "When a fetch brings in commits you haven't pulled.",
+                    Setting::NotifyBehind,
+                    true,
+                    cfg,
+                    p,
+                ),
+            ],
+            p,
+        ),
         group(
             "Corner badge",
             vec![
@@ -1195,6 +1238,9 @@ mod tests {
             Setting::GithubRepos,
             Setting::ScrollTogether,
             Setting::FlipAnimation,
+            Setting::NotifyReview,
+            Setting::NotifyChecks,
+            Setting::NotifyBehind,
         ];
         for setting in all {
             let before = Config::default();

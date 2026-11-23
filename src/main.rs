@@ -24,6 +24,8 @@ mod layout;
 #[cfg(any(windows, test))]
 mod monitor;
 #[cfg(any(windows, test))]
+mod notify;
+#[cfg(any(windows, test))]
 mod repo_graph;
 #[cfg(any(windows, test))]
 mod repo_icon;

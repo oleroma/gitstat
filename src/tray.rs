@@ -293,6 +293,11 @@ impl Tray {
         }
     }
 
+    /// The tray icon's own window, which its notifications come from.
+    pub fn hwnd(&self) -> isize {
+        self.icon.window_handle() as isize
+    }
+
     /// The icon's rect in physical px, for anchoring the panel when it is
     /// opened from the menu.
     pub fn icon_rect(&self) -> Option<layout::Rect> {
