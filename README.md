@@ -19,7 +19,7 @@ whether they're in sync with their remotes. It's built with
 - **Red with a number**: that many repos are unsynced.
 - **Gray …**: the first check is still running.
 
-**Display ▸ Number on the icon** picks what the number counts: unsynced repos
+**Settings ▸ Icon and badge ▸ Number on the icon and badge** picks what the number counts: unsynced repos
 (the default), repos with uncommitted changes, repos to push, repos to pull,
 open pull requests, pull requests needing you (a review asked of you, failing
 checks, conflicts or requested changes), or reviews asked of you. The colour
@@ -27,7 +27,7 @@ still follows sync: red while any repo is unsynced, green with the number
 once all are current, and the ✓ when that number is 0 too. The tooltip says
 what the number counts.
 
-**Display ▸ Sort repos by** sets the order of the repos, the same in the
+**Settings ▸ Status views ▸ Sort repos by** sets the order of the repos, the same in the
 panel and the big view: name (the default), status (worst first), last
 commit on any branch, last worked on (where HEAD last moved, from the
 reflog), last pull request activity, most open pull requests (the ones
@@ -40,8 +40,16 @@ display scale, with smooth edges and Segoe UI digits, so it stays crisp at
 125%, 150% and 200%. Above 99 it shows `99+`.
 
 A repo counts as unsynced if it is ahead, behind, diverged, has uncommitted
-changes, has no upstream branch, or its fetch failed. Status texts are `⬆2`,
-`⬇1`, `diverged`, `dirty`, `no upstream`, `✓ current`, or the error.
+changes, has no upstream branch, its fetch failed, a rebase, merge,
+cherry-pick, revert or bisect is half done, or another of its local branches
+has commits no remote has (ahead of its upstream, or never pushed; a branch
+whose upstream was deleted, as after a merged pull request, doesn't count).
+Status texts are `⬆2`, `⬇1`, `diverged`, `dirty`, `no upstream`,
+`detached at 1a2b3c4`, `rebasing 3/7`, `merging`, `cherry-picking`,
+`reverting`, `bisecting`, `wip unpushed` or `3 branches unpushed`,
+`✓ current`, or the error. Stashes are shown (`2 stashed`) but don't make a
+repo unsynced. Hover a repo for the details: the unpushed branches by name,
+and the last lines git printed when a fetch failed.
 
 gitstat only fetches. It never pulls, merges or pushes.
 
@@ -49,13 +57,31 @@ gitstat only fetches. It never pulls, merges or pushes.
 
 **Left-click** the tray icon to open the **status panel**, a flyout next to
 the taskbar. Unsynced repos come first, worst first; the synced ones are
-folded into one "✓ N synced" row that expands on click. Click a repo to open
-its folder. ↻ fetches every repo now and ⧉ pops the list out into the status
-window. The panel closes when you click elsewhere, press Esc or click the tray
-icon again.
+folded into one "✓ N synced" row that expands on click. A repo that needs
+something has an edge in its status colour, and the header sums them up: a
+thin bar and counts of synced (✓), local-work (●) and needs-a-look (!)
+repos. Click a repo to open it in the status window, scrolled to its column
+(or its folder, with the window turned off). ↻ fetches every repo now, ⧉
+turns the panel into the status window and ⚙ opens the settings. The panel
+closes when you click elsewhere, press Esc or click the tray icon again.
 
 **Double-click** the tray icon to open the **status window**, a normal window
-with every repo in name order and a **Refresh now** button.
+with every repo and a **Refresh now** button. Opening it from the panel
+turns the panel into it (**Settings ▸ Status views ▸ Flip animation**, at
+the **Flip speed** picked there; **Very slow** takes 5 seconds, for looking
+at each frame). Closing or minimising it turns it back into the panel.
+
+**Type** in the panel or the window to filter the repos: only those whose
+name or branch holds what you typed are listed, with every section open.
+Backspace takes a letter off, Enter opens the first repo listed, and Esc
+clears the filter (a second Esc closes).
+
+**Right-click** a repo, in the panel or the window, for its menu: **Open
+folder**, **Open terminal here** (Windows Terminal, or PowerShell without
+it), **Open in VS Code** (when `code` is on the `PATH`), **Open on GitHub**,
+**Copy branch name**, **Copy path**, **Fetch now** (also the way to retry a
+failed fetch) and **Hide this repo**, which adds it to `ignore`. A GitHub
+repo with no clone here offers only its page and hiding.
 
 In the window each repo is a column. Its header shows the name and checkout,
 then one row that sums the repo up: a small bar and coloured counts of its
@@ -71,8 +97,8 @@ again to fold them.
 
 Below the header runs the repo's history, newest at the top. The wheel
 over it scrolls it; anywhere else in the window, column headers included, the
-wheel scrolls the table sideways. A double-click goes back to the top. With **Display ▸ Scroll big
-view columns together** (on by default) every column scrolls with it, row
+wheel scrolls the table sideways. A double-click goes back to the top. With
+**Settings ▸ Status views ▸ Scroll columns together** (on by default) every column scrolls with it, row
 for row like the panel's strips, and thin lines between the rows line them
 up across the table; a column with fewer commits stops at its last. Hover a
 commit for its card, which shows the commit's whole message.
@@ -85,17 +111,27 @@ everywhere sort by it.
 - the summary and every repo (click one to open its folder)
 - **Open status panel**, **Open status window**
 - **Refresh now**
-- **Display ▸**: Status panel on click, Status window, Corner badge, Badge
-  corner ▸, Hide badge when all synced, Hide badge in fullscreen, Folder icons
-  in Explorer, Folder icon style ▸ (Status folder or Repo icon)
-- **Watch for changes**, **Start with Windows**, **Edit config.json**, **Quit**
+- **Settings…**, which opens the settings window: General (start with
+  Windows, the folders to watch, folder depth, watching for changes, how
+  often to fetch), Status views, Icon and badge (notifications, the corner
+  badge, the number on the icon), Folder icons and GitHub
+- **Quit**
 
 With the panel turned off, a left-click opens the window instead; with both
 off, a left-click shows the menu. The right-click menu is always there.
 
+### Notifications
+
+**Settings ▸ Icon and badge ▸ Notifications** can have Windows tell you when
+a pull request in your repos asks for your review, when an open pull
+request's checks fail, or when a fetch finds a repo behind its remote. Each
+is off until you turn it on. They come from the tray icon, several changes
+at once as one notification, and Windows holds them back in Do not disturb.
+Starting gitstat says nothing about what was already so.
+
 ### Corner badge
 
-**Display ▸ Corner badge** puts a small always-on-top circle in a corner of
+**Settings ▸ Icon and badge ▸ Show the corner badge** puts a small always-on-top circle in a corner of
 the primary monitor's work area, showing the unsynced count (or ✓, ! for a
 problem, … while checking). Clicking it opens the panel (or the window, if the
 panel is off). It never takes focus, clicks outside the circle go to the
@@ -107,12 +143,12 @@ monitor; a press that doesn't move is still a click. gitstat remembers the
 spot as the nearest corner plus the distance from that corner's edges
 (`overlay.corner`, `overlay.offset_x`, `overlay.offset_y`), so the badge keeps
 its place relative to that corner when the resolution or the taskbar changes.
-Picking a corner from **Badge corner ▸** puts it back `margin` from the edges. By default it hides while a fullscreen app or a presentation
+Picking a **Corner** in the settings puts it back `margin` from the edges. By default it hides while a fullscreen app or a presentation
 is running; it can also hide while everything is synced.
 
 ### Folder icons in Explorer
 
-**Display ▸ Folder icons in Explorer** gives each repo folder an icon that
+**Settings ▸ Folder icons** gives each repo folder an icon that
 shows its status (✓ synced, ⬆ ahead, ⬇ behind, ⬆⬇ diverged, ● dirty, – no
 upstream, ! error) and a tooltip such as `gitstat: ⬆2, uncommitted changes`.
 gitstat asks before turning it on.
@@ -144,7 +180,7 @@ only after F5.
 
 #### Repo icons
 
-**Display ▸ Folder icon style ▸ Repo icon** (`"folder_icon_mode": "repo-svg"`)
+The **Repo icon** style (`"folder_icon_mode": "repo-svg"`)
 shows a repo's own picture instead, for every repo that has a
 `.gitstat/icon.svg` (that exact name; any case on Windows). Repos without
 one keep the status folder. The picture takes one of three colours:
@@ -187,7 +223,7 @@ more than 10 seconds to draw, gitstat tries again on a later check.
 
 ### GitHub pull requests
 
-**Display ▸ GitHub pull requests** (`"github_prs": true`, on by default)
+**Settings ▸ GitHub ▸ Pull requests** (`"github_prs": true`, on by default)
 lists the open pull requests of every repo whose `origin` is on GitHub at the
 bottom of the panel: review requests for you first, then ones with failing
 checks, conflicts or requested changes, then the rest. Each row shows the
@@ -202,7 +238,7 @@ nothing on GitHub or in the repos is ever changed.
 
 ### GitHub repos not cloned here
 
-**Display ▸ GitHub repos not cloned here** (`"github_repos": true`, on by
+**Settings ▸ GitHub ▸ Repos not cloned here** (`"github_repos": true`, on by
 default) adds every repo of the account `gh` is signed in to, and of its
 organisations, that has no clone under the watched folders (archived repos are
 left out; a clone counts when its `origin` points at the repo). They come
@@ -234,6 +270,13 @@ repo, so repos directly inside `path` are found even under OneDrive; repos in
 a group folder below it are not.) A link straight to a repo is listed, unless
 the repo itself is found too.
 
+Repos named in `ignore` are left out altogether: never checked, fetched or
+listed. **Hide this repo** in a repo's right-click menu adds its name. A
+pattern is a name as gitstat shows it, such as `dev\gitstat\build\src`, or
+`owner/name` for a GitHub repo with no clone here; `*` stands for any run of
+characters (`*\build\src` hides every `build\src` worktree), `/` and `\`
+are the same, and case doesn't matter.
+
 It stops after looking at 50,000 folders or finding 500 repos. The menu and
 the panel then show the count with a `+` (for example `500+ repos`), and the
 panel's footer says which limit was hit; lower `depth` or point `path` at a
@@ -261,23 +304,28 @@ wakes from sleep, on **Refresh now**, and with a 1, 2, then 5 minute backoff
 while a fetch keeps failing). Each sweep also rechecks local state, which
 covers network drives and `\\wsl$`, where events are unreliable.
 
+While **GitHub pull requests** is on, the same poll reads when GitHub last
+saw a push to each repo whose `origin` is on GitHub. A sweep then fetches
+only the repos pushed to since their last fetch, and gives the others a
+local check; a repo the poll finds newly pushed to is fetched right away,
+without waiting for the sweep. Every sixth sweep, the first one and
+**Refresh now** still fetch every repo, which also covers other remotes
+and deleted branches.
+
 If the watch fails, the panel's footer says *Polling* and gitstat checks every
 repo once a minute until it can watch again. Untick **Watch for changes** (or
 set `"watch": false`) to check on the interval only, as before v0.3.
 
 ## Install
 
-1. Build `gitstat.exe` yourself, see [Build from source](#build-from-source).
-   When the PC is offline, the manual `fallback.yml` workflow runs the tests,
-   builds the exe on Windows and saves it on the run.
-2. Put `gitstat.exe` in a folder of its own, e.g. `D:\dev\gitstat\`.
-3. Run it. The first time, it writes `config.json` next to itself.
-4. Right-click the tray icon and tick **Start with Windows** to have it start
-   on every login.
-
 git must be on your `PATH` (Git for Windows puts it there).
 
-## Install
+Every build is published as a pre-release on its `build/<n>` tag, and the
+newest build of `main` as the **Development build** release; its
+`gitstat.exe` runs from any folder of its own. The first time, it writes
+`config.json` next to itself; tick **Start with Windows** in the settings
+to have it start on every login. To build it yourself, see
+[Build from source](#build-from-source).
 
 Each build on the PC installs itself to `%LOCALAPPDATA%\Programs\gitstat`
 with a **gitstat** shortcut in the Start menu. The install never stops or
@@ -325,7 +373,16 @@ from an older version keeps working:
   "repo_click": "folder",
   "badge_number": "unsynced",
   "sort": "name",
-  "scroll_together": true
+  "scroll_together": true,
+  "flip_animation": true,
+  "flip_ms": 560,
+  "panel_slide_ms": 150,
+  "ignore": [],
+  "notify": {
+    "review_requested": false,
+    "checks_failed": false,
+    "behind": false
+  }
 }
 ```
 
@@ -338,8 +395,8 @@ from an older version keeps working:
 | `watch` | true | Pick up local changes from file-system events. false checks on the interval only. |
 | `panel` | true | A tray left-click (and a badge click) opens the status panel. |
 | `window` | true | The status window is available from the menu, a double-click and the panel's ⧉ button. |
-| `icons_only` | false | **Display ▸ Icons only**: the panel and the badge show pictures, no words. Each repo is its `.gitstat/icon.svg` (or a status dot) beside its graph, the header a bar of green, amber and red repos, the badge a ring of the same colours around a dot in the most urgent one. Hover any of them for the words. |
-| `scroll_together` | true | **Display ▸ Scroll big view columns together**: every column of the big view scrolls with the one under the mouse, with thin lines between the rows. Off, each column scrolls on its own. |
+| `icons_only` | false | **Settings ▸ Status views ▸ Icons only**: the panel and the badge show pictures, no words. Each repo is its `.gitstat/icon.svg` (or a status dot) beside its graph, the header a bar of green, amber and red repos, the badge a ring of the same colours around a dot in the most urgent one. Hover any of them for the words. |
+| `scroll_together` | true | **Settings ▸ Status views ▸ Scroll columns together**: every column of the big view scrolls with the one under the mouse, with thin lines between the rows. Off, each column scrolls on its own. |
 | `overlay.enabled` | false | Show the corner badge. |
 | `overlay.corner` | `bottom-right` | `top-left`, `top-right`, `bottom-left` or `bottom-right`. |
 | `overlay.offset_x`, `overlay.offset_y` | unset | Where the badge was dragged to: px at 100% scale from the left or right, and the top or bottom, edge of the corner. Unset is `margin`. Written by dragging, removed by picking a corner from the menu. |
@@ -349,14 +406,19 @@ from an older version keeps working:
 | `overlay.hide_in_fullscreen` | true | Hide the badge while a fullscreen app or a presentation runs. |
 | `folder_icons` | false | Status icons on the repo folders, see above. Setting it by hand skips the confirmation. |
 | `folder_icon_mode` | `status` | `status` for the status folders, `repo-svg` for each repo's own `.gitstat/icon.svg` where it has one, see [Repo icons](#repo-icons). Only matters while `folder_icons` is on. |
-| `github_prs` | true | **Display ▸ GitHub pull requests**: open pull requests in the panel and big mode, read through `gh`, see [GitHub pull requests](#github-pull-requests). |
-| `github_repos` | true | **Display ▸ GitHub repos not cloned here**: the signed-in account's GitHub repos with no clone under `path`, read through `gh`, see [GitHub repos not cloned here](#github-repos-not-cloned-here). |
-| `badge_number` | `unsynced` | **Display ▸ Number on the icon**: what the number on the tray icon and the badge counts. `unsynced`, `dirty`, `ahead`, `behind`, `pull-requests`, `pull-requests-for-you` or `review-requests`. |
-| `sort` | `name` | **Display ▸ Sort repos by**: the order of the repos in the panel and the big view. `name`, `status`, `last-commit`, `last-worked`, `last-pull-request`, `open-pull-requests` or `hanging-branches`. |
-| `repo_click` | `folder` | **Display ▸ Repo click opens**: what a click on a repo (its name in big mode, or in the menu) opens. `folder` for its folder, `github` for its GitHub page; a repo whose `origin` isn't on GitHub opens its folder either way. |
+| `github_prs` | true | **Settings ▸ GitHub ▸ Pull requests**: open pull requests in the panel and big mode, read through `gh`, see [GitHub pull requests](#github-pull-requests). Also lets a sweep skip fetching repos with no new push, see [How status stays current](#how-status-stays-current). |
+| `github_repos` | true | **Settings ▸ GitHub ▸ Repos not cloned here**: the signed-in account's GitHub repos with no clone under `path`, read through `gh`, see [GitHub repos not cloned here](#github-repos-not-cloned-here). |
+| `badge_number` | `unsynced` | **Settings ▸ Icon and badge ▸ Number on the icon and badge**: what the number on the tray icon and the badge counts. `unsynced`, `dirty`, `ahead`, `behind`, `pull-requests`, `pull-requests-for-you` or `review-requests`. |
+| `sort` | `name` | **Settings ▸ Status views ▸ Sort repos by**: the order of the repos in the panel and the big view. `name`, `status`, `last-commit`, `last-worked`, `last-pull-request`, `open-pull-requests` or `hanging-branches`. |
+| `repo_click` | `folder` | **Settings ▸ Status views ▸ Clicking a repo opens**: what a click on a repo (its name in big mode, or in the menu) opens. `folder` for its folder, `github` for its GitHub page; a repo whose `origin` isn't on GitHub opens its folder either way. |
+| `flip_animation` | true | **Settings ▸ Status views ▸ Flip animation**: opening the window from the panel turns the panel into it, and closing turns it back. |
+| `flip_ms` | 560 | **Flip speed**: how long the flip takes, in ms. Fast 350, Normal 560, Slow 900, Very slow 5000 (for looking at each frame). |
+| `panel_slide_ms` | 150 | **Panel slides in**: how long the panel takes to slide in from the taskbar, in ms; 0 shows it at once. Very slow is 1500. |
+| `ignore` | `[]` | Repos to leave out entirely, by name, with `*` for any run of characters, see [Which repos](#which-repos). **Hide this repo** in a repo's right-click menu adds to it. |
+| `notify.review_requested`, `notify.checks_failed`, `notify.behind` | false | **Settings ▸ Icon and badge ▸ Notifications**, see [Notifications](#notifications). |
 
 Edits apply within about a second, without a restart. **Edit config.json** in
-the menu or the panel opens the file. The menu's toggles write the file too;
+the panel's footer opens the file. The menu's toggles write the file too;
 if it doesn't parse (say, an edit in progress), they leave it alone and the
 change lasts until gitstat quits.
 
@@ -417,6 +479,9 @@ folder-icon tests. They also run on Linux, where only `--once` is available.
   own `.gitstat/icon.svg` ([resvg](https://crates.io/crates/resvg), with no
   text, fonts or image loading), and `src/folder_icons.rs` applies and
   reverts the desktop.ini icons.
+- `src/repo_menu.rs` is a repo's right-click menu, run on a thread of its
+  own; `src/notify.rs` works out and shows the notifications;
+  `src/settings.rs` is the settings window.
 - `src/config.rs` reads and writes `config.json`. `src/autostart.rs` adds or
   removes gitstat under
   `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
