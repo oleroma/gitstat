@@ -647,7 +647,9 @@ pub(crate) fn section_tint(section: Section, p: &Palette) -> Hsla {
     section_color(section, p).opacity(0.10)
 }
 
-fn spine(section: Section, count: usize, folded: bool, p: &Palette) -> AnyElement {
+/// A section's spine in big mode; the flip slides it in and out from the
+/// window's sides.
+pub(crate) fn spine(section: Section, count: usize, folded: bool, p: &Palette) -> AnyElement {
     let (name, color) = match section {
         Section::NeedsYou => ("NEED YOU", p.red),
         Section::Synced => ("SYNCED", p.green),
@@ -698,6 +700,13 @@ fn spine(section: Section, count: usize, folded: bool, p: &Palette) -> AnyElemen
                 .text_color(p.muted)
                 .child(if folded { "▴" } else { "▸" }),
         )
+        .relative()
+        .child(crate::morph::tag(
+            crate::morph::Side::Column,
+            crate::morph::app(),
+            crate::morph::Part::Spine(section),
+            None,
+        ))
         .on_click(fold(section))
         .into_any_element()
 }
@@ -1037,6 +1046,168 @@ fn remote_problem_row(problem: &str, p: &Palette) -> AnyElement {
         .into_any_element()
 }
 
+/// The pull requests' block: in the panel the last rows of its list, in
+/// the big window the list under the columns, a few rows high and
+/// scrolling when there are more. Tagged for the flip, which slides it
+/// out of and into the bottom bar. None when there's nothing to list.
+pub(crate) fn prs_block(
+    state: &AppState,
+    mode: Mode,
+    icons_only: bool,
+    p: &Palette,
+    cx: &App,
+) -> Option<AnyElement> {
+    let open_prs = state.open_prs();
+    let pr_problem = state
+        .github_problem
+        .as_deref()
+        .filter(|_| state.config.github_prs);
+    // The pull requests show a GitHub problem; without them, this does.
+    let remote_problem = if state.config.github_prs || !state.config.github_repos {
+        None
+    } else {
+        state.github_problem.as_deref()
+    };
+    let mut rows = pr_rows(
+        &open_prs,
+        pr_problem,
+        p,
+        mode,
+        icons_only,
+        Some((
+            state.folded(Section::PullRequests),
+            fold(Section::PullRequests),
+        )),
+        cx,
+    );
+    if mode == Mode::Window
+        && state.remote_statuses.is_empty()
+        && let Some(problem) = remote_problem
+    {
+        rows.push(remote_problem_row(problem, p));
+    }
+    if rows.is_empty() {
+        return None;
+    }
+    let side = match mode {
+        Mode::Panel => crate::morph::Side::Panel,
+        Mode::Window => crate::morph::Side::Column,
+    };
+    let block = div()
+        .id("prs")
+        .relative()
+        .flex()
+        .flex_col()
+        .flex_none()
+        .bg(p.surface)
+        .children(rows)
+        .child(crate::morph::tag(
+            side,
+            crate::morph::app(),
+            crate::morph::Part::Prs,
+            None,
+        ));
+    Some(match mode {
+        Mode::Panel => block.into_any_element(),
+        Mode::Window => block
+            .max_h(px(WINDOW_PRS_HEIGHT))
+            .overflow_y_scroll()
+            .into_any_element(),
+    })
+}
+
+/// A panel section's heading: its tint, its words (icons only: the folded
+/// section's icons) and fold arrow; a click folds or opens it. Tagged for
+/// the flip, which slides it out of and into the list. None when the
+/// section is empty.
+pub(crate) fn panel_heading(
+    section: Section,
+    state: &AppState,
+    icons_only: bool,
+    p: &Palette,
+    cx: &App,
+) -> Option<AnyElement> {
+    let sorted = state.sorted_for_panel();
+    let (bad, good): (Vec<&RepoStatus>, Vec<&RepoStatus>) =
+        sorted.into_iter().partition(|s| !s.is_synced());
+    let remote = state.sorted(&state.remote_statuses);
+    let (repos, id, color) = match section {
+        Section::NeedsYou => (bad, "needs-you", p.red),
+        Section::Synced => (good, "synced", p.green),
+        Section::GithubOnly => (remote, "remote", p.muted),
+        Section::PullRequests => return None,
+    };
+    if repos.is_empty() {
+        return None;
+    }
+    let n = repos.len();
+    let text = match section {
+        Section::NeedsYou => format!("● {n} need you"),
+        Section::Synced => format!("✓ {n} synced"),
+        _ => format!("◌ {n} on GitHub only"),
+    };
+    let open = !state.folded(section);
+    let label = if icons_only {
+        div()
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .gap_1()
+            .overflow_hidden()
+            .when(!open, |d| {
+                d.children(repos.iter().map(|s| {
+                    let mark = match section {
+                        Section::NeedsYou => status_color(s, p),
+                        _ => color,
+                    };
+                    crate::repo_marks::global_mark(s, 16.0, mark, cx)
+                }))
+            })
+    } else {
+        heading_label(text)
+    };
+    let tooltip = match section {
+        Section::GithubOnly => Some(vec![
+            (format!("{n} GitHub repos not cloned here"), p.text),
+            ("Their trees come from GitHub".to_string(), p.muted),
+        ]),
+        Section::NeedsYou if icons_only => Some(vec![(format!("{n} need you"), p.red)]),
+        Section::Synced if icons_only => Some(vec![(format!("{n} synced"), p.green)]),
+        _ => None,
+    };
+    let arrow = div().flex_none().child(if open { "▾" } else { "▸" });
+    let arrow = match section {
+        Section::GithubOnly => arrow,
+        _ => arrow.text_color(p.muted),
+    };
+    Some(
+        div()
+            .id(id)
+            .relative()
+            .bg(section_tint(section, p))
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .px_4()
+            .py(px(6.))
+            .cursor_pointer()
+            .hover(|style| style.bg(p.hover))
+            .text_sm()
+            .text_color(color)
+            .when_some(tooltip, |d, lines| d.tooltip(tip(lines, p)))
+            .child(label)
+            .child(arrow)
+            .child(crate::morph::tag(
+                crate::morph::Side::Panel,
+                crate::morph::app(),
+                crate::morph::Part::Heading(section),
+                None,
+            ))
+            .on_click(fold(section))
+            .into_any_element(),
+    )
+}
+
 /// Big mode's pull request list at its tallest: the heading and about
 /// six rows.
 const WINDOW_PRS_HEIGHT: f32 = 230.;
@@ -1133,8 +1304,6 @@ impl Render for StatusView {
                 if found == 1 { "repo" } else { "repos" }
             );
         }
-        let open_prs = state.open_prs();
-
         // The top bar's parts, which the flip carries between the views.
         let side = match mode {
             Mode::Panel => crate::morph::Side::Panel,
@@ -1305,10 +1474,6 @@ impl Render for StatusView {
                 ),
         };
 
-        let pr_problem = state
-            .github_problem
-            .as_deref()
-            .filter(|_| state.config.github_prs);
         // The pull requests show a GitHub problem; without them, this does.
         let remote_problem = if state.config.github_prs || !state.config.github_repos {
             None
@@ -1330,46 +1495,7 @@ impl Render for StatusView {
                     sorted.into_iter().partition(|s| !s.is_synced());
                 if !bad.is_empty() {
                     let open = !state.folded(Section::NeedsYou);
-                    let label = if icons_only {
-                        div()
-                            .flex()
-                            .flex_1()
-                            .min_w_0()
-                            .gap_1()
-                            .overflow_hidden()
-                            .when(!open, |d| {
-                                d.children(bad.iter().map(|s| {
-                                    crate::repo_marks::global_mark(s, 16.0, status_color(s, &p), cx)
-                                }))
-                            })
-                    } else {
-                        heading_label(format!("● {} need you", bad.len()))
-                    };
-                    rows.push(
-                        div()
-                            .id("needs-you")
-                            .bg(section_tint(Section::NeedsYou, &p))
-                            .flex()
-                            .items_center()
-                            .gap(px(10.))
-                            .px_4()
-                            .py(px(6.))
-                            .cursor_pointer()
-                            .hover(|style| style.bg(p.hover))
-                            .text_sm()
-                            .text_color(p.red)
-                            .when(icons_only, |d| {
-                                d.tooltip(tip(vec![(format!("{} need you", bad.len()), p.red)], &p))
-                            })
-                            .child(label)
-                            .child(div().flex_none().text_color(p.muted).child(if open {
-                                "▾"
-                            } else {
-                                "▸"
-                            }))
-                            .on_click(fold(Section::NeedsYou))
-                            .into_any_element(),
-                    );
+                    rows.extend(panel_heading(Section::NeedsYou, state, icons_only, &p, cx));
                     if open {
                         for (i, s) in bad.iter().enumerate() {
                             rows.push(row(i, s, cx));
@@ -1378,51 +1504,7 @@ impl Render for StatusView {
                 }
                 if !good.is_empty() {
                     let open = !state.folded(Section::Synced);
-                    let label =
-                        if icons_only {
-                            // The synced repos' icons in a row, while collapsed.
-                            div()
-                                .flex()
-                                .flex_1()
-                                .min_w_0()
-                                .gap_1()
-                                .overflow_hidden()
-                                .when(!open, |d| {
-                                    d.children(good.iter().map(|s| {
-                                        crate::repo_marks::global_mark(s, 16.0, p.green, cx)
-                                    }))
-                                })
-                        } else {
-                            heading_label(format!("✓ {} synced", good.len()))
-                        };
-                    rows.push(
-                        div()
-                            .id("synced")
-                            .bg(section_tint(Section::Synced, &p))
-                            .flex()
-                            .items_center()
-                            .gap(px(10.))
-                            .px_4()
-                            .py(px(6.))
-                            .cursor_pointer()
-                            .hover(|style| style.bg(p.hover))
-                            .text_sm()
-                            .text_color(p.green)
-                            .when(icons_only, |d| {
-                                d.tooltip(tip(
-                                    vec![(format!("{} synced", good.len()), p.green)],
-                                    &p,
-                                ))
-                            })
-                            .child(label)
-                            .child(div().flex_none().text_color(p.muted).child(if open {
-                                "▾"
-                            } else {
-                                "▸"
-                            }))
-                            .on_click(fold(Section::Synced))
-                            .into_any_element(),
-                    );
+                    rows.extend(panel_heading(Section::Synced, state, icons_only, &p, cx));
                     if open {
                         let offset = bad.len();
                         for (i, s) in good.iter().enumerate() {
@@ -1435,50 +1517,13 @@ impl Render for StatusView {
                 let remote = state.sorted(&state.remote_statuses);
                 if !remote.is_empty() {
                     let open = !state.folded(Section::GithubOnly);
-                    let label =
-                        if icons_only {
-                            div()
-                                .flex()
-                                .flex_1()
-                                .min_w_0()
-                                .gap_1()
-                                .overflow_hidden()
-                                .when(!open, |d| {
-                                    d.children(remote.iter().map(|s| {
-                                        crate::repo_marks::global_mark(s, 16.0, p.muted, cx)
-                                    }))
-                                })
-                        } else {
-                            heading_label(format!("◌ {} on GitHub only", remote.len()))
-                        };
-                    rows.push(
-                        div()
-                            .id("remote")
-                            .bg(section_tint(Section::GithubOnly, &p))
-                            .flex()
-                            .items_center()
-                            .gap(px(10.))
-                            .px_4()
-                            .py(px(6.))
-                            .cursor_pointer()
-                            .hover(|style| style.bg(p.hover))
-                            .text_sm()
-                            .text_color(p.muted)
-                            .tooltip(tip(
-                                vec![
-                                    (
-                                        format!("{} GitHub repos not cloned here", remote.len()),
-                                        p.text,
-                                    ),
-                                    ("Their trees come from GitHub".to_string(), p.muted),
-                                ],
-                                &p,
-                            ))
-                            .child(label)
-                            .child(div().flex_none().child(if open { "▾" } else { "▸" }))
-                            .on_click(fold(Section::GithubOnly))
-                            .into_any_element(),
-                    );
+                    rows.extend(panel_heading(
+                        Section::GithubOnly,
+                        state,
+                        icons_only,
+                        &p,
+                        cx,
+                    ));
                     if open {
                         let offset = bad.len() + good.len();
                         for (i, s) in remote.iter().enumerate() {
@@ -1488,18 +1533,7 @@ impl Render for StatusView {
                 } else if let Some(problem) = remote_problem {
                     rows.push(remote_problem_row(problem, &p));
                 }
-                rows.extend(pr_rows(
-                    &open_prs,
-                    pr_problem,
-                    &p,
-                    mode,
-                    icons_only,
-                    Some((
-                        state.folded(Section::PullRequests),
-                        fold(Section::PullRequests),
-                    )),
-                    cx,
-                ));
+                rows.extend(prs_block(state, Mode::Panel, icons_only, &p, cx));
             }
         }
 
@@ -1574,38 +1608,8 @@ impl Render for StatusView {
         // Big mode lists the pull requests under the columns, a few rows
         // high, scrolling when there are more.
         let window_prs = (mode == Mode::Window)
-            .then(|| {
-                let mut rows = pr_rows(
-                    &open_prs,
-                    pr_problem,
-                    &p,
-                    mode,
-                    false,
-                    Some((
-                        state.folded(Section::PullRequests),
-                        fold(Section::PullRequests),
-                    )),
-                    cx,
-                );
-                if state.remote_statuses.is_empty()
-                    && let Some(problem) = remote_problem
-                {
-                    rows.push(remote_problem_row(problem, &p));
-                }
-                rows
-            })
-            .filter(|rows| !rows.is_empty())
-            .map(|rows| {
-                div()
-                    .id("prs")
-                    .flex()
-                    .flex_col()
-                    .flex_none()
-                    .max_h(px(WINDOW_PRS_HEIGHT))
-                    .overflow_y_scroll()
-                    .bg(p.surface)
-                    .children(rows)
-            });
+            .then(|| prs_block(state, mode, false, &p, cx))
+            .flatten();
 
         let config_file: PathBuf = state.config_file.clone();
         let edit_config = div()

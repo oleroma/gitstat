@@ -95,7 +95,7 @@ pub enum Update {
 enum Msg {
     Cmd(Command),
     Fs(notify::Result<notify::Event>),
-    Done(Done),
+    Done(Box<Done>),
     Walked(Walked),
 }
 
@@ -357,7 +357,7 @@ impl Scheduler {
                     }
                 }
                 Ok(Msg::Fs(event)) => self.on_fs(event, Instant::now()),
-                Ok(Msg::Done(done)) => self.on_done(done, Instant::now()),
+                Ok(Msg::Done(done)) => self.on_done(*done, Instant::now()),
                 Ok(Msg::Walked(walked)) => self.on_walked(walked, Instant::now()),
                 Err(RecvTimeoutError::Timeout) => {}
             }
@@ -496,13 +496,13 @@ impl Scheduler {
                         let status = git::failed(&root, &worker_repo, "internal error");
                         (status, Vec::new())
                     });
-                    let _ = tx.send(Msg::Done(Done {
+                    let _ = tx.send(Msg::Done(Box::new(Done {
                         generation,
                         repo: worker_repo,
                         need,
                         status,
                         ignored,
-                    }));
+                    })));
                 });
             self.emit(Update::Started {
                 repo: repo.clone(),

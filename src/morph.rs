@@ -10,14 +10,18 @@
 //!    fades in over the panel, hiding what only the panel shows. What both
 //!    views show (each repo's tree, icon, name and checkout, the top bar's
 //!    words and health bar) is drawn whole over its twin from the start.
-//! 2. Turn: the panel closes; the sheet grows from the panel's place to
+//! 2. Slide out: the panel's section headings slide out of the top or the
+//!    bottom of its list, and its pull requests down into its bottom bar,
+//!    drawn by the panel's own elements.
+//! 3. Turn: the panel closes; the sheet grows from the panel's place to
 //!    the big window's, its bars and title bar with it, each tree turns a
 //!    quarter turn from its strip to where its column will be
 //!    (`timeline::paint_tree`), and the shared parts move and grow to the
 //!    window's. Nothing fades while anything moves.
-//! 3. Hold: the big window opens underneath, still covered, and gets a
-//!    moment to draw.
-//! 4. Reveal: the sheet's colours fade out, showing what only the big
+//! 4. Hold: the big window opens underneath, still covered, and gets a
+//!    moment to draw, while its spines slide in from its sides and its pull
+//!    requests up out of its bottom bar.
+//! 5. Reveal: the sheet's colours fade out, showing what only the big
 //!    window shows, then the flip's window closes over the shared parts'
 //!    twins.
 //!
@@ -36,10 +40,12 @@
 //! words that differ between them aren't carried but fade with their own
 //! view, before or after the turn, like everything only one view shows.
 
+use crate::config::Section;
 use crate::layout::Rect;
 use crate::timeline::{COLUMN_WIDTH, Ends};
 use crate::view::{self, Palette, Ui};
 use crate::win;
+use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Bounds, Context, Global, Hsla, IntoElement, ParentElement, Pixels, Render,
     Styled, Window, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowHandle,
@@ -52,11 +58,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// The phases at the default speed, 560 ms in all; `flip_ms` stretches
-/// all but the hold, which is the big window's time to draw.
-const FADE: Duration = Duration::from_millis(90);
-const TURN: Duration = Duration::from_millis(280);
+/// all but the hold, which is the big window's time to draw. The slide in
+/// runs during the hold.
+const FADE: Duration = Duration::from_millis(70);
+const SLIDE: Duration = Duration::from_millis(80);
+const TURN: Duration = Duration::from_millis(230);
 const HOLD: Duration = Duration::from_millis(80);
-const REVEAL: Duration = Duration::from_millis(110);
+const REVEAL: Duration = Duration::from_millis(100);
 /// The panel's and the sheet's rounded corners, logical px.
 const RADIUS: f32 = 8.0;
 /// Until the big window has been measured: its title bar's height,
@@ -89,6 +97,13 @@ pub enum Part {
     /// The health bar under the headline, and its three counts.
     Health,
     Count(u8),
+    /// The pull requests' block, which slides out of and into the bottom
+    /// bar.
+    Prs,
+    /// A panel section heading, and a big-window spine, which slide out of
+    /// and into the body.
+    Heading(Section),
+    Spine(Section),
 }
 
 /// The path the top bar's parts are kept under.
@@ -480,6 +495,28 @@ struct Plan {
     footer: Option<(Bounds<f32>, Bounds<f32>)>,
     trees: Vec<Tree>,
     parts: Vec<Carried>,
+    sliders: Vec<Slider>,
+}
+
+/// A bar that slides out of its view before the turn, or into it after:
+/// the pull requests into and out of the bottom bar, the panel's section
+/// headings out of the top or the bottom of its list, the window's spines
+/// out of its sides. The flip draws the view's own element for it.
+struct Slider {
+    what: Slid,
+    /// Where its view draws it, physical px from the flip window's corner.
+    at: Bounds<f32>,
+    /// How far it moves to be out of sight, physical px.
+    away: (f32, f32),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Slid {
+    /// The pull requests' block, in the panel or the big window.
+    Prs(view::Mode),
+    Heading(Section),
+    /// A spine: its section, count and whether folded.
+    Spine(Section, usize, bool),
 }
 
 /// Lays out a flip between the panel at `panel_rect` (client area,
@@ -595,6 +632,7 @@ fn plan(
 
     let mut trees = Vec::new();
     let mut parts = Vec::new();
+    let mut spine_sliders = Vec::new();
     let panel_parts = PANEL_PARTS.with(|m| m.borrow().clone());
     let column_parts = COLUMN_PARTS.with(|m| m.borrow().clone());
     let header_at = HEADER_AT.with(|m| m.borrow().clone());
@@ -659,8 +697,29 @@ fn plan(
                 });
             }
             // Section headings and spines don't turn into each other:
-            // each fades with its own view, before or after the turn.
-            view::Cell::Spine(..) => {}
+            // each slides out of its own view, or in, before or after the
+            // turn.
+            view::Cell::Spine(section, n) => {
+                let key = (app().to_path_buf(), Part::Spine(section));
+                if let Some(b) = column_parts.get(&key) {
+                    let at = Bounds {
+                        origin: point(x, to.origin.y + f32::from(b.bounds.origin.y) * ws),
+                        size: size(view::SPINE_WIDTH * ws, f32::from(b.bounds.size.height) * ws),
+                    };
+                    // Out of the nearer side.
+                    let middle = to.origin.x + to.size.width / 2.0;
+                    let away = if at.origin.x + at.size.width / 2.0 < middle {
+                        to.origin.x - (at.origin.x + at.size.width)
+                    } else {
+                        to.origin.x + to.size.width - at.origin.x
+                    };
+                    spine_sliders.push(Slider {
+                        what: Slid::Spine(section, n, state.folded(section)),
+                        at,
+                        away: (away, 0.0),
+                    });
+                }
+            }
         }
     }
     // The top and bottom bars, and what's on the top one, from the
@@ -707,6 +766,58 @@ fn plan(
             kind,
         });
     }
+    // The bars that slide: each view's body runs from under its top bar to
+    // its bottom bar.
+    let mut sliders = spine_sliders;
+    let bodies = [
+        (
+            view::Mode::Panel,
+            &panel_parts,
+            bar.map_or(from.origin.y, |b| b.0.origin.y + b.0.size.height),
+            footer.map_or(from.origin.y + from.size.height, |f| f.0.origin.y),
+        ),
+        (
+            view::Mode::Window,
+            &column_parts,
+            bar.map_or(to.origin.y, |b| b.1.origin.y + b.1.size.height),
+            footer.map_or(to.origin.y + to.size.height, |f| f.1.origin.y),
+        ),
+    ];
+    for (mode, seen, top, bottom) in bodies {
+        let place = |b: &Bounds<Pixels>| match mode {
+            view::Mode::Panel => in_panel(b),
+            view::Mode::Window => in_window(b),
+        };
+        let key = |part| (app().to_path_buf(), part);
+        // The pull requests, down into the bottom bar.
+        if let Some(b) = seen.get(&key(Part::Prs)) {
+            let at = place(&b.bounds);
+            sliders.push(Slider {
+                what: Slid::Prs(mode),
+                at,
+                away: (0.0, bottom - at.origin.y),
+            });
+        }
+        // The panel's headings, out of the nearer end of its list.
+        if mode == view::Mode::Panel {
+            for section in [Section::NeedsYou, Section::Synced, Section::GithubOnly] {
+                let Some(b) = seen.get(&key(Part::Heading(section))) else {
+                    continue;
+                };
+                let at = place(&b.bounds);
+                let away = if at.origin.y + at.size.height / 2.0 < (top + bottom) / 2.0 {
+                    top - (at.origin.y + at.size.height)
+                } else {
+                    bottom - at.origin.y
+                };
+                sliders.push(Slider {
+                    what: Slid::Heading(section),
+                    at,
+                    away: (0.0, away),
+                });
+            }
+        }
+    }
     (!trees.is_empty()).then_some(Plan {
         union,
         from,
@@ -723,6 +834,7 @@ fn plan(
         footer,
         trees,
         parts,
+        sliders,
     })
 }
 
@@ -743,6 +855,7 @@ fn launch(plan: Plan, direction: Direction, cx: &mut App) -> bool {
         .map_or(560, |ui| ui.state.read(cx).config.flip_ms);
     let fixed = HOLD.as_millis() as f32;
     let stretch = ((ms as f32 - fixed) / (560.0 - fixed)).clamp(0.2, 12.0);
+    debug_assert_eq!((FADE + SLIDE + TURN + HOLD + REVEAL).as_millis(), 560);
     let mut flip_hwnd = None;
     let Ok(handle) = cx.open_window(
         WindowOptions {
@@ -883,7 +996,8 @@ impl Render for MorphView {
         };
         let k = self.stretch;
         let (fade, turn, reveal_len) = (FADE.mul_f32(k), TURN.mul_f32(k), REVEAL.mul_f32(k));
-        let turn_at = fade;
+        let slide = SLIDE.mul_f32(k);
+        let turn_at = fade + slide;
         let hold_at = turn_at + turn;
         let open = self.direction == Direction::Open;
         // The reveal waits for the window underneath to have drawn, so it
@@ -902,7 +1016,8 @@ impl Render for MorphView {
             let drawn = ready
                 .zip(LAST_PAINT.with(Cell::get))
                 .is_some_and(|(r, t)| t > r.max(arrived + Duration::from_millis(30)));
-            if since >= DRAW_WAIT || (since >= HOLD && drawn) {
+            // And the slide in has ended.
+            if since >= slide.max(HOLD) && (since >= DRAW_WAIT || drawn) {
                 self.reveal_from = Some(Instant::now());
             }
         }
@@ -1173,28 +1288,124 @@ impl Render for MorphView {
                                     .paint_image(b, Default::default(), image.clone(), 0, false)
                                     .ok();
                             }
+                            if let Kind::Icon(st) = &d.kind
+                                && st.off_trunk()
+                            {
+                                crate::repo_marks::paint_branch_badge(
+                                    b,
+                                    f32::from(b.size.width),
+                                    window,
+                                );
+                            }
                             if let Some((text, color, size, weight)) = &d.words {
                                 paint_words(window, cx, b, text.clone(), *color, *size, *weight);
                             }
                         }
                     });
-                    // The rim, as thick as Windows draws the windows' own.
-                    if rim_alpha > 0.0 {
-                        let rim = view::rim(dark).opacity(rim_alpha);
-                        window.paint_quad(quad(
-                            sheet,
-                            px(RADIUS),
-                            gpui::transparent_black(),
-                            px(view::rim_width(window.scale_factor()) / window.scale_factor()),
-                            rim,
-                            gpui::BorderStyle::Solid,
-                        ));
-                    }
                 });
             },
         )
         .size_full();
-        div().size_full().child(painter)
+        // The rim, as thick as Windows draws the windows' own, over the
+        // sliding bars too.
+        let rim = canvas(
+            |_, _, _| {},
+            move |_, _, window, _| {
+                if rim_alpha <= 0.0 {
+                    return;
+                }
+                window.with_content_mask(Some(gpui::ContentMask { bounds: work }), |window| {
+                    let s = window.scale_factor();
+                    window.paint_quad(quad(
+                        sheet,
+                        px(RADIUS),
+                        gpui::transparent_black(),
+                        px(view::rim_width(s) / s),
+                        view::rim(dark).opacity(rim_alpha),
+                        gpui::BorderStyle::Solid,
+                    ));
+                });
+            },
+        )
+        .absolute()
+        .inset_0();
+
+        // The bars that slide, the views' own elements: the starting
+        // view's slide out after the fade, the ending view's in before the
+        // reveal, both under the sheet's bars.
+        let p = Palette::for_appearance(appearance);
+        let out = ease(phase(elapsed, fade, slide));
+        let into = self
+            .arrived
+            .map(|a| 1.0 - ease(phase(a.elapsed(), Duration::ZERO, slide)));
+        let app: &App = cx;
+        let mut slid = Vec::new();
+        if let Some(ui) = app.try_global::<Ui>() {
+            let state = ui.state.read(app);
+            let icons_only = state.config.icons_only;
+            for sl in &self.plan.sliders {
+                let in_panel = matches!(sl.what, Slid::Prs(view::Mode::Panel) | Slid::Heading(_));
+                let k = if in_panel == open {
+                    if out >= 1.0 {
+                        continue;
+                    }
+                    out
+                } else {
+                    match into {
+                        Some(k) => k,
+                        None => continue,
+                    }
+                };
+                let element = match sl.what {
+                    Slid::Prs(mode) => {
+                        view::prs_block(state, mode, icons_only && in_panel, &p, app)
+                    }
+                    Slid::Heading(section) => {
+                        view::panel_heading(section, state, icons_only, &p, app)
+                    }
+                    Slid::Spine(section, n, folded) => Some(view::spine(section, n, folded, &p)),
+                };
+                let Some(element) = element else {
+                    continue;
+                };
+                let (dx, dy) = (sl.away.0 * k / s, sl.away.1 * k / s);
+                slid.push(
+                    div()
+                        .absolute()
+                        .left(px(sl.at.origin.x / s + dx) - body.left())
+                        .top(px(sl.at.origin.y / s + dy) - body.top())
+                        .w(px(sl.at.size.width / s))
+                        .h(px(sl.at.size.height / s))
+                        .flex()
+                        .flex_col()
+                        .child(element),
+                );
+            }
+        }
+        div()
+            .size_full()
+            .relative()
+            // As the views: digits of one width, and their text colour.
+            .map(|mut d| {
+                d.text_style()
+                    .get_or_insert_with(Default::default)
+                    .font_features =
+                    Some(gpui::FontFeatures(Arc::new(vec![("tnum".to_string(), 1)])));
+                d
+            })
+            .text_color(p.text)
+            .child(painter)
+            .child(
+                div()
+                    .absolute()
+                    .left(body.left())
+                    .top(body.top())
+                    .w(body.size.width)
+                    .h(body.size.height)
+                    .overflow_hidden()
+                    .children(slid),
+            )
+            .child(rim)
     }
 }
 

@@ -192,6 +192,7 @@ fn to_image(n: u32, mut rgba: Vec<u8>) -> Option<Arc<RenderImage>> {
 pub fn mark(marks: &Entity<RepoMarks>, status: &RepoStatus, side: f32, dot: Hsla) -> AnyElement {
     let path = status.path.clone();
     let tone = FolderState::of(status).tone();
+    let off_trunk = status.off_trunk();
     let (marks1, marks2) = (marks.clone(), marks.clone());
     let path2 = path.clone();
     canvas(
@@ -231,11 +232,78 @@ pub fn mark(marks: &Entity<RepoMarks>, status: &RepoStatus, side: f32, dot: Hsla
                 }
                 Look::Drawing => {}
             }
+            if off_trunk {
+                paint_branch_badge(bounds, side, window);
+            }
         },
     )
     .size(px(side))
     .flex_none()
     .into_any_element()
+}
+
+/// The badge on a repo's icon while it is checked out off its default
+/// branch: the app icon's branch, a white line with an amber branch off
+/// it, on a dark disc.
+const BRANCH_BADGE: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+<circle cx="8" cy="8" r="7.6" fill="#1e2a38" stroke="#ffffff" stroke-opacity="0.35" stroke-width="0.8"/>
+<g fill="none" stroke-width="1.7" stroke-linecap="round">
+<path stroke="#ffffff" d="M5.6 4.2 L5.6 11.8"/>
+<path stroke="#ffb74d" d="M5.6 10.2 C5.6 7.7 10.6 9 10.6 6.2"/>
+</g>
+<circle cx="5.6" cy="4.2" r="1.7" fill="#ffffff"/>
+<circle cx="5.6" cy="11.8" r="1.7" fill="#ffffff"/>
+<circle cx="10.6" cy="6.2" r="1.7" fill="#ffb74d"/>
+</svg>"##;
+
+thread_local! {
+    /// The branch badge, by device px.
+    static BADGES: std::cell::RefCell<HashMap<u32, Option<Arc<RenderImage>>>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// The branch badge at `n` device px square.
+fn branch_badge(n: u32) -> Option<Arc<RenderImage>> {
+    BADGES.with(|b| {
+        b.borrow_mut()
+            .entry(n)
+            .or_insert_with(|| {
+                use resvg::{tiny_skia, usvg};
+                let tree = usvg::Tree::from_str(BRANCH_BADGE, &usvg::Options::default()).ok()?;
+                let mut pixmap = tiny_skia::Pixmap::new(n, n)?;
+                let k = n as f32 / 16.0;
+                resvg::render(
+                    &tree,
+                    tiny_skia::Transform::from_scale(k, k),
+                    &mut pixmap.as_mut(),
+                );
+                to_image(n, pixmap.take_demultiplied())
+            })
+            .clone()
+    })
+}
+
+/// The branch badge over the top-right corner of an icon `side` logical px
+/// square at `bounds`, on whole device px.
+pub(crate) fn paint_branch_badge(bounds: Bounds<gpui::Pixels>, side: f32, window: &mut Window) {
+    let scale = window.scale_factor();
+    let n = (side * 0.62 * scale).round().max(6.0) as u32;
+    let Some(image) = branch_badge(n) else {
+        return;
+    };
+    let w = n as f32 / scale;
+    let snap = |v: f32| (v * scale).round() / scale;
+    let right = f32::from(bounds.origin.x) + side;
+    let at = Bounds::new(
+        point(
+            px(snap(right - w * 0.8)),
+            px(snap(f32::from(bounds.origin.y) - w * 0.2)),
+        ),
+        size(px(w), px(w)),
+    );
+    window
+        .paint_image(at, Default::default(), image, 0, false)
+        .ok();
 }
 
 /// `status`'s icon picture at the first of `sides` (device px) that is

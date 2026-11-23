@@ -205,7 +205,7 @@ pub struct NotifyConfig {
 /// The sections the panel lists, and the big window shows as groups of
 /// columns (the pull requests as the list under them).
 #[cfg_attr(not(windows), allow(dead_code))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Section {
     /// Repos with something to do: dirty, ahead, behind, erroring.
     NeedsYou,

@@ -280,6 +280,8 @@ pub struct SortFacts {
     pub last_commit: i64,
     pub last_worked: i64,
     pub unmerged: Vec<String>,
+    /// The default branch's own name, without its remote: `main`.
+    pub trunk: Option<String>,
 }
 
 /// Three read-only git calls: every branch with its commit time, the ones
@@ -317,6 +319,15 @@ pub fn sort_facts(repo: &Path) -> SortFacts {
             .to_string()
     });
     let branches = parse_branches(&all, &merged, short.as_deref());
+    let trunk = default
+        .as_deref()
+        .map(|d| match d.strip_prefix("refs/remotes/") {
+            Some(remote) => remote
+                .split_once('/')
+                .map_or(remote, |(_, n)| n)
+                .to_string(),
+            None => d.strip_prefix("refs/heads/").unwrap_or(d).to_string(),
+        });
     let last_worked = text(
         repo,
         &[
@@ -343,6 +354,7 @@ pub fn sort_facts(repo: &Path) -> SortFacts {
             .filter(|b| !b.merged)
             .map(|b| b.name)
             .collect(),
+        trunk,
     }
 }
 
@@ -690,6 +702,7 @@ mod tests {
         // `commit` dates commits 60 s apart from 1_700_000_000.
         assert_eq!(f.last_commit, 1_700_000_120);
         assert_eq!(f.unmerged, ["wip"]);
+        assert_eq!(f.trunk.as_deref(), Some("main"));
         assert!(f.last_worked > 1_700_000_000, "{}", f.last_worked);
         assert_eq!(reflog_time("HEAD@{1730000000}\n"), Some(1_730_000_000));
         assert_eq!(reflog_time(""), None);
