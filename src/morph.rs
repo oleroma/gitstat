@@ -14,8 +14,7 @@
 //!    the big window's, its bars and title bar with it, each tree turns a
 //!    quarter turn from its strip to where its column will be
 //!    (`timeline::paint_tree`), and the shared parts move and grow to the
-//!    window's. Section headings fade out where the panel has them and
-//!    spines fade in where the window has them.
+//!    window's. Nothing fades while anything moves.
 //! 3. Hold: the big window opens underneath, still covered, and gets a
 //!    moment to draw.
 //! 4. Reveal: the sheet's colours fade out, showing what only the big
@@ -33,11 +32,10 @@
 //! measured once the window has settled and kept in window.json, so the
 //! sheet lands on it from the first flip.
 //!
-//! Words that differ between the two views (a short and a long checkout,
-//! bold and plain) cross-fade over the middle of the turn rather than
-//! swapping at once.
+//! Words both views show move, growing and changing colour and weight;
+//! words that differ between them aren't carried but fade with their own
+//! view, before or after the turn, like everything only one view shows.
 
-use crate::config::Section;
 use crate::layout::Rect;
 use crate::timeline::{COLUMN_WIDTH, Ends};
 use crate::view::{self, Palette, Ui};
@@ -67,10 +65,8 @@ const CAPTION_GUESS: f32 = 32.0;
 /// Room left around the sheet for its shadow, logical px.
 const SHADOW_ROOM: f32 = 40.0;
 /// Until the big window has been drawn once: its column header's height,
-/// and the table's top and bottom margins, logical px.
+/// logical px.
 const HEADER_GUESS: f32 = 110.0;
-const TABLE_TOP_GUESS: f32 = 60.0;
-const TABLE_BOTTOM_GUESS: f32 = 40.0;
 
 /// A piece of a repo's row that its column header shows too, and the
 /// flip carries from one to the other.
@@ -128,25 +124,13 @@ thread_local! {
     /// The big window's header parts, by repo, as last drawn: window
     /// logical px, beside each header's own top-left corner.
     static COLUMN_PARTS: RefCell<HashMap<(PathBuf, Part), Seen>> = RefCell::new(HashMap::new());
-    /// The panel headings' words: bounds, text and colour.
-    static HEADING_LABELS: RefCell<HashMap<SectionKey, HeadingLabel>> =
-        RefCell::new(HashMap::new());
-    /// The spines' names: top and height in the big window's logical px,
-    /// and text.
-    static SPINE_LABELS: RefCell<HashMap<SectionKey, (f32, f32, String)>> =
-        RefCell::new(HashMap::new());
     static HEADER_AT: RefCell<HashMap<PathBuf, gpui::Point<Pixels>>> = RefCell::new(HashMap::new());
     /// Each strip in view, by repo, as the panel last drew it: bounds in
     /// the panel's logical px.
     static STRIPS: RefCell<HashMap<PathBuf, Bounds<Pixels>>> = RefCell::new(HashMap::new());
-    /// Each section heading in view, as the panel last drew it.
-    static HEADERS: RefCell<HashMap<SectionKey, Bounds<Pixels>>> = RefCell::new(HashMap::new());
     /// The column body's top below the big window's client top, physical
     /// px, as last drawn.
     static BODY_TOP: Cell<Option<f32>> = const { Cell::new(None) };
-    /// A spine's top, and its bottom's distance above the client bottom,
-    /// physical px, as last drawn.
-    static SPINE: Cell<Option<(f32, f32)>> = const { Cell::new(None) };
     /// The big window's client area minus the bounds it was opened with,
     /// physical px per edge (left, top, right, bottom), once measured.
     static CLIENT_DELTA: Cell<Option<Delta>> = const { Cell::new(None) };
@@ -159,21 +143,6 @@ thread_local! {
     /// When the big window last reached the place and state it opened
     /// with (a maximised one shows at its normal size first).
     static SETTLED: Cell<Option<Instant>> = const { Cell::new(None) };
-}
-
-/// A panel heading's words as drawn: bounds, text and colour.
-type HeadingLabel = (Bounds<Pixels>, String, Hsla);
-
-/// `Section` as a map key.
-type SectionKey = u8;
-
-fn key(section: Section) -> SectionKey {
-    match section {
-        Section::NeedsYou => 0,
-        Section::Synced => 1,
-        Section::PullRequests => 2,
-        Section::GithubOnly => 3,
-    }
 }
 
 /// Notes a strip the panel drew, for the flip.
@@ -233,54 +202,16 @@ pub fn tag_header(path: &Path) -> impl IntoElement {
     .inset_0()
 }
 
-/// Notes the words of a panel section heading, for the flip.
-pub fn seen_heading_label(section: Section, bounds: Bounds<Pixels>, text: &str, color: Hsla) {
-    HEADING_LABELS.with(|m| {
-        m.borrow_mut()
-            .insert(key(section), (bounds, text.to_string(), color));
-    });
-}
-
-/// Notes a spine's name as the big window drew it, for the flip.
-pub fn seen_spine_label(section: Section, bounds: Bounds<Pixels>, text: &str, _: &Window) {
-    SPINE_LABELS.with(|m| {
-        m.borrow_mut().insert(
-            key(section),
-            (
-                f32::from(bounds.top()),
-                f32::from(bounds.size.height),
-                text.to_string(),
-            ),
-        );
-    });
-}
-
-/// Notes a section heading the panel drew, for the flip.
-pub fn seen_header(section: Section, bounds: Bounds<Pixels>) {
-    HEADERS.with(|h| {
-        h.borrow_mut().insert(key(section), bounds);
-    });
-}
-
-/// Forgets the strips and headings; the panel is opening afresh.
+/// Forgets the strips and the panel's parts; the panel is opening afresh.
 pub fn clear_strips() {
     STRIPS.with(|s| s.borrow_mut().clear());
     PANEL_PARTS.with(|s| s.borrow_mut().clear());
-    HEADING_LABELS.with(|s| s.borrow_mut().clear());
-    HEADERS.with(|h| h.borrow_mut().clear());
 }
 
 /// Notes a column body the big window drew, for the flip.
 pub fn seen_column(body: Bounds<Pixels>, window: &Window) {
     let top = f32::from(body.top()) * window.scale_factor();
     BODY_TOP.with(|t| t.set(Some(top)));
-}
-
-/// Notes a section spine the big window drew, for the flip.
-pub fn seen_spine(spine: Bounds<Pixels>, window: &Window) {
-    let s = window.scale_factor();
-    let below = f32::from(window.viewport_size().height - spine.bottom()) * s;
-    SPINE.with(|t| t.set(Some((f32::from(spine.top()) * s, below))));
 }
 
 /// A client area minus the bounds asked for, physical px per edge (left,
@@ -489,42 +420,20 @@ struct Tree {
     dirty: bool,
     /// Physical px, from the flip window's top-left corner.
     ends: Ends,
-    /// Its column is past the big window's edge: it fades as it turns.
-    gone: bool,
-}
-
-/// A section's heading in the panel and its spine in the big window,
-/// physical px from the flip window's top-left corner.
-struct Spine {
-    section: Section,
-    from: Bounds<f32>,
-    to: Bounds<f32>,
-    name: Option<Name>,
-}
-
-/// A section's name: the panel heading's words, across, and the spine's,
-/// reading upwards. Bounds in physical px.
-struct Name {
-    from: Bounds<f32>,
-    to: Bounds<f32>,
-    from_text: String,
-    to_text: String,
-    color: Hsla,
 }
 
 /// A part's words: text, colour, size in px, and whether bold.
 type Words = (gpui::SharedString, Hsla, f32, bool);
 
+/// Words as drawn this frame: text, colour, size in px and weight.
+type Line = (gpui::SharedString, Hsla, f32, f32);
+
 /// A carried part this frame.
 struct Drawn {
     bounds: Bounds<Pixels>,
     image: Option<Arc<gpui::RenderImage>>,
-    /// Two while they cross-fade.
-    words: Vec<Words>,
-    alpha: f32,
+    words: Option<Line>,
     kind: Kind,
-    /// A button's fill, as much as has faded in.
-    fill: f32,
 }
 
 /// What a carried part is.
@@ -533,8 +442,6 @@ enum Kind {
     Words,
     /// The repo's icon, by its tone.
     Icon(Box<crate::git::RepoStatus>),
-    /// The big window's Refresh button, filled there and bare in the panel.
-    Button,
     /// The health bar: synced, local-work and needs-a-look repos.
     Health([usize; 3]),
 }
@@ -547,7 +454,6 @@ struct Carried {
     /// The words at each end: text, colour, size and boldness.
     words: Option<(Words, Words)>,
     kind: Kind,
-    gone: bool,
 }
 
 /// Everything a flip draws, laid out.
@@ -573,7 +479,6 @@ struct Plan {
     bar: Option<(Bounds<f32>, Bounds<f32>)>,
     footer: Option<(Bounds<f32>, Bounds<f32>)>,
     trees: Vec<Tree>,
-    spines: Vec<Spine>,
     parts: Vec<Carried>,
 }
 
@@ -592,7 +497,6 @@ fn plan(
     let state = ui.state.read(cx);
     let timelines = ui.timelines.read(cx);
     let strips = STRIPS.with(|s| s.borrow().clone());
-    let headers = HEADERS.with(|h| h.borrow().clone());
 
     let cells = view::table_cells(state);
     let lefts = view::cell_lefts(&cells);
@@ -688,19 +592,20 @@ fn plan(
             }),
     };
     let body_top = BODY_TOP.with(Cell::get).unwrap_or(HEADER_GUESS * ws);
-    let (spine_top, spine_below) = SPINE
-        .with(Cell::get)
-        .unwrap_or((TABLE_TOP_GUESS * ws, TABLE_BOTTOM_GUESS * ws));
 
     let mut trees = Vec::new();
-    let mut spines = Vec::new();
     let mut parts = Vec::new();
     let panel_parts = PANEL_PARTS.with(|m| m.borrow().clone());
     let column_parts = COLUMN_PARTS.with(|m| m.borrow().clone());
     let header_at = HEADER_AT.with(|m| m.borrow().clone());
     for (cell, left) in cells.iter().zip(&lefts) {
         let x = to.origin.x + left * ws - scroll;
+        // A column past the big window's edge isn't drawn: its strip
+        // fades with the panel before the turn.
         let gone = x + cell.width() * ws <= to.origin.x || x >= to.origin.x + to.size.width;
+        if gone {
+            continue;
+        }
         match *cell {
             view::Cell::Repo(status) => {
                 let (Some(strip), Some(graph)) =
@@ -724,7 +629,7 @@ fn plan(
                                 f32::from(b.bounds.size.height) * ws,
                             ),
                         };
-                        let words = a.text.clone().zip(b.text.clone());
+                        let words = same_words(a, b);
                         if part != Part::Icon && words.is_none() {
                             continue;
                         }
@@ -737,7 +642,6 @@ fn plan(
                             } else {
                                 Kind::Words
                             },
-                            gone,
                         });
                     }
                 }
@@ -752,43 +656,11 @@ fn plan(
                         column: (x, to.origin.y + body_top),
                         column_len: (to.size.height - body_top).max(0.0),
                     },
-                    gone,
                 });
             }
-            view::Cell::Spine(section, _) => {
-                let Some(header) = headers.get(&key(section)) else {
-                    continue;
-                };
-                if gone {
-                    continue;
-                }
-                let k = key(section);
-                let name = HEADING_LABELS
-                    .with(|m| m.borrow().get(&k).cloned())
-                    .zip(SPINE_LABELS.with(|m| m.borrow().get(&k).cloned()))
-                    .map(|((lb, from_text, color), (top, height, to_text))| Name {
-                        from: in_panel(&lb),
-                        to: Bounds {
-                            origin: point(x, to.origin.y + top * ws),
-                            size: size(view::SPINE_WIDTH * ws, height * ws),
-                        },
-                        from_text,
-                        to_text,
-                        color,
-                    });
-                spines.push(Spine {
-                    section,
-                    name,
-                    from: in_panel(header),
-                    to: Bounds {
-                        origin: point(x, to.origin.y + spine_top),
-                        size: size(
-                            view::SPINE_WIDTH * ws,
-                            (to.size.height - spine_top - spine_below).max(0.0),
-                        ),
-                    },
-                });
-            }
+            // Section headings and spines don't turn into each other:
+            // each fades with its own view, before or after the turn.
+            view::Cell::Spine(..) => {}
         }
     }
     // The top and bottom bars, and what's on the top one, from the
@@ -820,10 +692,9 @@ fn plan(
         let Some((a, b)) = both(part) else {
             continue;
         };
-        let words = a.text.clone().zip(b.text.clone());
+        let words = same_words(a, b);
         let kind = match part {
             Part::Health => Kind::Health(health),
-            Part::Refresh => Kind::Button,
             _ => Kind::Words,
         };
         if !matches!(kind, Kind::Health(_)) && words.is_none() {
@@ -834,10 +705,9 @@ fn plan(
             to: in_window(&b.bounds),
             words,
             kind,
-            gone: false,
         });
     }
-    (!trees.is_empty() || !spines.is_empty()).then_some(Plan {
+    (!trees.is_empty()).then_some(Plan {
         union,
         from,
         to,
@@ -852,9 +722,17 @@ fn plan(
         bar,
         footer,
         trees,
-        spines,
         parts,
     })
+}
+
+/// A part's words at each end, when both say the same: words that differ
+/// aren't carried but fade with their own view, before or after the turn.
+fn same_words(a: &Seen, b: &Seen) -> Option<(Words, Words)> {
+    a.text
+        .clone()
+        .zip(b.text.clone())
+        .filter(|(a, b)| a.0 == b.0)
 }
 
 /// Opens the flip's window for `plan`. False if it couldn't.
@@ -1164,12 +1042,13 @@ impl Render for MorphView {
 
         // The rim stays drawn from when the starting window has gone to the
         // very end, over the ending window's own of the same colour, so it
-        // never blinks. A maximised big window has none: there it thins
-        // out toward that end.
-        let rim_alpha = if self.frames >= self.framed.0 {
-            if self.plan.maximized { 1.0 - e } else { 1.0 }
-        } else {
-            0.0
+        // never blinks. A maximised big window has none: there it fades
+        // with that window, out after the turn or in before it.
+        let rim_alpha = match (self.plan.maximized, open) {
+            (true, false) => sheet_alpha,
+            _ if self.frames < self.framed.0 => 0.0,
+            (true, true) => reveal,
+            (false, _) => 1.0,
         };
         let trees: Vec<(Arc<crate::repo_graph::RepoGraph>, bool, Ends, f32)> = self
             .plan
@@ -1183,61 +1062,10 @@ impl Render for MorphView {
                     column: k(t.ends.column),
                     column_len: t.ends.column_len / s,
                 };
-                let alpha = if t.gone { 1.0 - e } else { 1.0 };
-                (t.graph.clone(), t.dirty, ends, alpha)
+                (t.graph.clone(), t.dirty, ends, 1.0)
             })
             .collect();
 
-        // Section headings and spines don't turn into each other: the
-        // headings fade out over the turn's first part where the panel has
-        // them, and the spines fade in over its last where the window has
-        // them. At either end the body leaves a hole for the ones shown,
-        // which then fade like a band of their own.
-        let heading_alpha = if e <= 0.0 { 1.0 } else { 1.0 - ease(e / 0.45) };
-        let spine_alpha = if e >= 1.0 {
-            1.0
-        } else {
-            ease((e - 0.55) / 0.45)
-        };
-        let mut blocks: Vec<(Bounds<Pixels>, Hsla, f32, bool)> = Vec::new();
-        // Their names: where, words, colour, alpha, and whether turned.
-        let mut names: Vec<(Bounds<Pixels>, String, Hsla, f32, bool)> = Vec::new();
-        for sp in &self.plan.spines {
-            let tint = p.surface.blend(view::section_tint(sp.section, &p));
-            let at = |b: Bounds<f32>| snapped(lerp_bounds(b, b, 0.0, s), s);
-            if heading_alpha > 0.0 {
-                blocks.push((at(sp.from), tint, heading_alpha, false));
-                if let Some(n) = &sp.name {
-                    names.push((
-                        lerp_bounds(n.from, n.from, 0.0, s),
-                        n.from_text.clone(),
-                        n.color,
-                        heading_alpha,
-                        false,
-                    ));
-                }
-            }
-            if spine_alpha > 0.0 {
-                blocks.push((at(sp.to), tint, spine_alpha, true));
-                if let Some(n) = &sp.name {
-                    names.push((
-                        lerp_bounds(n.to, n.to, 0.0, s),
-                        n.to_text.clone(),
-                        n.color,
-                        spine_alpha,
-                        true,
-                    ));
-                }
-            }
-        }
-        let holes: Vec<Bounds<Pixels>> =
-            blocks.iter().filter(|b| b.2 >= 1.0).map(|b| b.0).collect();
-        let body_parts = holes.iter().fold(vec![body], |pieces, h| {
-            pieces.iter().flat_map(|r| subtract(*r, *h)).collect()
-        });
-
-        // Words that differ cross-fade over the turn's middle.
-        let blend = ease((e - 0.3) / 0.4);
         // The parts both views show, moving and growing from one to the
         // other, over the sheet.
         let parts: Vec<Drawn> = self
@@ -1253,34 +1081,28 @@ impl Render for MorphView {
                     }
                     _ => None,
                 };
-                let words = c.words.as_ref().map_or_else(Vec::new, |(a, z)| {
-                    let size = mix(a.2, z.2);
-                    if a.0 == z.0 && a.3 == z.3 {
-                        // The same words: one line, its colour moving.
-                        let color = Hsla {
-                            h: if e < 0.5 { a.1.h } else { z.1.h },
-                            s: mix(a.1.s, z.1.s),
-                            l: mix(a.1.l, z.1.l),
-                            a: mix(a.1.a, z.1.a),
-                        };
-                        vec![(a.0.clone(), color, size, a.3)]
-                    } else {
-                        // Different words: each in its own colour, one
-                        // fading out as the other fades in.
-                        let fade = |c: Hsla, k: f32| Hsla { a: c.a * k, ..c };
-                        vec![
-                            (a.0.clone(), fade(a.1, 1.0 - blend), size, a.3),
-                            (z.0.clone(), fade(z.1, blend), size, z.3),
-                        ]
-                    }
+                // The same words at both ends: their size, colour and
+                // weight move from one view's to the other's.
+                let words = c.words.as_ref().map(|(a, z)| {
+                    let color = Hsla {
+                        h: if e < 0.5 { a.1.h } else { z.1.h },
+                        s: mix(a.1.s, z.1.s),
+                        l: mix(a.1.l, z.1.l),
+                        a: mix(a.1.a, z.1.a),
+                    };
+                    let weight = |bold: bool| if bold { 600.0 } else { 400.0 };
+                    (
+                        a.0.clone(),
+                        color,
+                        mix(a.2, z.2),
+                        mix(weight(a.3), weight(z.3)),
+                    )
                 });
                 Drawn {
                     bounds: lerp_bounds(c.from, c.to, e, s),
                     image,
                     words,
-                    alpha: if c.gone { 1.0 - e } else { 1.0 },
                     kind: c.kind.clone(),
-                    fill: blend,
                 }
             })
             .collect();
@@ -1331,46 +1153,8 @@ impl Render for MorphView {
                     for (b, color) in &bands {
                         paint_band(window, *b, color.opacity(color.a * fill));
                     }
-                    for b in &body_parts {
-                        paint_band(window, *b, p.surface.opacity(fill));
-                    }
+                    paint_band(window, body, p.surface.opacity(fill));
                     window.with_content_mask(Some(gpui::ContentMask { bounds: body }), |window| {
-                        for (b, tint, alpha, spine) in &blocks {
-                            // In its hole it fades like the bands; over the
-                            // sheet, by itself.
-                            let a = alpha * if *alpha >= 1.0 { fill } else { 1.0 };
-                            window.paint_quad(gpui::fill(*b, tint.opacity(a)));
-                            if *spine {
-                                // The spine's right edge line.
-                                let edge = Bounds::new(
-                                    point(b.right() - px(1.0), b.top()),
-                                    size(px(1.0), b.size.height),
-                                );
-                                window.paint_quad(gpui::fill(edge, p.border.opacity(a)));
-                            }
-                        }
-                        for (b, text, color, alpha, turned) in &names {
-                            let color = color.opacity(color.a * alpha);
-                            if *turned {
-                                crate::turned_text::paint(
-                                    window,
-                                    *b,
-                                    text,
-                                    view::SPINE_TEXT,
-                                    color,
-                                );
-                            } else {
-                                paint_words(
-                                    window,
-                                    cx,
-                                    *b,
-                                    text.clone().into(),
-                                    color,
-                                    14.0,
-                                    false,
-                                );
-                            }
-                        }
                         for (graph, dirty, ends, alpha) in &trees {
                             crate::timeline::paint_tree(
                                 graph, *dirty, *ends, e, *alpha, dark, &p, window,
@@ -1379,38 +1163,18 @@ impl Render for MorphView {
                     });
                     window.with_content_mask(Some(gpui::ContentMask { bounds: sheet }), |window| {
                         for d in &parts {
-                            if d.alpha <= 0.0 {
-                                continue;
-                            }
                             let b = d.bounds;
-                            match d.kind {
-                                Kind::Button if d.fill > 0.0 => {
-                                    window.paint_quad(quad(
-                                        b,
-                                        px(6.0),
-                                        p.button.opacity(d.fill * d.alpha),
-                                        px(0.0),
-                                        gpui::transparent_black(),
-                                        gpui::BorderStyle::Solid,
-                                    ));
-                                }
-                                Kind::Health(counts) => {
-                                    paint_health(window, b, counts, d.alpha, &p);
-                                    continue;
-                                }
-                                _ => {}
+                            if let Kind::Health(counts) = d.kind {
+                                paint_health(window, b, counts, &p);
+                                continue;
                             }
                             if let Some(image) = &d.image {
                                 window
                                     .paint_image(b, Default::default(), image.clone(), 0, false)
                                     .ok();
                             }
-                            for (text, color, size, bold) in &d.words {
-                                if color.a <= 0.0 {
-                                    continue;
-                                }
-                                let color = color.opacity(color.a * d.alpha);
-                                paint_words(window, cx, b, text.clone(), color, *size, *bold);
+                            if let Some((text, color, size, weight)) = &d.words {
+                                paint_words(window, cx, b, text.clone(), *color, *size, *weight);
                             }
                         }
                     });
@@ -1442,12 +1206,10 @@ fn paint_words(
     text: gpui::SharedString,
     color: Hsla,
     size: f32,
-    bold: bool,
+    weight: f32,
 ) {
     let mut font = window.text_style().font();
-    if bold {
-        font.weight = gpui::FontWeight::SEMIBOLD;
-    }
+    font.weight = gpui::FontWeight(weight);
     let run = gpui::TextRun {
         len: text.len(),
         font,
@@ -1466,18 +1228,12 @@ fn paint_words(
 
 /// The health bar as the views draw it: a rounded track filled by the
 /// synced, local-work and needs-a-look repos' shares, in that order.
-fn paint_health(
-    window: &mut Window,
-    b: Bounds<Pixels>,
-    counts: [usize; 3],
-    alpha: f32,
-    p: &Palette,
-) {
+fn paint_health(window: &mut Window, b: Bounds<Pixels>, counts: [usize; 3], p: &Palette) {
     let r = b.size.height / 2.0;
     window.paint_quad(quad(
         b,
         r,
-        p.hover.opacity(alpha),
+        p.hover,
         px(0.0),
         gpui::transparent_black(),
         gpui::BorderStyle::Solid,
@@ -1500,7 +1256,7 @@ fn paint_health(
                     top_right: round(seg.right() >= b.right() - px(0.01)),
                     bottom_right: round(seg.right() >= b.right() - px(0.01)),
                 },
-                color.opacity(alpha),
+                color,
                 px(0.0),
                 gpui::transparent_black(),
                 gpui::BorderStyle::Solid,
@@ -1508,23 +1264,4 @@ fn paint_health(
             x = seg.right();
         }
     });
-}
-
-/// `r` less `hole`: up to four rects around it.
-fn subtract(r: Bounds<Pixels>, hole: Bounds<Pixels>) -> Vec<Bounds<Pixels>> {
-    let i = r.intersect(&hole);
-    if i.size.width <= px(0.0) || i.size.height <= px(0.0) {
-        return vec![r];
-    }
-    let rect =
-        |l: Pixels, t: Pixels, rt: Pixels, b: Pixels| Bounds::new(point(l, t), size(rt - l, b - t));
-    [
-        rect(r.left(), r.top(), r.right(), i.top()),
-        rect(r.left(), i.bottom(), r.right(), r.bottom()),
-        rect(r.left(), i.top(), i.left(), i.bottom()),
-        rect(i.right(), i.top(), r.right(), i.bottom()),
-    ]
-    .into_iter()
-    .filter(|b| b.size.width > px(0.0) && b.size.height > px(0.0))
-    .collect()
 }

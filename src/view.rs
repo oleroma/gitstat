@@ -512,20 +512,6 @@ pub fn panel_rows(state: &AppState) -> usize {
     repos + prs + section(state.remote_statuses.len(), Section::GithubOnly)
 }
 
-/// Notes where a panel section's heading is drawn, for the flip.
-fn seen_header(section: Section) -> impl IntoElement {
-    canvas(
-        |_, _, _| {},
-        move |bounds, _, window, _| {
-            if window.content_mask().bounds.intersects(&bounds) {
-                crate::morph::seen_header(section, bounds);
-            }
-        },
-    )
-    .absolute()
-    .inset_0()
-}
-
 /// Folds or opens `section` everywhere, saved in config.json.
 fn fold(section: crate::config::Section) -> OnClick {
     Box::new(move |_, _, cx| {
@@ -650,19 +636,9 @@ pub(crate) fn section_color(section: Section, p: &Palette) -> Hsla {
     }
 }
 
-/// A panel section heading's words, noted for the flip, which turns them
-/// into the spine's.
-fn heading_label(section: Section, text: String, p: &Palette) -> gpui::Div {
-    let color = section_color(section, p);
-    let words = text.clone();
-    div().flex_1().relative().child(text).child(
-        canvas(
-            |_, _, _| {},
-            move |bounds, _, _, _| crate::morph::seen_heading_label(section, bounds, &words, color),
-        )
-        .absolute()
-        .inset_0(),
-    )
+/// A panel section heading's words.
+fn heading_label(text: String) -> gpui::Div {
+    div().flex_1().child(text)
 }
 
 /// The faint wash of its colour behind a section's heading in the panel
@@ -709,7 +685,6 @@ fn spine(section: Section, count: usize, folded: bool, p: &Palette) -> AnyElemen
             canvas(
                 |_, _, _| {},
                 move |bounds, _, window, _| {
-                    crate::morph::seen_spine_label(section, bounds, &label, window);
                     crate::turned_text::paint(window, bounds, &label, SPINE_TEXT, color)
                 },
             )
@@ -723,16 +698,6 @@ fn spine(section: Section, count: usize, folded: bool, p: &Palette) -> AnyElemen
                 .text_color(p.muted)
                 .child(if folded { "▴" } else { "▸" }),
         )
-        .child(
-            // Where the flip lands this section's spine.
-            canvas(
-                |_, _, _| {},
-                move |bounds, _, window, _| crate::morph::seen_spine(bounds, window),
-            )
-            .absolute()
-            .inset_0(),
-        )
-        .relative()
         .on_click(fold(section))
         .into_any_element()
 }
@@ -1378,14 +1343,12 @@ impl Render for StatusView {
                                 }))
                             })
                     } else {
-                        heading_label(Section::NeedsYou, format!("● {} need you", bad.len()), &p)
+                        heading_label(format!("● {} need you", bad.len()))
                     };
                     rows.push(
                         div()
                             .id("needs-you")
                             .bg(section_tint(Section::NeedsYou, &p))
-                            .relative()
-                            .child(seen_header(Section::NeedsYou))
                             .flex()
                             .items_center()
                             .gap(px(10.))
@@ -1430,14 +1393,12 @@ impl Render for StatusView {
                                     }))
                                 })
                         } else {
-                            heading_label(Section::Synced, format!("✓ {} synced", good.len()), &p)
+                            heading_label(format!("✓ {} synced", good.len()))
                         };
                     rows.push(
                         div()
                             .id("synced")
                             .bg(section_tint(Section::Synced, &p))
-                            .relative()
-                            .child(seen_header(Section::Synced))
                             .flex()
                             .items_center()
                             .gap(px(10.))
@@ -1488,18 +1449,12 @@ impl Render for StatusView {
                                     }))
                                 })
                         } else {
-                            heading_label(
-                                Section::GithubOnly,
-                                format!("◌ {} on GitHub only", remote.len()),
-                                &p,
-                            )
+                            heading_label(format!("◌ {} on GitHub only", remote.len()))
                         };
                     rows.push(
                         div()
                             .id("remote")
                             .bg(section_tint(Section::GithubOnly, &p))
-                            .relative()
-                            .child(seen_header(Section::GithubOnly))
                             .flex()
                             .items_center()
                             .gap(px(10.))
