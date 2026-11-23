@@ -87,10 +87,11 @@ impl RepoStatus {
             return "on GitHub only".to_string();
         }
         if let Some(error) = &self.error {
+            let first = error.lines().next().unwrap_or_default();
             if error.starts_with(repo_config::WARNING) {
-                return format!("⚠ {error}");
+                return format!("⚠ {first}");
             }
-            return format!("error: {error}");
+            return format!("error: {first}");
         }
         let mut parts = Vec::new();
         if let Some(op) = &self.operation {
@@ -654,8 +655,21 @@ fn fetch_repo(repo: &Path) -> Result<(), String> {
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
-    Err(match stderr.trim().lines().last() {
-        Some(line) => format!("fetch failed ({})", line.trim()),
+    let lines: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    Err(match lines.last() {
+        // The last line in the label, the few before it for the tooltip.
+        Some(last) => {
+            let mut text = format!("fetch failed ({last})");
+            for line in &lines[lines.len().saturating_sub(4)..lines.len() - 1] {
+                text.push('\n');
+                text.push_str(line);
+            }
+            text
+        }
         None => "fetch failed".to_string(),
     })
 }

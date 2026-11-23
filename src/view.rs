@@ -1881,6 +1881,32 @@ impl Render for Tip {
 }
 
 /// A tooltip builder showing `lines`, for icons-only mode.
+/// What a repo's tooltip adds below its name and status: the rest of a
+/// fetch error, the unpushed branches by name, the stash, and where the
+/// actions are.
+pub(crate) fn status_details(s: &RepoStatus, p: &Palette) -> Vec<(String, Hsla)> {
+    let mut lines = Vec::new();
+    if let Some(error) = &s.error {
+        for line in error.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+            lines.push((line.trim().to_string(), p.muted));
+        }
+    }
+    for (branch, n) in &s.unpushed_branches {
+        let commits = if *n == 1 { "commit" } else { "commits" };
+        lines.push((format!("{branch}: {n} {commits} on no remote"), p.amber));
+    }
+    if s.stashes > 0 {
+        lines.push((format!("{} stashed", s.stashes), p.muted));
+    }
+    let hint = if s.error.is_some() && !s.remote_only {
+        "Right-click to fetch again, or for more"
+    } else {
+        "Right-click for more"
+    };
+    lines.push((hint.to_string(), p.muted));
+    lines
+}
+
 pub(crate) fn tip(
     lines: Vec<(String, Hsla)>,
     p: &Palette,

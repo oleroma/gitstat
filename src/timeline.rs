@@ -921,11 +921,12 @@ impl Timelines {
             });
         let label = if icons_only {
             // The icon alone; its words in a tooltip.
-            let lines = vec![
+            let mut lines = vec![
                 (status.name.clone(), p.text),
                 (checkout, p.muted),
                 (status_text, status_color),
             ];
+            lines.extend(crate::view::status_details(status, p));
             label
                 .justify_center()
                 .w(px(ICON_LABEL_WIDTH))
@@ -948,7 +949,13 @@ impl Timelines {
                         )),
                 )
         } else {
+            let mut lines = vec![
+                (status.name.clone(), p.text),
+                (status_text.clone(), status_color),
+            ];
+            lines.extend(crate::view::status_details(status, p));
             label
+                .tooltip(crate::view::tip(lines, p))
                 .gap_2()
                 .w(px(LABEL_WIDTH))
                 .pl_2()

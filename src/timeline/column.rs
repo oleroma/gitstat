@@ -523,8 +523,14 @@ fn header(
         _ => status.label(),
     };
     let repo = path.to_path_buf();
+    let mut tip_lines = vec![
+        (status.name.clone(), p.text),
+        (label.clone(), crate::view::status_color(status, p)),
+    ];
+    tip_lines.extend(crate::view::status_details(status, p));
     let title = div()
         .id(("column-title", index))
+        .tooltip(crate::view::tip(tip_lines, p))
         .flex()
         .flex_col()
         .gap(px(2.))
