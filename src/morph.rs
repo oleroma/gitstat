@@ -887,6 +887,8 @@ fn launch(plan: Plan, direction: Direction, cx: &mut App) -> bool {
     let fixed = HOLD.as_millis() as f32;
     let stretch = ((ms as f32 - fixed) / (560.0 - fixed)).clamp(0.2, 12.0);
     debug_assert_eq!((FADE + SLIDE + TURN + HOLD + REVEAL).as_millis(), 560);
+    crate::frames::start(union, cx);
+    crate::frames::frame("before");
     let mut flip_hwnd = None;
     let Ok(handle) = cx.open_window(
         WindowOptions {
@@ -1053,6 +1055,17 @@ impl Render for MorphView {
             }
         }
         let revealed = self.reveal_from.map_or(Duration::ZERO, |t| t.elapsed());
+        crate::frames::frame(if self.reveal_from.is_some() {
+            "reveal"
+        } else if self.arrived.is_some() {
+            "hold"
+        } else if elapsed >= turn_at {
+            "turn"
+        } else if elapsed >= fade {
+            "slide"
+        } else {
+            "fade"
+        });
 
         if elapsed >= turn_at && !self.left {
             self.left = true;
@@ -1099,6 +1112,7 @@ impl Render for MorphView {
                     .ok();
             })
             .detach();
+            crate::frames::finish(cx);
             if self.direction == Direction::Close {
                 // Back in the panel, which then goes the way it came.
                 cx.defer(crate::panel::slide_away);

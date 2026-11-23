@@ -43,6 +43,8 @@ mod app;
 #[cfg(windows)]
 mod autostart;
 #[cfg(windows)]
+mod frames;
+#[cfg(windows)]
 mod morph;
 #[cfg(windows)]
 mod overlay;
