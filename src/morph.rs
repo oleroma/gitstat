@@ -104,6 +104,9 @@ pub enum Part {
     /// and into the body.
     Heading(Section),
     Spine(Section),
+    /// A heading's or spine's words and arrow, which turn with it.
+    Label(Section),
+    Arrow(Section),
 }
 
 /// The path the top bar's parts are kept under.
@@ -531,9 +534,76 @@ struct Plan {
 
 /// A turning heading this frame, in logical px: still, on whole px, at
 /// either end, or its four corners part way.
-enum Bar {
-    Still(Bounds<Pixels>, Hsla),
-    Turning([gpui::Point<Pixels>; 4], Hsla),
+struct Bar {
+    shape: Shape,
+    wash: Hsla,
+    /// The spine's edge line, at the spine's end.
+    border: Option<Bounds<Pixels>>,
+    label: Option<BarWords>,
+    arrow: Option<BarWords>,
+}
+
+enum Shape {
+    Still(Bounds<Pixels>),
+    /// Its corners, and its edge line's with that line's colour.
+    Turning(
+        [gpui::Point<Pixels>; 4],
+        Option<([gpui::Point<Pixels>; 4], Hsla)>,
+    ),
+}
+
+/// A turning heading's words this frame.
+enum BarWords {
+    /// As the panel sets them.
+    Upright(Bounds<Pixels>, Line),
+    /// As the spine draws them: its box, text, size and colour.
+    Turned(Bounds<Pixels>, String, f32, Hsla),
+    /// Part way: text, size, baseline start, reading direction, the way
+    /// up, colour.
+    Path(String, f32, (f32, f32), (f32, f32), (f32, f32), Hsla),
+}
+
+fn fill_quad(window: &mut Window, corners: &[gpui::Point<Pixels>; 4], color: Hsla) {
+    let mut path = gpui::PathBuilder::fill();
+    path.move_to(corners[0]);
+    for c in &corners[1..] {
+        path.line_to(*c);
+    }
+    path.close();
+    if let Ok(path) = path.build() {
+        window.paint_path(path, color);
+    }
+}
+
+fn paint_bar(window: &mut Window, cx: &mut App, bar: &Bar) {
+    match &bar.shape {
+        Shape::Still(b) => window.paint_quad(gpui::fill(*b, bar.wash)),
+        Shape::Turning(corners, line) => {
+            fill_quad(window, corners, bar.wash);
+            if let Some((line, color)) = line {
+                fill_quad(window, line, *color);
+            }
+        }
+    }
+    if let Some(b) = bar.border {
+        window.paint_quad(gpui::fill(b, window_border(window)));
+    }
+    for words in bar.label.iter().chain(&bar.arrow) {
+        match words {
+            BarWords::Upright(b, line) => paint_words(window, cx, *b, line, false),
+            BarWords::Turned(b, text, size, color) => {
+                crate::turned_text::paint(window, *b, text, *size, *color)
+            }
+            BarWords::Path(text, size, start, dir, up, color) => {
+                crate::glyph_path::paint(window, text, *size, *start, *dir, *up, *color)
+            }
+        }
+    }
+}
+
+/// The views' edge line colour, for the spine's.
+fn window_border(window: &Window) -> Hsla {
+    Palette::for_appearance(window.appearance()).border
 }
 
 /// A panel section heading that turns with the trees into its spine in
@@ -543,6 +613,19 @@ struct Turning {
     section: Section,
     from: Bounds<f32>,
     to: Bounds<f32>,
+    folded: bool,
+    /// Its words, the same in both, and where each view has them.
+    label: Option<TurnWords>,
+    /// Its arrow's box in each.
+    arrow: Option<(Bounds<f32>, Bounds<f32>)>,
+}
+
+/// A turning heading's words: text, colour, size and box at each end.
+struct TurnWords {
+    text: gpui::SharedString,
+    color: Hsla,
+    size: (f32, f32),
+    at: (Bounds<f32>, Bounds<f32>),
 }
 
 /// A bar that slides out of its view before the turn, or into it after:
@@ -780,7 +863,12 @@ fn plan(
                     b.origin.y += shift;
                 }
                 for ((path, part), seen) in panel_parts.iter_mut() {
-                    if path != app() || matches!(part, Part::Heading(_) | Part::Prs) {
+                    if path != app()
+                        || matches!(
+                            part,
+                            Part::Heading(_) | Part::Label(_) | Part::Arrow(_) | Part::Prs
+                        )
+                    {
                         seen.bounds.origin.y += shift;
                     }
                 }
@@ -1027,10 +1115,48 @@ fn plan(
                 let at = place(b);
                 // Turned with the trees into its spine.
                 if let Some(&(_, _, spine)) = spine_at.iter().find(|s| s.0 == section) {
+                    // Its words and arrow: in the panel as drawn, on the
+                    // spine as drawn there, moved with the spine to where
+                    // it is now.
+                    let on_spine = |part: Part| {
+                        let drawn = column_parts.get(&key(Part::Spine(section)))?;
+                        let seen = column_parts.get(&key(part))?;
+                        let dx = f32::from(seen.bounds.origin.x - drawn.bounds.origin.x) * ws;
+                        let dy = f32::from(seen.bounds.origin.y - drawn.bounds.origin.y) * ws;
+                        Some((
+                            seen,
+                            Bounds {
+                                origin: point(spine.origin.x + dx, spine.origin.y + dy),
+                                size: size(
+                                    f32::from(seen.bounds.size.width) * ws,
+                                    f32::from(seen.bounds.size.height) * ws,
+                                ),
+                            },
+                        ))
+                    };
+                    let label = seen
+                        .get(&key(Part::Label(section)))
+                        .zip(on_spine(Part::Label(section)))
+                        .and_then(|(a, (z, z_at))| {
+                            let ((text, color, a_size, _), (_, _, z_size, _)) = same_words(a, z)?;
+                            Some(TurnWords {
+                                text,
+                                color,
+                                size: (a_size, z_size),
+                                at: (place(a), z_at),
+                            })
+                        });
+                    let arrow = seen
+                        .get(&key(Part::Arrow(section)))
+                        .zip(on_spine(Part::Arrow(section)))
+                        .map(|(a, (_, z_at))| (place(a), z_at));
                     turning.push(Turning {
                         section,
                         from: at,
                         to: spine,
+                        folded: state.folded(section),
+                        label,
+                        arrow,
                     });
                     continue;
                 }
@@ -1491,21 +1617,76 @@ impl Render for MorphView {
         // right end and the spine's top, a quarter turn anticlockwise like
         // the trees. Its wash fades with the sheet's fills, over and under
         // its twin in the window beneath, as the bands do.
+        let muted = p.muted;
         let turning: Vec<Bar> = self
             .plan
             .turning
             .iter()
             .map(|t| {
-                let color = view::section_tint(t.section, &p);
-                let color = color.opacity(color.a * fill);
+                let tint = view::section_tint(t.section, &p);
+                // Carried whole when its words are: opaque, over its twin
+                // beneath. Without them, its wash fades with the sheet.
+                let wash = if t.label.is_some() {
+                    p.surface.blend(tint)
+                } else {
+                    tint.opacity(tint.a * fill)
+                };
                 let (a, z) = (t.from, t.to);
+                // Each end's arrow: the heading's points down when open,
+                // right when folded; the spine's, a quarter turn on.
+                let (arrow_a, arrow_z) = if t.folded {
+                    ('▸', '▴')
+                } else {
+                    ('▾', '▸')
+                };
+                let (arrow_size_a, arrow_size_z) = (14.0, view::SPINE_TEXT);
                 if e <= 0.0 || e >= 1.0 {
-                    let b = if e <= 0.0 { a } else { z };
-                    return Bar::Still(snapped(lerp_bounds(b, b, 0.0, s), s), color);
+                    let end = e >= 1.0;
+                    let b = if end { z } else { a };
+                    let still = snapped(lerp_bounds(b, b, 0.0, s), s);
+                    // The spine's edge line, as the window draws it.
+                    let border = end.then(|| {
+                        Bounds::new(
+                            point(still.right() - px(1.0), still.top()),
+                            size(px(1.0), still.size.height),
+                        )
+                    });
+                    let label = t.label.as_ref().map(|w| {
+                        let at = if end { w.at.1 } else { w.at.0 };
+                        let at = lerp_bounds(at, at, 0.0, s);
+                        if end {
+                            BarWords::Turned(at, w.text.to_string(), w.size.1, w.color)
+                        } else {
+                            BarWords::Upright(at, (w.text.clone(), w.color, w.size.0, 400.0))
+                        }
+                    });
+                    let arrow = t.arrow.map(|(aa, zz)| {
+                        let at = if end { zz } else { aa };
+                        let (c, size) = if end {
+                            (arrow_z, arrow_size_z)
+                        } else {
+                            (arrow_a, arrow_size_a)
+                        };
+                        BarWords::Upright(
+                            lerp_bounds(at, at, 0.0, s),
+                            (c.to_string().into(), muted, size, 400.0),
+                        )
+                    });
+                    return Bar {
+                        shape: Shape::Still(still),
+                        wash,
+                        border,
+                        label,
+                        arrow,
+                    };
                 }
+                // Turning, about the heading's right end, which becomes the
+                // spine's top: along its length from there, and across.
+                let anchor_a = (a.origin.x + a.size.width, a.origin.y + a.size.height / 2.0);
+                let anchor_z = (z.origin.x + z.size.width / 2.0, z.origin.y);
                 let anchor = (
-                    mix(a.origin.x + a.size.width, z.origin.x + z.size.width / 2.0) / s,
-                    mix(a.origin.y + a.size.height / 2.0, z.origin.y) / s,
+                    mix(anchor_a.0, anchor_z.0) / s,
+                    mix(anchor_a.1, anchor_z.1) / s,
                 );
                 let len = mix(a.size.width, z.size.height) / s;
                 let half = mix(a.size.height, z.size.width) / s / 2.0;
@@ -1513,15 +1694,82 @@ impl Render for MorphView {
                 let along = (-cos, -sin);
                 let across = (-sin, cos);
                 let at = |u: f32, v: f32| {
-                    point(
-                        px(anchor.0 + u * along.0 + v * across.0),
-                        px(anchor.1 + u * along.1 + v * across.1),
+                    (
+                        anchor.0 + u * along.0 + v * across.0,
+                        anchor.1 + u * along.1 + v * across.1,
                     )
                 };
-                Bar::Turning(
-                    [at(0.0, -half), at(len, -half), at(len, half), at(0.0, half)],
-                    color,
-                )
+                let pt = |(x, y): (f32, f32)| point(px(x), px(y));
+                // A point of each end in the bar's own terms, then where
+                // it is now.
+                let uv_a = |(x, y): (f32, f32)| ((anchor_a.0 - x) / s, (y - anchor_a.1) / s);
+                let uv_z = |(x, y): (f32, f32)| ((y - anchor_z.1) / s, (x - anchor_z.0) / s);
+                let carry = |pa: (f32, f32), pz: (f32, f32)| {
+                    let (ua, va) = uv_a(pa);
+                    let (uz, vz) = uv_z(pz);
+                    at(mix(ua, uz), mix(va, vz))
+                };
+                // Words read back towards the anchor, their tops away from
+                // the spine's edge line.
+                let dir = (-along.0, -along.1);
+                let up = (-across.0, -across.1);
+                let label = t.label.as_ref().map(|w| {
+                    let (la, lz) = w.at;
+                    let size = mix(w.size.0, w.size.1);
+                    // Where each starts, on the middle of its line.
+                    let start = carry(
+                        (la.origin.x, la.origin.y + la.size.height / 2.0),
+                        (
+                            lz.origin.x + lz.size.width / 2.0,
+                            lz.origin.y + lz.size.height - s,
+                        ),
+                    );
+                    let m = crate::glyph_path::middle(size);
+                    let baseline = (start.0 - m * up.0, start.1 - m * up.1);
+                    BarWords::Path(w.text.to_string(), size, baseline, dir, up, w.color)
+                });
+                let arrow = t.arrow.map(|(aa, zz)| {
+                    // The middle of each end's mark, as its view sets it.
+                    let mark = |b: Bounds<f32>, c: char, size: f32| {
+                        let (gx, gy) = crate::glyph_path::glyph_centre(c, size);
+                        let m = crate::glyph_path::middle(size);
+                        (
+                            b.origin.x + gx * s,
+                            b.origin.y + b.size.height / 2.0 + (m - gy) * s,
+                        )
+                    };
+                    let size = mix(arrow_size_a, arrow_size_z);
+                    let c = carry(
+                        mark(aa, arrow_a, arrow_size_a),
+                        mark(zz, arrow_z, arrow_size_z),
+                    );
+                    let (gx, gy) = crate::glyph_path::glyph_centre(arrow_a, size);
+                    let start = (c.0 - gx * dir.0 - gy * up.0, c.1 - gx * dir.1 - gy * up.1);
+                    BarWords::Path(arrow_a.to_string(), size, start, dir, up, muted)
+                });
+                // The spine's edge line, drawn as it turns into place.
+                let line = 1.0;
+                let border = [
+                    pt(at(0.0, half - line)),
+                    pt(at(len, half - line)),
+                    pt(at(len, half)),
+                    pt(at(0.0, half)),
+                ];
+                Bar {
+                    shape: Shape::Turning(
+                        [
+                            pt(at(0.0, -half)),
+                            pt(at(len, -half)),
+                            pt(at(len, half)),
+                            pt(at(0.0, half)),
+                        ],
+                        Some((border, p.border.opacity(p.border.a * e))),
+                    ),
+                    wash,
+                    border: None,
+                    label,
+                    arrow,
+                }
             })
             .collect();
 
@@ -1618,27 +1866,15 @@ impl Render for MorphView {
                     }
                     paint_band(window, body, p.surface.opacity(fill));
                     window.with_content_mask(Some(gpui::ContentMask { bounds: body }), |window| {
-                        for bar in &turning {
-                            match bar {
-                                Bar::Still(b, color) => window.paint_quad(gpui::fill(*b, *color)),
-                                Bar::Turning(corners, color) => {
-                                    let mut path = gpui::PathBuilder::fill();
-                                    path.move_to(corners[0]);
-                                    for c in &corners[1..] {
-                                        path.line_to(*c);
-                                    }
-                                    path.close();
-                                    if let Ok(path) = path.build() {
-                                        window.paint_path(path, *color);
-                                    }
-                                }
-                            }
-                        }
                         for (graph, dirty, ends, alpha) in &trees {
                             crate::timeline::paint_tree(
                                 graph, *dirty, *ends, e, *alpha, dark, &p, window,
                             );
                             crate::timeline::paint_tail_fade(*ends, e, p.surface, window);
+                        }
+                        // The headings over the trees, solid as they turn.
+                        for bar in &turning {
+                            paint_bar(window, cx, bar);
                         }
                     });
                     window.with_content_mask(Some(gpui::ContentMask { bounds: sheet }), |window| {

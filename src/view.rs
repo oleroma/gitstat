@@ -667,6 +667,16 @@ fn heading_gap() -> AnyElement {
 const HEADING_GAP: f32 = 4.0;
 
 /// A panel section heading's words.
+/// A section's heading words, alike in the panel and on its spine.
+pub(crate) fn section_text(section: Section, n: usize) -> String {
+    match section {
+        Section::NeedsYou => format!("● {n} need you"),
+        Section::Synced => format!("✓ {n} synced"),
+        Section::PullRequests => format!("{n} pull requests"),
+        Section::GithubOnly => format!("◌ {n} on GitHub only"),
+    }
+}
+
 fn heading_label(text: String) -> gpui::Div {
     div().flex_1().child(text)
 }
@@ -680,11 +690,10 @@ pub(crate) fn section_tint(section: Section, p: &Palette) -> Hsla {
 /// A section's spine in big mode; the flip slides it in and out from the
 /// window's sides.
 pub(crate) fn spine(section: Section, count: usize, folded: bool, p: &Palette) -> AnyElement {
-    let (name, color) = match section {
-        Section::NeedsYou => ("NEED YOU", p.red),
-        Section::Synced => ("SYNCED", p.green),
-        Section::GithubOnly => ("GITHUB ONLY", p.muted),
-        Section::PullRequests => ("PULL REQUESTS", p.muted),
+    let color = match section {
+        Section::NeedsYou => p.red,
+        Section::Synced => p.green,
+        Section::GithubOnly | Section::PullRequests => p.muted,
     };
     let id = match section {
         Section::NeedsYou => "spine-needs-you",
@@ -709,27 +718,53 @@ pub(crate) fn spine(section: Section, count: usize, folded: bool, p: &Palette) -
         .hover(|s| s.bg(p.hover))
         .text_xs()
         .text_color(color)
-        .child({
-            // The section's heading turned a quarter turn anticlockwise,
-            // reading upwards: its count nearest the arrow, as in the panel.
-            let label = format!("{count}  {name}");
-            let len = crate::turned_text::length(&label, SPINE_TEXT);
-            canvas(
-                |_, _, _| {},
-                move |bounds, _, window, _| {
-                    crate::turned_text::paint(window, bounds, &label, SPINE_TEXT, color)
-                },
-            )
-            .w_full()
-            .h(px(len))
-        })
-        // Open, its columns are to the right; folded, the arrow turns with
-        // the heading, as the panel's ▸ would.
+        // The panel's heading turned a quarter turn anticlockwise, as the
+        // flip turns it: its arrow at the top (open, its columns are to
+        // the right; folded, it points up), its words below reading
+        // upwards.
         .child(
             div()
+                .relative()
                 .text_color(p.muted)
-                .child(if folded { "▴" } else { "▸" }),
+                .child(if folded { "▴" } else { "▸" })
+                .child(crate::morph::tag(
+                    crate::morph::Side::Column,
+                    crate::morph::app(),
+                    crate::morph::Part::Arrow(section),
+                    None,
+                )),
         )
+        .child({
+            let label = section_text(section, count);
+            let len = crate::turned_text::length(&label, SPINE_TEXT);
+            let words: SharedString = label.clone().into();
+            div()
+                .relative()
+                .w_full()
+                .h(px(len))
+                .child(
+                    canvas(
+                        |_, _, _| {},
+                        move |bounds, _, window, _| {
+                            crate::turned_text::paint(window, bounds, &label, SPINE_TEXT, color)
+                        },
+                    )
+                    .size_full(),
+                )
+                .child(crate::morph::tag(
+                    crate::morph::Side::Column,
+                    crate::morph::app(),
+                    crate::morph::Part::Label(section),
+                    Some((
+                        words,
+                        crate::morph::Look {
+                            color,
+                            size: SPINE_TEXT,
+                            bold: false,
+                        },
+                    )),
+                ))
+        })
         .relative()
         .child(crate::morph::tag(
             crate::morph::Side::Column,
@@ -1171,11 +1206,7 @@ pub(crate) fn panel_heading(
         return None;
     }
     let n = repos.len();
-    let text = match section {
-        Section::NeedsYou => format!("● {n} need you"),
-        Section::Synced => format!("✓ {n} synced"),
-        _ => format!("◌ {n} on GitHub only"),
-    };
+    let text = section_text(section, n);
     let open = !state.folded(section);
     let label = if icons_only {
         div()
@@ -1194,7 +1225,21 @@ pub(crate) fn panel_heading(
                 }))
             })
     } else {
-        heading_label(text)
+        heading_label(text.clone())
+            .relative()
+            .child(crate::morph::tag(
+                crate::morph::Side::Panel,
+                crate::morph::app(),
+                crate::morph::Part::Label(section),
+                Some((
+                    text.into(),
+                    crate::morph::Look {
+                        color,
+                        size: 14.0,
+                        bold: false,
+                    },
+                )),
+            ))
     };
     let tooltip = match section {
         Section::GithubOnly => Some(vec![
@@ -1205,7 +1250,16 @@ pub(crate) fn panel_heading(
         Section::Synced if icons_only => Some(vec![(format!("{n} synced"), p.green)]),
         _ => None,
     };
-    let arrow = div().flex_none().child(if open { "▾" } else { "▸" });
+    let arrow = div()
+        .flex_none()
+        .relative()
+        .child(if open { "▾" } else { "▸" })
+        .child(crate::morph::tag(
+            crate::morph::Side::Panel,
+            crate::morph::app(),
+            crate::morph::Part::Arrow(section),
+            None,
+        ));
     let arrow = match section {
         Section::GithubOnly => arrow,
         _ => arrow.text_color(p.muted),

@@ -3,7 +3,7 @@
 //! ab_glyph from Segoe UI, turned, and painted as a picture, kept per text,
 //! size and colour.
 
-use ab_glyph::{Font, PxScale, ScaleFont};
+use ab_glyph::{Font, PxScale};
 use gpui::{Bounds, Hsla, Pixels, RenderImage, Window, point, px, size};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -17,28 +17,10 @@ thread_local! {
         RefCell::new(HashMap::new());
 }
 
-/// How long `text` runs at `height` logical px: the turned picture's
-/// height. 0 without the font.
-pub fn length(text: &str, height: f32) -> f32 {
-    let Some(font) = crate::icon::system_font() else {
-        return 0.0;
-    };
-    advance(font, text, height).ceil()
-}
-
-fn advance(font: &impl Font, text: &str, height: f32) -> f32 {
-    let f = font.as_scaled(PxScale::from(height));
-    let mut pen = 0.0;
-    let mut prev = None;
-    for c in text.chars() {
-        let id = f.glyph_id(c);
-        if let Some(prev) = prev {
-            pen += f.kern(prev, id);
-        }
-        pen += f.h_advance(id);
-        prev = Some(id);
-    }
-    pen
+/// How long `text` runs at `size` logical px (its em): the turned
+/// picture's height.
+pub fn length(text: &str, size: f32) -> f32 {
+    crate::glyph_path::advance(text, size).ceil()
 }
 
 /// Paints `text`, turned to read upwards, at `height` logical px, centred
@@ -79,26 +61,36 @@ pub fn paint(window: &mut Window, bounds: Bounds<Pixels>, text: &str, height: f3
         .ok();
 }
 
-/// The line drawn `height` device px tall, then turned: straight-alpha BGRA.
-fn draw(text: &str, height: u32, [r, g, b, a]: [u8; 4]) -> Option<Arc<RenderImage>> {
-    let font = crate::icon::system_font()?;
-    let h = height as f32;
-    let f = font.as_scaled(PxScale::from(h));
-    let w = advance(font, text, h).ceil() as usize + 2;
-    let rows = (f.ascent() - f.descent()).ceil() as usize + 2;
+/// The line drawn at `size` device px (its em), then turned:
+/// straight-alpha BGRA.
+fn draw(text: &str, size: u32, [r, g, b, a]: [u8; 4]) -> Option<Arc<RenderImage>> {
+    let (font, _) = crate::glyph_path::glyph('a')?;
+    let em = size as f32;
+    let k = em / font.units_per_em().unwrap_or(2048.0);
+    let (ascent, descent) = (font.ascent_unscaled() * k, font.descent_unscaled() * k);
+    let w = crate::glyph_path::advance(text, em).ceil() as usize + 2;
+    let rows = (ascent - descent).ceil() as usize + 2;
     if w == 0 || rows == 0 || w > 4096 {
         return None;
     }
     // The line as it reads, left to right: coverage per px.
     let mut mask = vec![0f32; w * rows];
-    let baseline = f.ascent().round() + 1.0;
-    let (mut pen, mut prev) = (1.0f32, None);
+    let baseline = ascent.round() + 1.0;
+    let mut pen = 1.0f32;
+    let mut prev: Option<(&ab_glyph::FontVec, ab_glyph::GlyphId)> = None;
     for c in text.chars() {
-        let id = f.glyph_id(c);
-        if let Some(prev) = prev {
-            pen += f.kern(prev, id);
+        let Some((font, id)) = crate::glyph_path::glyph(c) else {
+            continue;
+        };
+        let k = em / font.units_per_em().unwrap_or(2048.0);
+        if let Some((pf, pid)) = prev
+            && std::ptr::eq(pf, font)
+        {
+            pen += font.kern_unscaled(pid, id) * k;
         }
-        let glyph = id.with_scale_and_position(PxScale::from(h), ab_glyph::point(pen, baseline));
+        // ab_glyph scales by a line's height, not its em.
+        let scale = PxScale::from(font.height_unscaled() * k);
+        let glyph = id.with_scale_and_position(scale, ab_glyph::point(pen, baseline));
         if let Some(outlined) = font.outline_glyph(glyph) {
             let bb = outlined.px_bounds();
             let (left, top) = (bb.min.x as i32, bb.min.y as i32);
@@ -110,8 +102,8 @@ fn draw(text: &str, height: u32, [r, g, b, a]: [u8; 4]) -> Option<Arc<RenderImag
                 }
             });
         }
-        pen += f.h_advance(id);
-        prev = Some(id);
+        pen += font.h_advance_unscaled(id) * k;
+        prev = Some((font, id));
     }
     // Turned anticlockwise: the line's start at the bottom, its top edge
     // to the left. Source (x, y) lands at (y, w - 1 - x).
