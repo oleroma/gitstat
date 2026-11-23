@@ -1221,7 +1221,7 @@ impl Render for StatusView {
                     )),
             )
             .when(state.has_result && !state.statuses.is_empty(), |d| {
-                d.child(health_row(&state.statuses, sweeping, &p))
+                d.child(health_row(&state.statuses, sweeping, side, &p))
             });
 
         let titles = if icons_only {
@@ -1666,6 +1666,8 @@ impl Render for StatusView {
                 }
             });
         let footer = div()
+            .relative()
+            .child(bar_tag(crate::morph::Part::Footer, None))
             .flex()
             .items_center()
             .justify_between()
@@ -1940,7 +1942,7 @@ pub(crate) fn title_bar_rgb(dark: bool) -> u32 {
 /// A bar of the repos' tones: green synced, amber local work, red needs
 /// action, each as wide as its share; dimmed while a check runs.
 /// Repos synced, with local work, and needing a look.
-fn tone_counts(statuses: &[RepoStatus]) -> [usize; 3] {
+pub(crate) fn tone_counts(statuses: &[RepoStatus]) -> [usize; 3] {
     let mut counts = [0usize; 3];
     for s in statuses {
         let i = match crate::icon::FolderState::of(s).tone() {
@@ -1955,13 +1957,36 @@ fn tone_counts(statuses: &[RepoStatus]) -> [usize; 3] {
 
 /// The header's health: a thin bar of synced, local-work and
 /// needs-a-look repos, and their counts.
-fn health_row(statuses: &[RepoStatus], checking: bool, p: &Palette) -> gpui::Div {
+/// The flip carries the bar and the counts between the views.
+fn health_row(
+    statuses: &[RepoStatus],
+    checking: bool,
+    side: crate::morph::Side,
+    p: &Palette,
+) -> gpui::Div {
     let counts = tone_counts(statuses);
-    let count = |n: usize, mark: &str, color: Hsla| {
+    let app = crate::morph::app();
+    let count = |i: u8, n: usize, mark: &str, color: Hsla| {
+        let color = if n > 0 { color } else { p.muted.opacity(0.6) };
+        let text = format!("{mark}{n}");
         div()
             .flex_none()
-            .text_color(if n > 0 { color } else { p.muted.opacity(0.6) })
-            .child(format!("{mark}{n}"))
+            .relative()
+            .text_color(color)
+            .child(text.clone())
+            .child(crate::morph::tag(
+                side,
+                app,
+                crate::morph::Part::Count(i),
+                Some((
+                    text.into(),
+                    crate::morph::Look {
+                        color,
+                        size: 12.0,
+                        bold: false,
+                    },
+                )),
+            ))
     };
     div()
         .flex()
@@ -1969,10 +1994,20 @@ fn health_row(statuses: &[RepoStatus], checking: bool, p: &Palette) -> gpui::Div
         .gap_2()
         .pt_1()
         .text_xs()
-        .child(summary_bar(statuses, checking, p).h(px(4.)))
-        .child(count(counts[0], "✓ ", p.green))
-        .child(count(counts[1], "● ", p.amber))
-        .child(count(counts[2], "! ", p.red))
+        .child(
+            summary_bar(statuses, checking, p)
+                .h(px(4.))
+                .relative()
+                .child(crate::morph::tag(
+                    side,
+                    app,
+                    crate::morph::Part::Health,
+                    None,
+                )),
+        )
+        .child(count(0, counts[0], "✓ ", p.green))
+        .child(count(1, counts[1], "● ", p.amber))
+        .child(count(2, counts[2], "! ", p.red))
 }
 
 fn summary_bar(statuses: &[RepoStatus], checking: bool, p: &Palette) -> gpui::Div {

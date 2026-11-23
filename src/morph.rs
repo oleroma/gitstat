@@ -6,24 +6,29 @@
 //! transparent, click-through and topmost, covers both their places for
 //! the length of the flip and draws it. Opening:
 //!
-//! 1. Fade: a sheet the colour of the strips fades in over the panel,
-//!    hiding its words, while each repo's tree is drawn over its strip.
+//! 1. Fade: a sheet in the panel's colours (top bar, body, bottom bar)
+//!    fades in over the panel, hiding what only the panel shows. What both
+//!    views show (each repo's tree, icon, name and checkout, the top bar's
+//!    words and health bar) is drawn whole over its twin from the start.
 //! 2. Turn: the panel closes; the sheet grows from the panel's place to
-//!    the big window's, each tree turns a quarter turn from its strip to
-//!    where its column will be (`timeline::paint_tree`), and each section's
-//!    heading stretches into its spine.
+//!    the big window's, its bars and title bar with it, each tree turns a
+//!    quarter turn from its strip to where its column will be
+//!    (`timeline::paint_tree`), and the shared parts move and grow to the
+//!    window's. Section headings fade out where the panel has them and
+//!    spines fade in where the window has them.
 //! 3. Hold: the big window opens underneath, still covered, and gets a
 //!    moment to draw.
-//! 4. Reveal: the sheet and the trees fade out, showing the big window
-//!    with its words, then the flip's window closes.
+//! 4. Reveal: the sheet's colours fade out, showing what only the big
+//!    window shows, then the flip's window closes over the shared parts'
+//!    twins.
 //!
 //! Closing or minimising runs the same backwards: the sheet fades in over
 //! the big window, which then closes, everything turns back, the panel
 //! opens underneath, the sheet fades to show it, and the panel slides away.
 //!
 //! Where things land comes from what each window drew last time (`seen_*`),
-//! so the first flip after starting gitstat may land a few px off; the
-//! reveal's fade hides that. The big window's frame (how far its client
+//! so the first flip after starting gitstat may land a few px off and its
+//! shared parts settle at the end. The big window's frame (how far its client
 //! area sits inside the bounds it was opened with, maximised or not) is
 //! measured once the window has settled and kept in window.json, so the
 //! sheet lands on it from the first flip.
@@ -83,6 +88,11 @@ pub enum Part {
     Subline,
     Settings,
     Refresh,
+    /// The bottom bar both views have.
+    Footer,
+    /// The health bar under the headline, and its three counts.
+    Health,
+    Count(u8),
 }
 
 /// The path the top bar's parts are kept under.
@@ -492,13 +502,11 @@ struct Spine {
     name: Option<Name>,
 }
 
-/// A section's name, from the panel heading's words to the spine's, which
-/// read upwards: centres and sizes in physical px, and the words at each end.
+/// A section's name: the panel heading's words, across, and the spine's,
+/// reading upwards. Bounds in physical px.
 struct Name {
-    from: (f32, f32),
-    to: (f32, f32),
-    from_size: f32,
-    to_size: f32,
+    from: Bounds<f32>,
+    to: Bounds<f32>,
     from_text: String,
     to_text: String,
     color: Hsla,
@@ -507,15 +515,29 @@ struct Name {
 /// A part's words: text, colour, size in px, and whether bold.
 type Words = (gpui::SharedString, Hsla, f32, bool);
 
-/// A carried part this frame: where, its picture, its words (two while
-/// they cross-fade), alpha, and whether it is the top bar.
-type Drawn = (
-    Bounds<Pixels>,
-    Option<Arc<gpui::RenderImage>>,
-    Vec<Words>,
-    f32,
-    bool,
-);
+/// A carried part this frame.
+struct Drawn {
+    bounds: Bounds<Pixels>,
+    image: Option<Arc<gpui::RenderImage>>,
+    /// Two while they cross-fade.
+    words: Vec<Words>,
+    alpha: f32,
+    kind: Kind,
+    /// A button's fill, as much as has faded in.
+    fill: f32,
+}
+
+/// What a carried part is.
+#[derive(Clone)]
+enum Kind {
+    Words,
+    /// The repo's icon, by its tone.
+    Icon(Box<crate::git::RepoStatus>),
+    /// The big window's Refresh button, filled there and bare in the panel.
+    Button,
+    /// The health bar: synced, local-work and needs-a-look repos.
+    Health([usize; 3]),
+}
 
 /// A part carried from a panel row to a column header, physical px from
 /// the flip window's top-left corner.
@@ -524,11 +546,8 @@ struct Carried {
     to: Bounds<f32>,
     /// The words at each end: text, colour, size and boldness.
     words: Option<(Words, Words)>,
-    /// For the icon: its tone, to find its picture.
-    status: Option<crate::git::RepoStatus>,
+    kind: Kind,
     gone: bool,
-    /// The top bar itself: its bottom edge is drawn.
-    bar: bool,
 }
 
 /// Everything a flip draws, laid out.
@@ -550,6 +569,9 @@ struct Plan {
     /// corner: never over a taskbar, which the windows' own shadows stay
     /// under.
     work: Bounds<f32>,
+    /// The top bar and the bottom bar in each view, physical px.
+    bar: Option<(Bounds<f32>, Bounds<f32>)>,
+    footer: Option<(Bounds<f32>, Bounds<f32>)>,
     trees: Vec<Tree>,
     spines: Vec<Spine>,
     parts: Vec<Carried>,
@@ -710,9 +732,12 @@ fn plan(
                             from: in_panel(&a.bounds),
                             to: to_b,
                             words,
-                            status: (part == Part::Icon).then(|| status.clone()),
+                            kind: if part == Part::Icon {
+                                Kind::Icon(Box::new(status.clone()))
+                            } else {
+                                Kind::Words
+                            },
                             gone,
-                            bar: false,
                         });
                     }
                 }
@@ -741,25 +766,15 @@ fn plan(
                 let name = HEADING_LABELS
                     .with(|m| m.borrow().get(&k).cloned())
                     .zip(SPINE_LABELS.with(|m| m.borrow().get(&k).cloned()))
-                    .map(|((lb, from_text, color), (top, height, to_text))| {
-                        let from_size = 14.0;
-                        let len = crate::turned_text::length(&from_text, from_size);
-                        let lb = in_panel(&lb);
-                        Name {
-                            from: (
-                                lb.origin.x + len * ps / 2.0,
-                                lb.origin.y + lb.size.height / 2.0,
-                            ),
-                            to: (
-                                x + view::SPINE_WIDTH * ws / 2.0,
-                                to.origin.y + (top + height / 2.0) * ws,
-                            ),
-                            from_size: from_size * ps,
-                            to_size: view::SPINE_TEXT * ws,
-                            from_text,
-                            to_text,
-                            color,
-                        }
+                    .map(|((lb, from_text, color), (top, height, to_text))| Name {
+                        from: in_panel(&lb),
+                        to: Bounds {
+                            origin: point(x, to.origin.y + top * ws),
+                            size: size(view::SPINE_WIDTH * ws, height * ws),
+                        },
+                        from_text,
+                        to_text,
+                        color,
                     });
                 spines.push(Spine {
                     section,
@@ -776,38 +791,50 @@ fn plan(
             }
         }
     }
-    // The top bar and what's on it, from the panel's to the window's.
+    // The top and bottom bars, and what's on the top one, from the
+    // panel's to the window's.
+    let in_window = |b: &Bounds<Pixels>| Bounds {
+        origin: point(
+            to.origin.x + f32::from(b.origin.x) * ws,
+            to.origin.y + f32::from(b.origin.y) * ws,
+        ),
+        size: size(f32::from(b.size.width) * ws, f32::from(b.size.height) * ws),
+    };
+    let both = |part: Part| {
+        let key = (app().to_path_buf(), part);
+        panel_parts.get(&key).zip(column_parts.get(&key))
+    };
+    let bar = both(Part::Bar).map(|(a, b)| (in_panel(&a.bounds), in_window(&b.bounds)));
+    let footer = both(Part::Footer).map(|(a, b)| (in_panel(&a.bounds), in_window(&b.bounds)));
+    let health = view::tone_counts(&state.statuses);
     for part in [
-        Part::Bar,
         Part::Headline,
         Part::Subline,
         Part::Settings,
         Part::Refresh,
+        Part::Health,
+        Part::Count(0),
+        Part::Count(1),
+        Part::Count(2),
     ] {
-        let key = (app().to_path_buf(), part);
-        let (Some(a), Some(b)) = (panel_parts.get(&key), column_parts.get(&key)) else {
+        let Some((a, b)) = both(part) else {
             continue;
         };
         let words = a.text.clone().zip(b.text.clone());
-        if part != Part::Bar && words.is_none() {
+        let kind = match part {
+            Part::Health => Kind::Health(health),
+            Part::Refresh => Kind::Button,
+            _ => Kind::Words,
+        };
+        if !matches!(kind, Kind::Health(_)) && words.is_none() {
             continue;
         }
         parts.push(Carried {
             from: in_panel(&a.bounds),
-            to: Bounds {
-                origin: point(
-                    to.origin.x + f32::from(b.bounds.origin.x) * ws,
-                    to.origin.y + f32::from(b.bounds.origin.y) * ws,
-                ),
-                size: size(
-                    f32::from(b.bounds.size.width) * ws,
-                    f32::from(b.bounds.size.height) * ws,
-                ),
-            },
+            to: in_window(&b.bounds),
             words,
-            status: None,
+            kind,
             gone: false,
-            bar: part == Part::Bar,
         });
     }
     (!trees.is_empty() || !spines.is_empty()).then_some(Plan {
@@ -822,6 +849,8 @@ fn plan(
         ),
         maximized,
         work,
+        bar,
+        footer,
         trees,
         spines,
         parts,
@@ -1059,6 +1088,12 @@ impl Render for MorphView {
         // 0 is the panel's layout, 1 the big window's.
         let e = if open { turned } else { 1.0 - turned };
         let reveal = 1.0 - ease(phase(revealed, Duration::ZERO, reveal_len));
+        // The sheet's own fills: faded in over the starting window and out
+        // over the ending one. Everything both views show (words, icons,
+        // trees, the health bar) is drawn whole all through, right over
+        // its twin in the window beneath, so it never fades or blinks;
+        // only what one view alone shows fades in or out.
+        let fill = sheet_alpha * reveal;
         // The windows' own shadow, drawn around the sheet while neither
         // window is on screen to show its own.
         let framed = if (self.framed.0..self.framed.1).contains(&self.frames) {
@@ -1075,8 +1110,7 @@ impl Render for MorphView {
         let s = window.scale_factor();
         // The sheet grows to the big window's whole visible frame, title
         // bar and border too, so its rim lands where Windows draws that
-        // window's own. The title bar part takes its colour, as tall as
-        // the turn has gone.
+        // window's own.
         let (fl, cap, fr, fb) = self.plan.caption;
         let to_sheet = Bounds {
             origin: point(self.plan.to.origin.x - fl, self.plan.to.origin.y - cap),
@@ -1085,12 +1119,49 @@ impl Render for MorphView {
                 self.plan.to.size.height + cap + fb,
             ),
         };
-        // On whole physical px, so its 1 px rim stays crisp and even
-        // rather than smearing across two px as it moves.
+        // On whole physical px, so its rim stays crisp and even rather
+        // than smearing across two px as it moves.
         let sheet = snapped(lerp_bounds(self.plan.from, to_sheet, e, s), s);
         let work = lerp_bounds(self.plan.work, self.plan.work, 0.0, s);
-        let title = Bounds::new(sheet.origin, size(sheet.size.width, px(cap * e / s)));
-        let title_color = view::title_bar(dark);
+
+        // The sheet in bands, top to bottom, each its view's colour: the
+        // title bar (as tall as the turn has gone), the top bar, the body
+        // and the bottom bar, each with its edge line. They never overlap,
+        // so as they fade each shows exactly its colour over the same
+        // colour beneath, and the bars never flicker.
+        let mix = |a: f32, b: f32| a + (b - a) * e;
+        let top = f32::from(sheet.top()) * s;
+        let bottom = f32::from(sheet.bottom()) * s;
+        let title_end = (top + cap * e).round().min(bottom);
+        let bar_end = self.plan.bar.map_or(title_end, |(a, z)| {
+            mix(a.origin.y + a.size.height, z.origin.y + z.size.height)
+                .round()
+                .clamp(title_end, bottom)
+        });
+        let footer_at = self.plan.footer.map_or(bottom, |(a, z)| {
+            mix(a.origin.y, z.origin.y).round().clamp(bar_end, bottom)
+        });
+        let band = |t: f32, b: f32| {
+            Bounds::new(
+                point(sheet.left(), px(t / s)),
+                size(sheet.size.width, px((b - t).max(0.0) / s)),
+            )
+        };
+        // The bars' edge lines, 1 logical px like the views'.
+        let line = s;
+        let mut bands = vec![(band(top, title_end), view::title_bar(dark))];
+        if self.plan.bar.is_some() {
+            let edge = (bar_end - line).max(title_end);
+            bands.push((band(title_end, edge), p.bg));
+            bands.push((band(edge, bar_end), p.border));
+        }
+        let body = band(bar_end, footer_at);
+        if self.plan.footer.is_some() {
+            let edge = (footer_at + line).min(bottom);
+            bands.push((band(footer_at, edge), p.border));
+            bands.push((band(edge, bottom), p.bg));
+        }
+
         // The rim stays drawn from when the starting window has gone to the
         // very end, over the ending window's own of the same colour, so it
         // never blinks. A maximised big window has none: there it thins
@@ -1113,59 +1184,76 @@ impl Render for MorphView {
                     column_len: t.ends.column_len / s,
                 };
                 let alpha = if t.gone { 1.0 - e } else { 1.0 };
-                (t.graph.clone(), t.dirty, ends, alpha * reveal)
-            })
-            .collect();
-        // Each bar is drawn solid, its wash already laid on the panel's
-        // colour, so it never shows through to the bars beneath it.
-        // Words that differ cross-fade over the turn's middle.
-        let blend = ease((e - 0.3) / 0.4);
-        type Named = (gpui::Point<Pixels>, Vec<(String, f32)>, f32, Hsla);
-        let spines: Vec<(Bounds<Pixels>, Hsla, Option<Named>)> = self
-            .plan
-            .spines
-            .iter()
-            .map(|sp| {
-                let mix = |a: f32, b: f32| a + (b - a) * e;
-                let name = sp.name.as_ref().map(|n| {
-                    (
-                        point(px(mix(n.from.0, n.to.0) / s), px(mix(n.from.1, n.to.1) / s)),
-                        if n.from_text == n.to_text {
-                            vec![(n.from_text.clone(), 1.0)]
-                        } else {
-                            vec![
-                                (n.from_text.clone(), 1.0 - blend),
-                                (n.to_text.clone(), blend),
-                            ]
-                        },
-                        mix(n.from_size, n.to_size) / s,
-                        n.color,
-                    )
-                });
-                (
-                    lerp_bounds(sp.from, sp.to, e, s),
-                    p.surface.blend(view::section_tint(sp.section, &p)),
-                    name,
-                )
+                (t.graph.clone(), t.dirty, ends, alpha)
             })
             .collect();
 
+        // Section headings and spines don't turn into each other: the
+        // headings fade out over the turn's first part where the panel has
+        // them, and the spines fade in over its last where the window has
+        // them. At either end the body leaves a hole for the ones shown,
+        // which then fade like a band of their own.
+        let heading_alpha = if e <= 0.0 { 1.0 } else { 1.0 - ease(e / 0.45) };
+        let spine_alpha = if e >= 1.0 {
+            1.0
+        } else {
+            ease((e - 0.55) / 0.45)
+        };
+        let mut blocks: Vec<(Bounds<Pixels>, Hsla, f32, bool)> = Vec::new();
+        // Their names: where, words, colour, alpha, and whether turned.
+        let mut names: Vec<(Bounds<Pixels>, String, Hsla, f32, bool)> = Vec::new();
+        for sp in &self.plan.spines {
+            let tint = p.surface.blend(view::section_tint(sp.section, &p));
+            let at = |b: Bounds<f32>| snapped(lerp_bounds(b, b, 0.0, s), s);
+            if heading_alpha > 0.0 {
+                blocks.push((at(sp.from), tint, heading_alpha, false));
+                if let Some(n) = &sp.name {
+                    names.push((
+                        lerp_bounds(n.from, n.from, 0.0, s),
+                        n.from_text.clone(),
+                        n.color,
+                        heading_alpha,
+                        false,
+                    ));
+                }
+            }
+            if spine_alpha > 0.0 {
+                blocks.push((at(sp.to), tint, spine_alpha, true));
+                if let Some(n) = &sp.name {
+                    names.push((
+                        lerp_bounds(n.to, n.to, 0.0, s),
+                        n.to_text.clone(),
+                        n.color,
+                        spine_alpha,
+                        true,
+                    ));
+                }
+            }
+        }
+        let holes: Vec<Bounds<Pixels>> =
+            blocks.iter().filter(|b| b.2 >= 1.0).map(|b| b.0).collect();
+        let body_parts = holes.iter().fold(vec![body], |pieces, h| {
+            pieces.iter().flat_map(|r| subtract(*r, *h)).collect()
+        });
+
+        // Words that differ cross-fade over the turn's middle.
+        let blend = ease((e - 0.3) / 0.4);
         // The parts both views show, moving and growing from one to the
-        // other, over the sheet: they never fade with the words.
+        // other, over the sheet.
         let parts: Vec<Drawn> = self
             .plan
             .parts
             .iter()
             .map(|c| {
-                let b = lerp_bounds(c.from, c.to, e, s);
-                let alpha = reveal * if c.gone { 1.0 - e } else { 1.0 };
-                let image = c.status.as_ref().and_then(|st| {
-                    let a = c.from.size.width.round() as u32;
-                    let z = c.to.size.width.round() as u32;
-                    crate::repo_marks::picture(st, &[a.max(z), a.min(z)], cx)
-                });
+                let image = match &c.kind {
+                    Kind::Icon(st) => {
+                        let a = c.from.size.width.round() as u32;
+                        let z = c.to.size.width.round() as u32;
+                        crate::repo_marks::picture(st, &[a.max(z), a.min(z)], cx)
+                    }
+                    _ => None,
+                };
                 let words = c.words.as_ref().map_or_else(Vec::new, |(a, z)| {
-                    let mix = |x: f32, y: f32| x + (y - x) * e;
                     let size = mix(a.2, z.2);
                     if a.0 == z.0 && a.3 == z.3 {
                         // The same words: one line, its colour moving.
@@ -1186,7 +1274,14 @@ impl Render for MorphView {
                         ]
                     }
                 });
-                (b, image, words, alpha, c.bar)
+                Drawn {
+                    bounds: lerp_bounds(c.from, c.to, e, s),
+                    image,
+                    words,
+                    alpha: if c.gone { 1.0 - e } else { 1.0 },
+                    kind: c.kind.clone(),
+                    fill: blend,
+                }
             })
             .collect();
 
@@ -1196,7 +1291,6 @@ impl Render for MorphView {
                 // Never over a taskbar.
                 window.with_content_mask(Some(gpui::ContentMask { bounds: work }), |window| {
                     window.request_animation_frame();
-                    let bg = p.surface.opacity(sheet_alpha * reveal);
                     if framed > 0.0 {
                         window.paint_shadows(
                             sheet,
@@ -1218,50 +1312,63 @@ impl Render for MorphView {
                             ],
                         );
                     }
-                    window.paint_quad(quad(
-                        sheet,
-                        px(RADIUS),
-                        bg,
-                        px(0.0),
-                        gpui::transparent_black(),
-                        gpui::BorderStyle::Solid,
-                    ));
-                    if title.size.height > px(0.5) {
-                        let round = px(RADIUS);
-                        window.paint_quad(quad(
-                            title,
-                            gpui::Corners {
-                                top_left: round,
-                                top_right: round,
-                                bottom_left: px(0.0),
-                                bottom_right: px(0.0),
-                            },
-                            title_color.opacity(sheet_alpha * reveal),
-                            px(0.0),
-                            gpui::transparent_black(),
-                            gpui::BorderStyle::Solid,
-                        ));
+                    // A band: the sheet's rounded shape, cut to the band.
+                    let paint_band = |window: &mut Window, b: Bounds<Pixels>, color: Hsla| {
+                        if b.size.width <= px(0.0) || b.size.height <= px(0.0) || color.a <= 0.0 {
+                            return;
+                        }
+                        window.with_content_mask(Some(gpui::ContentMask { bounds: b }), |window| {
+                            window.paint_quad(quad(
+                                sheet,
+                                px(RADIUS),
+                                color,
+                                px(0.0),
+                                gpui::transparent_black(),
+                                gpui::BorderStyle::Solid,
+                            ));
+                        });
+                    };
+                    for (b, color) in &bands {
+                        paint_band(window, *b, color.opacity(color.a * fill));
                     }
-                    window.with_content_mask(Some(gpui::ContentMask { bounds: sheet }), |window| {
-                        // A section's heading stretching into its spine.
-                        for (b, bar, name) in &spines {
-                            window.paint_quad(gpui::fill(*b, bar.opacity(reveal)));
-                            // The name turns with its bar, from across to
-                            // reading upwards.
-                            if let Some((at, texts, size, color)) = name {
-                                for (text, a) in texts {
-                                    if *a <= 0.0 {
-                                        continue;
-                                    }
-                                    crate::turned_text::paint_turning(
-                                        window,
-                                        *at,
-                                        text,
-                                        *size,
-                                        color.opacity(color.a * reveal * a),
-                                        e,
-                                    );
-                                }
+                    for b in &body_parts {
+                        paint_band(window, *b, p.surface.opacity(fill));
+                    }
+                    window.with_content_mask(Some(gpui::ContentMask { bounds: body }), |window| {
+                        for (b, tint, alpha, spine) in &blocks {
+                            // In its hole it fades like the bands; over the
+                            // sheet, by itself.
+                            let a = alpha * if *alpha >= 1.0 { fill } else { 1.0 };
+                            window.paint_quad(gpui::fill(*b, tint.opacity(a)));
+                            if *spine {
+                                // The spine's right edge line.
+                                let edge = Bounds::new(
+                                    point(b.right() - px(1.0), b.top()),
+                                    size(px(1.0), b.size.height),
+                                );
+                                window.paint_quad(gpui::fill(edge, p.border.opacity(a)));
+                            }
+                        }
+                        for (b, text, color, alpha, turned) in &names {
+                            let color = color.opacity(color.a * alpha);
+                            if *turned {
+                                crate::turned_text::paint(
+                                    window,
+                                    *b,
+                                    text,
+                                    view::SPINE_TEXT,
+                                    color,
+                                );
+                            } else {
+                                paint_words(
+                                    window,
+                                    cx,
+                                    *b,
+                                    text.clone().into(),
+                                    color,
+                                    14.0,
+                                    false,
+                                );
                             }
                         }
                         for (graph, dirty, ends, alpha) in &trees {
@@ -1269,71 +1376,45 @@ impl Render for MorphView {
                                 graph, *dirty, *ends, e, *alpha, dark, &p, window,
                             );
                         }
-                        for (b, image, words, alpha, bar) in &parts {
-                            if *alpha <= 0.0 {
+                    });
+                    window.with_content_mask(Some(gpui::ContentMask { bounds: sheet }), |window| {
+                        for d in &parts {
+                            if d.alpha <= 0.0 {
                                 continue;
                             }
-                            if *bar {
-                                // The header's own colour, darker than the
-                                // sheet's, under the sheet's rounded top.
-                                let round = px(RADIUS);
-                                window.paint_quad(quad(
-                                    *b,
-                                    gpui::Corners {
-                                        top_left: round,
-                                        top_right: round,
-                                        bottom_left: px(0.0),
-                                        bottom_right: px(0.0),
-                                    },
-                                    p.bg.opacity(sheet_alpha * reveal),
-                                    px(0.0),
-                                    gpui::transparent_black(),
-                                    gpui::BorderStyle::Solid,
-                                ));
-                                // Its bottom edge, the line under the header.
-                                let edge = Bounds::new(
-                                    point(b.origin.x, b.bottom() - px(1.0)),
-                                    size(b.size.width, px(1.0)),
-                                );
-                                window.paint_quad(gpui::fill(edge, p.border.opacity(*alpha)));
-                                continue;
+                            let b = d.bounds;
+                            match d.kind {
+                                Kind::Button if d.fill > 0.0 => {
+                                    window.paint_quad(quad(
+                                        b,
+                                        px(6.0),
+                                        p.button.opacity(d.fill * d.alpha),
+                                        px(0.0),
+                                        gpui::transparent_black(),
+                                        gpui::BorderStyle::Solid,
+                                    ));
+                                }
+                                Kind::Health(counts) => {
+                                    paint_health(window, b, counts, d.alpha, &p);
+                                    continue;
+                                }
+                                _ => {}
                             }
-                            if let Some(image) = image {
+                            if let Some(image) = &d.image {
                                 window
-                                    .paint_image(*b, Default::default(), image.clone(), 0, false)
+                                    .paint_image(b, Default::default(), image.clone(), 0, false)
                                     .ok();
                             }
-                            for (text, color, size, bold) in words {
+                            for (text, color, size, bold) in &d.words {
                                 if color.a <= 0.0 {
                                     continue;
                                 }
-                                let mut font = window.text_style().font();
-                                if *bold {
-                                    font.weight = gpui::FontWeight::SEMIBOLD;
-                                }
-                                let run = gpui::TextRun {
-                                    len: text.len(),
-                                    font,
-                                    color: color.opacity(color.a * alpha),
-                                    background_color: None,
-                                    underline: None,
-                                    strikethrough: None,
-                                };
-                                let line = window.text_system().shape_line(
-                                    text.clone(),
-                                    px(*size),
-                                    &[run],
-                                    None,
-                                );
-                                // Cut where the view would cut it.
-                                window.with_content_mask(
-                                    Some(gpui::ContentMask { bounds: *b }),
-                                    |window| line.paint(b.origin, b.size.height, window, cx).ok(),
-                                );
+                                let color = color.opacity(color.a * d.alpha);
+                                paint_words(window, cx, b, text.clone(), color, *size, *bold);
                             }
                         }
                     });
-                    // The rim: one physical px, light over dark, dark over light.
+                    // The rim, as thick as Windows draws the windows' own.
                     if rim_alpha > 0.0 {
                         let rim = view::rim(dark).opacity(rim_alpha);
                         window.paint_quad(quad(
@@ -1351,4 +1432,99 @@ impl Render for MorphView {
         .size_full();
         div().size_full().child(painter)
     }
+}
+
+/// One line of words in `b`, cut where the view would cut it.
+fn paint_words(
+    window: &mut Window,
+    cx: &mut App,
+    b: Bounds<Pixels>,
+    text: gpui::SharedString,
+    color: Hsla,
+    size: f32,
+    bold: bool,
+) {
+    let mut font = window.text_style().font();
+    if bold {
+        font.weight = gpui::FontWeight::SEMIBOLD;
+    }
+    let run = gpui::TextRun {
+        len: text.len(),
+        font,
+        color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let line = window
+        .text_system()
+        .shape_line(text, px(size), &[run], None);
+    window.with_content_mask(Some(gpui::ContentMask { bounds: b }), |window| {
+        line.paint(b.origin, b.size.height, window, cx).ok()
+    });
+}
+
+/// The health bar as the views draw it: a rounded track filled by the
+/// synced, local-work and needs-a-look repos' shares, in that order.
+fn paint_health(
+    window: &mut Window,
+    b: Bounds<Pixels>,
+    counts: [usize; 3],
+    alpha: f32,
+    p: &Palette,
+) {
+    let r = b.size.height / 2.0;
+    window.paint_quad(quad(
+        b,
+        r,
+        p.hover.opacity(alpha),
+        px(0.0),
+        gpui::transparent_black(),
+        gpui::BorderStyle::Solid,
+    ));
+    let total = counts.iter().sum::<usize>().max(1) as f32;
+    let mut x = b.left();
+    window.with_content_mask(Some(gpui::ContentMask { bounds: b }), |window| {
+        for (n, color) in counts.into_iter().zip([p.green, p.amber, p.red]) {
+            if n == 0 {
+                continue;
+            }
+            let w = b.size.width * (n as f32 / total);
+            let seg = Bounds::new(point(x, b.top()), size(w, b.size.height));
+            let round = |at_end: bool| if at_end { r } else { px(0.0) };
+            window.paint_quad(quad(
+                seg,
+                gpui::Corners {
+                    top_left: round(x <= b.left()),
+                    bottom_left: round(x <= b.left()),
+                    top_right: round(seg.right() >= b.right() - px(0.01)),
+                    bottom_right: round(seg.right() >= b.right() - px(0.01)),
+                },
+                color.opacity(alpha),
+                px(0.0),
+                gpui::transparent_black(),
+                gpui::BorderStyle::Solid,
+            ));
+            x = seg.right();
+        }
+    });
+}
+
+/// `r` less `hole`: up to four rects around it.
+fn subtract(r: Bounds<Pixels>, hole: Bounds<Pixels>) -> Vec<Bounds<Pixels>> {
+    let i = r.intersect(&hole);
+    if i.size.width <= px(0.0) || i.size.height <= px(0.0) {
+        return vec![r];
+    }
+    let rect =
+        |l: Pixels, t: Pixels, rt: Pixels, b: Pixels| Bounds::new(point(l, t), size(rt - l, b - t));
+    [
+        rect(r.left(), r.top(), r.right(), i.top()),
+        rect(r.left(), i.bottom(), r.right(), r.bottom()),
+        rect(r.left(), i.top(), i.left(), i.bottom()),
+        rect(i.right(), i.top(), r.right(), i.bottom()),
+    ]
+    .into_iter()
+    .filter(|b| b.size.width > px(0.0) && b.size.height > px(0.0))
+    .collect()
 }
