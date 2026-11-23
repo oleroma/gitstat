@@ -249,6 +249,10 @@ fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
                         crate::notify::pr_changes(&s.config.notify, &names, &s.prs, &report.prs)
                     };
                     notify(&lines, cx);
+                    if !report.pushed.is_empty() {
+                        cx.global::<Shared>()
+                            .send_monitors(Command::Pushed(report.pushed.clone()));
+                    }
                     state.update(cx, |s, _| {
                         let (prs, repos) = (s.config.github_prs, s.config.github_repos);
                         s.github_report(report);
