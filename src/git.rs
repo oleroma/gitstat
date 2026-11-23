@@ -47,6 +47,8 @@ pub struct RepoStatus {
     pub operation: Option<String>,
     /// HEAD isn't on a branch: its short commit id.
     pub detached: Option<String>,
+    /// The checked-out branch's name.
+    pub branch: Option<String>,
     /// Local branches other than the checked-out one with commits no
     /// remote has: ahead of their upstream, or never pushed. Name and count.
     pub unpushed_branches: Vec<(String, u32)>,
@@ -421,6 +423,7 @@ pub fn check_repo_detailed(root: &Path, repo: &Path, fetch: bool) -> (RepoStatus
             status.ahead = local.ahead;
             status.behind = local.behind;
             status.detached = local.detached;
+            status.branch = local.branch;
             let dirs = quick_git_dirs(repo);
             if let Some((git_dir, common_dir)) = &dirs {
                 status.operation = operation(git_dir);
@@ -710,6 +713,8 @@ pub(crate) struct Parsed {
     pub has_upstream: bool,
     /// HEAD's short commit id when it isn't on a branch.
     pub detached: Option<String>,
+    /// The checked-out branch.
+    pub branch: Option<String>,
     /// Ignored directories, relative to the repo, with their trailing `/`,
     /// and ignored files outside them, such as `debug.log`.
     pub ignored: Vec<String>,
@@ -728,6 +733,8 @@ pub(crate) fn parse_status_v2(out: &[u8]) -> Parsed {
                     oid_seen = String::from_utf8_lossy(oid).chars().take(7).collect();
                 } else if field == b"# branch.head (detached)" {
                     detached = true;
+                } else if let Some(head) = field.strip_prefix(b"# branch.head ") {
+                    parsed.branch = Some(String::from_utf8_lossy(head).into_owned());
                 } else if let Some(ab) = field.strip_prefix(b"# branch.ab ") {
                     let ab = String::from_utf8_lossy(ab);
                     let mut counts = ab.split_whitespace();
@@ -1236,6 +1243,7 @@ mod tests {
             clean,
             Parsed {
                 has_upstream: true,
+                branch: Some("main".into()),
                 ..Default::default()
             }
         );

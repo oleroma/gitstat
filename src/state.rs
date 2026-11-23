@@ -289,7 +289,8 @@ impl AppState {
 
     /// Takes in the uncloned repos. One pushed to since the last list
     /// counts as checked, so its tree is read again.
-    pub fn set_remote_repos(&mut self, remote: Vec<crate::github::RemoteRepo>) {
+    pub fn set_remote_repos(&mut self, mut remote: Vec<crate::github::RemoteRepo>) {
+        remote.retain(|r| !self.config.is_ignored(&r.slug));
         for r in &remote {
             let pushed_before = self
                 .remote_repos

@@ -75,6 +75,8 @@ pub enum TrayAction {
     /// The folders to look for repos in: `path`, then `more_paths`.
     SetFolders(String, Vec<String>),
     OpenSettings,
+    /// A pick from a repo's right-click menu.
+    RepoMenu(crate::repo_menu::RepoAction, crate::repo_menu::Target),
     Quit,
 }
 

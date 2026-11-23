@@ -175,6 +175,11 @@ pub struct Config {
     /// Which sections of the repo list are folded, in the panel and the
     /// big window alike.
     pub folds: Folds,
+    /// Repos gitstat leaves out entirely, by name as gitstat shows it
+    /// (`dev\gitstat\build\src`, or `owner/name` for one only on GitHub).
+    /// `*` matches any run of characters, `/` and `\` are the same, and
+    /// case doesn't matter.
+    pub ignore: Vec<String>,
 }
 
 /// The sections the panel lists, and the big window shows as groups of
@@ -265,6 +270,7 @@ impl Default for Config {
             panel_slide_ms: 150,
             flip_ms: 560,
             folds: Folds::default(),
+            ignore: Vec::new(),
         }
     }
 }
@@ -279,6 +285,11 @@ pub enum ClickAction {
 }
 
 impl Config {
+    /// Whether the repo named `name` is on the `ignore` list.
+    pub fn is_ignored(&self, name: &str) -> bool {
+        self.ignore.iter().any(|pattern| glob_match(pattern, name))
+    }
+
     /// Reads `file`, or creates it with defaults when it doesn't exist. A new
     /// config watches the folder that holds gitstat's own folder, so dropping
     /// gitstat into `D:\dev\gitstat` watches `D:\dev`.
@@ -532,9 +543,64 @@ fn expand(path: &str) -> String {
     out
 }
 
+/// `name` against `pattern`, where `*` is any run of characters, `?` one
+/// character, `/` and `\` match each other, and case is ignored.
+pub fn glob_match(pattern: &str, name: &str) -> bool {
+    let norm = |s: &str| -> Vec<char> {
+        s.trim()
+            .chars()
+            .map(|c| if c == '\\' { '/' } else { c })
+            .flat_map(char::to_lowercase)
+            .collect()
+    };
+    let (p, n) = (norm(pattern), norm(name));
+    let p: &[char] = p.strip_suffix(&['/']).unwrap_or(&p);
+    if p.is_empty() {
+        return false;
+    }
+    // Greedy with backtracking to the last star.
+    let (mut pi, mut ni) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some((pi, ni));
+            pi += 1;
+        } else if let Some((sp, sn)) = star {
+            pi = sp + 1;
+            ni = sn + 1;
+            star = Some((sp, sn + 1));
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|&c| c == '*')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ignore_patterns() {
+        assert!(glob_match(
+            "dev\\gitstat\\build\\src",
+            "dev/gitstat/build/src"
+        ));
+        assert!(glob_match("DEV/*/build/src", "dev\\gitstat\\build\\src"));
+        assert!(glob_match("*/build/src", "dev\\x\\build\\src"));
+        assert!(glob_match("oleroma/*", "oleroma/gitstat"));
+        assert!(glob_match("a?c", "abc"));
+        assert!(!glob_match("dev/gitstat", "dev/gitstat/build/src"));
+        assert!(!glob_match("", "x"));
+        assert!(!glob_match("*/src", "dev/srcs"));
+        let mut c = Config::default();
+        c.ignore = vec!["*\\build\\src".into()];
+        assert!(c.is_ignored("dev\\gitstat\\build\\src"));
+        assert!(!c.is_ignored("dev\\gitstat"));
+    }
 
     #[test]
     fn expands_home_and_variables() {

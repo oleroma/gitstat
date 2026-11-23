@@ -415,7 +415,7 @@ impl StatusView {
             cx.observe_window_activation(window, |this: &mut Self, window, cx| {
                 if window.is_window_active() {
                     this.seen_active = true;
-                } else if this.seen_active {
+                } else if this.seen_active && !crate::repo_menu::is_open() {
                     panel::dismiss(window, cx);
                 }
             })
@@ -821,6 +821,13 @@ fn repo_row(index: usize, s: &RepoStatus, p: &Palette, mode: Mode, cx: &App) -> 
             open_repo(&path, cx);
             if mode == Mode::Panel {
                 panel::dismiss(window, cx);
+            }
+        })
+        .on_mouse_down(gpui::MouseButton::Right, {
+            let s = s.clone();
+            move |_, window, cx| {
+                cx.stop_propagation();
+                crate::repo_menu::show(&s, window, cx);
             }
         })
         .child(crate::repo_marks::global_mark(s, 16.0, color, cx))

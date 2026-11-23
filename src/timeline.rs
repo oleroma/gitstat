@@ -903,6 +903,13 @@ impl Timelines {
             .hover(|s| s.bg(p.hover))
             // Big mode, scrolled to this repo's column; the folder when the
             // window is turned off.
+            .on_mouse_down(gpui::MouseButton::Right, {
+                let status = status.clone();
+                move |_, window, cx| {
+                    cx.stop_propagation();
+                    crate::repo_menu::show(&status, window, cx);
+                }
+            })
             .on_click(move |_, window, cx| {
                 let big = this_for_label.read(cx).state.read(cx).config.window;
                 if big {

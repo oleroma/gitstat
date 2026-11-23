@@ -59,6 +59,8 @@ pub enum Command {
     /// config.json (unparsable mid-edit) couldn't take. A later good reload
     /// of the file replaces it, as it does in the app.
     Apply(Config),
+    /// Fetch this repo now, if this monitor watches it.
+    Fetch(PathBuf),
     Shutdown,
 }
 
@@ -322,6 +324,12 @@ impl Scheduler {
                     let now = Instant::now();
                     self.poll_config(now);
                     self.start_sweep(true, now);
+                }
+                Ok(Msg::Cmd(Command::Fetch(repo))) => {
+                    if self.repos.contains(&repo) {
+                        self.retries.remove(&repo);
+                        self.debouncer.request(&repo, Need::Fetch, Instant::now());
+                    }
                 }
                 Ok(Msg::Cmd(Command::Apply(config))) => {
                     if config != self.config {
@@ -802,6 +810,9 @@ impl Scheduler {
             self.start_sweep(false, now);
             return;
         }
+        if old.ignore != self.config.ignore {
+            self.walk_here(false, now);
+        }
         if old.watch != self.config.watch {
             self.setup_watch(now);
             if self.mode == WatchMode::Events {
@@ -824,6 +835,10 @@ impl Scheduler {
             pruned,
             entered,
         } = discovery;
+        let found: Vec<PathBuf> = found
+            .into_iter()
+            .filter(|r| !self.config.is_ignored(&git::repo_name(&self.name_base, r)))
+            .collect();
         self.router.set_pruned(&pruned);
         self.router.set_entered(&entered);
         self.router.set_capped(capped.is_some());

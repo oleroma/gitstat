@@ -379,7 +379,7 @@ pub fn flip_hwnd(cx: &App) -> Option<isize> {
 
 /// Longer than any flip runs: one still around after this is stuck, and
 /// no longer holds up the windows.
-const STUCK: Duration = Duration::from_secs(8);
+const STUCK: Duration = Duration::from_secs(12);
 
 fn enabled(cx: &App) -> bool {
     cx.try_global::<Ui>().is_some_and(|ui| {
@@ -825,7 +825,7 @@ fn launch(plan: Plan, direction: Direction, cx: &mut App) -> bool {
         .try_global::<Ui>()
         .map_or(560, |ui| ui.state.read(cx).config.flip_ms);
     let fixed = HOLD.as_millis() as f32;
-    let stretch = ((ms as f32 - fixed) / (560.0 - fixed)).clamp(0.2, 6.0);
+    let stretch = ((ms as f32 - fixed) / (560.0 - fixed)).clamp(0.2, 12.0);
     let mut flip_hwnd = None;
     let Ok(handle) = cx.open_window(
         WindowOptions {

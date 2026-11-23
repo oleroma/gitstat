@@ -530,16 +530,22 @@ fn views(cfg: &Config, p: &Palette) -> Vec<AnyElement> {
                     "From the taskbar's side, or the badge's, when the panel opens.",
                     segmented(
                         "panel-slide",
-                        [(0, "Off"), (100, "Fast"), (150, "Normal"), (300, "Slow")]
-                            .into_iter()
-                            .map(|(ms, label)| {
-                                (
-                                    label,
-                                    cfg.panel_slide_ms == ms,
-                                    TrayAction::SetPanelSlide(ms),
-                                )
-                            })
-                            .collect(),
+                        [
+                            (0, "Off"),
+                            (100, "Fast"),
+                            (150, "Normal"),
+                            (300, "Slow"),
+                            (1500, "Very slow"),
+                        ]
+                        .into_iter()
+                        .map(|(ms, label)| {
+                            (
+                                label,
+                                cfg.panel_slide_ms == ms,
+                                TrayAction::SetPanelSlide(ms),
+                            )
+                        })
+                        .collect(),
                         cfg.panel,
                         p,
                     ),
@@ -556,15 +562,18 @@ fn views(cfg: &Config, p: &Palette) -> Vec<AnyElement> {
                 ),
                 setting_row(
                     "Flip speed",
-                    "How long the panel takes to turn into the window, and back.",
+                    "How long the panel takes to turn into the window, and back. Very slow (5 s) is for looking at each frame.",
                     segmented(
                         "flip-speed",
-                        [(350, "Fast"), (560, "Normal"), (900, "Slow")]
-                            .into_iter()
-                            .map(|(ms, label)| {
-                                (label, cfg.flip_ms == ms, TrayAction::SetFlipSpeed(ms))
-                            })
-                            .collect(),
+                        [
+                            (350, "Fast"),
+                            (560, "Normal"),
+                            (900, "Slow"),
+                            (5000, "Very slow"),
+                        ]
+                        .into_iter()
+                        .map(|(ms, label)| (label, cfg.flip_ms == ms, TrayAction::SetFlipSpeed(ms)))
+                        .collect(),
                         cfg.window && cfg.panel && cfg.flip_animation,
                         p,
                     ),

@@ -530,6 +530,13 @@ fn header(
         .gap(px(2.))
         .cursor_pointer()
         .on_click(move |_, _, cx| crate::view::open_repo(&repo, cx))
+        .on_mouse_down(gpui::MouseButton::Right, {
+            let status = status.clone();
+            move |_, window, cx| {
+                cx.stop_propagation();
+                crate::repo_menu::show(&status, window, cx);
+            }
+        })
         .child(
             div()
                 .flex()

@@ -445,6 +445,36 @@ fn on_action(action: TrayAction, cx: &mut App) -> bool {
             shared.github.refresh();
         }
         TrayAction::OpenRepo(path) => view::open_repo(&path, cx),
+        TrayAction::RepoMenu(action, target) => {
+            use crate::repo_menu::RepoAction;
+            if action.leaves() {
+                panel::close(cx);
+            }
+            match action {
+                RepoAction::Fetch => {
+                    cx.global::<Shared>()
+                        .send_monitors(Command::Fetch(target.path.clone()));
+                }
+                RepoAction::Hide => {
+                    let name = if target.remote_only {
+                        crate::github::remote_slug(&target.path)
+                            .unwrap_or(&target.name)
+                            .to_string()
+                    } else {
+                        target.name.clone()
+                    };
+                    change_setting(
+                        move |c| {
+                            if !c.is_ignored(&name) {
+                                c.ignore.push(name);
+                            }
+                        },
+                        cx,
+                    );
+                }
+                _ => crate::repo_menu::run(action, &target, cx),
+            }
+        }
         TrayAction::EditConfig => {
             let file = cx.global::<Ui>().state.read(cx).config_file.clone();
             cx.open_with_system(&file);
@@ -609,6 +639,10 @@ fn apply_config(old: &Config, new: Config, cx: &mut App) {
     let state = cx.global::<Ui>().state.clone();
     state.update(cx, |s, cx| {
         s.config = new.clone();
+        if new.ignore != old.ignore {
+            let remote = s.remote_repos.clone();
+            s.set_remote_repos(remote);
+        }
         cx.notify();
     });
     if !new.panel {
