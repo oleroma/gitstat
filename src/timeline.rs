@@ -558,6 +558,36 @@ impl Timelines {
         cx.notify();
     }
 
+    /// Every strip and column glides back to its newest commits, as the
+    /// flip starts from them: how long that takes, or None when all are
+    /// there already.
+    pub fn glide_newest(&mut self, cx: &mut Context<Self>) -> Option<Duration> {
+        let now = Instant::now();
+        let mut moving = false;
+        for slot in self.slots.values_mut() {
+            if slot.shown_scroll(now).0.abs() > 0.5 {
+                slot.glide_to(0.0, now);
+                moving = true;
+            } else {
+                slot.scroll = 0.0;
+                slot.glide = None;
+            }
+            if slot.shown_top(now).0.abs() > 0.01 {
+                slot.glide_top_to(0.0, now);
+                moving = true;
+            } else {
+                slot.top = 0.0;
+                slot.top_glide = None;
+            }
+        }
+        self.table_top = 0.0;
+        moving.then(|| {
+            self.unhover();
+            cx.notify();
+            GLIDE
+        })
+    }
+
     fn scroll_home(&mut self, path: &Path, cx: &mut Context<Self>) {
         if let Some(slot) = self.slots.get_mut(path) {
             let home = slot.graph.as_ref().map_or(0.0, |g| g.home() * STEP);

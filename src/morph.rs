@@ -338,6 +338,9 @@ struct MorphSlot {
     hwnd: Option<isize>,
     /// When it opened.
     since: Option<Instant>,
+    /// Waiting for the trees to glide back to their newest commits before
+    /// it starts, since then.
+    waiting: Option<Instant>,
 }
 
 impl Global for MorphSlot {}
@@ -345,9 +348,36 @@ impl Global for MorphSlot {}
 /// Whether a flip is drawing now.
 pub fn running(cx: &App) -> bool {
     cx.try_global::<MorphSlot>().is_some_and(|s| {
-        s.handle.is_some_and(|h| view::is_live(h.into(), cx))
-            && s.since.is_some_and(|t| t.elapsed() < STUCK)
+        s.waiting.is_some_and(|t| t.elapsed() < STUCK)
+            || s.handle.is_some_and(|h| view::is_live(h.into(), cx))
+                && s.since.is_some_and(|t| t.elapsed() < STUCK)
     })
+}
+
+/// Glides every tree back to its newest commits, where the flip starts
+/// from: true when they were elsewhere, after which `then` runs once
+/// they're there.
+fn newest_first(then: impl FnOnce(&mut App) + 'static, cx: &mut App) -> bool {
+    let Some(t) = cx.try_global::<Ui>().map(|ui| ui.timelines.clone()) else {
+        return false;
+    };
+    let Some(wait) = t.update(cx, |t, cx| t.glide_newest(cx)) else {
+        return false;
+    };
+    cx.default_global::<MorphSlot>().waiting = Some(Instant::now());
+    cx.spawn(async move |cx| {
+        // A frame more, so the last of the glide is drawn.
+        cx.background_executor()
+            .timer(wait + Duration::from_millis(20))
+            .await;
+        cx.update(|cx| {
+            cx.default_global::<MorphSlot>().waiting = None;
+            then(cx);
+        })
+        .ok();
+    })
+    .detach();
+    true
 }
 
 /// The flip's HWND while it draws.
@@ -382,6 +412,20 @@ pub fn open_window(panel: &mut Window, focus: Option<PathBuf>, cx: &mut App) {
         return;
     }
     let flip = enabled(cx) && !view::window_open(cx);
+    if flip {
+        let handle = panel.window_handle();
+        let again = focus.clone();
+        if newest_first(
+            move |cx| {
+                handle
+                    .update(cx, |_, window, cx| open_window(window, again, cx))
+                    .ok();
+            },
+            cx,
+        ) {
+            return;
+        }
+    }
     let started = flip
         && win::hwnd(panel)
             .and_then(win::client_rect)
@@ -421,9 +465,30 @@ pub fn flip_back(big: &mut Window, cx: &mut App) -> bool {
         // Mid-flip; the flip closes it.
         return true;
     }
-    if !enabled(cx) {
+    if !enabled(cx) || crate::panel::last_rect(cx).is_none() {
         return false;
     }
+    // The columns back at their newest commits first; then the flip, or,
+    // should it not start, the window just closes.
+    let handle = big.window_handle();
+    if newest_first(
+        move |cx| {
+            let started = handle
+                .update(cx, |_, window, cx| flip_back_now(window, minimized, cx))
+                .unwrap_or(false);
+            if !started {
+                view::close_window(cx);
+            }
+        },
+        cx,
+    ) {
+        return true;
+    }
+    flip_back_now(big, minimized, cx)
+}
+
+/// Starts the flip back into the panel, the trees at their newest.
+fn flip_back_now(big: &mut Window, minimized: bool, cx: &mut App) -> bool {
     let Some(panel_rect) = crate::panel::last_rect(cx) else {
         return false;
     };
