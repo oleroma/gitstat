@@ -636,6 +636,15 @@ pub(crate) fn section_color(section: Section, p: &Palette) -> Hsla {
     }
 }
 
+/// Room under an open section's heading, so a tag's diamond over a dot in
+/// the first strip's top lane stays clear of the heading.
+fn heading_gap() -> AnyElement {
+    div().h(px(HEADING_GAP)).flex_none().into_any_element()
+}
+
+/// How tall that room is, logical px.
+const HEADING_GAP: f32 = 4.0;
+
 /// A panel section heading's words.
 fn heading_label(text: String) -> gpui::Div {
     div().flex_1().child(text)
@@ -1497,6 +1506,7 @@ impl Render for StatusView {
                     let open = !state.folded(Section::NeedsYou);
                     rows.extend(panel_heading(Section::NeedsYou, state, icons_only, &p, cx));
                     if open {
+                        rows.push(heading_gap());
                         for (i, s) in bad.iter().enumerate() {
                             rows.push(row(i, s, cx));
                         }
@@ -1506,6 +1516,7 @@ impl Render for StatusView {
                     let open = !state.folded(Section::Synced);
                     rows.extend(panel_heading(Section::Synced, state, icons_only, &p, cx));
                     if open {
+                        rows.push(heading_gap());
                         let offset = bad.len();
                         for (i, s) in good.iter().enumerate() {
                             rows.push(row(offset + i, s, cx));
@@ -1525,6 +1536,7 @@ impl Render for StatusView {
                         cx,
                     ));
                     if open {
+                        rows.push(heading_gap());
                         let offset = bad.len() + good.len();
                         for (i, s) in remote.iter().enumerate() {
                             rows.push(row(offset + i, s, cx));

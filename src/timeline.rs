@@ -1642,14 +1642,7 @@ fn paint_strip(
             ink::circle(window, c, r, Some(color), None);
         }
         if g.ctx.refs.at(id).iter().any(|r| matches!(r, Ref::Tag(_))) {
-            // Beside the dot toward the strip's middle, so a dot in a top
-            // lane never puts its diamond over the bar or row above.
-            let dy = if f32::from(center.y) < cy - 0.5 {
-                r + 4.0
-            } else {
-                -(r + 4.0)
-            };
-            diamond(point(center.x, center.y + px(dy)), 2.5, color, window);
+            diamond(point(center.x, center.y - px(r + 4.0)), 2.5, color, window);
         }
         if g.stashes_at(row).next().is_some() {
             stash(
