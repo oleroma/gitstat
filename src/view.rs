@@ -391,6 +391,8 @@ impl StatusView {
         cx: &mut Context<Self>,
     ) -> Self {
         cx.observe(&state, |_, _, cx| cx.notify()).detach();
+        // A new panel or window starts unfiltered.
+        state.update(cx, |s, _| s.filter.clear());
         if mode == Mode::Window {
             cx.observe_in(&state, window, |this: &mut Self, state, window, cx| {
                 this.fit_to_repos(&state, window, cx)
@@ -1094,6 +1096,7 @@ impl Render for StatusView {
         // The panel's rows measured as laid out, so the panel can be made
         // exactly as tall as what it shows.
         let content_h = Rc::new(std::cell::Cell::new(0.0f32));
+        let filter_state = self.state.clone();
         let timelines = self.timelines.clone();
         // Pictures only: the panel's words move into tooltips.
         let icons_only = mode == Mode::Panel && self.state.read(cx).config.icons_only;
@@ -1143,6 +1146,15 @@ impl Render for StatusView {
         }
         if sweeping {
             subline.push_str(" · checking…");
+        }
+        if !state.filter.is_empty() {
+            let found =
+                state.sorted(&state.statuses).len() + state.sorted(&state.remote_statuses).len();
+            subline = format!(
+                "Filter “{}”: {found} {} · Esc clears",
+                state.filter,
+                if found == 1 { "repo" } else { "repos" }
+            );
         }
         let open_prs = state.open_prs();
 
@@ -1719,6 +1731,10 @@ impl Render for StatusView {
             .track_focus(&self.focus)
             .key_context("StatusView")
             .on_key_down(move |event, window, cx| {
+                if filter_key(&filter_state, event, mode, window, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
                 if event.keystroke.key == "escape" {
                     match mode {
                         Mode::Panel => panel::dismiss(window, cx),
@@ -1774,6 +1790,62 @@ impl Render for StatusView {
 /// In the window, a wheel over `part` (the header or the footer) scrolls the
 /// table sideways, as it does over the columns' headers; only over a
 /// column's commits does it scroll up and down.
+/// Typing filters the repos: letters add to the filter, Backspace takes
+/// one off, Esc clears it, Enter opens the first repo listed. True when
+/// the key was the filter's.
+fn filter_key(
+    state: &Entity<AppState>,
+    event: &gpui::KeyDownEvent,
+    mode: Mode,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    let k = &event.keystroke;
+    let m = &k.modifiers;
+    if m.control || m.alt || m.platform || m.function {
+        return false;
+    }
+    let filter = state.read(cx).filter.clone();
+    let typed = k
+        .key_char
+        .as_deref()
+        .filter(|c| c.chars().all(|ch| !ch.is_control()) && !c.is_empty());
+    let new = match k.key.as_str() {
+        "escape" if !filter.is_empty() => String::new(),
+        "backspace" if !filter.is_empty() => {
+            let mut f = filter.clone();
+            f.pop();
+            f
+        }
+        "enter" if !filter.is_empty() => {
+            let first = {
+                let s = state.read(cx);
+                s.sorted(&s.statuses)
+                    .first()
+                    .or(s.sorted(&s.remote_statuses).first())
+                    .map(|r| r.path.clone())
+            };
+            if let Some(path) = first {
+                open_repo(&path, cx);
+                if mode == Mode::Panel {
+                    panel::dismiss(window, cx);
+                }
+            }
+            return true;
+        }
+        _ => match typed {
+            // A space can't start a filter.
+            Some(c) if !(filter.is_empty() && c.trim().is_empty()) => format!("{filter}{c}"),
+            _ => return false,
+        },
+    };
+    state.update(cx, |s, cx| {
+        s.filter = new;
+        cx.notify();
+    });
+    true
+}
+
 fn sideways(part: impl IntoElement, mode: Mode, cx: &mut Context<StatusView>) -> AnyElement {
     if mode != Mode::Window {
         return part.into_any_element();

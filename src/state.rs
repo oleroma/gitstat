@@ -48,6 +48,9 @@ pub struct AppState {
     /// The same repos as statuses, by name, so the timeline can list them
     /// after the cloned ones. Never counted as unsynced.
     pub remote_statuses: Vec<RepoStatus>,
+    /// What was typed into the panel or the window: only repos whose name
+    /// or branch holds it are listed, with every section open. Not saved.
+    pub filter: String,
 }
 
 impl AppState {
@@ -76,6 +79,7 @@ impl AppState {
             prs: HashMap::new(),
             github_problem: None,
             remote_repos: Vec::new(),
+            filter: String::new(),
             remote_statuses: Vec::new(),
         }
     }
@@ -324,7 +328,7 @@ impl AppState {
     /// mode share it, and config.json keeps it.
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn folded(&self, section: crate::config::Section) -> bool {
-        self.config.folds.folded(section)
+        self.filter.trim().is_empty() && self.config.folds.folded(section)
     }
 
     /// The listed repos' open pull requests, most pressing first.
@@ -354,7 +358,7 @@ impl AppState {
     pub fn sorted<'a>(&self, list: &'a [RepoStatus]) -> Vec<&'a RepoStatus> {
         use crate::config::RepoSort;
         use std::cmp::Reverse;
-        let mut sorted: Vec<&RepoStatus> = list.iter().collect();
+        let mut sorted: Vec<&RepoStatus> = list.iter().filter(|s| self.matches(s)).collect();
         let sort = self.config.sort;
         // Larger is earlier, then the name.
         sorted.sort_by_cached_key(|s| {
@@ -370,6 +374,17 @@ impl AppState {
             (Reverse(score), s.name.to_lowercase())
         });
         sorted
+    }
+
+    /// Whether `s` passes the typed filter: its name or branch holds it,
+    /// ignoring case. Everything passes an empty one.
+    pub fn matches(&self, s: &RepoStatus) -> bool {
+        let filter = self.filter.trim().to_lowercase();
+        filter.is_empty()
+            || s.name.to_lowercase().contains(&filter)
+            || s.branch
+                .as_deref()
+                .is_some_and(|b| b.to_lowercase().contains(&filter))
     }
 
     /// When `s`'s newest pull request was last updated, Unix seconds.
@@ -524,6 +539,11 @@ mod tests {
             s.sorted(&list).iter().map(|r| r.name.clone()).collect()
         };
         assert_eq!(order(&s), ["a", "b", "c"]);
+        s.filter = "B".into();
+        assert_eq!(order(&s), ["b"]);
+        assert!(!s.folded(crate::config::Section::Synced));
+        s.filter.clear();
+        assert!(s.folded(crate::config::Section::Synced));
         s.config.sort = RepoSort::Status;
         assert_eq!(order(&s), ["a", "b", "c"]);
         s.config.sort = RepoSort::LastCommit;
