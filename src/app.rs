@@ -368,13 +368,19 @@ fn on_update(slot: usize, update: Update, cx: &mut App) -> (bool, bool) {
             (false, false)
         }
         Update::Status(status) => {
-            let line = {
+            let (line, changes) = {
                 let s = state.read(cx);
                 let old = s.statuses.iter().find(|o| o.path == status.path);
-                crate::notify::behind(&s.config.notify, old, &status)
+                (
+                    crate::notify::behind(&s.config.notify, old, &status),
+                    crate::notify::remote_changes(&s.config.notify, old, &status),
+                )
             };
             if let Some(line) = line {
                 notify(&[line], cx);
+            }
+            if !changes.is_empty() {
+                notify_remote(&status, changes, cx);
             }
             state.update(cx, |s, _| {
                 s.in_flight.remove(&status.path);
@@ -751,6 +757,52 @@ impl Render for Keepalive {
 }
 
 /// The current local time as HH:MM.
+/// Notifies what a fetch brought in, counting the new commits off the UI
+/// thread first.
+fn notify_remote(
+    status: &crate::git::RepoStatus,
+    changes: Vec<crate::notify::RemoteChange>,
+    cx: &mut App,
+) {
+    use crate::notify::RemoteChange;
+    let (repo, name) = (status.path.clone(), status.name.clone());
+    let task = cx.background_spawn(async move {
+        changes
+            .into_iter()
+            .map(|c| match c {
+                RemoteChange::New { branch } => format!("{name}: new branch {branch}"),
+                RemoteChange::Moved { branch, from, to } => {
+                    let range = format!("{from}..{to}");
+                    let count = crate::git::git(
+                        &repo,
+                        &["rev-list", "--count", &range, "--"],
+                        crate::git::LOCAL_TIMEOUT,
+                    )
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .and_then(|o| {
+                        String::from_utf8_lossy(&o.stdout)
+                            .trim()
+                            .parse::<u32>()
+                            .ok()
+                    });
+                    match count {
+                        Some(1) => format!("{name}: 1 new commit on {branch}"),
+                        Some(n) if n > 0 => format!("{name}: {n} new commits on {branch}"),
+                        // Rewritten (a force push), or git couldn't say.
+                        _ => format!("{name}: {branch} changed"),
+                    }
+                }
+            })
+            .collect::<Vec<String>>()
+    });
+    cx.spawn(async move |cx| {
+        let lines = task.await;
+        cx.update(|cx| notify(&lines, cx)).ok();
+    })
+    .detach();
+}
+
 /// Shows `lines` as one Windows notification from the tray icon.
 fn notify(lines: &[String], cx: &mut App) {
     if let Some(note) = crate::notify::note(lines) {

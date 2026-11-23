@@ -36,6 +36,9 @@ pub enum Setting {
     NotifyReview,
     NotifyChecks,
     NotifyBehind,
+    NotifyNewPr,
+    NotifyNewBranch,
+    NotifyNewCommits,
 }
 
 impl Setting {
@@ -56,6 +59,9 @@ impl Setting {
             Setting::NotifyReview => cfg.notify.review_requested,
             Setting::NotifyChecks => cfg.notify.checks_failed,
             Setting::NotifyBehind => cfg.notify.behind,
+            Setting::NotifyNewPr => cfg.notify.new_pr,
+            Setting::NotifyNewBranch => cfg.notify.new_branch,
+            Setting::NotifyNewCommits => cfg.notify.new_commits,
         }
     }
 
@@ -76,6 +82,9 @@ impl Setting {
             Setting::NotifyReview => &mut cfg.notify.review_requested,
             Setting::NotifyChecks => &mut cfg.notify.checks_failed,
             Setting::NotifyBehind => &mut cfg.notify.behind,
+            Setting::NotifyNewPr => &mut cfg.notify.new_pr,
+            Setting::NotifyNewBranch => &mut cfg.notify.new_branch,
+            Setting::NotifyNewCommits => &mut cfg.notify.new_commits,
         };
         *field = !*field;
     }
@@ -652,6 +661,15 @@ fn badges(cfg: &Config, p: &Palette) -> Vec<AnyElement> {
                     p,
                 ),
                 flag(
+                    "notify-new-pr",
+                    "A pull request is opened",
+                    "When someone opens a pull request in one of your repos.",
+                    Setting::NotifyNewPr,
+                    cfg.github_prs,
+                    cfg,
+                    p,
+                ),
+                flag(
                     "notify-checks",
                     "Checks fail",
                     "When an open pull request's checks turn red.",
@@ -665,6 +683,24 @@ fn badges(cfg: &Config, p: &Palette) -> Vec<AnyElement> {
                     "A repo falls behind",
                     "When a fetch brings in commits you haven't pulled.",
                     Setting::NotifyBehind,
+                    true,
+                    cfg,
+                    p,
+                ),
+                flag(
+                    "notify-new-branch",
+                    "A new branch appears",
+                    "When a fetch brings in a branch that wasn't on the remote before.",
+                    Setting::NotifyNewBranch,
+                    true,
+                    cfg,
+                    p,
+                ),
+                flag(
+                    "notify-new-commits",
+                    "New commits arrive",
+                    "When a fetch brings in commits on any remote branch, not your own pushes.",
+                    Setting::NotifyNewCommits,
                     true,
                     cfg,
                     p,
@@ -1241,6 +1277,9 @@ mod tests {
             Setting::NotifyReview,
             Setting::NotifyChecks,
             Setting::NotifyBehind,
+            Setting::NotifyNewPr,
+            Setting::NotifyNewBranch,
+            Setting::NotifyNewCommits,
         ];
         for setting in all {
             let before = Config::default();

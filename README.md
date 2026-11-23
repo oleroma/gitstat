@@ -123,9 +123,11 @@ off, a left-click shows the menu. The right-click menu is always there.
 ### Notifications
 
 **Settings ▸ Icon and badge ▸ Notifications** can have Windows tell you when
-a pull request in your repos asks for your review, when an open pull
-request's checks fail, or when a fetch finds a repo behind its remote. Each
-is off until you turn it on. They come from the tray icon, several changes
+a pull request in your repos asks for your review, when one is opened, when
+an open pull request's checks fail, when a fetch finds a repo behind its
+remote, when a fetch brings in a branch that wasn't there, or when it brings
+in new commits on any remote branch (with their count; your own pushes
+don't count). Each is off until you turn it on. They come from the tray icon, several changes
 at once as one notification, and Windows holds them back in Do not disturb.
 Starting gitstat says nothing about what was already so.
 
@@ -380,8 +382,11 @@ from an older version keeps working:
   "ignore": [],
   "notify": {
     "review_requested": false,
+    "new_pr": false,
     "checks_failed": false,
-    "behind": false
+    "behind": false,
+    "new_branch": false,
+    "new_commits": false
   }
 }
 ```
@@ -415,7 +420,7 @@ from an older version keeps working:
 | `flip_ms` | 560 | **Flip speed**: how long the flip takes, in ms. Fast 350, Normal 560, Slow 900, Very slow 5000 (for looking at each frame). |
 | `panel_slide_ms` | 150 | **Panel slides in**: how long the panel takes to slide in from the taskbar, in ms; 0 shows it at once. Very slow is 1500. |
 | `ignore` | `[]` | Repos to leave out entirely, by name, with `*` for any run of characters, see [Which repos](#which-repos). **Hide this repo** in a repo's right-click menu adds to it. |
-| `notify.review_requested`, `notify.checks_failed`, `notify.behind` | false | **Settings ▸ Icon and badge ▸ Notifications**, see [Notifications](#notifications). |
+| `notify.review_requested`, `notify.new_pr`, `notify.checks_failed`, `notify.behind`, `notify.new_branch`, `notify.new_commits` | false | **Settings ▸ Icon and badge ▸ Notifications**, see [Notifications](#notifications). |
 
 Edits apply within about a second, without a restart. **Edit config.json** in
 the panel's footer opens the file. The menu's toggles write the file too;

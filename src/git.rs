@@ -54,6 +54,9 @@ pub struct RepoStatus {
     pub unpushed_branches: Vec<(String, u32)>,
     /// Stash entries. Shown, but they don't make a repo unsynced.
     pub stashes: u32,
+    /// Every local and remote-tracking branch's full refname and commit,
+    /// so the app can tell what a fetch brought in.
+    pub tips: Vec<(String, String)>,
 }
 
 impl RepoStatus {
@@ -430,7 +433,14 @@ pub fn check_repo_detailed(root: &Path, repo: &Path, fetch: bool) -> (RepoStatus
                 status.operation = operation(git_dir);
                 status.stashes = stash_count(common_dir);
             }
-            status.unpushed_branches = unpushed_branches(repo);
+            status.tips = ref_tips(repo);
+            let has_remotes = status
+                .tips
+                .iter()
+                .any(|(r, _)| r.starts_with("refs/remotes/"));
+            if has_remotes {
+                status.unpushed_branches = unpushed_branches(repo);
+            }
             status.fetch_failed = fetch_error.is_some();
             status.error = fetch_error;
             // For sorting; the command-line build doesn't sort.
@@ -535,14 +545,40 @@ fn stash_count(common_dir: &Path) -> u32 {
         .unwrap_or(0)
 }
 
+/// Every branch, local and remote-tracking, with its commit.
+fn ref_tips(repo: &Path) -> Vec<(String, String)> {
+    let Ok(out) = git(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname)%1f%(objectname)",
+            "refs/heads",
+            "refs/remotes",
+        ],
+        LOCAL_TIMEOUT,
+    ) else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let (r, oid) = l.split_once('\x1f')?;
+            (!r.ends_with("/HEAD")).then(|| (r.to_string(), oid.to_string()))
+        })
+        .collect()
+}
+
 /// At most this many never-pushed branches get a `rev-list` each.
 const MAX_LOCAL_ONLY_CHECKS: usize = 30;
 
 /// Local branches other than HEAD's with commits that no remote has: ahead
 /// of their upstream, or with no upstream and commits on no remote branch.
 /// A branch whose upstream is gone (deleted after a merge) is left out, and
-/// so is everything in a repo with no remote branches at all, which already
-/// shows as having no upstream.
+/// a repo with no remote branches at all isn't asked, as it already shows
+/// as having no upstream.
 fn unpushed_branches(repo: &Path) -> Vec<(String, u32)> {
     let text = |args: &[&str]| -> Option<String> {
         let out = git(repo, args, LOCAL_TIMEOUT).ok()?;
@@ -550,12 +586,6 @@ fn unpushed_branches(repo: &Path) -> Vec<(String, u32)> {
             .success()
             .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
     };
-    let Some(remotes) = text(&["for-each-ref", "--count=1", "--format=x", "refs/remotes"]) else {
-        return Vec::new();
-    };
-    if remotes.trim().is_empty() {
-        return Vec::new();
-    }
     let Some(heads) = text(&[
         "for-each-ref",
         "--format=%(HEAD)%1f%(refname:short)%1f%(upstream)%1f%(upstream:track)",

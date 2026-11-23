@@ -45,6 +45,8 @@ pub fn pr_changes(
                 && !was.is_some_and(|b| b.review_requested)
             {
                 "review asked"
+            } else if cfg.new_pr && was.is_none() {
+                "new pull request"
             } else if cfg.checks_failed
                 && pr.checks == Checks::Failing
                 && !was.is_some_and(|b| b.checks == Checks::Failing && b.head_oid == pr.head_oid)
@@ -58,6 +60,64 @@ pub fn pr_changes(
     }
     lines.sort();
     lines
+}
+
+/// What a fetch brought in on one remote branch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RemoteChange {
+    /// A branch that wasn't there.
+    New { branch: String },
+    /// A branch that moved: its old and new commits.
+    Moved {
+        branch: String,
+        from: String,
+        to: String,
+    },
+}
+
+/// The remote branches that appeared or moved between two checks of one
+/// repo, as far as `cfg` asks. Ones that now match a local branch are left
+/// out: that is your own push. The repo's first check says nothing.
+pub fn remote_changes(
+    cfg: &NotifyConfig,
+    old: Option<&RepoStatus>,
+    new: &RepoStatus,
+) -> Vec<RemoteChange> {
+    let Some(old) = old.filter(|o| !o.tips.is_empty()) else {
+        return Vec::new();
+    };
+    if !(cfg.new_branch || cfg.new_commits) || new.remote_only {
+        return Vec::new();
+    }
+    let local: Vec<&str> = new
+        .tips
+        .iter()
+        .filter(|(r, _)| r.starts_with("refs/heads/"))
+        .map(|(_, oid)| oid.as_str())
+        .collect();
+    let mut changes = Vec::new();
+    for (r, oid) in &new.tips {
+        let Some(branch) = r.strip_prefix("refs/remotes/") else {
+            continue;
+        };
+        if local.contains(&oid.as_str()) {
+            continue;
+        }
+        match old.tips.iter().find(|(o, _)| o == r) {
+            None if cfg.new_branch => changes.push(RemoteChange::New {
+                branch: branch.to_string(),
+            }),
+            Some((_, before)) if cfg.new_commits && before != oid => {
+                changes.push(RemoteChange::Moved {
+                    branch: branch.to_string(),
+                    from: before.clone(),
+                    to: oid.clone(),
+                })
+            }
+            _ => {}
+        }
+    }
+    changes
 }
 
 /// Several lines become one notification.
@@ -133,11 +193,57 @@ mod tests {
     }
 
     #[test]
+    fn remote_branches_that_appear_or_move() {
+        let on = NotifyConfig {
+            new_branch: true,
+            new_commits: true,
+            ..Default::default()
+        };
+        let tips = |t: &[(&str, &str)]| RepoStatus {
+            tips: t
+                .iter()
+                .map(|(r, o)| (r.to_string(), o.to_string()))
+                .collect(),
+            ..Default::default()
+        };
+        let old = tips(&[
+            ("refs/heads/main", "a"),
+            ("refs/remotes/origin/main", "a"),
+            ("refs/remotes/origin/x", "x1"),
+        ]);
+        let new = tips(&[
+            ("refs/heads/main", "a"),
+            ("refs/heads/mine", "m"),
+            ("refs/remotes/origin/main", "b"),
+            ("refs/remotes/origin/x", "x1"),
+            ("refs/remotes/origin/y", "y1"),
+            ("refs/remotes/origin/mine", "m"),
+        ]);
+        assert_eq!(
+            remote_changes(&on, Some(&old), &new),
+            [
+                RemoteChange::Moved {
+                    branch: "origin/main".into(),
+                    from: "a".into(),
+                    to: "b".into()
+                },
+                RemoteChange::New {
+                    branch: "origin/y".into()
+                },
+            ]
+        );
+        assert!(remote_changes(&on, None, &new).is_empty());
+        assert!(remote_changes(&NotifyConfig::default(), Some(&old), &new).is_empty());
+    }
+
+    #[test]
     fn only_new_changes_notify() {
         let on = NotifyConfig {
             review_requested: true,
             checks_failed: true,
             behind: true,
+            new_pr: true,
+            ..Default::default()
         };
         let path = PathBuf::from("r");
         let names = HashMap::from([(path.clone(), "repo".to_string())]);
@@ -155,7 +261,10 @@ mod tests {
         )]);
         assert_eq!(
             pr_changes(&on, &names, &old, &new),
-            ["repo #1: review asked · t1", "repo #3: checks failed · t3"]
+            [
+                "repo #1: review asked · t1",
+                "repo #3: new pull request · t3"
+            ]
         );
         // The first poll says nothing.
         assert!(pr_changes(&on, &names, &HashMap::new(), &new).is_empty());

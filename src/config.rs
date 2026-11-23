@@ -194,6 +194,12 @@ pub struct NotifyConfig {
     pub checks_failed: bool,
     /// A fetch finds a repo behind its remote.
     pub behind: bool,
+    /// A pull request is opened.
+    pub new_pr: bool,
+    /// A fetch brings in a branch that wasn't there.
+    pub new_branch: bool,
+    /// A fetch brings in commits on a remote branch.
+    pub new_commits: bool,
 }
 
 /// The sections the panel lists, and the big window shows as groups of
