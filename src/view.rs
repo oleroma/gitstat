@@ -121,7 +121,9 @@ pub fn show_window(cx: &mut App) {
                     cx.spawn(async move |cx| {
                         // Minimising goes the way closing does.
                         unsafe { win::minimize_closes(h) };
-                        // Its rim and title bar in colours the flip draws.
+                        // Its rim and title bar in colours the flip draws,
+                        // as thick as Windows draws it.
+                        seen_rim(h);
                         unsafe {
                             win::set_frame_colors(h, rim_rgb(dark), Some(title_bar_rgb(dark)))
                         };
@@ -1792,7 +1794,7 @@ impl Render for StatusView {
                                 bounds,
                                 px(win::PANEL_RADIUS),
                                 gpui::transparent_black(),
-                                px(1.0 / window.scale_factor()),
+                                px(rim_width(window.scale_factor()) / window.scale_factor()),
                                 rim(dark),
                                 gpui::BorderStyle::Solid,
                             ));
@@ -1897,6 +1899,27 @@ fn sideways(part: impl IntoElement, mode: Mode, cx: &mut Context<StatusView>) ->
 /// one it draws is exactly the same and they hand over unseen.
 pub(crate) fn rim(dark: bool) -> Hsla {
     gpui::rgb(rim_rgb(dark)).into()
+}
+
+thread_local! {
+    /// How thick Windows draws the rim, physical px, once read.
+    static RIM_PX: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Notes how thick Windows draws `h`'s rim, for gitstat to draw its own
+/// exactly as thick.
+pub(crate) fn seen_rim(h: isize) {
+    if let Some(v) = win::rim_thickness(h) {
+        RIM_PX.with(|c| c.set(Some(v)));
+    }
+}
+
+/// The rim's thickness, physical px, at scale `s`: as Windows draws it,
+/// else one logical px.
+pub(crate) fn rim_width(s: f32) -> f32 {
+    RIM_PX
+        .with(|c| c.get())
+        .map_or(s.round().max(1.0), |v| v as f32)
 }
 
 /// The rim's colour, 0xRRGGBB.

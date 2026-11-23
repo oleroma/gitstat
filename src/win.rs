@@ -11,8 +11,8 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM}
 use windows_sys::Win32::Graphics::Dwm::{
     DWMNCRP_DISABLED, DWMNCRP_USEWINDOWSTYLE, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR,
     DWMWA_COLOR_DEFAULT, DWMWA_COLOR_NONE, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_NCRENDERING_POLICY,
-    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND, DwmGetWindowAttribute,
-    DwmSetWindowAttribute,
+    DWMWA_VISIBLE_FRAME_BORDER_THICKNESS, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
+    DWMWCP_ROUND, DwmGetWindowAttribute, DwmSetWindowAttribute,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     ClientToScreen, CombineRgn, CreateEllipticRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject,
@@ -398,6 +398,22 @@ fn hidden_part(moved: Rect, shown: Rect) -> Rect {
     } else {
         Rect::new(shown.right, moved.top, moved.right, moved.bottom)
     }
+}
+
+/// The thickness Windows draws a window's rim at, physical px, as it
+/// draws it on `h` (Windows 11; it scales with the display).
+pub fn rim_thickness(h: isize) -> Option<u32> {
+    let hwnd = live(h)?;
+    let mut v: u32 = 0;
+    let ok = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_VISIBLE_FRAME_BORDER_THICKNESS as u32,
+            (&raw mut v).cast(),
+            size_of::<u32>() as u32,
+        )
+    } == 0;
+    (ok && (1..=8).contains(&v)).then_some(v)
 }
 
 /// How far the window's visible frame (where Windows draws its rim)

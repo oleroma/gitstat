@@ -1340,7 +1340,7 @@ impl Render for MorphView {
                             sheet,
                             px(RADIUS),
                             gpui::transparent_black(),
-                            px(1.0 / window.scale_factor()),
+                            px(view::rim_width(window.scale_factor()) / window.scale_factor()),
                             rim,
                             gpui::BorderStyle::Solid,
                         ));

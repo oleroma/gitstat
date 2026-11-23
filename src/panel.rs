@@ -213,7 +213,8 @@ fn open(anchor: Anchor, slide: bool, cx: &mut App) {
                     );
                     // Its rim in the colour the flip and a clipped slide draw.
                     cx.spawn(async move |_| unsafe {
-                        win::set_frame_colors(h, view::rim_rgb(dark), None)
+                        win::set_frame_colors(h, view::rim_rgb(dark), None);
+                        view::seen_rim(h);
                     })
                     .detach();
                     cx.spawn(async move |_| unsafe { win::panel_topmost(h, under, sliding) })
