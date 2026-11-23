@@ -542,6 +542,8 @@ struct Plan {
     /// The big window's title bar height, physical px: the sheet grows
     /// over it too, so the bar never pops in at the end.
     caption: f32,
+    /// The big window is maximised (or will be): it has no rim.
+    maximized: bool,
     /// The work areas the flip may draw in, physical px from its top-left
     /// corner: never over a taskbar, which the windows' own shadows stay
     /// under.
@@ -811,6 +813,7 @@ fn plan(
         from,
         to,
         caption: caption as f32,
+        maximized,
         work,
         trees,
         spines,
@@ -1041,8 +1044,8 @@ impl Render for MorphView {
         // 0 is the panel's layout, 1 the big window's.
         let e = if open { turned } else { 1.0 - turned };
         let reveal = 1.0 - ease(phase(revealed, Duration::ZERO, reveal_len));
-        // The windows' own rim and shadow, drawn around the sheet while
-        // neither window is on screen to show its own.
+        // The windows' own shadow, drawn around the sheet while neither
+        // window is on screen to show its own.
         let framed = if (self.framed.0..self.framed.1).contains(&self.frames) {
             1.0
         } else {
@@ -1065,10 +1068,15 @@ impl Render for MorphView {
         let sheet = lerp_bounds(self.plan.from, to_sheet, e, s);
         let work = lerp_bounds(self.plan.work, self.plan.work, 0.0, s);
         let title = Bounds::new(sheet.origin, size(sheet.size.width, px(cap * e / s)));
-        let title_color: Hsla = if dark {
-            gpui::rgb(0x202020).into()
+        let title_color = view::title_bar(dark);
+        // The rim stays drawn from when the starting window has gone to the
+        // very end, over the ending window's own of the same colour, so it
+        // never blinks. A maximised big window has none: there it thins
+        // out toward that end.
+        let rim_alpha = if self.frames >= self.framed.0 {
+            if self.plan.maximized { 1.0 - e } else { 1.0 }
         } else {
-            gpui::rgb(0xf3f3f3).into()
+            0.0
         };
         let trees: Vec<(Arc<crate::repo_graph::RepoGraph>, bool, Ends, f32)> = self
             .plan
@@ -1304,9 +1312,8 @@ impl Render for MorphView {
                         }
                     });
                     // The rim: one physical px, light over dark, dark over light.
-                    if framed > 0.0 {
-                        let rim = view::rim(dark);
-                        let rim = rim.opacity(rim.a * framed);
+                    if rim_alpha > 0.0 {
+                        let rim = view::rim(dark).opacity(rim_alpha);
                         window.paint_quad(quad(
                             sheet,
                             px(RADIUS),

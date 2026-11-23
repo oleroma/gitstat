@@ -207,6 +207,15 @@ fn open(anchor: Anchor, slide: bool, cx: &mut App) {
                 if let Some(h) = hwnd {
                     // Native z-order calls must run outside this update.
                     let under = crate::morph::flip_hwnd(cx);
+                    let dark = matches!(
+                        window.appearance(),
+                        gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+                    );
+                    // Its rim in the colour the flip and a clipped slide draw.
+                    cx.spawn(async move |_| unsafe {
+                        win::set_frame_colors(h, view::rim_rgb(dark), None)
+                    })
+                    .detach();
                     cx.spawn(async move |_| unsafe { win::panel_topmost(h, under, sliding) })
                         .detach();
                 }

@@ -114,9 +114,17 @@ pub fn show_window(cx: &mut App) {
                             at(bounds.origin.y + bounds.size.height),
                         )
                     };
+                    let dark = matches!(
+                        window.appearance(),
+                        WindowAppearance::Dark | WindowAppearance::VibrantDark
+                    );
                     cx.spawn(async move |cx| {
                         // Minimising goes the way closing does.
                         unsafe { win::minimize_closes(h) };
+                        // Its rim and title bar in colours the flip draws.
+                        unsafe {
+                            win::set_frame_colors(h, rim_rgb(dark), Some(title_bar_rgb(dark)))
+                        };
                         // A maximised window shows at its normal size and
                         // maximises a moment later: measure it, and let
                         // the flip reveal it, once it has.
@@ -1791,12 +1799,25 @@ fn sideways(part: impl IntoElement, mode: Mode, cx: &mut Context<StatusView>) ->
 
 /// The light rim Windows 11 draws around a window, for where gitstat
 /// draws it itself (the flip, a clipped slide).
+/// gitstat sets it on its windows itself (`win::set_frame_colors`), so the
+/// one it draws is exactly the same and they hand over unseen.
 pub(crate) fn rim(dark: bool) -> Hsla {
-    if dark {
-        gpui::white().opacity(0.16)
-    } else {
-        gpui::black().opacity(0.16)
-    }
+    gpui::rgb(rim_rgb(dark)).into()
+}
+
+/// The rim's colour, 0xRRGGBB.
+pub(crate) fn rim_rgb(dark: bool) -> u32 {
+    if dark { 0x444444 } else { 0xd6d6d6 }
+}
+
+/// The big window's title bar colour, set on it and drawn by the flip.
+pub(crate) fn title_bar(dark: bool) -> Hsla {
+    gpui::rgb(title_bar_rgb(dark)).into()
+}
+
+/// The title bar's colour, 0xRRGGBB.
+pub(crate) fn title_bar_rgb(dark: bool) -> u32 {
+    if dark { 0x202020 } else { 0xf3f3f3 }
 }
 
 /// A bar of the repos' tones: green synced, amber local work, red needs

@@ -9,8 +9,8 @@
 use crate::layout::Rect;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::{
-    DWMNCRP_DISABLED, DWMNCRP_USEWINDOWSTYLE, DWMWA_BORDER_COLOR, DWMWA_COLOR_DEFAULT,
-    DWMWA_COLOR_NONE, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_NCRENDERING_POLICY,
+    DWMNCRP_DISABLED, DWMNCRP_USEWINDOWSTYLE, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR,
+    DWMWA_COLOR_DEFAULT, DWMWA_COLOR_NONE, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_NCRENDERING_POLICY,
     DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND, DwmGetWindowAttribute,
     DwmSetWindowAttribute,
 };
@@ -518,7 +518,38 @@ pub unsafe fn slide_panel(h: isize, moved: Rect, shown: Option<Rect>) {
                 DWMNCRP_USEWINDOWSTYLE as u32,
             );
             dwm_set(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND as u32);
-            dwm_set(hwnd, DWMWA_BORDER_COLOR, DWMWA_COLOR_DEFAULT);
+            dwm_set(
+                hwnd,
+                DWMWA_BORDER_COLOR,
+                PANEL_RIM.load(std::sync::atomic::Ordering::Relaxed),
+            );
+        }
+    }
+}
+
+/// The panel's rim as set, a COLORREF, for after a clipped slide.
+static PANEL_RIM: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(DWMWA_COLOR_DEFAULT);
+
+/// 0xRRGGBB as a COLORREF (0x00BBGGRR).
+fn colorref(rgb: u32) -> u32 {
+    ((rgb & 0xff) << 16) | (rgb & 0xff00) | ((rgb >> 16) & 0xff)
+}
+
+/// Sets the window's rim and, given, its title bar to exact colours
+/// (0xRRGGBB), which gitstat then draws itself in the flip and a clipped
+/// slide, so the drawn and the real ones hand over unseen. A panel's rim
+/// is also kept for after a clipped slide.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn set_frame_colors(h: isize, rim: u32, caption: Option<u32>) {
+    let Some(hwnd) = live(h) else { return };
+    unsafe {
+        dwm_set(hwnd, DWMWA_BORDER_COLOR, colorref(rim));
+        match caption {
+            Some(c) => dwm_set(hwnd, DWMWA_CAPTION_COLOR, colorref(c)),
+            None => PANEL_RIM.store(colorref(rim), std::sync::atomic::Ordering::Relaxed),
         }
     }
 }
