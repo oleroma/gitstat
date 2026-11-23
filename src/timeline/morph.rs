@@ -225,6 +225,59 @@ pub fn paint_tree(
     }
 }
 
+/// The strip's fade at the end of its history, carried with the tree as
+/// it turns and narrowing to nothing by the column, which has none.
+pub fn paint_tail_fade(ends: Ends, e: f32, bg: Hsla, window: &mut Window) {
+    let e = e.clamp(0.0, 1.0);
+    let f = Frame::new(ends, e);
+    let w = super::FADE.min(f.len) * (1.0 - e);
+    if w <= 0.0 {
+        return;
+    }
+    let half = super::STRIP_HEIGHT / 2.0;
+    // From the end of the drawn history, back towards the newest.
+    let tail = (
+        f.origin.0 + f.len * f.along.0,
+        f.origin.1 + f.len * f.along.1,
+    );
+    let at = |u: f32, v: f32| {
+        pt((
+            tail.0 - u * f.along.0 + v * f.across.0,
+            tail.1 - u * f.along.1 + v * f.across.1,
+        ))
+    };
+    if e <= 0.0 {
+        // Still, exactly the strip's own.
+        let b = Bounds::new(at(0.0, -half), size(px(w), px(2.0 * half)));
+        window.paint_quad(gpui::fill(
+            b,
+            gpui::linear_gradient(
+                90.,
+                gpui::linear_color_stop(bg, 0.),
+                gpui::linear_color_stop(bg.opacity(0.), 1.),
+            ),
+        ));
+        return;
+    }
+    let mut path = PathBuilder::fill();
+    path.move_to(at(0.0, -half));
+    path.line_to(at(w, -half));
+    path.line_to(at(w, half));
+    path.line_to(at(0.0, half));
+    path.close();
+    if let Ok(path) = path.build() {
+        // Towards the newest: right in the strip, up in the column.
+        window.paint_path(
+            path,
+            gpui::linear_gradient(
+                90. * (1.0 - e),
+                gpui::linear_color_stop(bg, 0.),
+                gpui::linear_color_stop(bg.opacity(0.), 1.),
+            ),
+        );
+    }
+}
+
 fn pt((x, y): P) -> gpui::Point<gpui::Pixels> {
     point(px(x), px(y))
 }

@@ -1300,11 +1300,15 @@ impl Render for StatusView {
                     f32::from(self.list.max_offset().height),
                 );
             }
-            Mode::Window => {
-                if let Some(x) = NEXT_TABLE_SCROLL.take() {
-                    self.table.set_offset(point(px(-x), self.table.offset().y));
-                }
-            }
+            Mode::Window => {}
+        }
+        // Set by the flip, which has brought any asked-for column into
+        // sight already.
+        let table_to = (mode == Mode::Window)
+            .then(|| NEXT_TABLE_SCROLL.take())
+            .flatten();
+        if let Some(x) = table_to {
+            self.table.set_offset(point(px(-x), self.table.offset().y));
         }
         let state = self.state.clone();
         let state = state.read(cx);
@@ -1605,7 +1609,7 @@ impl Render for StatusView {
                 let cells = table_cells(state);
                 let lefts = cell_lefts(&cells);
                 let focused = focus.as_deref().and_then(|f| cell_of(&cells, f));
-                if let Some(i) = focused {
+                if let Some(i) = focused.filter(|_| table_to.is_none()) {
                     self.table.scroll_to_item(i);
                 }
                 let shown = shown_columns(&self.table, window, &lefts, focused);

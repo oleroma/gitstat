@@ -14,7 +14,7 @@ pub(crate) mod ink;
 mod morph;
 
 pub use column::COLUMN_WIDTH;
-pub use morph::{Ends, paint_tree};
+pub use morph::{Ends, paint_tail_fade, paint_tree};
 
 use crate::git::RepoStatus;
 use crate::graph::{self, Class, PrColors, PrState, Seg};

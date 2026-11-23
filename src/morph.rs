@@ -499,9 +499,11 @@ struct Carried {
 struct Plan {
     /// The flip window's place, physical px.
     union: Rect,
-    /// The panel's and the big window's client areas, physical px from the
+    /// The panel's visible frame, rim and all, physical px from the flip
+    /// window's top-left corner: where the sheet starts or ends.
+    from_frame: Bounds<f32>,
+    /// The big window's client area, physical px from the
     /// flip window's top-left corner.
-    from: Bounds<f32>,
     to: Bounds<f32>,
     /// The big window's title bar height, physical px: the sheet grows
     /// over it too, so the bar never pops in at the end.
@@ -642,6 +644,13 @@ fn plan(
         size: size(r.width() as f32, r.height() as f32),
     };
     let (from, to) = (local(panel_rect), local(target));
+    // The panel's visible frame: its rim, which Windows draws just outside
+    // its client area, too.
+    let rim = view::rim_width(ps).round();
+    let from_frame = Bounds {
+        origin: point(from.origin.x - rim, from.origin.y - rim),
+        size: size(from.size.width + 2.0 * rim, from.size.height + 2.0 * rim),
+    };
     let work = {
         let (a, b) = (panel_rect.centre(), target.centre());
         let (a, b) = (
@@ -718,27 +727,35 @@ fn plan(
     let mut table_to = None;
     let mut list_to = None;
     match big {
-        None if focus.is_none() => {
+        None => {
             let topmost = repo_cells
                 .iter()
                 .filter_map(|s| Some((*s, strips.get(&s.path)?)))
                 .filter(|(_, b)| f32::from(b.origin.y) + f32::from(b.size.height) / 2.0 >= list_top)
                 .min_by(|a, b| f32::from(a.1.origin.y).total_cmp(&f32::from(b.1.origin.y)))
                 .map(|(s, _)| s);
-            if let Some(i) = topmost.and_then(|s| cell_of_repo(&s.path)) {
-                let k = if i > 0 && matches!(cells[i - 1], view::Cell::Spine(..)) {
-                    i - 1
-                } else {
-                    i
-                };
-                let total = lefts
-                    .last()
-                    .zip(cells.last())
-                    .map_or(0.0, |(l, c)| l + c.width());
-                let x = lefts[k].min(total - to.size.width / ws).max(0.0);
-                scroll = x * ws;
-                table_to = Some(x);
+            let total = lefts
+                .last()
+                .zip(cells.last())
+                .map_or(0.0, |(l, c)| l + c.width());
+            let wide = to.size.width / ws;
+            let mut x = match topmost.and_then(|s| cell_of_repo(&s.path)) {
+                Some(i) if i > 0 && matches!(cells[i - 1], view::Cell::Spine(..)) => lefts[i - 1],
+                Some(i) => lefts[i],
+                None => 0.0,
+            };
+            // A repo asked for comes into sight, as little moved as it
+            // takes.
+            if let Some(i) = focus.and_then(|f| view::cell_of(&cells, f)) {
+                if lefts[i] < x {
+                    x = lefts[i];
+                } else if lefts[i] + COLUMN_WIDTH > x + wide {
+                    x = lefts[i] + COLUMN_WIDTH - wide;
+                }
             }
+            let x = x.min(total - wide).max(0.0);
+            scroll = x * ws;
+            table_to = Some(x);
         }
         Some(_) => {
             let leftmost = cells.iter().zip(&lefts).find_map(|(c, l)| match c {
@@ -769,7 +786,6 @@ fn plan(
                 }
             }
         }
-        None => {}
     }
     // Where each header part sits in a strip and in a column, from a repo
     // both views drew: for a repo one of them didn't.
@@ -1051,7 +1067,7 @@ fn plan(
     }
     (!trees.is_empty()).then_some(Plan {
         union,
-        from,
+        from_frame,
         to,
         caption: (
             caption.0 as f32,
@@ -1403,7 +1419,7 @@ impl Render for MorphView {
         };
         // On whole physical px, so its rim stays crisp and even rather
         // than smearing across two px as it moves.
-        let sheet = snapped(lerp_bounds(self.plan.from, to_sheet, e, s), s);
+        let sheet = snapped(lerp_bounds(self.plan.from_frame, to_sheet, e, s), s);
         let work = lerp_bounds(self.plan.work, self.plan.work, 0.0, s);
 
         // The sheet in bands, top to bottom, each its view's colour: the
@@ -1511,6 +1527,10 @@ impl Render for MorphView {
 
         // The parts both views show, moving and growing from one to the
         // other, over the sheet.
+        // A check under way dims the health bar, in the views and here.
+        let checking = cx
+            .try_global::<Ui>()
+            .is_some_and(|ui| ui.state.read(cx).sweeping);
         let parts: Vec<Drawn> = self
             .plan
             .parts
@@ -1618,13 +1638,14 @@ impl Render for MorphView {
                             crate::timeline::paint_tree(
                                 graph, *dirty, *ends, e, *alpha, dark, &p, window,
                             );
+                            crate::timeline::paint_tail_fade(*ends, e, p.surface, window);
                         }
                     });
                     window.with_content_mask(Some(gpui::ContentMask { bounds: sheet }), |window| {
                         for d in &parts {
                             let b = d.bounds;
                             if let Kind::Health(counts) = d.kind {
-                                paint_health(window, b, counts, &p);
+                                paint_health(window, b, counts, checking, &p);
                                 continue;
                             }
                             if let Some(image) = &d.image {
@@ -1787,16 +1808,28 @@ fn paint_words(
 
 /// The health bar as the views draw it: a rounded track filled by the
 /// synced, local-work and needs-a-look repos' shares, in that order.
-fn paint_health(window: &mut Window, b: Bounds<Pixels>, counts: [usize; 3], p: &Palette) {
+fn paint_health(
+    window: &mut Window,
+    b: Bounds<Pixels>,
+    counts: [usize; 3],
+    checking: bool,
+    p: &Palette,
+) {
+    // Dimmed while a check runs, as the views dim it.
+    let dim = |c: Hsla| if checking { c.opacity(c.a * 0.6) } else { c };
     let r = b.size.height / 2.0;
-    window.paint_quad(quad(
-        b,
-        r,
-        p.hover,
-        px(0.0),
-        gpui::transparent_black(),
-        gpui::BorderStyle::Solid,
-    ));
+    // The track shows only with no repos: the segments cover it all, and
+    // dimmed over it they would show it through.
+    if counts.iter().sum::<usize>() == 0 {
+        window.paint_quad(quad(
+            b,
+            r,
+            dim(p.hover),
+            px(0.0),
+            gpui::transparent_black(),
+            gpui::BorderStyle::Solid,
+        ));
+    }
     let total = counts.iter().sum::<usize>().max(1) as f32;
     let mut x = b.left();
     window.with_content_mask(Some(gpui::ContentMask { bounds: b }), |window| {
@@ -1815,7 +1848,7 @@ fn paint_health(window: &mut Window, b: Bounds<Pixels>, counts: [usize; 3], p: &
                     top_right: round(seg.right() >= b.right() - px(0.01)),
                     bottom_right: round(seg.right() >= b.right() - px(0.01)),
                 },
-                color,
+                dim(color),
                 px(0.0),
                 gpui::transparent_black(),
                 gpui::BorderStyle::Solid,
