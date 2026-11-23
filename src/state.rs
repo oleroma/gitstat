@@ -124,7 +124,7 @@ impl AppState {
         match self.config.badge_number {
             BadgeNumber::Unsynced => self.unsynced(),
             BadgeNumber::Dirty => repos(|s| s.dirty),
-            BadgeNumber::Ahead => repos(|s| s.ahead > 0),
+            BadgeNumber::Ahead => repos(|s| s.ahead > 0 || !s.unpushed_branches.is_empty()),
             BadgeNumber::Behind => repos(|s| s.behind > 0),
             BadgeNumber::PullRequests => {
                 let remote: u64 = self.remote_repos.iter().map(|r| r.open_prs).sum();
@@ -431,13 +431,13 @@ fn worst_mode(modes: &[WatchMode]) -> Option<WatchMode> {
 
 /// 0 is worst: error, diverged, behind, ahead, dirty, no upstream, synced.
 fn severity(s: &RepoStatus) -> u8 {
-    if s.error.is_some() {
+    if s.error.is_some() || s.operation.is_some() {
         0
     } else if s.is_diverged() {
         1
     } else if s.behind > 0 {
         2
-    } else if s.ahead > 0 {
+    } else if s.ahead > 0 || !s.unpushed_branches.is_empty() {
         3
     } else if s.dirty {
         4

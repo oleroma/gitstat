@@ -303,7 +303,11 @@ pub fn tip(s: &RepoStatus) -> String {
         return format!("{TIP_PREFIX} error: {short}");
     }
     let mut parts = Vec::new();
-    if !s.has_upstream {
+    if let Some(op) = &s.operation {
+        parts.push(op.clone());
+    } else if let Some(oid) = &s.detached {
+        parts.push(format!("detached at {oid}"));
+    } else if !s.has_upstream {
         parts.push("no upstream".to_string());
     }
     if s.ahead > 0 {
@@ -315,8 +319,14 @@ pub fn tip(s: &RepoStatus) -> String {
     if s.dirty {
         parts.push("uncommitted changes".to_string());
     }
+    if !s.unpushed_branches.is_empty() {
+        parts.push(s.unpushed_branches_text());
+    }
     if parts.is_empty() {
         parts.push("in sync".to_string());
+    }
+    if s.stashes > 0 {
+        parts.push(format!("{} stashed", s.stashes));
     }
     format!("{TIP_PREFIX} {}", parts.join(", "))
 }

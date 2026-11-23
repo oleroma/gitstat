@@ -42,6 +42,16 @@ pub struct RepoStatus {
     /// Branches (by name, local and remote merged) whose commits aren't all
     /// in the default branch, which itself is left out.
     pub unmerged: Vec<String>,
+    /// A rebase, merge, cherry-pick, revert or bisect left half done, such
+    /// as `rebasing 3/7`.
+    pub operation: Option<String>,
+    /// HEAD isn't on a branch: its short commit id.
+    pub detached: Option<String>,
+    /// Local branches other than the checked-out one with commits no
+    /// remote has: ahead of their upstream, or never pushed. Name and count.
+    pub unpushed_branches: Vec<(String, u32)>,
+    /// Stash entries. Shown, but they don't make a repo unsynced.
+    pub stashes: u32,
 }
 
 impl RepoStatus {
@@ -51,6 +61,18 @@ impl RepoStatus {
             && !self.dirty
             && self.ahead == 0
             && self.behind == 0
+            && self.operation.is_none()
+            && self.unpushed_branches.is_empty()
+    }
+
+    /// Short text for the other branches' unpushed work, such as
+    /// `wip unpushed` or `3 branches unpushed`; empty when there is none.
+    pub fn unpushed_branches_text(&self) -> String {
+        match self.unpushed_branches.as_slice() {
+            [] => String::new(),
+            [(name, _)] => format!("{name} unpushed"),
+            more => format!("{} branches unpushed", more.len()),
+        }
     }
 
     pub fn is_diverged(&self) -> bool {
@@ -69,7 +91,11 @@ impl RepoStatus {
             return format!("error: {error}");
         }
         let mut parts = Vec::new();
-        if !self.has_upstream {
+        if let Some(op) = &self.operation {
+            parts.push(op.clone());
+        } else if let Some(oid) = &self.detached {
+            parts.push(format!("detached at {oid}"));
+        } else if !self.has_upstream {
             parts.push("no upstream".to_string());
         }
         if self.ahead > 0 {
@@ -84,9 +110,17 @@ impl RepoStatus {
         if self.dirty {
             parts.push("dirty".to_string());
         }
+        if !self.unpushed_branches.is_empty() {
+            parts.push(self.unpushed_branches_text());
+        }
+        let stashed = (self.stashes > 0).then(|| format!("{} stashed", self.stashes));
         if parts.is_empty() {
+            if let Some(stashed) = stashed {
+                return format!("✓ current, {stashed}");
+            }
             "✓ current".to_string()
         } else {
+            parts.extend(stashed);
             parts.join(" ")
         }
     }
@@ -386,6 +420,13 @@ pub fn check_repo_detailed(root: &Path, repo: &Path, fetch: bool) -> (RepoStatus
             status.has_upstream = local.has_upstream;
             status.ahead = local.ahead;
             status.behind = local.behind;
+            status.detached = local.detached;
+            let dirs = quick_git_dirs(repo);
+            if let Some((git_dir, common_dir)) = &dirs {
+                status.operation = operation(git_dir);
+                status.stashes = stash_count(common_dir);
+            }
+            status.unpushed_branches = unpushed_branches(repo);
             status.fetch_failed = fetch_error.is_some();
             status.error = fetch_error;
             // For sorting; the command-line build doesn't sort.
@@ -404,6 +445,167 @@ pub fn check_repo_detailed(root: &Path, repo: &Path, fetch: bool) -> (RepoStatus
             (status, Vec::new())
         }
     }
+}
+
+/// The repo's git dir and common dir read straight from disk, without
+/// running git: `.git` is the git dir, or a file naming it (a linked
+/// worktree), whose `commondir` file names the shared one.
+fn quick_git_dirs(repo: &Path) -> Option<(PathBuf, PathBuf)> {
+    let dot_git = repo.join(".git");
+    let git_dir = if dot_git.is_dir() {
+        dot_git
+    } else {
+        let text = std::fs::read_to_string(&dot_git).ok()?;
+        let target = text.lines().next()?.strip_prefix("gitdir:")?.trim();
+        let target = Path::new(target);
+        if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            repo.join(target)
+        }
+    };
+    let common_dir = match std::fs::read_to_string(git_dir.join("commondir")) {
+        Ok(text) => {
+            let c = Path::new(text.trim());
+            if c.is_absolute() {
+                c.to_path_buf()
+            } else {
+                git_dir.join(c)
+            }
+        }
+        Err(_) => git_dir.clone(),
+    };
+    Some((git_dir, common_dir))
+}
+
+/// The operation git has left half done in `git_dir`, if any, from the
+/// files it keeps while one runs.
+pub(crate) fn operation(git_dir: &Path) -> Option<String> {
+    let read_num =
+        |path: PathBuf| -> Option<u32> { std::fs::read_to_string(path).ok()?.trim().parse().ok() };
+    let progress = |what: &str, step: Option<u32>, total: Option<u32>| match (step, total) {
+        (Some(step), Some(total)) if total > 0 => format!("{what} {}/{total}", step.min(total)),
+        _ => what.to_string(),
+    };
+    let merge = git_dir.join("rebase-merge");
+    if merge.is_dir() {
+        return Some(progress(
+            "rebasing",
+            read_num(merge.join("msgnum")),
+            read_num(merge.join("end")),
+        ));
+    }
+    let apply = git_dir.join("rebase-apply");
+    if apply.is_dir() {
+        let what = if apply.join("applying").exists() {
+            "applying patches"
+        } else {
+            "rebasing"
+        };
+        return Some(progress(
+            what,
+            read_num(apply.join("next")),
+            read_num(apply.join("last")),
+        ));
+    }
+    [
+        ("MERGE_HEAD", "merging"),
+        ("CHERRY_PICK_HEAD", "cherry-picking"),
+        ("REVERT_HEAD", "reverting"),
+        ("BISECT_LOG", "bisecting"),
+    ]
+    .into_iter()
+    .find(|(file, _)| git_dir.join(file).is_file())
+    .map(|(_, what)| what.to_string())
+}
+
+/// Entries in the stash, from its reflog: one line each.
+fn stash_count(common_dir: &Path) -> u32 {
+    std::fs::read(common_dir.join("logs").join("refs").join("stash"))
+        .map(|bytes| {
+            bytes
+                .split(|&b| b == b'\n')
+                .filter(|l| !l.is_empty())
+                .count() as u32
+        })
+        .unwrap_or(0)
+}
+
+/// At most this many never-pushed branches get a `rev-list` each.
+const MAX_LOCAL_ONLY_CHECKS: usize = 30;
+
+/// Local branches other than HEAD's with commits that no remote has: ahead
+/// of their upstream, or with no upstream and commits on no remote branch.
+/// A branch whose upstream is gone (deleted after a merge) is left out, and
+/// so is everything in a repo with no remote branches at all, which already
+/// shows as having no upstream.
+fn unpushed_branches(repo: &Path) -> Vec<(String, u32)> {
+    let text = |args: &[&str]| -> Option<String> {
+        let out = git(repo, args, LOCAL_TIMEOUT).ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let Some(remotes) = text(&["for-each-ref", "--count=1", "--format=x", "refs/remotes"]) else {
+        return Vec::new();
+    };
+    if remotes.trim().is_empty() {
+        return Vec::new();
+    }
+    let Some(heads) = text(&[
+        "for-each-ref",
+        "--format=%(HEAD)%1f%(refname:short)%1f%(upstream)%1f%(upstream:track)",
+        "refs/heads",
+    ]) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    let mut checks = 0;
+    for line in heads.lines() {
+        let Some(branch) = parse_head_line(line) else {
+            continue;
+        };
+        match branch {
+            HeadLine::Ahead(name, n) => found.push((name, n)),
+            HeadLine::NoUpstream(name) if checks < MAX_LOCAL_ONLY_CHECKS => {
+                checks += 1;
+                let tip = format!("refs/heads/{name}");
+                let count = text(&["rev-list", "--count", &tip, "--not", "--remotes", "--"])
+                    .and_then(|t| t.trim().parse().ok())
+                    .unwrap_or(0);
+                if count > 0 {
+                    found.push((name, count));
+                }
+            }
+            HeadLine::NoUpstream(_) => {}
+        }
+    }
+    found
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum HeadLine {
+    Ahead(String, u32),
+    NoUpstream(String),
+}
+
+/// One `for-each-ref` line of `%(HEAD)`, name, upstream and its track. The
+/// checked-out branch, branches in step and gone upstreams give `None`.
+fn parse_head_line(line: &str) -> Option<HeadLine> {
+    let mut f = line.split('\x1f');
+    let (head, name, upstream, track) = (f.next()?, f.next()?, f.next()?, f.next().unwrap_or(""));
+    if head.trim() == "*" || name.is_empty() {
+        return None;
+    }
+    if upstream.is_empty() {
+        return Some(HeadLine::NoUpstream(name.to_string()));
+    }
+    let ahead = track
+        .trim_matches(|c| c == '[' || c == ']')
+        .split(',')
+        .find_map(|part| part.trim().strip_prefix("ahead ")?.parse().ok())
+        .unwrap_or(0);
+    (ahead > 0).then(|| HeadLine::Ahead(name.to_string(), ahead))
 }
 
 /// A local-only recheck can't tell whether the network is back, so it keeps
@@ -506,6 +708,8 @@ pub(crate) struct Parsed {
     /// `# branch.ab` is present only when the upstream exists, so a gone
     /// upstream counts as none, as `rev-list ...@{upstream}` failing did.
     pub has_upstream: bool,
+    /// HEAD's short commit id when it isn't on a branch.
+    pub detached: Option<String>,
     /// Ignored directories, relative to the repo, with their trailing `/`,
     /// and ignored files outside them, such as `debug.log`.
     pub ignored: Vec<String>,
@@ -514,12 +718,17 @@ pub(crate) struct Parsed {
 pub(crate) fn parse_status_v2(out: &[u8]) -> Parsed {
     let mut parsed = Parsed::default();
     let (mut dirs, mut files) = (0, 0);
+    let (mut detached, mut oid_seen) = (false, String::new());
     let mut fields = out.split(|&b| b == 0);
     while let Some(field) = fields.next() {
         match field.first() {
             None => {}
             Some(b'#') => {
-                if let Some(ab) = field.strip_prefix(b"# branch.ab ") {
+                if let Some(oid) = field.strip_prefix(b"# branch.oid ") {
+                    oid_seen = String::from_utf8_lossy(oid).chars().take(7).collect();
+                } else if field == b"# branch.head (detached)" {
+                    detached = true;
+                } else if let Some(ab) = field.strip_prefix(b"# branch.ab ") {
                     let ab = String::from_utf8_lossy(ab);
                     let mut counts = ab.split_whitespace();
                     let mut count = |sign: char| {
@@ -558,6 +767,9 @@ pub(crate) fn parse_status_v2(out: &[u8]) -> Parsed {
                 }
             }
         }
+    }
+    if detached && !oid_seen.is_empty() {
+        parsed.detached = Some(oid_seen);
     }
     parsed
 }
@@ -934,6 +1146,85 @@ mod tests {
 
     fn with_header(rest: &[&'static str]) -> Vec<&'static str> {
         HEADER.iter().copied().chain(rest.iter().copied()).collect()
+    }
+
+    #[test]
+    fn parses_detached_head() {
+        let p = parse(&["# branch.oid 1234567890abcdef", "# branch.head (detached)"]);
+        assert_eq!(p.detached.as_deref(), Some("1234567"));
+        assert!(!p.has_upstream);
+        assert_eq!(parse(&HEADER).detached, None);
+    }
+
+    #[test]
+    fn parses_branch_lines() {
+        let l = |s: &str| parse_head_line(&s.replace('|', "\x1f"));
+        assert_eq!(l("*|main|refs/remotes/origin/main|[ahead 1]"), None);
+        assert_eq!(l(" |even|refs/remotes/origin/even|"), None);
+        assert_eq!(l(" |gone|refs/remotes/origin/gone|[gone]"), None);
+        assert_eq!(l(" |behind|refs/remotes/origin/b|[behind 4]"), None);
+        assert_eq!(
+            l(" |wip|refs/remotes/origin/wip|[ahead 2, behind 1]"),
+            Some(HeadLine::Ahead("wip".into(), 2))
+        );
+        assert_eq!(l(" |local||"), Some(HeadLine::NoUpstream("local".into())));
+    }
+
+    #[test]
+    fn finds_operations_and_stashes() {
+        let root = temp_root("operations");
+        let git_dir = root.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        assert_eq!(operation(&git_dir), None);
+        std::fs::write(git_dir.join("MERGE_HEAD"), "x\n").unwrap();
+        assert_eq!(operation(&git_dir).as_deref(), Some("merging"));
+        let rm = git_dir.join("rebase-merge");
+        std::fs::create_dir_all(&rm).unwrap();
+        std::fs::write(rm.join("msgnum"), "3\n").unwrap();
+        std::fs::write(rm.join("end"), "7\n").unwrap();
+        assert_eq!(operation(&git_dir).as_deref(), Some("rebasing 3/7"));
+        assert_eq!(stash_count(&git_dir), 0);
+        let logs = git_dir.join("logs").join("refs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(logs.join("stash"), "a\nb\n").unwrap();
+        assert_eq!(stash_count(&git_dir), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn other_branches_unpushed_work() {
+        let root = temp_root("unpushed-branches");
+        let origin = root.join("origin");
+        init_repo(&origin);
+        let repo = root.join("clone");
+        run(&root, &["clone", "-q", origin.to_str().unwrap(), "clone"]);
+        let main = output(&repo, &["symbolic-ref", "--short", "HEAD"]);
+        let main = main.trim();
+        let check = || check_repo(&root, &repo, false);
+        assert!(check().is_synced(), "{:?}", check());
+        // A branch never pushed, with a commit of its own.
+        run(&repo, &["checkout", "-q", "-b", "wip"]);
+        commit(&repo, "wip");
+        run(&repo, &["checkout", "-q", main]);
+        let s = check();
+        assert_eq!(s.unpushed_branches, [("wip".to_string(), 1)]);
+        assert!(!s.is_synced());
+        assert_eq!(s.label(), "wip unpushed");
+        // A stash shows but doesn't unsync.
+        run(&repo, &["branch", "-q", "-D", "wip"]);
+        std::fs::write(repo.join("f.txt"), "x").unwrap();
+        run(&repo, &["add", "f.txt"]);
+        run(&repo, &["stash", "-q"]);
+        let s = check();
+        assert_eq!(s.stashes, 1);
+        assert!(s.is_synced(), "{s:?}");
+        assert_eq!(s.label(), "✓ current, 1 stashed");
+        // Detached HEAD.
+        run(&repo, &["checkout", "-q", "--detach"]);
+        let s = check();
+        assert!(s.detached.is_some());
+        assert!(s.label().starts_with("detached at "), "{}", s.label());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
