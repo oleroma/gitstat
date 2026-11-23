@@ -469,6 +469,8 @@ struct Drawn {
 #[derive(Clone)]
 enum Kind {
     Words,
+    /// Words centred in their bounds, as a button's glyph.
+    Glyph,
     /// The repo's icon, by its tone.
     Icon(Box<crate::git::RepoStatus>),
     /// The health bar: synced, local-work and needs-a-look repos.
@@ -781,6 +783,8 @@ fn plan(
         let words = same_words(a, b);
         let kind = match part {
             Part::Health => Kind::Health(health),
+            // A glyph in the middle of its button.
+            Part::Settings | Part::Refresh => Kind::Glyph,
             _ => Kind::Words,
         };
         if !matches!(kind, Kind::Health(_)) && words.is_none() {
@@ -1182,13 +1186,13 @@ impl Render for MorphView {
             bands.push((band(edge, bottom), p.bg));
         }
 
-        // The rim stays drawn from when the starting window has gone to the
-        // very end, over the ending window's own of the same colour, so it
-        // never blinks. A maximised big window has none: there it fades
-        // with that window, out after the turn or in before it.
+        // The rim is drawn from the first frame to the last, right over the
+        // windows' own of the same colour and thickness at either end, so
+        // it never blinks: the sheet covers the starting window's own as
+        // it fades in. A maximised big window has none: there it fades
+        // with that window, in before the turn or out after it.
         let rim_alpha = match (self.plan.maximized, open) {
             (true, false) => sheet_alpha,
-            _ if self.frames < self.framed.0 => 0.0,
             (true, true) => reveal,
             (false, _) => 1.0,
         };
@@ -1324,8 +1328,9 @@ impl Render for MorphView {
                                     window,
                                 );
                             }
-                            if let Some((text, color, size, weight)) = &d.words {
-                                paint_words(window, cx, b, text.clone(), *color, *size, *weight);
+                            if let Some(words) = &d.words {
+                                let centred = matches!(d.kind, Kind::Glyph);
+                                paint_words(window, cx, b, words, centred);
                             }
                         }
                     });
@@ -1441,13 +1446,12 @@ fn paint_words(
     window: &mut Window,
     cx: &mut App,
     b: Bounds<Pixels>,
-    text: gpui::SharedString,
-    color: Hsla,
-    size: f32,
-    weight: f32,
+    (text, color, size, weight): &Line,
+    centred: bool,
 ) {
+    let (color, size) = (*color, *size);
     let mut font = window.text_style().font();
-    font.weight = gpui::FontWeight(weight);
+    font.weight = gpui::FontWeight(*weight);
     let run = gpui::TextRun {
         len: text.len(),
         font,
@@ -1458,9 +1462,13 @@ fn paint_words(
     };
     let line = window
         .text_system()
-        .shape_line(text, px(size), &[run], None);
+        .shape_line(text.clone(), px(size), &[run], None);
+    let mut at = b.origin;
+    if centred {
+        at.x += (b.size.width - line.width) / 2.0;
+    }
     window.with_content_mask(Some(gpui::ContentMask { bounds: b }), |window| {
-        line.paint(b.origin, b.size.height, window, cx).ok()
+        line.paint(at, b.size.height, window, cx).ok()
     });
 }
 
