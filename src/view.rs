@@ -168,6 +168,24 @@ pub fn show_window(cx: &mut App) {
     cx.default_global::<WindowSlot>().handle = handle;
 }
 
+thread_local! {
+    /// Where the next panel's list and big window's table are to be
+    /// scrolled when they first draw, logical px: set by the flip.
+    static NEXT_LIST_SCROLL: std::cell::Cell<Option<f32>> = const { std::cell::Cell::new(None) };
+    static NEXT_TABLE_SCROLL: std::cell::Cell<Option<f32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Scrolls the panel's list this far down when it next draws, logical px.
+pub fn scroll_list_to(y: f32) {
+    NEXT_LIST_SCROLL.set(Some(y));
+}
+
+/// Scrolls the big window's table this far sideways when it next draws,
+/// logical px.
+pub fn scroll_table_to(x: f32) {
+    NEXT_TABLE_SCROLL.set(Some(x));
+}
+
 /// How far the open big window's table is scrolled sideways, logical px.
 pub fn table_scroll(cx: &App) -> f32 {
     cx.try_global::<WindowSlot>()
@@ -385,6 +403,8 @@ pub struct StatusView {
     mode: Mode,
     /// Big mode's table of columns, scrolled sideways.
     table: ScrollHandle,
+    /// The panel's list, scrolled up and down.
+    list: ScrollHandle,
     focus: FocusHandle,
     /// The panel has been active once, so a deactivation now means the user
     /// clicked elsewhere rather than the foreground lock refusing us.
@@ -443,6 +463,7 @@ impl StatusView {
             timelines,
             mode,
             table: ScrollHandle::new(),
+            list: ScrollHandle::new(),
             focus,
             seen_active: false,
             fit: None,
@@ -1267,6 +1288,24 @@ impl Render for StatusView {
             (Some(t), Mode::Window) => t.update(cx, |t, _| t.take_focus()),
             _ => None,
         };
+        // The flip lines one view's scroll up with the other's: the
+        // panel's topmost repo is the window's leftmost column, and back.
+        match mode {
+            Mode::Panel => {
+                if let Some(y) = NEXT_LIST_SCROLL.take() {
+                    self.list.set_offset(point(px(0.), px(-y)));
+                }
+                crate::morph::seen_list_scroll(
+                    -f32::from(self.list.offset().y),
+                    f32::from(self.list.max_offset().height),
+                );
+            }
+            Mode::Window => {
+                if let Some(x) = NEXT_TABLE_SCROLL.take() {
+                    self.table.set_offset(point(px(-x), self.table.offset().y));
+                }
+            }
+        }
         let state = self.state.clone();
         let state = state.read(cx);
         let unsynced = state.unsynced();
@@ -1611,6 +1650,7 @@ impl Render for StatusView {
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
+            .track_scroll(&self.list)
             .bg(p.surface)
             .children(rows)
             .when(empty, |list| {

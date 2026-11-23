@@ -161,6 +161,14 @@ thread_local! {
     /// When the big window last reached the place and state it opened
     /// with (a maximised one shows at its normal size first).
     static SETTLED: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// How far the panel's list was scrolled and could be, logical px, as
+    /// last drawn.
+    static LIST_SCROLL: Cell<(f32, f32)> = const { Cell::new((0.0, 0.0)) };
+}
+
+/// Notes how far the panel's list is scrolled and could be, logical px.
+pub fn seen_list_scroll(at: f32, max: f32) {
+    LIST_SCROLL.set((at, max));
 }
 
 /// Notes a strip the panel drew, for the flip.
@@ -512,6 +520,27 @@ struct Plan {
     trees: Vec<Tree>,
     parts: Vec<Carried>,
     sliders: Vec<Slider>,
+    turning: Vec<Turning>,
+    /// Where the view the flip ends in is to be scrolled, logical px: the
+    /// big window's table sideways, or the panel's list down.
+    table_to: Option<f32>,
+    list_to: Option<f32>,
+}
+
+/// A turning heading this frame, in logical px: still, on whole px, at
+/// either end, or its four corners part way.
+enum Bar {
+    Still(Bounds<Pixels>, Hsla),
+    Turning([gpui::Point<Pixels>; 4], Hsla),
+}
+
+/// A panel section heading that turns with the trees into its spine in
+/// the big window, physical px from the flip window's corner. Only its
+/// wash turns: each end's words fade with its own view, before or after.
+struct Turning {
+    section: Section,
+    from: Bounds<f32>,
+    to: Bounds<f32>,
 }
 
 /// A bar that slides out of its view before the turn, or into it after:
@@ -549,7 +578,7 @@ fn plan(
     let ui = cx.try_global::<Ui>()?;
     let state = ui.state.read(cx);
     let timelines = ui.timelines.read(cx);
-    let strips = STRIPS.with(|s| s.borrow().clone());
+    let mut strips = STRIPS.with(|s| s.borrow().clone());
 
     let cells = view::table_cells(state);
     let lefts = view::cell_lefts(&cells);
@@ -636,7 +665,7 @@ fn plan(
     };
 
     // The table's scroll: as it is, or bringing the focused column in.
-    let scroll = match big {
+    let mut scroll = match big {
         Some((_, scroll)) => scroll,
         None => focus
             .and_then(|f| view::cell_of(&cells, f))
@@ -648,58 +677,206 @@ fn plan(
 
     let mut trees = Vec::new();
     let mut parts = Vec::new();
-    let mut spine_sliders = Vec::new();
-    let panel_parts = PANEL_PARTS.with(|m| m.borrow().clone());
+    let mut spines = Vec::new();
+    let mut panel_parts = PANEL_PARTS.with(|m| m.borrow().clone());
     let column_parts = COLUMN_PARTS.with(|m| m.borrow().clone());
     let header_at = HEADER_AT.with(|m| m.borrow().clone());
-    for (cell, left) in cells.iter().zip(&lefts) {
-        let x = to.origin.x + left * ws - scroll;
-        // A column past the big window's edge isn't drawn: its strip
-        // fades with the panel before the turn.
-        let gone = x + cell.width() * ws <= to.origin.x || x >= to.origin.x + to.size.width;
-        if gone {
-            continue;
-        }
-        match *cell {
-            view::Cell::Repo(status) => {
-                let (Some(strip), Some(graph)) =
-                    (strips.get(&status.path), timelines.graph_of(&status.path))
-                else {
-                    continue;
+
+    // Each repo's strip in the panel: as the panel last drew it, or, for
+    // one its list didn't show, rows on from the nearest one it did, so
+    // every tree turns, out of sight or not.
+    let repo_cells: Vec<&crate::git::RepoStatus> = cells
+        .iter()
+        .filter_map(|c| match c {
+            view::Cell::Repo(s) => Some(*s),
+            view::Cell::Spine(..) => None,
+        })
+        .collect();
+    let known: Vec<Option<Bounds<Pixels>>> = repo_cells
+        .iter()
+        .map(|s| strips.get(&s.path).copied())
+        .collect();
+    let mut strip_of: HashMap<&Path, Bounds<Pixels>> = repo_cells
+        .iter()
+        .zip(fill_rows(&known))
+        .filter_map(|(s, b)| Some((s.path.as_path(), b?)))
+        .collect();
+
+    // One view's scroll lined up with the other's. Opening, the table
+    // starts at the panel's topmost repo in view, with its section's spine
+    // when that heads it; closing, the panel's list starts at the window's
+    // leftmost column in view.
+    let (list_scroll, list_max) = LIST_SCROLL.with(Cell::get);
+    let list_top = panel_parts
+        .get(&(app().to_path_buf(), Part::Bar))
+        .map_or(0.0, |b| f32::from(b.bounds.bottom()));
+    let cell_of_repo = |path: &Path| {
+        cells
+            .iter()
+            .position(|c| matches!(c, view::Cell::Repo(s) if s.path == path))
+    };
+    let mut table_to = None;
+    let mut list_to = None;
+    match big {
+        None if focus.is_none() => {
+            let topmost = repo_cells
+                .iter()
+                .filter_map(|s| Some((*s, strips.get(&s.path)?)))
+                .filter(|(_, b)| f32::from(b.origin.y) + f32::from(b.size.height) / 2.0 >= list_top)
+                .min_by(|a, b| f32::from(a.1.origin.y).total_cmp(&f32::from(b.1.origin.y)))
+                .map(|(s, _)| s);
+            if let Some(i) = topmost.and_then(|s| cell_of_repo(&s.path)) {
+                let k = if i > 0 && matches!(cells[i - 1], view::Cell::Spine(..)) {
+                    i - 1
+                } else {
+                    i
                 };
-                // The parts both views show, where each last drew them.
-                if let Some(hat) = header_at.get(&status.path) {
-                    for part in [Part::Icon, Part::Name, Part::Checkout, Part::Status] {
-                        let key = (status.path.clone(), part);
-                        let (Some(a), Some(b)) = (panel_parts.get(&key), column_parts.get(&key))
-                        else {
-                            continue;
-                        };
-                        let dx = f32::from(b.bounds.origin.x - hat.x) * ws;
-                        let to_b = Bounds {
-                            origin: point(x + dx, to.origin.y + f32::from(b.bounds.origin.y) * ws),
-                            size: size(
-                                f32::from(b.bounds.size.width) * ws,
-                                f32::from(b.bounds.size.height) * ws,
-                            ),
-                        };
-                        let words = same_words(a, b);
-                        if part != Part::Icon && words.is_none() {
-                            continue;
-                        }
-                        parts.push(Carried {
-                            from: in_panel(&a.bounds),
-                            to: to_b,
-                            words,
-                            kind: if part == Part::Icon {
-                                Kind::Icon(Box::new(status.clone()))
-                            } else {
-                                Kind::Words
-                            },
-                        });
+                let total = lefts
+                    .last()
+                    .zip(cells.last())
+                    .map_or(0.0, |(l, c)| l + c.width());
+                let x = lefts[k].min(total - to.size.width / ws).max(0.0);
+                scroll = x * ws;
+                table_to = Some(x);
+            }
+        }
+        Some(_) => {
+            let leftmost = cells.iter().zip(&lefts).find_map(|(c, l)| match c {
+                view::Cell::Repo(s) if (l + c.width() / 2.0) * ws - scroll >= 0.0 => Some(*s),
+                _ => None,
+            });
+            if let Some(b) = leftmost.and_then(|s| strip_of.get(s.path.as_path())) {
+                // Its section's heading too, when it heads it.
+                let i = leftmost.and_then(|s| cell_of_repo(&s.path)).unwrap_or(0);
+                let heading = match (i > 0).then(|| cells[i - 1]) {
+                    Some(view::Cell::Spine(section, _)) => panel_parts
+                        .get(&(app().to_path_buf(), Part::Heading(section)))
+                        .map(|h| f32::from(h.bounds.origin.y)),
+                    _ => None,
+                };
+                let at = heading.unwrap_or(f32::from(b.origin.y)) + list_scroll;
+                let y = (at - list_top).clamp(0.0, list_max.max(0.0));
+                list_to = Some(y);
+                // The list's parts, where the panel will draw them.
+                let shift = px(list_scroll - y);
+                for b in strips.values_mut().chain(strip_of.values_mut()) {
+                    b.origin.y += shift;
+                }
+                for ((path, part), seen) in panel_parts.iter_mut() {
+                    if path != app() || matches!(part, Part::Heading(_) | Part::Prs) {
+                        seen.bounds.origin.y += shift;
                     }
                 }
-                let strip = in_panel(strip);
+            }
+        }
+        None => {}
+    }
+    // Where each header part sits in a strip and in a column, from a repo
+    // both views drew: for a repo one of them didn't.
+    let mut strip_template: HashMap<Part, Bounds<Pixels>> = HashMap::new();
+    let mut column_template: HashMap<Part, Bounds<Pixels>> = HashMap::new();
+    for status in &repo_cells {
+        let path = &status.path;
+        for part in [Part::Icon, Part::Name, Part::Checkout, Part::Status] {
+            let key = (path.clone(), part);
+            if let (Some(a), Some(strip)) = (panel_parts.get(&key), strips.get(path)) {
+                strip_template.entry(part).or_insert(Bounds {
+                    origin: a.bounds.origin - strip.origin,
+                    size: a.bounds.size,
+                });
+            }
+            if let (Some(b), Some(hat)) = (column_parts.get(&key), header_at.get(path)) {
+                column_template.entry(part).or_insert(Bounds {
+                    origin: point(b.bounds.origin.x - hat.x, b.bounds.origin.y),
+                    size: b.bounds.size,
+                });
+            }
+        }
+    }
+
+    for (cell, left) in cells.iter().zip(&lefts) {
+        // Past the big window's edges too: a column out of sight still
+        // takes its tree, which turns out of the sheet's side.
+        let x = to.origin.x + left * ws - scroll;
+        match *cell {
+            view::Cell::Repo(status) => {
+                let (Some(&strip), Some(graph)) = (
+                    strip_of.get(status.path.as_path()),
+                    timelines.graph_of(&status.path),
+                ) else {
+                    continue;
+                };
+                // Not drawn when out of the flip window at both ends.
+                let (uw, uh) = (union.width() as f32, union.height() as f32);
+                let out = |b: Bounds<f32>| {
+                    b.origin.x + b.size.width < 0.0
+                        || b.origin.x > uw
+                        || b.origin.y + b.size.height < 0.0
+                        || b.origin.y > uh
+                };
+                let column = Bounds {
+                    origin: point(x, to.origin.y),
+                    size: size(COLUMN_WIDTH * ws, to.size.height),
+                };
+                if out(in_panel(&strip)) && out(column) {
+                    continue;
+                }
+                let drawn = strips.contains_key(&status.path);
+                // The parts both views show, where each last drew them,
+                // or where they'd be.
+                for part in [Part::Icon, Part::Name, Part::Checkout, Part::Status] {
+                    let key = (status.path.clone(), part);
+                    let a = panel_parts.get(&key).filter(|_| drawn);
+                    let b =
+                        column_parts
+                            .get(&key)
+                            .zip(header_at.get(&status.path))
+                            .map(|(b, hat)| Bounds {
+                                origin: point(b.bounds.origin.x - hat.x, b.bounds.origin.y),
+                                size: b.bounds.size,
+                            });
+                    // The words: both views' when both drew them, else
+                    // the one that did, for a repo out of the other's
+                    // sight (where nobody sees them change).
+                    let words = match (a, column_parts.get(&key)) {
+                        (Some(a), Some(b)) => same_words(a, b),
+                        (Some(one), None) | (None, Some(one)) => {
+                            one.text.clone().map(|w| (w.clone(), w))
+                        }
+                        (None, None) => None,
+                    };
+                    if part != Part::Icon && words.is_none() {
+                        continue;
+                    }
+                    let a = a.map(|a| a.bounds).or_else(|| {
+                        strip_template.get(&part).map(|t| Bounds {
+                            origin: strip.origin + t.origin,
+                            size: t.size,
+                        })
+                    });
+                    let b = b.or_else(|| column_template.get(&part).copied());
+                    let (Some(a), Some(b)) = (a, b) else {
+                        continue;
+                    };
+                    let to_b = Bounds {
+                        origin: point(
+                            x + f32::from(b.origin.x) * ws,
+                            to.origin.y + f32::from(b.origin.y) * ws,
+                        ),
+                        size: size(f32::from(b.size.width) * ws, f32::from(b.size.height) * ws),
+                    };
+                    parts.push(Carried {
+                        from: in_panel(&a),
+                        to: to_b,
+                        words,
+                        kind: if part == Part::Icon {
+                            Kind::Icon(Box::new(status.clone()))
+                        } else {
+                            Kind::Words
+                        },
+                    });
+                }
+                let strip = in_panel(&strip);
                 let newest = strip.origin.x + strip.size.width - crate::timeline::STRIP_PAD * ps;
                 trees.push(Tree {
                     graph,
@@ -712,35 +889,7 @@ fn plan(
                     },
                 });
             }
-            // Section headings and spines don't turn into each other:
-            // each slides out of its own view, or in, before or after the
-            // turn.
-            view::Cell::Spine(section, n) => {
-                let key = (app().to_path_buf(), Part::Spine(section));
-                if let Some(b) = column_parts.get(&key) {
-                    // From under the top bar to its distance above the
-                    // window's bottom then.
-                    let top = to.origin.y + f32::from(b.bounds.origin.y) * ws;
-                    let bottom = to.origin.y + to.size.height
-                        - (b.height - f32::from(b.bounds.bottom())) * ws;
-                    let at = Bounds {
-                        origin: point(x, top),
-                        size: size(view::SPINE_WIDTH * ws, (bottom - top).max(0.0)),
-                    };
-                    // Out of the nearer side.
-                    let middle = to.origin.x + to.size.width / 2.0;
-                    let away = if at.origin.x + at.size.width / 2.0 < middle {
-                        to.origin.x - (at.origin.x + at.size.width)
-                    } else {
-                        to.origin.x + to.size.width - at.origin.x
-                    };
-                    spine_sliders.push(Slider {
-                        what: Slid::Spine(section, n, state.folded(section)),
-                        at,
-                        away: (away, 0.0),
-                    });
-                }
-            }
+            view::Cell::Spine(section, n) => spines.push((section, n, x)),
         }
     }
     // The top and bottom bars, and what's on the top one, from the
@@ -766,6 +915,29 @@ fn plan(
     };
     let bar = both(Part::Bar).map(|(a, b)| (in_panel(&a.bounds), in_window(&b.bounds)));
     let footer = both(Part::Footer).map(|(a, b)| (in_panel(&a.bounds), from_bottom(b)));
+    // The spines, from under the top bar to the bottom bar: where the
+    // window last drew them, or would.
+    let spine_at: Vec<(Section, usize, Bounds<f32>)> = spines
+        .iter()
+        .map(|&(section, n, x)| {
+            let key = (app().to_path_buf(), Part::Spine(section));
+            let (top, bottom) = match column_parts.get(&key) {
+                Some(b) => (
+                    to.origin.y + f32::from(b.bounds.origin.y) * ws,
+                    to.origin.y + to.size.height - (b.height - f32::from(b.bounds.bottom())) * ws,
+                ),
+                None => (
+                    bar.map_or(to.origin.y + body_top, |b| b.1.origin.y + b.1.size.height),
+                    footer.map_or(to.origin.y + to.size.height, |f| f.1.origin.y),
+                ),
+            };
+            let at = Bounds {
+                origin: point(x, top),
+                size: size(view::SPINE_WIDTH * ws, (bottom - top).max(0.0)),
+            };
+            (section, n, at)
+        })
+        .collect();
     let health = view::tone_counts(&state.statuses);
     for part in [
         Part::Headline,
@@ -799,7 +971,8 @@ fn plan(
     }
     // The bars that slide: each view's body runs from under its top bar to
     // its bottom bar.
-    let mut sliders = spine_sliders;
+    let mut sliders = Vec::new();
+    let mut turning = Vec::new();
     let bodies = [
         (
             view::Mode::Panel,
@@ -836,6 +1009,15 @@ fn plan(
                     continue;
                 };
                 let at = place(b);
+                // Turned with the trees into its spine.
+                if let Some(&(_, _, spine)) = spine_at.iter().find(|s| s.0 == section) {
+                    turning.push(Turning {
+                        section,
+                        from: at,
+                        to: spine,
+                    });
+                    continue;
+                }
                 let away = if at.origin.y + at.size.height / 2.0 < (top + bottom) / 2.0 {
                     top - (at.origin.y + at.size.height)
                 } else {
@@ -848,6 +1030,24 @@ fn plan(
                 });
             }
         }
+    }
+    // A spine with no heading in sight slides out of the window's nearer
+    // side.
+    for &(section, n, at) in &spine_at {
+        if turning.iter().any(|t| t.section == section) {
+            continue;
+        }
+        let middle = to.origin.x + to.size.width / 2.0;
+        let away = if at.origin.x + at.size.width / 2.0 < middle {
+            to.origin.x - (at.origin.x + at.size.width)
+        } else {
+            to.origin.x + to.size.width - at.origin.x
+        };
+        sliders.push(Slider {
+            what: Slid::Spine(section, n, state.folded(section)),
+            at,
+            away: (away, 0.0),
+        });
     }
     (!trees.is_empty()).then_some(Plan {
         union,
@@ -866,7 +1066,45 @@ fn plan(
         trees,
         parts,
         sliders,
+        turning,
+        table_to,
+        list_to,
     })
+}
+
+/// Strips as the panel drew them, with the ones it didn't filled in: rows
+/// on from the nearest drawn one, a row being the least step between two
+/// drawn neighbours.
+fn fill_rows(known: &[Option<Bounds<Pixels>>]) -> Vec<Option<Bounds<Pixels>>> {
+    let step = known
+        .windows(2)
+        .filter_map(|w| Some(f32::from(w[1]?.origin.y - w[0]?.origin.y)))
+        .filter(|d| *d > 0.0)
+        .fold(None, |m: Option<f32>, d| Some(m.map_or(d, |m| m.min(d))))
+        .or_else(|| {
+            known
+                .iter()
+                .flatten()
+                .next()
+                .map(|b| f32::from(b.size.height))
+        });
+    let Some(step) = step else {
+        return known.to_vec();
+    };
+    (0..known.len())
+        .map(|i| {
+            if known[i].is_some() {
+                return known[i];
+            }
+            // The nearest drawn one, before or after.
+            let j = (0..known.len())
+                .filter(|&j| known[j].is_some())
+                .min_by_key(|&j| (j as isize - i as isize).unsigned_abs())?;
+            let mut b = known[j]?;
+            b.origin.y += px((i as f32 - j as f32) * step);
+            Some(b)
+        })
+        .collect()
 }
 
 /// A part's words at each end, when both say the same: words that differ
@@ -887,6 +1125,12 @@ fn launch(plan: Plan, direction: Direction, cx: &mut App) -> bool {
     let fixed = HOLD.as_millis() as f32;
     let stretch = ((ms as f32 - fixed) / (560.0 - fixed)).clamp(0.2, 12.0);
     debug_assert_eq!((FADE + SLIDE + TURN + HOLD + REVEAL).as_millis(), 560);
+    if let Some(x) = plan.table_to {
+        view::scroll_table_to(x);
+    }
+    if let Some(y) = plan.list_to {
+        view::scroll_list_to(y);
+    }
     crate::frames::start(union, cx);
     crate::frames::frame("before");
     let mut flip_hwnd = None;
@@ -1226,6 +1470,45 @@ impl Render for MorphView {
             })
             .collect();
 
+        // The section headings, turning with the trees into their spines:
+        // each a bar along its history from its newest end, the heading's
+        // right end and the spine's top, a quarter turn anticlockwise like
+        // the trees. Its wash fades with the sheet's fills, over and under
+        // its twin in the window beneath, as the bands do.
+        let turning: Vec<Bar> = self
+            .plan
+            .turning
+            .iter()
+            .map(|t| {
+                let color = view::section_tint(t.section, &p);
+                let color = color.opacity(color.a * fill);
+                let (a, z) = (t.from, t.to);
+                if e <= 0.0 || e >= 1.0 {
+                    let b = if e <= 0.0 { a } else { z };
+                    return Bar::Still(snapped(lerp_bounds(b, b, 0.0, s), s), color);
+                }
+                let anchor = (
+                    mix(a.origin.x + a.size.width, z.origin.x + z.size.width / 2.0) / s,
+                    mix(a.origin.y + a.size.height / 2.0, z.origin.y) / s,
+                );
+                let len = mix(a.size.width, z.size.height) / s;
+                let half = mix(a.size.height, z.size.width) / s / 2.0;
+                let (sin, cos) = (-std::f32::consts::FRAC_PI_2 * e).sin_cos();
+                let along = (-cos, -sin);
+                let across = (-sin, cos);
+                let at = |u: f32, v: f32| {
+                    point(
+                        px(anchor.0 + u * along.0 + v * across.0),
+                        px(anchor.1 + u * along.1 + v * across.1),
+                    )
+                };
+                Bar::Turning(
+                    [at(0.0, -half), at(len, -half), at(len, half), at(0.0, half)],
+                    color,
+                )
+            })
+            .collect();
+
         // The parts both views show, moving and growing from one to the
         // other, over the sheet.
         let parts: Vec<Drawn> = self
@@ -1315,6 +1598,22 @@ impl Render for MorphView {
                     }
                     paint_band(window, body, p.surface.opacity(fill));
                     window.with_content_mask(Some(gpui::ContentMask { bounds: body }), |window| {
+                        for bar in &turning {
+                            match bar {
+                                Bar::Still(b, color) => window.paint_quad(gpui::fill(*b, *color)),
+                                Bar::Turning(corners, color) => {
+                                    let mut path = gpui::PathBuilder::fill();
+                                    path.move_to(corners[0]);
+                                    for c in &corners[1..] {
+                                        path.line_to(*c);
+                                    }
+                                    path.close();
+                                    if let Ok(path) = path.build() {
+                                        window.paint_path(path, *color);
+                                    }
+                                }
+                            }
+                        }
                         for (graph, dirty, ends, alpha) in &trees {
                             crate::timeline::paint_tree(
                                 graph, *dirty, *ends, e, *alpha, dark, &p, window,
