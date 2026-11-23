@@ -523,13 +523,26 @@ fn header(
         _ => status.label(),
     };
     let repo = path.to_path_buf();
+    let mut tip_lines = vec![
+        (status.name.clone(), p.text),
+        (label.clone(), crate::view::status_color(status, p)),
+    ];
+    tip_lines.extend(crate::view::status_details(status, p));
     let title = div()
         .id(("column-title", index))
+        .tooltip(crate::view::tip(tip_lines, p))
         .flex()
         .flex_col()
         .gap(px(2.))
         .cursor_pointer()
         .on_click(move |_, _, cx| crate::view::open_repo(&repo, cx))
+        .on_mouse_down(gpui::MouseButton::Right, {
+            let status = status.clone();
+            move |_, window, cx| {
+                cx.stop_propagation();
+                crate::repo_menu::show(&status, window, cx);
+            }
+        })
         .child(
             div()
                 .flex()

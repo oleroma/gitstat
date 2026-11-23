@@ -340,7 +340,10 @@ fn structural(kind: &EventKind) -> bool {
 /// The whitelist of git-dir files that change what `git status` reports.
 fn git_class(rel: &str) -> Class {
     let ci = |name: &str| rel.eq_ignore_ascii_case(name);
-    if ci("HEAD") || ci("index") || ci("config") || ci("packed-refs") {
+    if ci("HEAD") || ci("index") || ci("config") || ci("packed-refs") || ci("refs/stash") {
+        return Class::GitMeta;
+    }
+    if is_operation(rel) {
         return Class::GitMeta;
     }
     // Every lock ends in a rename to the real name, which is what counts.
@@ -372,7 +375,25 @@ fn is_repo_icon(rel: &str) -> bool {
 }
 
 fn is_per_worktree(rel: &str) -> bool {
-    rel.eq_ignore_ascii_case("HEAD") || rel.eq_ignore_ascii_case("index")
+    rel.eq_ignore_ascii_case("HEAD") || rel.eq_ignore_ascii_case("index") || is_operation(rel)
+}
+
+/// What git keeps in a worktree's git dir while a rebase, merge,
+/// cherry-pick, revert or bisect is half done, and a rebase's step number.
+/// Their coming and going is all `git::operation` reads.
+fn is_operation(rel: &str) -> bool {
+    [
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "BISECT_LOG",
+        "rebase-merge",
+        "rebase-apply",
+        "rebase-merge/msgnum",
+        "rebase-apply/next",
+    ]
+    .iter()
+    .any(|name| rel.eq_ignore_ascii_case(name))
 }
 
 fn is_ignored(route: &Keyed, rel: &str) -> bool {
@@ -816,8 +837,15 @@ mod tests {
             "/dev/r/.git/refs/heads/main",
             "/dev/r/.git/refs/heads/feature/x",
             "/dev/r/.git/refs/tags/v1",
+            "/dev/r/.git/refs/stash",
+            "/dev/r/.git/MERGE_HEAD",
+            "/dev/r/.git/rebase-merge",
+            "/dev/r/.git/rebase-merge/msgnum",
         ] {
-            let expect = if path.ends_with("HEAD") || path.ends_with("index") {
+            let expect = if path.ends_with("HEAD")
+                || path.ends_with("index")
+                || path.contains("rebase-merge")
+            {
                 one("/dev/r", Class::GitMeta)
             } else {
                 // Shared with the linked worktree.

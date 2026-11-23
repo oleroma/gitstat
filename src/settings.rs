@@ -33,6 +33,12 @@ pub enum Setting {
     GithubRepos,
     ScrollTogether,
     FlipAnimation,
+    NotifyReview,
+    NotifyChecks,
+    NotifyBehind,
+    NotifyNewPr,
+    NotifyNewBranch,
+    NotifyNewCommits,
 }
 
 impl Setting {
@@ -50,6 +56,12 @@ impl Setting {
             Setting::GithubRepos => cfg.github_repos,
             Setting::ScrollTogether => cfg.scroll_together,
             Setting::FlipAnimation => cfg.flip_animation,
+            Setting::NotifyReview => cfg.notify.review_requested,
+            Setting::NotifyChecks => cfg.notify.checks_failed,
+            Setting::NotifyBehind => cfg.notify.behind,
+            Setting::NotifyNewPr => cfg.notify.new_pr,
+            Setting::NotifyNewBranch => cfg.notify.new_branch,
+            Setting::NotifyNewCommits => cfg.notify.new_commits,
         }
     }
 
@@ -67,6 +79,12 @@ impl Setting {
             Setting::GithubRepos => &mut cfg.github_repos,
             Setting::ScrollTogether => &mut cfg.scroll_together,
             Setting::FlipAnimation => &mut cfg.flip_animation,
+            Setting::NotifyReview => &mut cfg.notify.review_requested,
+            Setting::NotifyChecks => &mut cfg.notify.checks_failed,
+            Setting::NotifyBehind => &mut cfg.notify.behind,
+            Setting::NotifyNewPr => &mut cfg.notify.new_pr,
+            Setting::NotifyNewBranch => &mut cfg.notify.new_branch,
+            Setting::NotifyNewCommits => &mut cfg.notify.new_commits,
         };
         *field = !*field;
     }
@@ -530,16 +548,22 @@ fn views(cfg: &Config, p: &Palette) -> Vec<AnyElement> {
                     "From the taskbar's side, or the badge's, when the panel opens.",
                     segmented(
                         "panel-slide",
-                        [(0, "Off"), (100, "Fast"), (150, "Normal"), (300, "Slow")]
-                            .into_iter()
-                            .map(|(ms, label)| {
-                                (
-                                    label,
-                                    cfg.panel_slide_ms == ms,
-                                    TrayAction::SetPanelSlide(ms),
-                                )
-                            })
-                            .collect(),
+                        [
+                            (0, "Off"),
+                            (100, "Fast"),
+                            (150, "Normal"),
+                            (300, "Slow"),
+                            (1500, "Very slow"),
+                        ]
+                        .into_iter()
+                        .map(|(ms, label)| {
+                            (
+                                label,
+                                cfg.panel_slide_ms == ms,
+                                TrayAction::SetPanelSlide(ms),
+                            )
+                        })
+                        .collect(),
                         cfg.panel,
                         p,
                     ),
@@ -556,15 +580,18 @@ fn views(cfg: &Config, p: &Palette) -> Vec<AnyElement> {
                 ),
                 setting_row(
                     "Flip speed",
-                    "How long the panel takes to turn into the window, and back.",
+                    "How long the panel takes to turn into the window, and back. Very slow (5 s) is for looking at each frame.",
                     segmented(
                         "flip-speed",
-                        [(350, "Fast"), (560, "Normal"), (900, "Slow")]
-                            .into_iter()
-                            .map(|(ms, label)| {
-                                (label, cfg.flip_ms == ms, TrayAction::SetFlipSpeed(ms))
-                            })
-                            .collect(),
+                        [
+                            (350, "Fast"),
+                            (560, "Normal"),
+                            (900, "Slow"),
+                            (5000, "Very slow"),
+                        ]
+                        .into_iter()
+                        .map(|(ms, label)| (label, cfg.flip_ms == ms, TrayAction::SetFlipSpeed(ms)))
+                        .collect(),
                         cfg.window && cfg.panel && cfg.flip_animation,
                         p,
                     ),
@@ -620,6 +647,67 @@ fn badges(cfg: &Config, p: &Palette) -> Vec<AnyElement> {
         .map(|&(c, label)| (label, c == cfg.overlay.corner, TrayAction::SetCorner(c)))
         .collect();
     vec![
+        group_with_note(
+            "Notifications",
+            "Shown by Windows, which holds them back in Do not disturb.",
+            vec![
+                flag(
+                    "notify-review",
+                    "A review is asked of you",
+                    "When a pull request in your repos asks for your review.",
+                    Setting::NotifyReview,
+                    cfg.github_prs,
+                    cfg,
+                    p,
+                ),
+                flag(
+                    "notify-new-pr",
+                    "A pull request is opened",
+                    "When someone opens a pull request in one of your repos.",
+                    Setting::NotifyNewPr,
+                    cfg.github_prs,
+                    cfg,
+                    p,
+                ),
+                flag(
+                    "notify-checks",
+                    "Checks fail",
+                    "When an open pull request's checks turn red.",
+                    Setting::NotifyChecks,
+                    cfg.github_prs,
+                    cfg,
+                    p,
+                ),
+                flag(
+                    "notify-behind",
+                    "A repo falls behind",
+                    "When a fetch brings in commits you haven't pulled.",
+                    Setting::NotifyBehind,
+                    true,
+                    cfg,
+                    p,
+                ),
+                flag(
+                    "notify-new-branch",
+                    "A new branch appears",
+                    "When a fetch brings in a branch that wasn't on the remote before.",
+                    Setting::NotifyNewBranch,
+                    true,
+                    cfg,
+                    p,
+                ),
+                flag(
+                    "notify-new-commits",
+                    "New commits arrive",
+                    "When a fetch brings in commits on any remote branch, not your own pushes.",
+                    Setting::NotifyNewCommits,
+                    true,
+                    cfg,
+                    p,
+                ),
+            ],
+            p,
+        ),
         group(
             "Corner badge",
             vec![
@@ -1186,6 +1274,12 @@ mod tests {
             Setting::GithubRepos,
             Setting::ScrollTogether,
             Setting::FlipAnimation,
+            Setting::NotifyReview,
+            Setting::NotifyChecks,
+            Setting::NotifyBehind,
+            Setting::NotifyNewPr,
+            Setting::NotifyNewBranch,
+            Setting::NotifyNewCommits,
         ];
         for setting in all {
             let before = Config::default();

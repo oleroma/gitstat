@@ -17,6 +17,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
 /// Concurrent `git` checks, as in `git::check_all`.
+/// Every this many sweeps fetches every repo, pushed to or not.
+const FULL_SWEEP_EVERY: u64 = 6;
 const MAX_WORKERS: usize = 6;
 const HEALTH_EVERY: Duration = Duration::from_secs(60);
 /// Without a working watch: a local sweep this often, and a new watch attempt.
@@ -59,6 +61,11 @@ pub enum Command {
     /// config.json (unparsable mid-edit) couldn't take. A later good reload
     /// of the file replaces it, as it does in the app.
     Apply(Config),
+    /// Fetch this repo now, if this monitor watches it.
+    Fetch(PathBuf),
+    /// When GitHub last saw a push to each repo with a GitHub `origin`, from
+    /// the pull request poll (ISO 8601).
+    Pushed(HashMap<PathBuf, String>),
     Shutdown,
 }
 
@@ -216,6 +223,15 @@ struct Scheduler {
     sweep: HashSet<PathBuf>,
     sweeping: bool,
     sweeps: u64,
+    /// GitHub's last push time per repo, from the latest poll.
+    pushed: HashMap<PathBuf, String>,
+    /// That time as it was when a fetch of the repo started...
+    fetching_push: HashMap<PathBuf, String>,
+    /// ...and as of the last fetch that went through. A sweep skips the
+    /// fetch while it is unchanged.
+    fetched_push: HashMap<PathBuf, String>,
+    /// The next sweep fetches every repo: Refresh now asked for it.
+    full_fetch: bool,
     /// `None` while a sweep runs: the next one is timed from its end.
     next_sweep: Option<Instant>,
     retries: HashMap<PathBuf, Retry>,
@@ -276,6 +292,10 @@ impl Scheduler {
             sweep: HashSet::new(),
             sweeping: false,
             sweeps: 0,
+            pushed: HashMap::new(),
+            fetching_push: HashMap::new(),
+            fetched_push: HashMap::new(),
+            full_fetch: false,
             next_sweep: None,
             retries: HashMap::new(),
             next_health: None,
@@ -320,9 +340,17 @@ impl Scheduler {
                 Ok(Msg::Cmd(Command::Shutdown)) | Err(RecvTimeoutError::Disconnected) => break,
                 Ok(Msg::Cmd(Command::RefreshAll)) => {
                     let now = Instant::now();
+                    self.full_fetch = true;
                     self.poll_config(now);
                     self.start_sweep(true, now);
                 }
+                Ok(Msg::Cmd(Command::Fetch(repo))) => {
+                    if self.repos.contains(&repo) {
+                        self.retries.remove(&repo);
+                        self.debouncer.request(&repo, Need::Fetch, Instant::now());
+                    }
+                }
+                Ok(Msg::Cmd(Command::Pushed(pushed))) => self.on_pushed(pushed, Instant::now()),
                 Ok(Msg::Cmd(Command::Apply(config))) => {
                     if config != self.config {
                         self.apply_config(config, Instant::now());
@@ -446,6 +474,12 @@ impl Scheduler {
         }
         for (repo, need) in due {
             let fetch = need == Need::Fetch;
+            if fetch {
+                match self.pushed.get(&repo) {
+                    Some(p) => self.fetching_push.insert(repo.clone(), p.clone()),
+                    None => self.fetching_push.remove(&repo),
+                };
+            }
             let tx = self.tx.clone();
             let generation = self.generation;
             let worker_repo = repo.clone();
@@ -517,6 +551,10 @@ impl Scheduler {
         };
         if need == Need::Fetch {
             // Even when the local status failed too: the fetch still did.
+            match self.fetching_push.remove(&repo) {
+                Some(p) if !status.fetch_errored => self.fetched_push.insert(repo.clone(), p),
+                _ => self.fetched_push.remove(&repo),
+            };
             if status.fetch_errored {
                 let retry = self.retries.entry(repo.clone()).or_insert(Retry {
                     failures: 0,
@@ -561,12 +599,41 @@ impl Scheduler {
         }
     }
 
+    /// Fetches every repo, except those GitHub has seen no push to since
+    /// their last fetch: those get a local check. Every
+    /// `FULL_SWEEP_EVERY`th sweep, and Refresh now, fetch them all, which
+    /// also catches other remotes and deleted branches.
     fn fetch_all(&mut self, now: Instant) {
+        let full = std::mem::take(&mut self.full_fetch) || self.sweeps % FULL_SWEEP_EVERY == 1;
         for repo in &self.repos {
+            let unchanged = !full
+                && self
+                    .pushed
+                    .get(repo)
+                    .is_some_and(|p| self.fetched_push.get(repo) == Some(p));
+            if unchanged {
+                self.debouncer.request(repo, Need::Local, now);
+                continue;
+            }
             self.sweep.insert(repo.clone());
             self.debouncer.request(repo, Need::Fetch, now);
         }
         self.finish_sweep_if_done(now);
+    }
+
+    /// A GitHub poll's push times: a repo pushed to since its last fetch is
+    /// fetched now, without waiting for the sweep.
+    fn on_pushed(&mut self, pushed: HashMap<PathBuf, String>, now: Instant) {
+        for repo in &self.repos {
+            let Some(p) = pushed.get(repo) else {
+                continue;
+            };
+            let known = self.fetched_push.get(repo);
+            if known.is_some_and(|k| k != p) {
+                self.debouncer.request(repo, Need::Fetch, now);
+            }
+        }
+        self.pushed = pushed;
     }
 
     fn finish_sweep_if_done(&mut self, now: Instant) {
@@ -802,6 +869,9 @@ impl Scheduler {
             self.start_sweep(false, now);
             return;
         }
+        if old.ignore != self.config.ignore {
+            self.walk_here(false, now);
+        }
         if old.watch != self.config.watch {
             self.setup_watch(now);
             if self.mode == WatchMode::Events {
@@ -824,6 +894,10 @@ impl Scheduler {
             pruned,
             entered,
         } = discovery;
+        let found: Vec<PathBuf> = found
+            .into_iter()
+            .filter(|r| !self.config.is_ignored(&git::repo_name(&self.name_base, r)))
+            .collect();
         self.router.set_pruned(&pruned);
         self.router.set_entered(&entered);
         self.router.set_capped(capped.is_some());
@@ -1762,6 +1836,52 @@ mod tests {
                 .is_some(),
             "config edit didn't turn watching on"
         );
+    }
+
+    #[test]
+    fn github_pushes_decide_fetches() {
+        let h = Harness::new(
+            "pushed",
+            |root| {
+                let origin = root.parent().unwrap().join("origin-pushed.git");
+                let seed = root.parent().unwrap().join("seed-pushed");
+                init_repo(&seed);
+                git(
+                    root,
+                    &[
+                        "clone",
+                        "-q",
+                        "--bare",
+                        seed.to_str().unwrap(),
+                        origin.to_str().unwrap(),
+                    ],
+                );
+                git(root, &["clone", "-q", origin.to_str().unwrap(), "a"]);
+            },
+            |_| {},
+        );
+        h.settle();
+        let a = h.root.join("a");
+        let fetched = |h: &Harness, wait: Duration| {
+            h.wait_for(
+                wait,
+                |u| matches!(u, Update::Started { repo, fetch: true } if *repo == a),
+            )
+            .is_some()
+        };
+        let pushed = |at: &str| Command::Pushed(HashMap::from([(a.clone(), at.to_string())]));
+        // Nothing known yet: a push time alone fetches nothing.
+        h.send(pushed("t1"));
+        assert!(!fetched(&h, Duration::from_secs(2)));
+        // A fetch now records it.
+        h.send(Command::Fetch(a.clone()));
+        assert!(fetched(&h, WAIT));
+        assert!(h.status("a", WAIT).is_some());
+        // The same time again: no fetch. A newer one: a fetch at once.
+        h.send(pushed("t1"));
+        assert!(!fetched(&h, Duration::from_secs(2)));
+        h.send(pushed("t2"));
+        assert!(fetched(&h, WAIT));
     }
 
     #[test]

@@ -391,6 +391,8 @@ impl StatusView {
         cx: &mut Context<Self>,
     ) -> Self {
         cx.observe(&state, |_, _, cx| cx.notify()).detach();
+        // A new panel or window starts unfiltered.
+        state.update(cx, |s, _| s.filter.clear());
         if mode == Mode::Window {
             cx.observe_in(&state, window, |this: &mut Self, state, window, cx| {
                 this.fit_to_repos(&state, window, cx)
@@ -415,7 +417,7 @@ impl StatusView {
             cx.observe_window_activation(window, |this: &mut Self, window, cx| {
                 if window.is_window_active() {
                     this.seen_active = true;
-                } else if this.seen_active {
+                } else if this.seen_active && !crate::repo_menu::is_open() {
                     panel::dismiss(window, cx);
                 }
             })
@@ -823,6 +825,13 @@ fn repo_row(index: usize, s: &RepoStatus, p: &Palette, mode: Mode, cx: &App) -> 
                 panel::dismiss(window, cx);
             }
         })
+        .on_mouse_down(gpui::MouseButton::Right, {
+            let s = s.clone();
+            move |_, window, cx| {
+                cx.stop_propagation();
+                crate::repo_menu::show(&s, window, cx);
+            }
+        })
         .child(crate::repo_marks::global_mark(s, 16.0, color, cx))
         .child(
             div()
@@ -1087,6 +1096,7 @@ impl Render for StatusView {
         // The panel's rows measured as laid out, so the panel can be made
         // exactly as tall as what it shows.
         let content_h = Rc::new(std::cell::Cell::new(0.0f32));
+        let filter_state = self.state.clone();
         let timelines = self.timelines.clone();
         // Pictures only: the panel's words move into tooltips.
         let icons_only = mode == Mode::Panel && self.state.read(cx).config.icons_only;
@@ -1136,6 +1146,15 @@ impl Render for StatusView {
         }
         if sweeping {
             subline.push_str(" · checking…");
+        }
+        if !state.filter.is_empty() {
+            let found =
+                state.sorted(&state.statuses).len() + state.sorted(&state.remote_statuses).len();
+            subline = format!(
+                "Filter “{}”: {found} {} · Esc clears",
+                state.filter,
+                if found == 1 { "repo" } else { "repos" }
+            );
         }
         let open_prs = state.open_prs();
 
@@ -1188,7 +1207,10 @@ impl Render for StatusView {
                         crate::morph::Part::Subline,
                         Some((subline.clone().into(), p.muted, 12.0, false)),
                     )),
-            );
+            )
+            .when(state.has_result && !state.statuses.is_empty(), |d| {
+                d.child(health_row(&state.statuses, sweeping, &p))
+            });
 
         let titles = if icons_only {
             let mut lines = vec![
@@ -1709,9 +1731,23 @@ impl Render for StatusView {
                 })
             })
             .id("root")
+            // Digits of one width, so counts and ⬆⬇ numbers line up.
+            .map(|mut d| {
+                d.text_style()
+                    .get_or_insert_with(Default::default)
+                    .font_features = Some(gpui::FontFeatures(std::sync::Arc::new(vec![(
+                    "tnum".to_string(),
+                    1,
+                )])));
+                d
+            })
             .track_focus(&self.focus)
             .key_context("StatusView")
             .on_key_down(move |event, window, cx| {
+                if filter_key(&filter_state, event, mode, window, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
                 if event.keystroke.key == "escape" {
                     match mode {
                         Mode::Panel => panel::dismiss(window, cx),
@@ -1767,6 +1803,62 @@ impl Render for StatusView {
 /// In the window, a wheel over `part` (the header or the footer) scrolls the
 /// table sideways, as it does over the columns' headers; only over a
 /// column's commits does it scroll up and down.
+/// Typing filters the repos: letters add to the filter, Backspace takes
+/// one off, Esc clears it, Enter opens the first repo listed. True when
+/// the key was the filter's.
+fn filter_key(
+    state: &Entity<AppState>,
+    event: &gpui::KeyDownEvent,
+    mode: Mode,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    let k = &event.keystroke;
+    let m = &k.modifiers;
+    if m.control || m.alt || m.platform || m.function {
+        return false;
+    }
+    let filter = state.read(cx).filter.clone();
+    let typed = k
+        .key_char
+        .as_deref()
+        .filter(|c| c.chars().all(|ch| !ch.is_control()) && !c.is_empty());
+    let new = match k.key.as_str() {
+        "escape" if !filter.is_empty() => String::new(),
+        "backspace" if !filter.is_empty() => {
+            let mut f = filter.clone();
+            f.pop();
+            f
+        }
+        "enter" if !filter.is_empty() => {
+            let first = {
+                let s = state.read(cx);
+                s.sorted(&s.statuses)
+                    .first()
+                    .or(s.sorted(&s.remote_statuses).first())
+                    .map(|r| r.path.clone())
+            };
+            if let Some(path) = first {
+                open_repo(&path, cx);
+                if mode == Mode::Panel {
+                    panel::dismiss(window, cx);
+                }
+            }
+            return true;
+        }
+        _ => match typed {
+            // A space can't start a filter.
+            Some(c) if !(filter.is_empty() && c.trim().is_empty()) => format!("{filter}{c}"),
+            _ => return false,
+        },
+    };
+    state.update(cx, |s, cx| {
+        s.filter = new;
+        cx.notify();
+    });
+    true
+}
+
 fn sideways(part: impl IntoElement, mode: Mode, cx: &mut Context<StatusView>) -> AnyElement {
     if mode != Mode::Window {
         return part.into_any_element();
@@ -1801,7 +1893,8 @@ pub(crate) fn rim(dark: bool) -> Hsla {
 
 /// A bar of the repos' tones: green synced, amber local work, red needs
 /// action, each as wide as its share; dimmed while a check runs.
-fn summary_bar(statuses: &[RepoStatus], checking: bool, p: &Palette) -> gpui::Div {
+/// Repos synced, with local work, and needing a look.
+fn tone_counts(statuses: &[RepoStatus]) -> [usize; 3] {
     let mut counts = [0usize; 3];
     for s in statuses {
         let i = match crate::icon::FolderState::of(s).tone() {
@@ -1811,6 +1904,33 @@ fn summary_bar(statuses: &[RepoStatus], checking: bool, p: &Palette) -> gpui::Di
         };
         counts[i] += 1;
     }
+    counts
+}
+
+/// The header's health: a thin bar of synced, local-work and
+/// needs-a-look repos, and their counts.
+fn health_row(statuses: &[RepoStatus], checking: bool, p: &Palette) -> gpui::Div {
+    let counts = tone_counts(statuses);
+    let count = |n: usize, mark: &str, color: Hsla| {
+        div()
+            .flex_none()
+            .text_color(if n > 0 { color } else { p.muted.opacity(0.6) })
+            .child(format!("{mark}{n}"))
+    };
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .pt_1()
+        .text_xs()
+        .child(summary_bar(statuses, checking, p).h(px(4.)))
+        .child(count(counts[0], "✓ ", p.green))
+        .child(count(counts[1], "● ", p.amber))
+        .child(count(counts[2], "! ", p.red))
+}
+
+fn summary_bar(statuses: &[RepoStatus], checking: bool, p: &Palette) -> gpui::Div {
+    let counts = tone_counts(statuses);
     let total = statuses.len().max(1) as f32;
     let bar = div()
         .flex()
@@ -1874,6 +1994,32 @@ impl Render for Tip {
 }
 
 /// A tooltip builder showing `lines`, for icons-only mode.
+/// What a repo's tooltip adds below its name and status: the rest of a
+/// fetch error, the unpushed branches by name, the stash, and where the
+/// actions are.
+pub(crate) fn status_details(s: &RepoStatus, p: &Palette) -> Vec<(String, Hsla)> {
+    let mut lines = Vec::new();
+    if let Some(error) = &s.error {
+        for line in error.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+            lines.push((line.trim().to_string(), p.muted));
+        }
+    }
+    for (branch, n) in &s.unpushed_branches {
+        let commits = if *n == 1 { "commit" } else { "commits" };
+        lines.push((format!("{branch}: {n} {commits} on no remote"), p.amber));
+    }
+    if s.stashes > 0 {
+        lines.push((format!("{} stashed", s.stashes), p.muted));
+    }
+    let hint = if s.error.is_some() && !s.remote_only {
+        "Right-click to fetch again, or for more"
+    } else {
+        "Right-click for more"
+    };
+    lines.push((hint.to_string(), p.muted));
+    lines
+}
+
 pub(crate) fn tip(
     lines: Vec<(String, Hsla)>,
     p: &Palette,

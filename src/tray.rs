@@ -75,6 +75,8 @@ pub enum TrayAction {
     /// The folders to look for repos in: `path`, then `more_paths`.
     SetFolders(String, Vec<String>),
     OpenSettings,
+    /// A pick from a repo's right-click menu.
+    RepoMenu(crate::repo_menu::RepoAction, crate::repo_menu::Target),
     Quit,
 }
 
@@ -289,6 +291,11 @@ impl Tray {
                 .find(|(item, _, _)| item.id() == id)
                 .map(|(_, path, _)| TrayAction::OpenRepo(path.clone()))
         }
+    }
+
+    /// The tray icon's own window, which its notifications come from.
+    pub fn hwnd(&self) -> isize {
+        self.icon.window_handle() as isize
     }
 
     /// The icon's rect in physical px, for anchoring the panel when it is
