@@ -24,6 +24,8 @@ mod layout;
 #[cfg(any(windows, test))]
 mod monitor;
 #[cfg(any(windows, test))]
+mod notify;
+#[cfg(any(windows, test))]
 mod repo_graph;
 #[cfg(any(windows, test))]
 mod repo_icon;
@@ -48,6 +50,8 @@ mod overlay;
 mod panel;
 #[cfg(windows)]
 mod repo_marks;
+#[cfg(windows)]
+mod repo_menu;
 #[cfg(windows)]
 mod settings;
 #[cfg(windows)]

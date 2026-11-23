@@ -464,13 +464,13 @@ impl FolderState {
     /// The most urgent thing about the repo: an error, then anything that
     /// needs a pull, then a push, then a commit.
     pub fn of(s: &RepoStatus) -> Self {
-        if s.error.is_some() {
+        if s.error.is_some() || s.operation.is_some() {
             Self::Error
         } else if s.is_diverged() {
             Self::Diverged
         } else if s.behind > 0 {
             Self::Behind
-        } else if s.ahead > 0 {
+        } else if s.ahead > 0 || !s.unpushed_branches.is_empty() {
             Self::Ahead
         } else if s.dirty {
             Self::Dirty

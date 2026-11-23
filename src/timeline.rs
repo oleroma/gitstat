@@ -903,6 +903,13 @@ impl Timelines {
             .hover(|s| s.bg(p.hover))
             // Big mode, scrolled to this repo's column; the folder when the
             // window is turned off.
+            .on_mouse_down(gpui::MouseButton::Right, {
+                let status = status.clone();
+                move |_, window, cx| {
+                    cx.stop_propagation();
+                    crate::repo_menu::show(&status, window, cx);
+                }
+            })
             .on_click(move |_, window, cx| {
                 let big = this_for_label.read(cx).state.read(cx).config.window;
                 if big {
@@ -914,11 +921,12 @@ impl Timelines {
             });
         let label = if icons_only {
             // The icon alone; its words in a tooltip.
-            let lines = vec![
+            let mut lines = vec![
                 (status.name.clone(), p.text),
                 (checkout, p.muted),
                 (status_text, status_color),
             ];
+            lines.extend(crate::view::status_details(status, p));
             label
                 .justify_center()
                 .w(px(ICON_LABEL_WIDTH))
@@ -941,7 +949,13 @@ impl Timelines {
                         )),
                 )
         } else {
+            let mut lines = vec![
+                (status.name.clone(), p.text),
+                (status_text.clone(), status_color),
+            ];
+            lines.extend(crate::view::status_details(status, p));
             label
+                .tooltip(crate::view::tip(lines, p))
                 .gap_2()
                 .w(px(LABEL_WIDTH))
                 .pl_2()
@@ -1074,8 +1088,22 @@ impl Timelines {
                 cx.stop_propagation();
                 entity.update(cx, |t, cx| t.scroll(&wheel_path, dx, all, cx));
             })
+            .relative()
             .child(painter)
             .child(label)
+            // An edge in the status colour on a repo that needs something.
+            .when(!status.is_synced() && !status.remote_only, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top(px(3.))
+                        .bottom(px(3.))
+                        .w(px(3.))
+                        .rounded_r_sm()
+                        .bg(crate::view::status_color(status, p)),
+                )
+            })
             .into_any_element()
     }
 

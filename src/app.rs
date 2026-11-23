@@ -239,6 +239,20 @@ fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
             Input::Github(report) => {
                 let c = &state.read(cx).config;
                 if c.github_prs || c.github_repos {
+                    let lines = {
+                        let s = state.read(cx);
+                        let names = s
+                            .statuses
+                            .iter()
+                            .map(|r| (r.path.clone(), r.name.clone()))
+                            .collect();
+                        crate::notify::pr_changes(&s.config.notify, &names, &s.prs, &report.prs)
+                    };
+                    notify(&lines, cx);
+                    if !report.pushed.is_empty() {
+                        cx.global::<Shared>()
+                            .send_monitors(Command::Pushed(report.pushed.clone()));
+                    }
                     state.update(cx, |s, _| {
                         let (prs, repos) = (s.config.github_prs, s.config.github_repos);
                         s.github_report(report);
@@ -353,12 +367,28 @@ fn on_update(slot: usize, update: Update, cx: &mut App) -> (bool, bool) {
             state.update(cx, |s, _| s.in_flight.insert(repo));
             (false, false)
         }
-        Update::Status(status) => state.update(cx, |s, _| {
-            s.in_flight.remove(&status.path);
-            s.checked(&status.path);
-            let changed = s.merge_status(status);
-            (changed, changed)
-        }),
+        Update::Status(status) => {
+            let (line, changes) = {
+                let s = state.read(cx);
+                let old = s.statuses.iter().find(|o| o.path == status.path);
+                (
+                    crate::notify::behind(&s.config.notify, old, &status),
+                    crate::notify::remote_changes(&s.config.notify, old, &status),
+                )
+            };
+            if let Some(line) = line {
+                notify(&[line], cx);
+            }
+            if !changes.is_empty() {
+                notify_remote(&status, changes, cx);
+            }
+            state.update(cx, |s, _| {
+                s.in_flight.remove(&status.path);
+                s.checked(&status.path);
+                let changed = s.merge_status(status);
+                (changed, changed)
+            })
+        }
         Update::SweepStarted => {
             state.update(cx, |s, _| s.set_sweeping(slot, true));
             (true, false)
@@ -445,6 +475,36 @@ fn on_action(action: TrayAction, cx: &mut App) -> bool {
             shared.github.refresh();
         }
         TrayAction::OpenRepo(path) => view::open_repo(&path, cx),
+        TrayAction::RepoMenu(action, target) => {
+            use crate::repo_menu::RepoAction;
+            if action.leaves() {
+                panel::close(cx);
+            }
+            match action {
+                RepoAction::Fetch => {
+                    cx.global::<Shared>()
+                        .send_monitors(Command::Fetch(target.path.clone()));
+                }
+                RepoAction::Hide => {
+                    let name = if target.remote_only {
+                        crate::github::remote_slug(&target.path)
+                            .unwrap_or(&target.name)
+                            .to_string()
+                    } else {
+                        target.name.clone()
+                    };
+                    change_setting(
+                        move |c| {
+                            if !c.is_ignored(&name) {
+                                c.ignore.push(name);
+                            }
+                        },
+                        cx,
+                    );
+                }
+                _ => crate::repo_menu::run(action, &target, cx),
+            }
+        }
         TrayAction::EditConfig => {
             let file = cx.global::<Ui>().state.read(cx).config_file.clone();
             cx.open_with_system(&file);
@@ -609,6 +669,10 @@ fn apply_config(old: &Config, new: Config, cx: &mut App) {
     let state = cx.global::<Ui>().state.clone();
     state.update(cx, |s, cx| {
         s.config = new.clone();
+        if new.ignore != old.ignore {
+            let remote = s.remote_repos.clone();
+            s.set_remote_repos(remote);
+        }
         cx.notify();
     });
     if !new.panel {
@@ -693,6 +757,59 @@ impl Render for Keepalive {
 }
 
 /// The current local time as HH:MM.
+/// Notifies what a fetch brought in, counting the new commits off the UI
+/// thread first.
+fn notify_remote(
+    status: &crate::git::RepoStatus,
+    changes: Vec<crate::notify::RemoteChange>,
+    cx: &mut App,
+) {
+    use crate::notify::RemoteChange;
+    let (repo, name) = (status.path.clone(), status.name.clone());
+    let task = cx.background_spawn(async move {
+        changes
+            .into_iter()
+            .map(|c| match c {
+                RemoteChange::New { branch } => format!("{name}: new branch {branch}"),
+                RemoteChange::Moved { branch, from, to } => {
+                    let range = format!("{from}..{to}");
+                    let count = crate::git::git(
+                        &repo,
+                        &["rev-list", "--count", &range, "--"],
+                        crate::git::LOCAL_TIMEOUT,
+                    )
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .and_then(|o| {
+                        String::from_utf8_lossy(&o.stdout)
+                            .trim()
+                            .parse::<u32>()
+                            .ok()
+                    });
+                    match count {
+                        Some(1) => format!("{name}: 1 new commit on {branch}"),
+                        Some(n) if n > 0 => format!("{name}: {n} new commits on {branch}"),
+                        // Rewritten (a force push), or git couldn't say.
+                        _ => format!("{name}: {branch} changed"),
+                    }
+                }
+            })
+            .collect::<Vec<String>>()
+    });
+    cx.spawn(async move |cx| {
+        let lines = task.await;
+        cx.update(|cx| notify(&lines, cx)).ok();
+    })
+    .detach();
+}
+
+/// Shows `lines` as one Windows notification from the tray icon.
+fn notify(lines: &[String], cx: &mut App) {
+    if let Some(note) = crate::notify::note(lines) {
+        crate::notify::show(cx.global::<Shared>().tray.hwnd(), &note);
+    }
+}
+
 fn local_time() -> String {
     let mut t = unsafe { std::mem::zeroed::<windows_sys::Win32::Foundation::SYSTEMTIME>() };
     unsafe { windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut t) };

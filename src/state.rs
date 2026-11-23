@@ -48,6 +48,9 @@ pub struct AppState {
     /// The same repos as statuses, by name, so the timeline can list them
     /// after the cloned ones. Never counted as unsynced.
     pub remote_statuses: Vec<RepoStatus>,
+    /// What was typed into the panel or the window: only repos whose name
+    /// or branch holds it are listed, with every section open. Not saved.
+    pub filter: String,
 }
 
 impl AppState {
@@ -76,6 +79,7 @@ impl AppState {
             prs: HashMap::new(),
             github_problem: None,
             remote_repos: Vec::new(),
+            filter: String::new(),
             remote_statuses: Vec::new(),
         }
     }
@@ -124,7 +128,7 @@ impl AppState {
         match self.config.badge_number {
             BadgeNumber::Unsynced => self.unsynced(),
             BadgeNumber::Dirty => repos(|s| s.dirty),
-            BadgeNumber::Ahead => repos(|s| s.ahead > 0),
+            BadgeNumber::Ahead => repos(|s| s.ahead > 0 || !s.unpushed_branches.is_empty()),
             BadgeNumber::Behind => repos(|s| s.behind > 0),
             BadgeNumber::PullRequests => {
                 let remote: u64 = self.remote_repos.iter().map(|r| r.open_prs).sum();
@@ -289,7 +293,8 @@ impl AppState {
 
     /// Takes in the uncloned repos. One pushed to since the last list
     /// counts as checked, so its tree is read again.
-    pub fn set_remote_repos(&mut self, remote: Vec<crate::github::RemoteRepo>) {
+    pub fn set_remote_repos(&mut self, mut remote: Vec<crate::github::RemoteRepo>) {
+        remote.retain(|r| !self.config.is_ignored(&r.slug));
         for r in &remote {
             let pushed_before = self
                 .remote_repos
@@ -323,7 +328,7 @@ impl AppState {
     /// mode share it, and config.json keeps it.
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn folded(&self, section: crate::config::Section) -> bool {
-        self.config.folds.folded(section)
+        self.filter.trim().is_empty() && self.config.folds.folded(section)
     }
 
     /// The listed repos' open pull requests, most pressing first.
@@ -353,7 +358,7 @@ impl AppState {
     pub fn sorted<'a>(&self, list: &'a [RepoStatus]) -> Vec<&'a RepoStatus> {
         use crate::config::RepoSort;
         use std::cmp::Reverse;
-        let mut sorted: Vec<&RepoStatus> = list.iter().collect();
+        let mut sorted: Vec<&RepoStatus> = list.iter().filter(|s| self.matches(s)).collect();
         let sort = self.config.sort;
         // Larger is earlier, then the name.
         sorted.sort_by_cached_key(|s| {
@@ -369,6 +374,17 @@ impl AppState {
             (Reverse(score), s.name.to_lowercase())
         });
         sorted
+    }
+
+    /// Whether `s` passes the typed filter: its name or branch holds it,
+    /// ignoring case. Everything passes an empty one.
+    pub fn matches(&self, s: &RepoStatus) -> bool {
+        let filter = self.filter.trim().to_lowercase();
+        filter.is_empty()
+            || s.name.to_lowercase().contains(&filter)
+            || s.branch
+                .as_deref()
+                .is_some_and(|b| b.to_lowercase().contains(&filter))
     }
 
     /// When `s`'s newest pull request was last updated, Unix seconds.
@@ -431,13 +447,13 @@ fn worst_mode(modes: &[WatchMode]) -> Option<WatchMode> {
 
 /// 0 is worst: error, diverged, behind, ahead, dirty, no upstream, synced.
 fn severity(s: &RepoStatus) -> u8 {
-    if s.error.is_some() {
+    if s.error.is_some() || s.operation.is_some() {
         0
     } else if s.is_diverged() {
         1
     } else if s.behind > 0 {
         2
-    } else if s.ahead > 0 {
+    } else if s.ahead > 0 || !s.unpushed_branches.is_empty() {
         3
     } else if s.dirty {
         4
@@ -523,6 +539,11 @@ mod tests {
             s.sorted(&list).iter().map(|r| r.name.clone()).collect()
         };
         assert_eq!(order(&s), ["a", "b", "c"]);
+        s.filter = "B".into();
+        assert_eq!(order(&s), ["b"]);
+        assert!(!s.folded(crate::config::Section::Synced));
+        s.filter.clear();
+        assert!(s.folded(crate::config::Section::Synced));
         s.config.sort = RepoSort::Status;
         assert_eq!(order(&s), ["a", "b", "c"]);
         s.config.sort = RepoSort::LastCommit;

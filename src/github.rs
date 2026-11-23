@@ -133,6 +133,9 @@ pub struct Report {
     /// recently pushed first. `None` when not asked for, or when they
     /// couldn't be read (then the app keeps the last list).
     pub remote_only: Option<Vec<RemoteRepo>>,
+    /// When GitHub last saw a push to each polled repo (ISO 8601), so the
+    /// fetch sweep can leave out the ones with nothing new.
+    pub pushed: HashMap<PathBuf, String>,
 }
 
 /// What a poll reads.
@@ -296,6 +299,9 @@ fn poll(repos: &[PathBuf], wants: Wants, slugs: &mut HashMap<PathBuf, Option<Str
                 for (i, prs) in parse(&json, batch.len()).into_iter().enumerate() {
                     if let Some(prs) = prs {
                         report.prs.insert(batch[i].0.clone(), prs);
+                    }
+                    if let Some(at) = json["data"][format!("r{i}")]["pushedAt"].as_str() {
+                        report.pushed.insert(batch[i].0.clone(), at.to_string());
                     }
                 }
             }
@@ -614,7 +620,7 @@ fn query(slugs: &[&str]) -> String {
     for (i, slug) in slugs.iter().enumerate() {
         let (owner, name) = slug.split_once('/').unwrap_or((slug, ""));
         q.push_str(&format!(
-            "r{i}:repository(owner:\"{owner}\",name:\"{name}\"){{\
+            "r{i}:repository(owner:\"{owner}\",name:\"{name}\"){{pushedAt \
              open:pullRequests(states:OPEN,first:{MAX_OPEN},\
              orderBy:{{field:UPDATED_AT,direction:DESC}}){{nodes{{...pr}}}}\
              done:pullRequests(states:[MERGED,CLOSED],first:{MAX_DONE},\
