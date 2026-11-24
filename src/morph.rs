@@ -10,7 +10,7 @@
 //!    fades in over the panel, hiding what only the panel shows. What both
 //!    views show (each repo's tree, icon, name and checkout, the top bar's
 //!    words and health bar) is drawn whole over its twin from the start.
-//! 2. Slide out: the panel's section headings slide out of the top or the
+//! 2. Slide out, with the fade: the panel's section headings slide out of the top or the
 //!    bottom of its list, and its pull requests down into its bottom bar,
 //!    drawn by the panel's own elements.
 //! 3. Turn: the panel closes; the sheet grows from the panel's place to
@@ -1518,7 +1518,9 @@ impl Render for MorphView {
         let k = self.stretch;
         let (fade, turn, reveal_len) = (FADE.mul_f32(k), TURN.mul_f32(k), REVEAL.mul_f32(k));
         let slide = SLIDE.mul_f32(k);
-        let turn_at = fade + slide;
+        // The fade and the slide out run together, so the turn follows the
+        // glide home at once.
+        let turn_at = fade.max(slide);
         let hold_at = turn_at + turn;
         let open = self.direction == Direction::Open;
         // The reveal waits for the window underneath to have drawn, so it
@@ -2079,10 +2081,10 @@ impl Render for MorphView {
         .inset_0();
 
         // The bars that slide, the views' own elements: the starting
-        // view's slide out after the fade, the ending view's in before the
+        // view's slide out with the fade, the ending view's in before the
         // reveal, both under the sheet's bars.
         let p = Palette::for_appearance(appearance);
-        let out = ease(phase(elapsed, fade, slide));
+        let out = ease(phase(elapsed, Duration::ZERO, slide));
         let into = self
             .arrived
             .map(|a| 1.0 - ease(phase(a.elapsed(), Duration::ZERO, slide)));

@@ -2,8 +2,8 @@
 //! `flip_frames` set to a folder, each flip saves the screen under it on
 //! every frame it draws, and for a moment after it closes, as numbered
 //! PNGs in a folder of their own. Off by default and not in the settings
-//! window. Capturing slows the flip a little, so its timing isn't quite
-//! the real one; its picture is.
+//! window. The screen is captured and saved on a thread of its own, so
+//! recording barely slows the flip.
 
 use crate::layout::Rect;
 use std::cell::RefCell;
@@ -16,11 +16,10 @@ const AFTER: Duration = Duration::from_millis(250);
 const AFTER_EVERY: Duration = Duration::from_millis(16);
 
 struct Recorder {
-    rect: Rect,
     start: Instant,
     n: u32,
     /// To the thread that writes the files.
-    tx: mpsc::Sender<(String, u32, u32, Vec<u8>)>,
+    tx: mpsc::Sender<String>,
 }
 
 thread_local! {
@@ -44,9 +43,19 @@ pub fn start(rect: Rect, cx: &gpui::App) {
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
-    let (tx, rx) = mpsc::channel::<(String, u32, u32, Vec<u8>)>();
+    // One thread captures each frame as soon as it's asked for; another
+    // writes them, however long that takes.
+    let (tx, rx) = mpsc::channel::<String>();
+    let (save, saved) = mpsc::channel::<(String, u32, u32, Vec<u8>)>();
     std::thread::spawn(move || {
-        for (name, w, h, pixels) in rx {
+        for name in rx {
+            if let Some((w, h, pixels)) = crate::win::capture(rect) {
+                let _ = save.send((name, w, h, pixels));
+            }
+        }
+    });
+    std::thread::spawn(move || {
+        for (name, w, h, pixels) in saved {
             let _ = image::save_buffer(
                 dir.join(name),
                 &pixels,
@@ -58,7 +67,6 @@ pub fn start(rect: Rect, cx: &gpui::App) {
     });
     RECORDER.with(|r| {
         *r.borrow_mut() = Some(Recorder {
-            rect,
             start: Instant::now(),
             n: 0,
             tx,
@@ -73,13 +81,10 @@ pub fn frame(what: &str) {
         let Some(rec) = r.as_mut() else {
             return;
         };
-        let Some((w, h, pixels)) = crate::win::capture(rec.rect) else {
-            return;
-        };
         rec.n += 1;
         let ms = rec.start.elapsed().as_millis();
         let name = format!("{:04}-{ms:05}ms-{what}.png", rec.n);
-        let _ = rec.tx.send((name, w, h, pixels));
+        let _ = rec.tx.send(name);
     });
 }
 
