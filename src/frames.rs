@@ -85,7 +85,12 @@ fn start_named(rect: Rect, name: &str, cx: &gpui::App) {
     let (tx, rx) = mpsc::channel::<String>();
     let (save, saved) = mpsc::channel::<(String, u32, u32, Vec<u8>)>();
     std::thread::spawn(move || {
-        for name in rx {
+        while let Ok(mut name) = rx.recv() {
+            // Behind: only the newest frame asked for, so each picture is
+            // the moment its name says.
+            while let Ok(newer) = rx.try_recv() {
+                name = newer;
+            }
             if let Some((w, h, pixels)) = crate::win::capture(rect) {
                 let _ = save.send((name, w, h, pixels));
             }

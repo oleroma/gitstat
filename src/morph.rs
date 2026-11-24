@@ -57,10 +57,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// The phases at the default speed, 560 ms in all; `flip_ms` stretches
-/// all but the hold, which is the big window's time to draw. The slide in
-/// runs during the hold.
-const FADE: Duration = Duration::from_millis(70);
+/// The phases at the default speed (`flip_ms` 560), 450 ms in all:
+/// `flip_ms` stretches all but the hold, which is the big window's time to
+/// draw. The slide out runs with the fade, the slide in during the hold.
+const FADE: Duration = Duration::from_millis(40);
 const SLIDE: Duration = Duration::from_millis(80);
 const TURN: Duration = Duration::from_millis(230);
 const HOLD: Duration = Duration::from_millis(80);
@@ -341,6 +341,46 @@ struct MorphSlot {
     /// Waiting for the trees to glide back to their newest commits before
     /// it starts, since then.
     waiting: Option<Instant>,
+    /// A flip window opened ahead, hidden, while the views glide home.
+    spare: Option<WindowHandle<MorphView>>,
+}
+
+/// Opens a hidden flip window ahead of the flip, so starting it needn't
+/// wait for a window to open.
+fn open_spare(cx: &mut App) {
+    if cx.default_global::<MorphSlot>().spare.is_some() {
+        return;
+    }
+    let area = win::primary_monitor().rect;
+    let handle = cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(crate::panel::logical(area))),
+            titlebar: None,
+            focus: false,
+            show: false,
+            kind: WindowKind::PopUp,
+            is_movable: false,
+            is_resizable: false,
+            is_minimizable: false,
+            window_background: WindowBackgroundAppearance::Transparent,
+            ..Default::default()
+        },
+        |window, cx| {
+            if let Some(h) = win::hwnd(window) {
+                cx.spawn(async move |_| unsafe { win::style_morph(h) })
+                    .detach();
+            }
+            cx.new(|_| MorphView::new(None, Direction::Open, 1.0, None))
+        },
+    );
+    cx.default_global::<MorphSlot>().spare = handle.ok();
+}
+
+/// Closes a spare flip window that no flip took.
+fn drop_spare(cx: &mut App) {
+    if let Some(spare) = cx.default_global::<MorphSlot>().spare.take() {
+        view::remove(spare.into(), cx);
+    }
 }
 
 impl Global for MorphSlot {}
@@ -384,14 +424,16 @@ fn newest_first(from_panel: bool, then: impl FnOnce(&mut App) + 'static, cx: &mu
         return false;
     }
     cx.default_global::<MorphSlot>().waiting = Some(Instant::now());
+    open_spare(cx);
     cx.spawn(async move |cx| {
         // A frame more, so the last of the glide is drawn.
         cx.background_executor()
-            .timer(wait + Duration::from_millis(20))
+            .timer(wait + Duration::from_millis(8))
             .await;
         cx.update(|cx| {
             cx.default_global::<MorphSlot>().waiting = None;
             then(cx);
+            drop_spare(cx);
         })
         .ok();
     })
@@ -1365,7 +1407,7 @@ fn same_words(a: &Seen, b: &Seen) -> Option<(Words, Words)> {
 fn launch(plan: Plan, direction: Direction, cx: &mut App) -> bool {
     let union = plan.union;
     let stretch = stretch(cx);
-    debug_assert_eq!((FADE + SLIDE + TURN + HOLD + REVEAL).as_millis(), 560);
+    debug_assert_eq!((FADE + TURN + HOLD + REVEAL).as_millis(), 450);
     if let Some(x) = plan.table_to {
         view::scroll_table_to(x);
     }
@@ -1374,6 +1416,31 @@ fn launch(plan: Plan, direction: Direction, cx: &mut App) -> bool {
     }
     crate::frames::start(union, cx);
     crate::frames::frame("before");
+    let mut plan = Some(plan);
+    // The window opened ahead, while the views glided home, saves opening
+    // one now.
+    if let Some(spare) = cx.default_global::<MorphSlot>().spare.take() {
+        let hwnd = spare
+            .update(cx, |view, window, _| {
+                *view = MorphView::new(plan.take(), direction, stretch, win::hwnd(window));
+                window.refresh();
+                view.hwnd
+            })
+            .ok()
+            .flatten();
+        if let Some(h) = hwnd {
+            cx.spawn(async move |_| unsafe { win::place_morph(h, union) })
+                .detach();
+            let old = cx.default_global::<MorphSlot>().handle.replace(spare);
+            if let Some(old) = old {
+                old.update(cx, |_, window, _| window.remove_window()).ok();
+            }
+            let slot = cx.default_global::<MorphSlot>();
+            slot.since = Some(Instant::now());
+            slot.hwnd = Some(h);
+            return true;
+        }
+    }
     let mut flip_hwnd = None;
     let Ok(handle) = cx.open_window(
         WindowOptions {
@@ -1402,20 +1469,7 @@ fn launch(plan: Plan, direction: Direction, cx: &mut App) -> bool {
                 })
                 .detach();
             }
-            cx.new(|_| MorphView {
-                start: Instant::now(),
-                stretch,
-                plan,
-                direction,
-                hwnd: win::hwnd(window),
-                left: false,
-                arrived: None,
-                reveal_from: None,
-                frames: 0,
-                drew: (0.0, 0.0),
-                framed: (u32::MAX, u32::MAX),
-                hiding: false,
-            })
+            cx.new(|_| MorphView::new(plan.take(), direction, stretch, win::hwnd(window)))
         },
     ) else {
         return false;
@@ -1435,7 +1489,8 @@ pub struct MorphView {
     start: Instant,
     /// `flip_ms` over the default.
     stretch: f32,
-    plan: Plan,
+    /// None while it waits, hidden, for a flip to draw.
+    plan: Option<Plan>,
     direction: Direction,
     hwnd: Option<isize>,
     /// The window the flip starts from has closed.
@@ -1455,6 +1510,29 @@ pub struct MorphView {
     framed: (u32, u32),
     /// Hidden, to be removed next frame.
     hiding: bool,
+}
+
+impl MorphView {
+    fn p(&self) -> &Plan {
+        self.plan.as_ref().expect("a flip's plan")
+    }
+
+    fn new(plan: Option<Plan>, direction: Direction, stretch: f32, hwnd: Option<isize>) -> Self {
+        MorphView {
+            start: Instant::now(),
+            stretch,
+            plan,
+            direction,
+            hwnd,
+            left: false,
+            arrived: None,
+            reveal_from: None,
+            frames: 0,
+            drew: (0.0, 0.0),
+            framed: (u32::MAX, u32::MAX),
+            hiding: false,
+        }
+    }
 }
 
 thread_local! {
@@ -1505,6 +1583,10 @@ impl Render for MorphView {
             window.remove_window();
             return div();
         }
+        if self.plan.is_none() {
+            // Waiting to be handed a flip.
+            return div();
+        }
         // Shown once its first frame is drawn; the clock starts then.
         self.frames += 1;
         if self.frames == 2 {
@@ -1520,7 +1602,7 @@ impl Render for MorphView {
         let slide = SLIDE.mul_f32(k);
         // The fade and the slide out run together, so the turn follows the
         // glide home at once.
-        let turn_at = fade.max(slide);
+        let turn_at = fade;
         let hold_at = turn_at + turn;
         let open = self.direction == Direction::Open;
         // The reveal waits for the window underneath to have drawn, so it
@@ -1608,7 +1690,7 @@ impl Render for MorphView {
             })
             .detach();
             crate::frames::finish(cx);
-            if let Some(x) = self.plan.focus_to {
+            if let Some(x) = self.p().focus_to {
                 let over = SCROLL_HOME.mul_f32(self.stretch);
                 cx.defer(move |cx| {
                     view::glide_table_to(x, over, cx);
@@ -1651,18 +1733,18 @@ impl Render for MorphView {
         // The sheet grows to the big window's whole visible frame, title
         // bar and border too, so its rim lands where Windows draws that
         // window's own.
-        let (fl, cap, fr, fb) = self.plan.caption;
+        let (fl, cap, fr, fb) = self.p().caption;
         let to_sheet = Bounds {
-            origin: point(self.plan.to.origin.x - fl, self.plan.to.origin.y - cap),
+            origin: point(self.p().to.origin.x - fl, self.p().to.origin.y - cap),
             size: size(
-                self.plan.to.size.width + fl + fr,
-                self.plan.to.size.height + cap + fb,
+                self.p().to.size.width + fl + fr,
+                self.p().to.size.height + cap + fb,
             ),
         };
         // On whole physical px, so its rim stays crisp and even rather
         // than smearing across two px as it moves.
-        let sheet = snapped(lerp_bounds(self.plan.from_frame, to_sheet, e, s), s);
-        let work = lerp_bounds(self.plan.work, self.plan.work, 0.0, s);
+        let sheet = snapped(lerp_bounds(self.p().from_frame, to_sheet, e, s), s);
+        let work = lerp_bounds(self.p().work, self.p().work, 0.0, s);
 
         // The sheet in bands, top to bottom, each its view's colour: the
         // title bar (as tall as the turn has gone), the top bar, the body
@@ -1673,12 +1755,12 @@ impl Render for MorphView {
         let top = f32::from(sheet.top()) * s;
         let bottom = f32::from(sheet.bottom()) * s;
         let title_end = (top + cap * e).round().min(bottom);
-        let bar_end = self.plan.bar.map_or(title_end, |(a, z)| {
+        let bar_end = self.p().bar.map_or(title_end, |(a, z)| {
             mix(a.origin.y + a.size.height, z.origin.y + z.size.height)
                 .round()
                 .clamp(title_end, bottom)
         });
-        let footer_at = self.plan.footer.map_or(bottom, |(a, z)| {
+        let footer_at = self.p().footer.map_or(bottom, |(a, z)| {
             mix(a.origin.y, z.origin.y).round().clamp(bar_end, bottom)
         });
         let band = |t: f32, b: f32| {
@@ -1690,13 +1772,13 @@ impl Render for MorphView {
         // The bars' edge lines, 1 logical px like the views'.
         let line = s;
         let mut bands = vec![(band(top, title_end), view::title_bar(dark))];
-        if self.plan.bar.is_some() {
+        if self.p().bar.is_some() {
             let edge = (bar_end - line).max(title_end);
             bands.push((band(title_end, edge), p.bg));
             bands.push((band(edge, bar_end), p.border));
         }
         let body = band(bar_end, footer_at);
-        if self.plan.footer.is_some() {
+        if self.p().footer.is_some() {
             let edge = (footer_at + line).min(bottom);
             bands.push((band(footer_at, edge), p.border));
             bands.push((band(edge, bottom), p.bg));
@@ -1707,13 +1789,13 @@ impl Render for MorphView {
         // it never blinks: the sheet covers the starting window's own as
         // it fades in. A maximised big window has none: there it fades
         // with that window, in before the turn or out after it.
-        let rim_alpha = match (self.plan.maximized, open) {
+        let rim_alpha = match (self.p().maximized, open) {
             (true, false) => sheet_alpha,
             (true, true) => reveal,
             (false, _) => 1.0,
         };
         let trees: Vec<(Arc<crate::repo_graph::RepoGraph>, bool, Ends, f32)> = self
-            .plan
+            .p()
             .trees
             .iter()
             .map(|t| {
@@ -1735,7 +1817,7 @@ impl Render for MorphView {
         // its twin in the window beneath, as the bands do.
         let muted = p.muted;
         let turning: Vec<Bar> = self
-            .plan
+            .p()
             .turning
             .iter()
             .map(|t| {
@@ -1896,7 +1978,7 @@ impl Render for MorphView {
             .try_global::<Ui>()
             .is_some_and(|ui| ui.state.read(cx).sweeping);
         let parts: Vec<Drawn> = self
-            .plan
+            .p()
             .parts
             .iter()
             .map(|c| {
@@ -2084,7 +2166,7 @@ impl Render for MorphView {
         // view's slide out with the fade, the ending view's in before the
         // reveal, both under the sheet's bars.
         let p = Palette::for_appearance(appearance);
-        let out = ease(phase(elapsed, Duration::ZERO, slide));
+        let out = ease(phase(elapsed, Duration::ZERO, fade));
         let into = self
             .arrived
             .map(|a| 1.0 - ease(phase(a.elapsed(), Duration::ZERO, slide)));
@@ -2093,7 +2175,7 @@ impl Render for MorphView {
         if let Some(ui) = app.try_global::<Ui>() {
             let state = ui.state.read(app);
             let icons_only = state.config.icons_only;
-            for sl in &self.plan.sliders {
+            for sl in &self.p().sliders {
                 let in_panel = matches!(sl.what, Slid::Prs(view::Mode::Panel) | Slid::Heading(_));
                 let k = if in_panel == open {
                     if out >= 1.0 {
