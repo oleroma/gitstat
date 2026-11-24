@@ -172,6 +172,9 @@ fn open(anchor: Anchor, slide: bool, cx: &mut App) {
         a => a,
     };
     crate::morph::clear_strips();
+    if !crate::morph::running(cx) {
+        crate::frames::watch(win::primary_monitor().rect, "panel", cx);
+    }
     if let Some(t) = cx.try_global::<Ui>().map(|ui| ui.timelines.clone()) {
         t.update(cx, |t, cx| t.show_newest(cx));
     }

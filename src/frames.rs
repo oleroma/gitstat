@@ -28,6 +28,43 @@ thread_local! {
 
 /// Starts recording `rect` (physical px), when config asks for it.
 pub fn start(rect: Rect, cx: &gpui::App) {
+    start_named(rect, "flip", cx);
+}
+
+/// Records `rect` (physical px) every few ms for a moment, when config
+/// asks for it and nothing else is being recorded: to catch what shows as
+/// the panel opens.
+pub fn watch(rect: Rect, what: &'static str, cx: &mut gpui::App) {
+    if RECORDER.with(|r| r.borrow().is_some()) {
+        return;
+    }
+    start_named(rect, what, cx);
+    if RECORDER.with(|r| r.borrow().is_none()) {
+        return;
+    }
+    frame("start");
+    let mine = RECORDER.with(|r| r.borrow().as_ref().map(|r| r.start));
+    // Stops early when a flip starts recording in its place.
+    let still = move || RECORDER.with(|r| r.borrow().as_ref().map(|r| r.start)) == mine;
+    cx.spawn(async move |cx| {
+        let end = Instant::now() + WATCH;
+        while Instant::now() < end && still() {
+            cx.background_executor().timer(AFTER_EVERY).await;
+            if still() {
+                frame(what);
+            }
+        }
+        if still() {
+            RECORDER.with(|r| r.borrow_mut().take());
+        }
+    })
+    .detach();
+}
+
+/// How long [`watch`] records.
+const WATCH: Duration = Duration::from_millis(700);
+
+fn start_named(rect: Rect, name: &str, cx: &gpui::App) {
     let Some(ui) = cx.try_global::<crate::view::Ui>() else {
         return;
     };
@@ -39,7 +76,7 @@ pub fn start(rect: Rect, cx: &gpui::App) {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis());
-    let dir = PathBuf::from(folder).join(format!("flip-{stamp}"));
+    let dir = PathBuf::from(folder).join(format!("{name}-{stamp}"));
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
