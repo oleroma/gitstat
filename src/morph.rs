@@ -558,6 +558,10 @@ enum Kind {
 struct Carried {
     from: Bounds<f32>,
     to: Bounds<f32>,
+    /// The tree it rides with, by its place in the plan's trees: it turns
+    /// about that tree's newest commit as the tree does, rather than
+    /// sliding straight across.
+    tree: Option<usize>,
     /// The words at each end: text, colour, size and boldness.
     words: Option<(Words, Words)>,
     kind: Kind,
@@ -1037,6 +1041,7 @@ fn plan(
                     parts.push(Carried {
                         from: in_panel(&a),
                         to: to_b,
+                        tree: Some(trees.len()),
                         words,
                         kind: if part == Part::Icon {
                             Kind::Icon(Box::new(status.clone()))
@@ -1134,6 +1139,7 @@ fn plan(
         parts.push(Carried {
             from: in_panel(&a.bounds),
             to: in_window(&b.bounds),
+            tree: None,
             words,
             kind,
         });
@@ -1378,6 +1384,7 @@ fn launch(plan: Plan, direction: Direction, cx: &mut App) -> bool {
                 arrived: None,
                 reveal_from: None,
                 frames: 0,
+                drew: (0.0, 0.0),
                 framed: (u32::MAX, u32::MAX),
                 hiding: false,
             })
@@ -1411,6 +1418,8 @@ pub struct MorphView {
     reveal_from: Option<Instant>,
     /// Frames drawn; shown from the second.
     frames: u32,
+    /// The last frame's turn and sheet fill, for the frame recorder.
+    drew: (f32, f32),
     /// The frames between which the sheet draws the windows' rim and
     /// shadow: from the one after the starting window closed until the one
     /// after the ending window showed, so the real and the drawn one hand
@@ -1506,17 +1515,22 @@ impl Render for MorphView {
             }
         }
         let revealed = self.reveal_from.map_or(Duration::ZERO, |t| t.elapsed());
-        crate::frames::frame(if self.reveal_from.is_some() {
-            "reveal"
-        } else if self.arrived.is_some() {
-            "hold"
-        } else if elapsed >= turn_at {
-            "turn"
-        } else if elapsed >= fade {
-            "slide"
-        } else {
-            "fade"
-        });
+        // Named with what the last frame drew: its phase, turn and fill.
+        let (last_e, last_fill) = self.drew;
+        crate::frames::frame(&format!(
+            "{}-e{last_e:.2}-fill{last_fill:.2}",
+            if self.reveal_from.is_some() {
+                "reveal"
+            } else if self.arrived.is_some() {
+                "hold"
+            } else if elapsed >= turn_at {
+                "turn"
+            } else if elapsed >= fade {
+                "slide"
+            } else {
+                "fade"
+            }
+        ));
 
         if elapsed >= turn_at && !self.left {
             self.left = true;
@@ -1583,6 +1597,7 @@ impl Render for MorphView {
         // its twin in the window beneath, so it never fades or blinks;
         // only what one view alone shows fades in or out.
         let fill = sheet_alpha * reveal;
+        self.drew = (e, fill);
         // The windows' own shadow, drawn around the sheet while neither
         // window is on screen to show its own.
         let framed = if (self.framed.0..self.framed.1).contains(&self.frames) {
@@ -1874,8 +1889,40 @@ impl Render for MorphView {
                         mix(weight(a.3), weight(z.3)),
                     )
                 });
+                // Riding with its tree: where it sits in the tree's frame
+                // at each end, blended, in the tree's frame now.
+                let bounds = match c.tree.and_then(|i| trees.get(i)) {
+                    Some((_, _, ends, _)) if e > 0.0 && e < 1.0 => {
+                        let centre = |b: Bounds<f32>| {
+                            (
+                                (b.origin.x + b.size.width / 2.0) / s,
+                                (b.origin.y + b.size.height / 2.0) / s,
+                            )
+                        };
+                        let dot = |a: (f32, f32), b: (f32, f32)| a.0 * b.0 + a.1 * b.1;
+                        let local = |p: (f32, f32), at: f32| {
+                            let (o, al, ac) = crate::timeline::pose(*ends, at);
+                            let d = (p.0 - o.0, p.1 - o.1);
+                            (dot(d, al), dot(d, ac))
+                        };
+                        let (ua, va) = local(centre(c.from), 0.0);
+                        let (uz, vz) = local(centre(c.to), 1.0);
+                        let (u, v) = (mix(ua, uz), mix(va, vz));
+                        let (o, al, ac) = crate::timeline::pose(*ends, e);
+                        let (cx_, cy_) = (o.0 + u * al.0 + v * ac.0, o.1 + u * al.1 + v * ac.1);
+                        let (w, h) = (
+                            mix(c.from.size.width, c.to.size.width) / s,
+                            mix(c.from.size.height, c.to.size.height) / s,
+                        );
+                        Bounds::new(
+                            point(px(cx_ - w / 2.0), px(cy_ - h / 2.0)),
+                            size(px(w), px(h)),
+                        )
+                    }
+                    _ => lerp_bounds(c.from, c.to, e, s),
+                };
                 Drawn {
-                    bounds: lerp_bounds(c.from, c.to, e, s),
+                    bounds,
                     image,
                     words,
                     kind: c.kind.clone(),

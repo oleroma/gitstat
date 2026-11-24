@@ -49,6 +49,14 @@ struct Frame {
     e: f32,
 }
 
+/// Where a tree's newest commit is at progress `e`, and the unit vectors
+/// along its history and across its lanes: the frame its header parts ride
+/// in, so they turn with it.
+pub fn pose(ends: Ends, e: f32) -> (P, P, P) {
+    let f = Frame::new(ends, e.clamp(0.0, 1.0));
+    (f.origin, f.along, f.across)
+}
+
 impl Frame {
     fn new(ends: Ends, e: f32) -> Self {
         let lerp = |a: f32, b: f32| a + (b - a) * e;
