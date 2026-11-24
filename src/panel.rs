@@ -123,6 +123,13 @@ pub fn drawn_rim(cx: &App) -> bool {
         .is_some_and(|s| s.clips)
 }
 
+/// The open panel's window.
+pub fn handle(cx: &App) -> Option<WindowHandle<StatusView>> {
+    cx.try_global::<PanelSlot>()
+        .and_then(|slot| slot.handle)
+        .filter(|h| view::is_live((*h).into(), cx))
+}
+
 pub fn is_open(cx: &App) -> bool {
     cx.try_global::<PanelSlot>()
         .and_then(|slot| slot.handle)

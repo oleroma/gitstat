@@ -370,13 +370,17 @@ fn stretch(cx: &App) -> f32 {
 /// Glides every tree back to its newest commits, where the flip starts
 /// from: true when they were elsewhere, after which `then` runs once
 /// they're there.
-fn newest_first(then: impl FnOnce(&mut App) + 'static, cx: &mut App) -> bool {
+fn newest_first(from_panel: bool, then: impl FnOnce(&mut App) + 'static, cx: &mut App) -> bool {
     let Some(t) = cx.try_global::<Ui>().map(|ui| ui.timelines.clone()) else {
         return false;
     };
-    // A scroll you can follow, paced with the flip.
+    // A scroll you can follow, paced with the flip: the trees to their
+    // newest commits, and the view the flip starts from to its start, the
+    // panel's list to its top or the window's table to its left edge.
     let wait = SCROLL_HOME.mul_f32(stretch(cx));
-    if !t.update(cx, |t, cx| t.glide_newest(wait, cx)) {
+    let trees = t.update(cx, |t, cx| t.glide_newest(wait, cx));
+    let view = view::glide_to_start(from_panel, wait, cx);
+    if !trees && !view {
         return false;
     }
     cx.default_global::<MorphSlot>().waiting = Some(Instant::now());
@@ -431,6 +435,7 @@ pub fn open_window(panel: &mut Window, focus: Option<PathBuf>, cx: &mut App) {
         let handle = panel.window_handle();
         let again = focus.clone();
         if newest_first(
+            true,
             move |cx| {
                 handle
                     .update(cx, |_, window, cx| open_window(window, again, cx))
@@ -487,6 +492,7 @@ pub fn flip_back(big: &mut Window, cx: &mut App) -> bool {
     // should it not start, the window just closes.
     let handle = big.window_handle();
     if newest_first(
+        false,
         move |cx| {
             let started = handle
                 .update(cx, |_, window, cx| flip_back_now(window, minimized, cx))
@@ -1449,7 +1455,7 @@ thread_local! {
 const DRAW_WAIT: Duration = Duration::from_millis(500);
 
 /// `t` eased in and out.
-fn ease(t: f32) -> f32 {
+pub(crate) fn ease(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     if t < 0.5 {
         4.0 * t * t * t

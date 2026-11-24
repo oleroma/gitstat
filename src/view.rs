@@ -186,6 +186,60 @@ pub fn scroll_table_to(x: f32) {
     NEXT_TABLE_SCROLL.set(Some(x));
 }
 
+/// Scrolls the panel's list to its top, or the big window's table to its
+/// left edge, over `over`, eased: true when it wasn't there already.
+pub fn glide_to_start(panel: bool, over: std::time::Duration, cx: &mut App) -> bool {
+    let handle = if panel {
+        panel::handle(cx)
+    } else {
+        cx.try_global::<WindowSlot>()
+            .and_then(|s| s.handle)
+            .filter(|h| is_live((*h).into(), cx))
+    };
+    let Some(handle) = handle else {
+        return false;
+    };
+    let pick = move |v: &StatusView| {
+        if panel {
+            v.list.clone()
+        } else {
+            v.table.clone()
+        }
+    };
+    let Some(scroll) = handle.read(cx).ok().map(pick) else {
+        return false;
+    };
+    let from = scroll.offset();
+    if f32::from(from.x).abs() < 0.5 && f32::from(from.y).abs() < 0.5 {
+        return false;
+    }
+    let start = std::time::Instant::now();
+    cx.spawn(async move |cx| {
+        loop {
+            let t = (start.elapsed().as_secs_f32() / over.as_secs_f32().max(0.001)).min(1.0);
+            let k = 1.0 - crate::morph::ease(t);
+            let alive = cx
+                .update(|cx| {
+                    handle
+                        .update(cx, |_, _, cx| {
+                            scroll.set_offset(point(from.x * k, from.y * k));
+                            cx.notify();
+                        })
+                        .is_ok()
+                })
+                .unwrap_or(false);
+            if !alive || t >= 1.0 {
+                break;
+            }
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(8))
+                .await;
+        }
+    })
+    .detach();
+    true
+}
+
 /// How far the open big window's table is scrolled sideways, logical px.
 pub fn table_scroll(cx: &App) -> f32 {
     cx.try_global::<WindowSlot>()
