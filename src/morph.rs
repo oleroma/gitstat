@@ -354,6 +354,19 @@ pub fn running(cx: &App) -> bool {
     })
 }
 
+/// How long the trees take to scroll back to their newest commits before
+/// a flip, at the default speed.
+const SCROLL_HOME: Duration = Duration::from_millis(260);
+
+/// `flip_ms` over the default, for the phases that stretch with it.
+fn stretch(cx: &App) -> f32 {
+    let ms = cx
+        .try_global::<Ui>()
+        .map_or(560, |ui| ui.state.read(cx).config.flip_ms);
+    let fixed = HOLD.as_millis() as f32;
+    ((ms as f32 - fixed) / (560.0 - fixed)).clamp(0.2, 12.0)
+}
+
 /// Glides every tree back to its newest commits, where the flip starts
 /// from: true when they were elsewhere, after which `then` runs once
 /// they're there.
@@ -361,9 +374,11 @@ fn newest_first(then: impl FnOnce(&mut App) + 'static, cx: &mut App) -> bool {
     let Some(t) = cx.try_global::<Ui>().map(|ui| ui.timelines.clone()) else {
         return false;
     };
-    let Some(wait) = t.update(cx, |t, cx| t.glide_newest(cx)) else {
+    // A scroll you can follow, paced with the flip.
+    let wait = SCROLL_HOME.mul_f32(stretch(cx));
+    if !t.update(cx, |t, cx| t.glide_newest(wait, cx)) {
         return false;
-    };
+    }
     cx.default_global::<MorphSlot>().waiting = Some(Instant::now());
     cx.spawn(async move |cx| {
         // A frame more, so the last of the glide is drawn.
@@ -1332,11 +1347,7 @@ fn same_words(a: &Seen, b: &Seen) -> Option<(Words, Words)> {
 /// Opens the flip's window for `plan`. False if it couldn't.
 fn launch(plan: Plan, direction: Direction, cx: &mut App) -> bool {
     let union = plan.union;
-    let ms = cx
-        .try_global::<Ui>()
-        .map_or(560, |ui| ui.state.read(cx).config.flip_ms);
-    let fixed = HOLD.as_millis() as f32;
-    let stretch = ((ms as f32 - fixed) / (560.0 - fixed)).clamp(0.2, 12.0);
+    let stretch = stretch(cx);
     debug_assert_eq!((FADE + SLIDE + TURN + HOLD + REVEAL).as_millis(), 560);
     if let Some(x) = plan.table_to {
         view::scroll_table_to(x);
