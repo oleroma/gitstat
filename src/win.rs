@@ -448,6 +448,29 @@ fn w(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
 }
 
+/// The notification area's rect on the main taskbar, screen px, where the
+/// tray icon sits: or, without it, the main taskbar's.
+pub fn tray_area() -> Option<Rect> {
+    let main = w("Shell_TrayWnd");
+    let notify = w("TrayNotifyWnd");
+    unsafe {
+        let tray = FindWindowW(main.as_ptr(), std::ptr::null());
+        if tray.is_null() {
+            return None;
+        }
+        let area = FindWindowExW(
+            tray,
+            std::ptr::null_mut(),
+            notify.as_ptr(),
+            std::ptr::null(),
+        );
+        let mut r = RECT::default();
+        let got = (!area.is_null() && GetWindowRect(area, &mut r) != 0)
+            || GetWindowRect(tray, &mut r) != 0;
+        got.then(|| rect(r))
+    }
+}
+
 /// The taskbar (any monitor's) overlapping `r`, screen px.
 fn taskbar_over(r: Rect) -> Option<HWND> {
     let main = w("Shell_TrayWnd");

@@ -485,7 +485,7 @@ pub fn flip_back(big: &mut Window, cx: &mut App) -> bool {
         // Mid-flip; the flip closes it.
         return true;
     }
-    if !enabled(cx) || crate::panel::last_rect(cx).is_none() {
+    if !enabled(cx) || crate::panel::guess_place(cx).is_none() {
         return false;
     }
     // The columns back at their newest commits first; then the flip, or,

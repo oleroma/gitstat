@@ -101,6 +101,24 @@ pub fn last_rect(cx: &App) -> Option<Rect> {
     cx.try_global::<PanelSlot>()?.rect
 }
 
+/// Where the panel would open, when it hasn't been open since gitstat
+/// started: by the floating button if it shows, else by the tray. So the
+/// big window, opened some other way, still flips back into it.
+pub fn guess_place(cx: &mut App) -> Option<Rect> {
+    if let Some(rect) = last_rect(cx) {
+        return Some(rect);
+    }
+    let anchor =
+        crate::overlay::anchor(cx).or_else(|| win::tray_area().map(|r| Anchor::Tray(Some(r))))?;
+    let state = cx.try_global::<Ui>()?.state.clone();
+    let rows = view::panel_rows(state.read(cx));
+    let rect = place(anchor, Height::Rows(rows), cx);
+    let slot = cx.default_global::<PanelSlot>();
+    slot.anchor = Some(anchor);
+    slot.rect = Some(rect);
+    Some(rect)
+}
+
 /// Opens the panel where it last was, at once, for the flip back from
 /// the big window. False when it has never been open.
 pub fn reopen(cx: &mut App) -> bool {
