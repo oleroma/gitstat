@@ -620,6 +620,9 @@ struct Plan {
     /// big window's table sideways, or the panel's list down.
     table_to: Option<f32>,
     list_to: Option<f32>,
+    /// Where the table then scrolls, after the flip, to bring a repo asked
+    /// for into sight, logical px.
+    focus_to: Option<f32>,
 }
 
 /// A turning heading this frame, in logical px: still, on whole px, at
@@ -899,6 +902,7 @@ fn plan(
     };
     let mut table_to = None;
     let mut list_to = None;
+    let mut focus_to = None;
     match big {
         None => {
             let topmost = repo_cells
@@ -912,21 +916,27 @@ fn plan(
                 .zip(cells.last())
                 .map_or(0.0, |(l, c)| l + c.width());
             let wide = to.size.width / ws;
-            let mut x = match topmost.and_then(|s| cell_of_repo(&s.path)) {
+            let x = match topmost.and_then(|s| cell_of_repo(&s.path)) {
                 Some(i) if i > 0 && matches!(cells[i - 1], view::Cell::Spine(..)) => lefts[i - 1],
                 Some(i) => lefts[i],
                 None => 0.0,
             };
-            // A repo asked for comes into sight, as little moved as it
-            // takes.
+            let x = x.min(total - wide).max(0.0);
+            // A repo asked for scrolls into sight once the flip is over, as
+            // little moved as it takes: the flip itself lands where the
+            // flip back starts from, so the two are each other reversed.
             if let Some(i) = focus.and_then(|f| view::cell_of(&cells, f)) {
-                if lefts[i] < x {
-                    x = lefts[i];
-                } else if lefts[i] + COLUMN_WIDTH > x + wide {
-                    x = lefts[i] + COLUMN_WIDTH - wide;
+                let mut to = x;
+                if lefts[i] < to {
+                    to = lefts[i];
+                } else if lefts[i] + COLUMN_WIDTH > to + wide {
+                    to = lefts[i] + COLUMN_WIDTH - wide;
+                }
+                let to = to.min(total - wide).max(0.0);
+                if (to - x).abs() > 0.5 {
+                    focus_to = Some(to);
                 }
             }
-            let x = x.min(total - wide).max(0.0);
             scroll = x * ws;
             table_to = Some(x);
         }
@@ -1303,6 +1313,7 @@ fn plan(
         turning,
         table_to,
         list_to,
+        focus_to,
     })
 }
 
@@ -1595,6 +1606,12 @@ impl Render for MorphView {
             })
             .detach();
             crate::frames::finish(cx);
+            if let Some(x) = self.plan.focus_to {
+                let over = SCROLL_HOME.mul_f32(self.stretch);
+                cx.defer(move |cx| {
+                    view::glide_table_to(x, over, cx);
+                });
+            }
             if self.direction == Direction::Close {
                 // Back in the panel, which then goes the way it came.
                 cx.defer(crate::panel::slide_away);

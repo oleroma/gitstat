@@ -189,40 +189,49 @@ pub fn scroll_table_to(x: f32) {
 /// Scrolls the panel's list to its top, or the big window's table to its
 /// left edge, over `over`, eased: true when it wasn't there already.
 pub fn glide_to_start(panel: bool, over: std::time::Duration, cx: &mut App) -> bool {
+    glide_scroll(panel, point(px(0.), px(0.)), over, cx)
+}
+
+/// Scrolls the big window's table sideways to `x` logical px over `over`.
+pub fn glide_table_to(x: f32, over: std::time::Duration, cx: &mut App) -> bool {
+    glide_scroll(false, point(px(-x), px(0.)), over, cx)
+}
+
+/// Moves the panel's list or the window's table to offset `to`, eased:
+/// true when it wasn't there already.
+fn glide_scroll(
+    panel: bool,
+    to: gpui::Point<gpui::Pixels>,
+    over: std::time::Duration,
+    cx: &mut App,
+) -> bool {
+    // Through the scroll handles themselves: this runs from inside the
+    // view's own window handlers, where that window can't be read.
     let handle = if panel {
-        panel::handle(cx)
+        cx.try_global::<panel::PanelSlot>().and_then(|s| s.handle())
     } else {
-        cx.try_global::<WindowSlot>()
-            .and_then(|s| s.handle)
-            .filter(|h| is_live((*h).into(), cx))
+        cx.try_global::<WindowSlot>().and_then(|s| s.handle)
     };
-    let Some(handle) = handle else {
-        return false;
-    };
-    let pick = move |v: &StatusView| {
-        if panel {
-            v.list.clone()
-        } else {
-            v.table.clone()
-        }
-    };
-    let Some(scroll) = handle.read(cx).ok().map(pick) else {
+    let (Some(handle), Some(scroll)) = (handle, SCROLLS.with(|s| s.borrow().get(panel))) else {
         return false;
     };
     let from = scroll.offset();
-    if f32::from(from.x).abs() < 0.5 && f32::from(from.y).abs() < 0.5 {
+    if f32::from(from.x - to.x).abs() < 0.5 && f32::from(from.y - to.y).abs() < 0.5 {
         return false;
     }
     let start = std::time::Instant::now();
     cx.spawn(async move |cx| {
         loop {
             let t = (start.elapsed().as_secs_f32() / over.as_secs_f32().max(0.001)).min(1.0);
-            let k = 1.0 - crate::morph::ease(t);
+            let k = crate::morph::ease(t);
             let alive = cx
                 .update(|cx| {
                     handle
                         .update(cx, |_, _, cx| {
-                            scroll.set_offset(point(from.x * k, from.y * k));
+                            scroll.set_offset(point(
+                                from.x + (to.x - from.x) * k,
+                                from.y + (to.y - from.y) * k,
+                            ));
                             cx.notify();
                         })
                         .is_ok()
@@ -241,11 +250,41 @@ pub fn glide_to_start(panel: bool, over: std::time::Duration, cx: &mut App) -> b
 }
 
 /// How far the open big window's table is scrolled sideways, logical px.
+/// Read through its scroll handle, so it works from inside the window's
+/// own handlers too, where the window can't be read.
 pub fn table_scroll(cx: &App) -> f32 {
-    cx.try_global::<WindowSlot>()
+    if cx
+        .try_global::<WindowSlot>()
         .and_then(|s| s.handle)
-        .and_then(|h| h.read(cx).ok())
-        .map_or(0.0, |v| (-f32::from(v.table.offset().x)).max(0.0))
+        .is_none()
+    {
+        return 0.0;
+    }
+    SCROLLS
+        .with(|s| s.borrow().get(false))
+        .map_or(0.0, |t| (-f32::from(t.offset().x)).max(0.0))
+}
+
+/// The open panel's list and big window's table scroll handles, kept apart
+/// from their views so they can be read and moved from anywhere.
+#[derive(Default)]
+struct Scrolls {
+    list: Option<ScrollHandle>,
+    table: Option<ScrollHandle>,
+}
+
+impl Scrolls {
+    fn get(&self, panel: bool) -> Option<ScrollHandle> {
+        if panel {
+            self.list.clone()
+        } else {
+            self.table.clone()
+        }
+    }
+}
+
+thread_local! {
+    static SCROLLS: std::cell::RefCell<Scrolls> = std::cell::RefCell::new(Scrolls::default());
 }
 
 /// Whether the big window is open.
@@ -512,12 +551,20 @@ impl StatusView {
         // The root tracks this handle, so Esc reaches it without a click first.
         let focus = cx.focus_handle();
         focus.focus(window);
+        let (table, list) = (ScrollHandle::new(), ScrollHandle::new());
+        SCROLLS.with(|s| {
+            let mut s = s.borrow_mut();
+            match mode {
+                Mode::Panel => s.list = Some(list.clone()),
+                Mode::Window => s.table = Some(table.clone()),
+            }
+        });
         Self {
             state,
             timelines,
             mode,
-            table: ScrollHandle::new(),
-            list: ScrollHandle::new(),
+            table,
+            list,
             focus,
             seen_active: false,
             fit: None,

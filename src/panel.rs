@@ -72,6 +72,13 @@ impl Slide {
 
 impl Global for PanelSlot {}
 
+impl PanelSlot {
+    /// The panel's window, open or being drawn.
+    pub fn handle(&self) -> Option<WindowHandle<StatusView>> {
+        self.handle
+    }
+}
+
 /// Closes the panel if it is open, else opens it at `anchor` unless the
 /// click is the tail of the one that just closed it.
 pub fn toggle(anchor: Anchor, cx: &mut App) {
@@ -121,13 +128,6 @@ pub fn drawn_rim(cx: &App) -> bool {
     cx.try_global::<PanelSlot>()
         .and_then(|s| s.slide)
         .is_some_and(|s| s.clips)
-}
-
-/// The open panel's window.
-pub fn handle(cx: &App) -> Option<WindowHandle<StatusView>> {
-    cx.try_global::<PanelSlot>()
-        .and_then(|slot| slot.handle)
-        .filter(|h| view::is_live((*h).into(), cx))
 }
 
 pub fn is_open(cx: &App) -> bool {
