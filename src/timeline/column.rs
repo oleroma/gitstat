@@ -998,6 +998,43 @@ impl Geometry {
     }
 }
 
+/// A column body at rest, for the flip: its tree exactly as the big
+/// window draws it at its newest commits with nothing hovered. `bounds`
+/// are the body's, logical px.
+pub fn paint_still_column(
+    bounds: Bounds<Pixels>,
+    g: &RepoGraph,
+    dirty: bool,
+    dark: bool,
+    p: &Palette,
+    window: &mut Window,
+) {
+    let colors = Colors::new(dark, p);
+    let geo = Geometry::new(g, dirty, 0.0);
+    window.with_content_mask(Some(ContentMask { bounds }), |window| {
+        paint_column(bounds, g, &geo, Grow::default(), None, &colors, window);
+    });
+}
+
+/// How wide a column's tree is, from the body's left edge to where its
+/// rows' words start, logical px.
+pub fn tree_width(g: &RepoGraph, dirty: bool) -> f32 {
+    Geometry::new(g, dirty, 0.0).text_left()
+}
+
+/// Where the rows' lines cross a column body `height` logical px tall at
+/// its newest commits, from its top, logical px (as `paint_row_lines`
+/// puts them, before snapping to device px).
+pub fn row_line_tops(height: f32) -> Vec<f32> {
+    let mut out = Vec::new();
+    let mut y = ROW;
+    while y < height {
+        out.push(y);
+        y += ROW;
+    }
+    out
+}
+
 /// The rows' thin lines across a column, one between each two rows, the
 /// same colour and width as the lines between the columns.
 fn paint_row_lines(bounds: Bounds<Pixels>, top: f32, color: Hsla, window: &mut Window) {

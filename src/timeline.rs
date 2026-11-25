@@ -13,8 +13,8 @@ mod column;
 pub(crate) mod ink;
 mod morph;
 
-pub use column::COLUMN_WIDTH;
-pub use morph::{Ends, paint_tail_fade, paint_tree, pose, tail_fade_end};
+pub use column::{COLUMN_WIDTH, paint_still_column, row_line_tops, tree_width};
+pub use morph::{Ends, paint_tail_fade, paint_tree, pose};
 
 use crate::git::RepoStatus;
 use crate::graph::{self, Class, PrColors, PrState, Seg};
@@ -53,7 +53,7 @@ const LANE: f32 = 5.0;
 const LANES: usize = 5;
 /// Px a strip may paint past its top and bottom, into its neighbours'
 /// empty margins, so nothing near its edge is cut flat.
-const BLEED: f32 = 6.0;
+pub const BLEED: f32 = 6.0;
 const DOT: f32 = 3.0;
 const DOT_HOVER: f32 = 4.5;
 const STROKE: f32 = 1.5;
@@ -451,6 +451,24 @@ impl Timelines {
         result: Result<Loaded, String>,
         cx: &mut Context<Self>,
     ) {
+        // Never under a flip, or the glide home before one: the trees it
+        // turns stay as it planned them, and the new ones land after.
+        if crate::morph::running(cx) {
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(50))
+                        .await;
+                    if !cx.update(|cx| crate::morph::running(cx)).unwrap_or(false) {
+                        break;
+                    }
+                }
+                this.update(cx, |this, cx| this.landed(path, generation, result, cx))
+                    .ok();
+            })
+            .detach();
+            return;
+        }
         let Some(slot) = self.slots.get_mut(&path) else {
             return;
         };
@@ -566,6 +584,14 @@ impl Timelines {
         self.table_top = 0.0;
         self.unhover();
         cx.notify();
+    }
+
+    /// Whether any strip or column is gliding now.
+    pub fn gliding(&self) -> bool {
+        let now = Instant::now();
+        self.slots
+            .values()
+            .any(|s| s.shown_scroll(now).1 || s.shown_top(now).1)
     }
 
     /// Every strip and column scrolls back to its newest commits over
@@ -844,10 +870,10 @@ impl Timelines {
                 window.insert_hitbox(bounds, HitboxBehavior::Normal)
             },
             move |bounds, hitbox, window, _cx| {
-                // Where the flip starts this repo's tree, if it's in view.
-                if window.content_mask().bounds.intersects(&bounds) {
-                    crate::morph::seen_strip(&paint_path, bounds);
-                }
+                // Where the flip starts this repo's tree: every strip, in
+                // view or not, so a tree out of sight turns from its own
+                // row rather than from where it last showed.
+                crate::morph::seen_strip(&paint_path, bounds);
                 let Some(g) = graph else { return };
                 if moving {
                     window.request_animation_frame();
@@ -857,7 +883,9 @@ impl Timelines {
                     size(bounds.size.width, bounds.size.height + px(2.0 * BLEED)),
                 );
                 let dots = window.with_content_mask(Some(ContentMask { bounds: mask }), |window| {
-                    paint_strip(bounds, &g, scroll, grow, copied, dirty, &colors, window)
+                    paint_strip(
+                        bounds, &g, scroll, grow, copied, dirty, true, &colors, window,
+                    )
                 });
                 fade(bounds, surface, window);
 
@@ -1531,6 +1559,7 @@ fn paint_strip(
     grow: Grow,
     copied: Option<usize>,
     dirty: bool,
+    marks: bool,
     colors: &Colors,
     window: &mut Window,
 ) -> Vec<(Point<Pixels>, Dot)> {
@@ -1681,6 +1710,9 @@ fn paint_strip(
         } else {
             ink::circle(window, c, r, Some(color), None);
         }
+        if !marks {
+            continue;
+        }
         if g.ctx.refs.at(id).iter().any(|r| matches!(r, Ref::Tag(_))) {
             diamond(point(center.x, center.y - px(r + 4.0)), 2.5, color, window);
         }
@@ -1729,6 +1761,82 @@ fn diamond(c: Point<Pixels>, r: f32, color: Hsla, window: &mut Window) {
     if let Ok(path) = path.build() {
         window.paint_path(path, color);
     }
+}
+
+/// A strip at rest, for the flip: exactly as the panel draws it with its
+/// newest commits home and nothing hovered, tail fade and all, but
+/// without the tag and stash marks only the panel shows (the flip fades
+/// those with the panel). `bounds` are the strip's, logical px.
+pub fn paint_still_strip(
+    bounds: Bounds<Pixels>,
+    g: &RepoGraph,
+    dirty: bool,
+    dark: bool,
+    p: &crate::view::Palette,
+    window: &mut Window,
+) {
+    let colors = Colors::new(dark, p);
+    let mask = Bounds::new(
+        point(bounds.left(), bounds.top() - px(BLEED)),
+        size(bounds.size.width, bounds.size.height + px(2.0 * BLEED)),
+    );
+    window.with_content_mask(Some(ContentMask { bounds: mask }), |window| {
+        paint_strip(
+            bounds,
+            g,
+            0.0,
+            Grow::default(),
+            None,
+            dirty,
+            false,
+            &colors,
+            window,
+        );
+    });
+    fade(bounds, p.surface, window);
+}
+
+/// Where a strip at rest (`paint_still_strip`) draws what only the panel
+/// shows, its tag and stash marks, logical px: boxes around each, with a
+/// px to spare for their soft edges.
+pub fn strip_marks(bounds: Bounds<Pixels>, g: &RepoGraph, dirty: bool) -> Vec<Bounds<Pixels>> {
+    let rows = g.layout.nodes.len();
+    let right = f32::from(bounds.right());
+    let left = f32::from(bounds.left());
+    let head = g.head_row.filter(|&row| row < rows);
+    let gap = head
+        .filter(|&row| dirty && row > 0)
+        .map_or(0.0, |row| row as f32);
+    let top_x = right - PAD - if dirty { STEP } else { 0.0 };
+    let cy = f32::from(bounds.center().y);
+    let x = |row: f32| top_x - row * STEP + if row < gap - 0.5 { STEP } else { 0.0 };
+    let hi = ((((top_x - left) / STEP).ceil() + 1.0).max(0.0) as usize).min(rows);
+    let mut out = Vec::new();
+    let r = DOT;
+    for row in 0..hi {
+        let node = &g.layout.nodes[row];
+        let (cx, cy) = (x(row as f32), cy + lane_offset(node.lane));
+        let id = &g.commits[row].id;
+        if g.ctx.refs.at(id).iter().any(|r| matches!(r, Ref::Tag(_))) {
+            let (dx, dy) = (cx, cy - (r + 4.0));
+            out.push(Bounds::new(
+                point(px(dx - 4.0), px(dy - 4.0)),
+                size(px(8.0), px(8.0)),
+            ));
+        }
+        if g.stashes_at(row).next().is_some() {
+            let s = 2.5;
+            let (ax, ay) = (cx + STEP * 0.6, cy + r + 5.0);
+            out.push(Bounds::new(
+                point(px(cx - 1.0), px(cy + r - 1.0)),
+                size(
+                    px(ax + s + 1.0 - (cx - 1.0)),
+                    px(ay + s + 1.0 - (cy + r - 1.0)),
+                ),
+            ));
+        }
+    }
+    out
 }
 
 /// Fades the tail into the background at the strip's left edge.

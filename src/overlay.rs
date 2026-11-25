@@ -427,10 +427,15 @@ pub fn sync(cx: &mut App) {
         let window = rect.outset(pad);
         // Also shows it, topmost and without activation. An open panel goes
         // back above it in the same task, so the badge never covers it.
+        // A flip drawing stays over both.
+        let flip = crate::morph::flip_hwnd(cx);
         cx.spawn(async move |_| unsafe {
             win::place_overlay(h, window);
             if let Some(p) = panel {
                 win::panel_restack(p);
+            }
+            if let Some(f) = flip {
+                win::reassert_topmost(f);
             }
         })
         .detach();
@@ -637,11 +642,16 @@ fn tick(id: u64, cx: &mut App) -> bool {
     }
     if let Some(h) = slot.hwnd.filter(|_| slot.visible) {
         let panel = panel::hwnd(cx);
+        // A flip drawing stays over both.
+        let flip = crate::morph::flip_hwnd(cx);
         cx.spawn(async move |_| unsafe {
             win::reassert_topmost(h);
             // Topmost puts the badge above the panel; put the panel back.
             if let Some(p) = panel {
                 win::panel_restack(p);
+            }
+            if let Some(f) = flip {
+                win::reassert_topmost(f);
             }
         })
         .detach();

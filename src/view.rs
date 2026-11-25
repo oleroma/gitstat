@@ -71,9 +71,26 @@ pub fn window_hwnd(cx: &mut App) -> Option<isize> {
         .flatten()
 }
 
+/// The big window, while it is open.
+pub fn window_handle(cx: &App) -> Option<WindowHandle<StatusView>> {
+    let handle = cx.try_global::<WindowSlot>().and_then(|s| s.handle)?;
+    is_live(handle.into(), cx).then_some(handle)
+}
+
 /// Brings the normal window to the front, opening it at the bottom-right of
 /// the primary work area if it isn't open.
 pub fn show_window(cx: &mut App) {
+    show_window_as(false, cx);
+}
+
+/// Opens the big window cloaked, for the flip to reveal: cloaked as it is
+/// made, before Windows first shows it, so neither it nor its shadow ever
+/// shows under the flip.
+pub fn show_window_cloaked(cx: &mut App) {
+    show_window_as(true, cx);
+}
+
+fn show_window_as(cloaked: bool, cx: &mut App) {
     if let Some(handle) = cx.try_global::<WindowSlot>().and_then(|s| s.handle)
         && handle
             .update(cx, |_, window, _| window.activate_window())
@@ -81,6 +98,8 @@ pub fn show_window(cx: &mut App) {
     {
         return;
     }
+    // Its header parts are noted afresh as it draws.
+    crate::morph::clear_column_parts();
     let Some(state) = cx.try_global::<Ui>().map(|ui| ui.state.clone()) else {
         return;
     };
@@ -105,10 +124,17 @@ pub fn show_window(cx: &mut App) {
                     ..Default::default()
                 }),
                 window_min_size: Some(size(px(300.), px(200.))),
+                // Cloaked, it is placed and shown as it activates, after
+                // the cloak below.
+                show: !cloaked,
                 ..Default::default()
             },
             |window, cx| {
-                // Safe: opened with show: true, so there is no parked placement.
+                if cloaked && let Some(h) = win::hwnd(window) {
+                    win::cloak(h);
+                }
+                // Shown, there is no parked placement; cloaked, activating
+                // places and shows it, cloaked.
                 window.activate_window();
                 // Where the client area came out, so the flip lands on it.
                 if let Some(h) = win::hwnd(window) {
@@ -196,21 +222,92 @@ pub fn scroll_table_to(x: f32) {
 }
 
 /// Scrolls the panel's list to its top, or the big window's table to its
-/// left edge, over `over`, eased: true when it wasn't there already.
+/// left edge (and its pull requests to their top), over `over`, eased:
+/// true when it wasn't there already.
 pub fn glide_to_start(panel: bool, over: std::time::Duration, cx: &mut App) -> bool {
-    glide_scroll(panel, point(px(0.), px(0.)), over, cx)
+    let also = (!panel).then(|| PRS_SCROLL.with(Clone::clone));
+    glide_scroll(panel, point(px(0.), px(0.)), also, over, cx)
 }
 
 /// Scrolls the big window's table sideways to `x` logical px over `over`.
 pub fn glide_table_to(x: f32, over: std::time::Duration, cx: &mut App) -> bool {
-    glide_scroll(false, point(px(-x), px(0.)), over, cx)
+    glide_scroll(false, point(px(-x), px(0.)), None, over, cx)
 }
 
-/// Moves the panel's list or the window's table to offset `to`, eased:
-/// true when it wasn't there already.
+thread_local! {
+    /// The big window's pull requests' own scroll, up and down.
+    static PRS_SCROLL: ScrollHandle = ScrollHandle::new();
+    /// Each view's latest glide (the list's, the table's), by number: a
+    /// new one takes over from one under way.
+    static GLIDES: std::cell::Cell<[u64; 2]> = const { std::cell::Cell::new([0; 2]) };
+    /// Until when each view's glide runs, while it does.
+    static GLIDING: std::cell::Cell<[Option<std::time::Instant>; 2]> =
+        const { std::cell::Cell::new([None; 2]) };
+    /// When a glide last took its last step.
+    static GLIDE_END: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Whether a list or table glide is under way.
+pub fn gliding() -> bool {
+    let now = std::time::Instant::now();
+    GLIDING.get().iter().flatten().any(|&until| now < until)
+}
+
+/// When a glide last took its last step.
+pub fn last_glide_end() -> Option<std::time::Instant> {
+    GLIDE_END.get()
+}
+
+/// One glide: the handle it moves, from where to where, and over how long.
+#[derive(Clone)]
+struct Glide {
+    slot: usize,
+    id: u64,
+    scroll: ScrollHandle,
+    from: gpui::Point<gpui::Pixels>,
+    to: gpui::Point<gpui::Pixels>,
+    /// Another handle glided with it to the top: the pull requests'.
+    also: Option<(ScrollHandle, gpui::Point<gpui::Pixels>)>,
+    start: std::time::Instant,
+    over: std::time::Duration,
+}
+
+/// Takes the glide's next step as each frame starts, until it ends or a
+/// newer one takes over.
+fn glide_step(window: &mut Window, g: Glide) {
+    window.on_next_frame(move |window, _| {
+        if GLIDES.get()[g.slot] != g.id {
+            return;
+        }
+        let t = (g.start.elapsed().as_secs_f32() / g.over.as_secs_f32().max(0.001)).min(1.0);
+        let k = crate::morph::ease(t);
+        let at = |from: gpui::Point<gpui::Pixels>, to: gpui::Point<gpui::Pixels>| {
+            point(from.x + (to.x - from.x) * k, from.y + (to.y - from.y) * k)
+        };
+        g.scroll.set_offset(at(g.from, g.to));
+        if let Some((also, from)) = &g.also {
+            also.set_offset(at(*from, point(px(0.), px(0.))));
+        }
+        window.refresh();
+        if t >= 1.0 {
+            let mut gliding = GLIDING.get();
+            gliding[g.slot] = None;
+            GLIDING.set(gliding);
+            GLIDE_END.set(Some(std::time::Instant::now()));
+        } else {
+            glide_step(window, g);
+        }
+    });
+}
+
+/// Moves the panel's list or the window's table to offset `to`, eased,
+/// a step each frame, taking over from a glide of it under way: true
+/// when it wasn't there already.
 fn glide_scroll(
     panel: bool,
     to: gpui::Point<gpui::Pixels>,
+    also: Option<ScrollHandle>,
     over: std::time::Duration,
     cx: &mut App,
 ) -> bool {
@@ -225,33 +322,41 @@ fn glide_scroll(
         return false;
     };
     let from = scroll.offset();
-    if f32::from(from.x - to.x).abs() < 0.5 && f32::from(from.y - to.y).abs() < 0.5 {
+    let also = also
+        .map(|h| (h.clone(), h.offset()))
+        .filter(|(_, o)| f32::from(o.y).abs() >= 0.5);
+    let near = |a: gpui::Pixels, b: gpui::Pixels| f32::from(a - b).abs() < 0.5;
+    if near(from.x, to.x) && near(from.y, to.y) && also.is_none() {
         return false;
     }
+    let slot = usize::from(!panel);
+    let mut ids = GLIDES.get();
+    ids[slot] += 1;
+    GLIDES.set(ids);
     let start = std::time::Instant::now();
+    let mut gliding = GLIDING.get();
+    // Never longer than this, should its window close under it.
+    gliding[slot] = Some(start + over + std::time::Duration::from_millis(100));
+    GLIDING.set(gliding);
+    let g = Glide {
+        slot,
+        id: ids[slot],
+        scroll,
+        from,
+        to,
+        also,
+        start,
+        over,
+    };
+    // Outside the update this may be called from.
     cx.spawn(async move |cx| {
-        loop {
-            let t = (start.elapsed().as_secs_f32() / over.as_secs_f32().max(0.001)).min(1.0);
-            let k = crate::morph::ease(t);
-            let alive = cx
-                .update(|cx| {
-                    handle
-                        .update(cx, |_, _, cx| {
-                            scroll.set_offset(point(
-                                from.x + (to.x - from.x) * k,
-                                from.y + (to.y - from.y) * k,
-                            ));
-                            cx.notify();
-                        })
-                        .is_ok()
-                })
-                .unwrap_or(false);
-            if !alive || t >= 1.0 {
-                break;
-            }
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(8))
-                .await;
+        let started = handle
+            .update(cx, |_, window, _| glide_step(window, g))
+            .is_ok();
+        if !started {
+            let mut gliding = GLIDING.get();
+            gliding[slot] = None;
+            GLIDING.set(gliding);
         }
     })
     .detach();
@@ -541,8 +646,23 @@ impl StatusView {
         if let Some(marks) = cx.try_global::<Ui>().map(|ui| ui.marks.clone()) {
             cx.observe(&marks, |_, _, cx| cx.notify()).detach();
         }
-        cx.observe_window_appearance(window, |_, _, cx| cx.notify())
-            .detach();
+        cx.observe_window_appearance(window, move |_, window, cx| {
+            // The rim and title bar follow the theme, in the colours the
+            // flip draws.
+            if let Some(h) = win::hwnd(window) {
+                let dark = matches!(
+                    window.appearance(),
+                    WindowAppearance::Dark | WindowAppearance::VibrantDark
+                );
+                let caption = (mode == Mode::Window).then(|| title_bar_rgb(dark));
+                cx.spawn(async move |_, _| unsafe {
+                    win::set_frame_colors(h, rim_rgb(dark), caption)
+                })
+                .detach();
+            }
+            cx.notify()
+        })
+        .detach();
         if mode == Mode::Window {
             // Closing flips it back into the panel when it can.
             window.on_window_should_close(cx, |window, cx| !crate::morph::flip_back(window, cx));
@@ -1287,6 +1407,7 @@ pub(crate) fn prs_block(
         Mode::Window => block
             .max_h(px(WINDOW_PRS_HEIGHT))
             .overflow_y_scroll()
+            .track_scroll(&PRS_SCROLL.with(Clone::clone))
             .into_any_element(),
     })
 }
@@ -2088,23 +2209,31 @@ pub(crate) fn rim(dark: bool) -> Hsla {
 }
 
 thread_local! {
-    /// How thick Windows draws the rim, physical px, once read.
-    static RIM_PX: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    /// How thick Windows draws the rim, physical px, by the scale (in
+    /// hundredths) it was read at: each monitor's scale has its own.
+    static RIM_PX: std::cell::RefCell<std::collections::HashMap<u32, u32>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-/// Notes how thick Windows draws `h`'s rim, for gitstat to draw its own
-/// exactly as thick.
+fn scale_key(s: f32) -> u32 {
+    (s * 100.0).round() as u32
+}
+
+/// Notes how thick Windows draws `h`'s rim at the scale it draws at, for
+/// gitstat to draw its own exactly as thick.
 pub(crate) fn seen_rim(h: isize) {
-    if let Some(v) = win::rim_thickness(h) {
-        RIM_PX.with(|c| c.set(Some(v)));
+    if let (Some(v), Some(s)) = (win::rim_thickness(h), win::window_scale(h)) {
+        RIM_PX.with(|c| {
+            c.borrow_mut().insert(scale_key(s), v);
+        });
     }
 }
 
-/// The rim's thickness, physical px, at scale `s`: as Windows draws it,
-/// else one logical px.
+/// The rim's thickness, physical px, at scale `s`: as Windows draws it
+/// there, else one logical px.
 pub(crate) fn rim_width(s: f32) -> f32 {
     RIM_PX
-        .with(|c| c.get())
+        .with(|c| c.borrow().get(&scale_key(s)).copied())
         .map_or(s.round().max(1.0), |v| v as f32)
 }
 

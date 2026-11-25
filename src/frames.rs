@@ -135,13 +135,21 @@ pub fn finish(cx: &mut gpui::App) {
     if RECORDER.with(|r| r.borrow().is_none()) {
         return;
     }
+    // Only this flip's recording: a flip starting meanwhile records its
+    // own, which this leaves alone.
+    let mine = RECORDER.with(|r| r.borrow().as_ref().map(|r| r.start));
+    let still = move || RECORDER.with(|r| r.borrow().as_ref().map(|r| r.start)) == mine;
     cx.spawn(async move |cx| {
         let end = Instant::now() + AFTER;
-        while Instant::now() < end {
+        while Instant::now() < end && still() {
             cx.background_executor().timer(AFTER_EVERY).await;
-            frame("after");
+            if still() {
+                frame("after");
+            }
         }
-        RECORDER.with(|r| r.borrow_mut().take());
+        if still() {
+            RECORDER.with(|r| r.borrow_mut().take());
+        }
     })
     .detach();
 }

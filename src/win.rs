@@ -16,9 +16,9 @@ use windows_sys::Win32::Graphics::Dwm::{
 };
 use windows_sys::Win32::Graphics::Gdi::{
     ClientToScreen, CombineRgn, CreateEllipticRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject,
-    GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL,
-    MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, MonitorFromRect, RGN_AND,
-    SetWindowRgn,
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST,
+    MONITOR_DEFAULTTONULL, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
+    MonitorFromRect, RGN_AND, SetWindowRgn,
 };
 use windows_sys::Win32::UI::Controls::{
     ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, TOOLTIPS_CLASSW, TTDT_AUTOPOP,
@@ -326,6 +326,65 @@ pub fn cloak(h: isize) {
     unsafe { dwm_set(hwnd, 13, 1) };
 }
 
+/// Lets clicks through the flip's window to what is beneath it, or
+/// takes them: while it draws in place of the windows, a click lands on
+/// it rather than on whatever lies behind them.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn click_through(h: isize, through: bool) {
+    let Some(hwnd) = live(h) else { return };
+    unsafe {
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let ex = if through {
+            ex | WS_EX_TRANSPARENT as isize
+        } else {
+            ex & !(WS_EX_TRANSPARENT as isize)
+        };
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex);
+    }
+}
+
+/// Every monitor's work area, physical px.
+pub fn work_areas() -> Vec<Rect> {
+    unsafe extern "system" fn each(
+        mon: HMONITOR,
+        _: HDC,
+        _: *mut RECT,
+        data: LPARAM,
+    ) -> windows_sys::core::BOOL {
+        let out = unsafe { &mut *(data as *mut Vec<Rect>) };
+        out.push(monitor_info(mon).work);
+        1
+    }
+    let mut out: Vec<Rect> = Vec::new();
+    unsafe {
+        EnumDisplayMonitors(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            Some(each),
+            (&raw mut out) as LPARAM,
+        )
+    };
+    if out.is_empty() {
+        out.push(primary_monitor().work);
+    }
+    out
+}
+
+/// The scale `h` draws at, from its monitor's DPI.
+pub fn window_scale(h: isize) -> Option<f32> {
+    let hwnd = live(h)?;
+    let dpi = unsafe { GetDpiForWindow(hwnd) };
+    (dpi > 0).then(|| dpi as f32 / 96.0)
+}
+
+/// Whether the panel `h` is sliding clipped now, with DWM's rim off, so
+/// it draws its own.
+pub fn is_bare(h: isize) -> bool {
+    BARE_PANEL.load(std::sync::atomic::Ordering::Relaxed) == h
+}
+
 /// Shows a window [`cloak`] hid, at the next composition.
 pub fn uncloak(h: isize) {
     let Some(hwnd) = live(h) else { return };
@@ -400,12 +459,6 @@ pub unsafe fn panel_restack(h: isize) {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         )
     };
-}
-
-/// Whether a slide from `hidden` (the panel's place out of sight, screen
-/// px) is clipped rather than from behind a taskbar.
-pub fn slide_clips(hidden: Rect) -> bool {
-    taskbar_over(hidden).is_none() && on_a_monitor(hidden)
 }
 
 /// Whether any of `r` (screen px) is on a monitor; past every screen's
@@ -559,9 +612,23 @@ fn taskbar_over(r: Rect) -> Option<HWND> {
 pub unsafe fn slide_panel(h: isize, moved: Rect, shown: Option<Rect>) {
     use std::sync::atomic::Ordering::Relaxed;
     let Some(hwnd) = live(h) else { return };
+    // Behind a taskbar that edges onto another monitor, the part past it
+    // would show on that monitor: clipped instead, like a slide from a
+    // screen's edge.
     let behind = shown
         .filter(|s| *s != moved)
-        .and_then(|_| taskbar_over(moved));
+        .and_then(|_| taskbar_over(moved))
+        .filter(|_| {
+            let (x, y) = shown.map_or(moved.centre(), |s| s.centre());
+            let mon = monitor_at(x, y).rect;
+            let inside = Rect::new(
+                moved.left.max(mon.left),
+                moved.top.max(mon.top),
+                moved.right.min(mon.right),
+                moved.bottom.min(mon.bottom),
+            );
+            inside == moved || !on_a_monitor(hidden_part(moved, inside))
+        });
     // Past a screen's edge with nothing beyond, it needs no clip either:
     // Windows keeps its own rim and shadow on all the way.
     let clip = shown
