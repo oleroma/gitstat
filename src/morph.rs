@@ -71,7 +71,7 @@ const RADIUS: f32 = 8.0;
 /// logical px.
 const CAPTION_GUESS: f32 = 32.0;
 /// Room left around the sheet for its shadow, logical px.
-const SHADOW_ROOM: f32 = 40.0;
+const SHADOW_ROOM: f32 = 72.0;
 /// Until the big window has been drawn once: its column header's height,
 /// logical px.
 const HEADER_GUESS: f32 = 110.0;
@@ -343,6 +343,9 @@ struct MorphSlot {
     waiting: Option<Instant>,
     /// A flip window opened ahead, hidden, while the views glide home.
     spare: Option<WindowHandle<MorphView>>,
+    /// The window the flip ends in, cloaked until the reveal, when it
+    /// takes over the shadow from the sheet's in one frame.
+    ending: Option<isize>,
 }
 
 /// Opens a hidden flip window ahead of the flip, so starting it needn't
@@ -1650,6 +1653,12 @@ impl Render for MorphView {
             // And the slide in has ended.
             if since >= slide.max(HOLD) && (since >= DRAW_WAIT || drawn) {
                 self.reveal_from = Some(Instant::now());
+                // The ending window and its shadow show as this frame,
+                // without the sheet's, does.
+                self.framed.1 = self.frames;
+                if let Some(h) = cx.default_global::<MorphSlot>().ending.take() {
+                    win::uncloak(h);
+                }
             }
         }
         let revealed = self.reveal_from.map_or(Duration::ZERO, |t| t.elapsed());
@@ -1685,11 +1694,17 @@ impl Render for MorphView {
         }
         if elapsed >= hold_at && self.arrived.is_none() {
             self.arrived = Some(Instant::now());
-            self.framed.1 = self.frames + 1;
+            // The sheet keeps drawing the shadow until the reveal, when the
+            // ending window, opened cloaked, shows its own instead.
             let cloaked = self.from.is_some();
             if open {
                 cx.defer(move |cx| {
                     view::show_window(cx);
+                    let h = view::window_hwnd(cx);
+                    if let Some(h) = h {
+                        win::cloak(h);
+                    }
+                    cx.default_global::<MorphSlot>().ending = h;
                     if cloaked {
                         crate::panel::close(cx);
                     }
@@ -1698,6 +1713,11 @@ impl Render for MorphView {
                 let me = self.hwnd;
                 cx.defer(move |cx| {
                     crate::panel::reopen(cx);
+                    let h = crate::panel::hwnd(cx);
+                    if let Some(h) = h {
+                        win::cloak(h);
+                    }
+                    cx.default_global::<MorphSlot>().ending = h;
                     if cloaked {
                         view::close_window(cx);
                     }
@@ -2098,18 +2118,21 @@ impl Render for MorphView {
                             sheet,
                             gpui::Corners::all(px(RADIUS)),
                             &[
+                                // Fitted to Windows 11's own, measured
+                                // around the panel and the big window: an
+                                // even one all round and a deep one
+                                // below.
                                 gpui::BoxShadow {
-                                    color: gpui::black().opacity(0.19 * framed),
-                                    offset: point(px(0.0), px(2.0)),
-                                    blur_radius: px(4.0),
-                                    spread_radius: px(0.0),
+                                    color: gpui::black().opacity(0.39 * framed),
+                                    offset: point(px(0.0), px(0.0)),
+                                    blur_radius: px(12.0),
+                                    spread_radius: px(4.8),
                                 },
                                 gpui::BoxShadow {
-                                    color: gpui::black()
-                                        .opacity(if dark { 0.54 } else { 0.35 } * framed),
-                                    offset: point(px(0.0), px(8.0)),
-                                    blur_radius: px(24.0),
-                                    spread_radius: px(0.0),
+                                    color: gpui::black().opacity(0.50 * framed),
+                                    offset: point(px(0.0), px(42.5)),
+                                    blur_radius: px(24.4),
+                                    spread_radius: px(-12.6),
                                 },
                             ],
                         );

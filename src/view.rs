@@ -62,6 +62,15 @@ struct WindowSlot {
 
 impl Global for WindowSlot {}
 
+/// The big window's HWND while it is open.
+pub fn window_hwnd(cx: &mut App) -> Option<isize> {
+    let handle = cx.try_global::<WindowSlot>().and_then(|s| s.handle)?;
+    handle
+        .update(cx, |_, window, _| crate::win::hwnd(window))
+        .ok()
+        .flatten()
+}
+
 /// Brings the normal window to the front, opening it at the bottom-right of
 /// the primary work area if it isn't open.
 pub fn show_window(cx: &mut App) {

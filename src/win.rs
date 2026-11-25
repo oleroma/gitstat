@@ -326,6 +326,12 @@ pub fn cloak(h: isize) {
     unsafe { dwm_set(hwnd, 13, 1) };
 }
 
+/// Shows a window [`cloak`] hid, at the next composition.
+pub fn uncloak(h: isize) {
+    let Some(hwnd) = live(h) else { return };
+    unsafe { dwm_set(hwnd, 13, 0) };
+}
+
 /// Puts the hidden flip window's client area at `r`, still hidden, so it
 /// draws its first frame at its size before it shows.
 ///
