@@ -72,6 +72,13 @@ impl Slide {
 
 impl Global for PanelSlot {}
 
+impl PanelSlot {
+    /// The panel's window, open or being drawn.
+    pub fn handle(&self) -> Option<WindowHandle<StatusView>> {
+        self.handle
+    }
+}
+
 /// Closes the panel if it is open, else opens it at `anchor` unless the
 /// click is the tail of the one that just closed it.
 pub fn toggle(anchor: Anchor, cx: &mut App) {
@@ -92,6 +99,24 @@ pub fn toggle(anchor: Anchor, cx: &mut App) {
 /// The open panel's client area, or the last one's, physical px.
 pub fn last_rect(cx: &App) -> Option<Rect> {
     cx.try_global::<PanelSlot>()?.rect
+}
+
+/// Where the panel would open, when it hasn't been open since gitstat
+/// started: by the floating button if it shows, else by the tray. So the
+/// big window, opened some other way, still flips back into it.
+pub fn guess_place(cx: &mut App) -> Option<Rect> {
+    if let Some(rect) = last_rect(cx) {
+        return Some(rect);
+    }
+    let anchor =
+        crate::overlay::anchor(cx).or_else(|| win::tray_area().map(|r| Anchor::Tray(Some(r))))?;
+    let state = cx.try_global::<Ui>()?.state.clone();
+    let rows = view::panel_rows(state.read(cx));
+    let rect = place(anchor, Height::Rows(rows), cx);
+    let slot = cx.default_global::<PanelSlot>();
+    slot.anchor = Some(anchor);
+    slot.rect = Some(rect);
+    Some(rect)
 }
 
 /// Opens the panel where it last was, at once, for the flip back from
@@ -165,6 +190,9 @@ fn open(anchor: Anchor, slide: bool, cx: &mut App) {
         a => a,
     };
     crate::morph::clear_strips();
+    if !crate::morph::running(cx) {
+        crate::frames::watch(win::primary_monitor().rect, "panel", cx);
+    }
     if let Some(t) = cx.try_global::<Ui>().map(|ui| ui.timelines.clone()) {
         t.update(cx, |t, cx| t.show_newest(cx));
     }
@@ -207,6 +235,16 @@ fn open(anchor: Anchor, slide: bool, cx: &mut App) {
                 if let Some(h) = hwnd {
                     // Native z-order calls must run outside this update.
                     let under = crate::morph::flip_hwnd(cx);
+                    let dark = matches!(
+                        window.appearance(),
+                        gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+                    );
+                    // Its rim in the colour the flip and a clipped slide draw.
+                    cx.spawn(async move |_| unsafe {
+                        win::set_frame_colors(h, view::rim_rgb(dark), None);
+                        view::seen_rim(h);
+                    })
+                    .detach();
                     cx.spawn(async move |_| unsafe { win::panel_topmost(h, under, sliding) })
                         .detach();
                 }

@@ -19,7 +19,7 @@ notify = { version = "=9.0.0-rc.6", default-features = false }
 ab_glyph = { version = "0.2.32", default-features = false, features = ["std"] }
 gpui = "0.2.2"
 # GPUI's pictures are frames of this crate; the version GPUI uses.
-image = { version = "0.25", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png"] }
 # Renders a repo's own .gitstat/icon.svg into its folder icon. No text, fonts
 # or raster images: an icon needs shapes, and every loader is attack surface.
 resvg = { version = "0.48.1", default-features = false }

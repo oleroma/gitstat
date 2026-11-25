@@ -9,15 +9,16 @@
 use crate::layout::Rect;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::{
-    DWMNCRP_DISABLED, DWMNCRP_USEWINDOWSTYLE, DWMWA_BORDER_COLOR, DWMWA_COLOR_DEFAULT,
-    DWMWA_COLOR_NONE, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_NCRENDERING_POLICY,
-    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND, DwmGetWindowAttribute,
-    DwmSetWindowAttribute,
+    DWMNCRP_DISABLED, DWMNCRP_USEWINDOWSTYLE, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR,
+    DWMWA_COLOR_DEFAULT, DWMWA_COLOR_NONE, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_NCRENDERING_POLICY,
+    DWMWA_VISIBLE_FRAME_BORDER_THICKNESS, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
+    DWMWCP_ROUND, DwmGetWindowAttribute, DwmSetWindowAttribute,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     ClientToScreen, CombineRgn, CreateEllipticRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject,
-    GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
-    MonitorFromPoint, RGN_AND, SetWindowRgn,
+    GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL,
+    MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, MonitorFromRect, RGN_AND,
+    SetWindowRgn,
 };
 use windows_sys::Win32::UI::Controls::{
     ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, TOOLTIPS_CLASSW, TTDT_AUTOPOP,
@@ -316,6 +317,42 @@ pub unsafe fn style_morph(h: isize) {
     }
 }
 
+/// Hides `h` from the screen, shadow and all, at the next composition,
+/// without hiding it from Windows: it stays the active window, so the
+/// window that follows it can still come to the front.
+pub fn cloak(h: isize) {
+    let Some(hwnd) = live(h) else { return };
+    // DWMWA_CLOAK
+    unsafe { dwm_set(hwnd, 13, 1) };
+}
+
+/// Shows a window [`cloak`] hid, at the next composition.
+pub fn uncloak(h: isize) {
+    let Some(hwnd) = live(h) else { return };
+    unsafe { dwm_set(hwnd, 13, 0) };
+}
+
+/// Puts the hidden flip window's client area at `r`, still hidden, so it
+/// draws its first frame at its size before it shows.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn size_morph(h: isize, r: Rect) {
+    let Some(hwnd) = live(h) else { return };
+    unsafe {
+        let (dx, dy, bw, bh) = frame(hwnd);
+        SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            r.left - dx,
+            r.top - dy,
+            r.width() + bw,
+            r.height() + bh,
+            SWP_NOACTIVATE,
+        );
+    }
+}
+
 /// Puts the flip's client area at `r`, topmost and shown without activation.
 ///
 /// # Safety
@@ -368,12 +405,57 @@ pub unsafe fn panel_restack(h: isize) {
 /// Whether a slide from `hidden` (the panel's place out of sight, screen
 /// px) is clipped rather than from behind a taskbar.
 pub fn slide_clips(hidden: Rect) -> bool {
-    taskbar_over(hidden).is_none()
+    taskbar_over(hidden).is_none() && on_a_monitor(hidden)
 }
 
-/// How far the window's client area starts below its visible top edge
-/// (the title bar), physical px.
-pub fn caption_height(h: isize) -> Option<i32> {
+/// Whether any of `r` (screen px) is on a monitor; past every screen's
+/// edge, a sliding panel needs no clip.
+fn on_a_monitor(r: Rect) -> bool {
+    let rc = RECT {
+        left: r.left,
+        top: r.top,
+        right: r.right,
+        bottom: r.bottom,
+    };
+    r.width() > 0
+        && r.height() > 0
+        && !unsafe { MonitorFromRect(&rc, MONITOR_DEFAULTTONULL) }.is_null()
+}
+
+/// The part of `moved` outside `shown`: the strip past the edge it
+/// slides from.
+fn hidden_part(moved: Rect, shown: Rect) -> Rect {
+    if shown.top > moved.top {
+        Rect::new(moved.left, moved.top, moved.right, shown.top)
+    } else if shown.bottom < moved.bottom {
+        Rect::new(moved.left, shown.bottom, moved.right, moved.bottom)
+    } else if shown.left > moved.left {
+        Rect::new(moved.left, moved.top, shown.left, moved.bottom)
+    } else {
+        Rect::new(shown.right, moved.top, moved.right, moved.bottom)
+    }
+}
+
+/// The thickness Windows draws a window's rim at, physical px, as it
+/// draws it on `h` (Windows 11; it scales with the display).
+pub fn rim_thickness(h: isize) -> Option<u32> {
+    let hwnd = live(h)?;
+    let mut v: u32 = 0;
+    let ok = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_VISIBLE_FRAME_BORDER_THICKNESS as u32,
+            (&raw mut v).cast(),
+            size_of::<u32>() as u32,
+        )
+    } == 0;
+    (ok && (1..=8).contains(&v)).then_some(v)
+}
+
+/// How far the window's visible frame (where Windows draws its rim)
+/// reaches past its client area on each side, physical px (left, top:
+/// the title bar, right, bottom).
+pub fn frame_insets(h: isize) -> Option<(i32, i32, i32, i32)> {
     let hwnd = live(h)?;
     let client = client_rect(h)?;
     let mut r = RECT::default();
@@ -385,8 +467,13 @@ pub fn caption_height(h: isize) -> Option<i32> {
             size_of::<RECT>() as u32,
         )
     } == 0;
-    ok.then(|| client.top - r.top)
-        .filter(|c| (0..200).contains(c))
+    let d = (
+        client.left - r.left,
+        client.top - r.top,
+        r.right - client.right,
+        r.bottom - client.bottom,
+    );
+    (ok && [d.0, d.1, d.2, d.3].iter().all(|v| (0..200).contains(v))).then_some(d)
 }
 
 /// The panel whose DWM border and shadow are off for its slide.
@@ -395,6 +482,29 @@ static BARE_PANEL: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsi
 /// `s` as a NUL-ended UTF-16 string.
 fn w(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
+}
+
+/// The notification area's rect on the main taskbar, screen px, where the
+/// tray icon sits: or, without it, the main taskbar's.
+pub fn tray_area() -> Option<Rect> {
+    let main = w("Shell_TrayWnd");
+    let notify = w("TrayNotifyWnd");
+    unsafe {
+        let tray = FindWindowW(main.as_ptr(), std::ptr::null());
+        if tray.is_null() {
+            return None;
+        }
+        let area = FindWindowExW(
+            tray,
+            std::ptr::null_mut(),
+            notify.as_ptr(),
+            std::ptr::null(),
+        );
+        let mut r = RECT::default();
+        let got = (!area.is_null() && GetWindowRect(area, &mut r) != 0)
+            || GetWindowRect(tray, &mut r) != 0;
+        got.then(|| rect(r))
+    }
 }
 
 /// The taskbar (any monitor's) overlapping `r`, screen px.
@@ -452,7 +562,11 @@ pub unsafe fn slide_panel(h: isize, moved: Rect, shown: Option<Rect>) {
     let behind = shown
         .filter(|s| *s != moved)
         .and_then(|_| taskbar_over(moved));
-    let clip = shown.filter(|_| behind.is_none());
+    // Past a screen's edge with nothing beyond, it needs no clip either:
+    // Windows keeps its own rim and shadow on all the way.
+    let clip = shown
+        .filter(|_| behind.is_none())
+        .filter(|s| *s != moved && on_a_monitor(hidden_part(moved, *s)));
     unsafe {
         let bare = BARE_PANEL.load(Relaxed) == h;
         if clip.is_some() && !bare {
@@ -518,7 +632,38 @@ pub unsafe fn slide_panel(h: isize, moved: Rect, shown: Option<Rect>) {
                 DWMNCRP_USEWINDOWSTYLE as u32,
             );
             dwm_set(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND as u32);
-            dwm_set(hwnd, DWMWA_BORDER_COLOR, DWMWA_COLOR_DEFAULT);
+            dwm_set(
+                hwnd,
+                DWMWA_BORDER_COLOR,
+                PANEL_RIM.load(std::sync::atomic::Ordering::Relaxed),
+            );
+        }
+    }
+}
+
+/// The panel's rim as set, a COLORREF, for after a clipped slide.
+static PANEL_RIM: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(DWMWA_COLOR_DEFAULT);
+
+/// 0xRRGGBB as a COLORREF (0x00BBGGRR).
+fn colorref(rgb: u32) -> u32 {
+    ((rgb & 0xff) << 16) | (rgb & 0xff00) | ((rgb >> 16) & 0xff)
+}
+
+/// Sets the window's rim and, given, its title bar to exact colours
+/// (0xRRGGBB), which gitstat then draws itself in the flip and a clipped
+/// slide, so the drawn and the real ones hand over unseen. A panel's rim
+/// is also kept for after a clipped slide.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn set_frame_colors(h: isize, rim: u32, caption: Option<u32>) {
+    let Some(hwnd) = live(h) else { return };
+    unsafe {
+        dwm_set(hwnd, DWMWA_BORDER_COLOR, colorref(rim));
+        match caption {
+            Some(c) => dwm_set(hwnd, DWMWA_CAPTION_COLOR, colorref(c)),
+            None => PANEL_RIM.store(colorref(rim), std::sync::atomic::Ordering::Relaxed),
         }
     }
 }
@@ -787,5 +932,64 @@ fn tool_info(owner: HWND, text: *mut u16) -> TTTOOLINFOW {
         uId: owner as usize,
         lpszText: text,
         ..Default::default()
+    }
+}
+
+/// The screen's pixels in `r` (physical px) as they are shown now, layered
+/// windows included: straight RGBA rows, top down. For the flip's frame
+/// recorder.
+pub fn capture(r: Rect) -> Option<(u32, u32, Vec<u8>)> {
+    use windows_sys::Win32::Graphics::Gdi::{
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleBitmap,
+        CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, GetDC, GetDIBits, ReleaseDC, SRCCOPY,
+        SelectObject,
+    };
+    let (w, h) = (r.width(), r.height());
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    unsafe {
+        let screen = GetDC(std::ptr::null_mut());
+        if screen.is_null() {
+            return None;
+        }
+        let dc = CreateCompatibleDC(screen);
+        let bitmap = CreateCompatibleBitmap(screen, w, h);
+        let old = SelectObject(dc, bitmap);
+        let copied = BitBlt(dc, 0, 0, w, h, screen, r.left, r.top, SRCCOPY | CAPTUREBLT) != 0;
+        let mut info: BITMAPINFO = std::mem::zeroed();
+        info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        info.bmiHeader.biWidth = w;
+        // Negative: rows top down.
+        info.bmiHeader.biHeight = -h;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        let mut pixels = vec![0u8; w as usize * h as usize * 4];
+        let rows = if copied {
+            GetDIBits(
+                dc,
+                bitmap,
+                0,
+                h as u32,
+                pixels.as_mut_ptr().cast(),
+                &mut info,
+                DIB_RGB_COLORS,
+            )
+        } else {
+            0
+        };
+        SelectObject(dc, old);
+        DeleteObject(bitmap);
+        DeleteDC(dc);
+        ReleaseDC(std::ptr::null_mut(), screen);
+        if rows == 0 {
+            return None;
+        }
+        for px in pixels.as_chunks_mut::<4>().0 {
+            px.swap(0, 2);
+            px[3] = 255;
+        }
+        Some((w as u32, h as u32, pixels))
     }
 }
