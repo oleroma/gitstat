@@ -49,6 +49,8 @@ pub struct RepoStatus {
     pub detached: Option<String>,
     /// The checked-out branch's name.
     pub branch: Option<String>,
+    /// The default branch's own name (`main`), when known.
+    pub trunk: Option<String>,
     /// Local branches other than the checked-out one with commits no
     /// remote has: ahead of their upstream, or never pushed. Name and count.
     pub unpushed_branches: Vec<(String, u32)>,
@@ -60,6 +62,19 @@ pub struct RepoStatus {
 }
 
 impl RepoStatus {
+    /// Checked out on something other than the default branch: another
+    /// branch, or no branch at all.
+    pub fn off_trunk(&self) -> bool {
+        if self.remote_only {
+            return false;
+        }
+        match (&self.branch, &self.trunk) {
+            _ if self.detached.is_some() => true,
+            (Some(branch), Some(trunk)) => branch != trunk,
+            _ => false,
+        }
+    }
+
     pub fn is_synced(&self) -> bool {
         self.error.is_none()
             && self.has_upstream
@@ -450,6 +465,7 @@ pub fn check_repo_detailed(root: &Path, repo: &Path, fetch: bool) -> (RepoStatus
                 status.last_commit = facts.last_commit;
                 status.last_worked = facts.last_worked;
                 status.unmerged = facts.unmerged;
+                status.trunk = facts.trunk;
             }
             (status, local.ignored)
         }
@@ -1137,6 +1153,21 @@ fn file_name(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn off_trunk_is_another_branch_or_none() {
+        let on = |branch: Option<&str>, trunk: Option<&str>, detached: bool| RepoStatus {
+            branch: branch.map(String::from),
+            trunk: trunk.map(String::from),
+            detached: detached.then(|| "abc1234".to_string()),
+            ..Default::default()
+        };
+        assert!(!on(Some("main"), Some("main"), false).off_trunk());
+        assert!(on(Some("wip"), Some("main"), false).off_trunk());
+        assert!(on(None, Some("main"), true).off_trunk());
+        // Without a known default branch, nothing to say.
+        assert!(!on(Some("wip"), None, false).off_trunk());
+    }
 
     fn run(dir: &Path, args: &[&str]) {
         let ok = Command::new("git")

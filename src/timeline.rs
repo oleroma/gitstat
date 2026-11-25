@@ -14,7 +14,7 @@ pub(crate) mod ink;
 mod morph;
 
 pub use column::COLUMN_WIDTH;
-pub use morph::{Ends, paint_tree};
+pub use morph::{Ends, paint_tail_fade, paint_tree, pose, tail_fade_end};
 
 use crate::git::RepoStatus;
 use crate::graph::{self, Class, PrColors, PrState, Seg};
@@ -101,20 +101,20 @@ struct Slot {
     scroll: f32,
     /// Where the strip was shown when the wheel last moved it, and when:
     /// it glides from there to `scroll`.
-    glide: Option<(f32, Instant)>,
+    glide: Option<(f32, Instant, Duration)>,
     /// Big mode's column scrolls on its own, apart from the strip: the row
     /// at its top, 0 for the newest.
     top: f32,
     /// Like `glide`, for `top`.
-    top_glide: Option<(f32, Instant)>,
+    top_glide: Option<(f32, Instant, Duration)>,
 }
 
 /// Where a glide from `glide` to `to` is at `now`, and whether it is still
 /// going.
-fn glided(to: f32, glide: Option<(f32, Instant)>, now: Instant) -> (f32, bool) {
+fn glided(to: f32, glide: Option<(f32, Instant, Duration)>, now: Instant) -> (f32, bool) {
     match glide {
-        Some((from, start)) => {
-            let t = progress(start, now, GLIDE);
+        Some((from, start, over)) => {
+            let t = progress(start, now, over);
             (from + (to - from) * t, t < 1.0)
         }
         None => (to, false),
@@ -130,8 +130,14 @@ impl Slot {
 
     /// Moves the scroll to `to`, gliding from wherever it shows now.
     fn glide_to(&mut self, to: f32, now: Instant) {
+        self.glide_over(to, now, GLIDE);
+    }
+
+    /// Moves the scroll to `to` over `over`, gliding from wherever it
+    /// shows now.
+    fn glide_over(&mut self, to: f32, now: Instant, over: Duration) {
         let (shown, _) = self.shown_scroll(now);
-        self.glide = Some((shown, now));
+        self.glide = Some((shown, now, over));
         self.scroll = to;
     }
 
@@ -142,8 +148,12 @@ impl Slot {
 
     /// Moves the column's top to `to`, gliding from wherever it shows now.
     fn glide_top_to(&mut self, to: f32, now: Instant) {
+        self.glide_top_over(to, now, GLIDE);
+    }
+
+    fn glide_top_over(&mut self, to: f32, now: Instant, over: Duration) {
         let (shown, _) = self.shown_top(now);
-        self.top_glide = Some((shown, now));
+        self.top_glide = Some((shown, now, over));
         self.top = to;
     }
 }
@@ -556,6 +566,36 @@ impl Timelines {
         self.table_top = 0.0;
         self.unhover();
         cx.notify();
+    }
+
+    /// Every strip and column scrolls back to its newest commits over
+    /// `over`, as the flip starts from them: true when any had to, false
+    /// when all are there already.
+    pub fn glide_newest(&mut self, over: Duration, cx: &mut Context<Self>) -> bool {
+        let now = Instant::now();
+        let mut moving = false;
+        for slot in self.slots.values_mut() {
+            if slot.shown_scroll(now).0.abs() > 0.5 {
+                slot.glide_over(0.0, now, over);
+                moving = true;
+            } else {
+                slot.scroll = 0.0;
+                slot.glide = None;
+            }
+            if slot.shown_top(now).0.abs() > 0.01 {
+                slot.glide_top_over(0.0, now, over);
+                moving = true;
+            } else {
+                slot.top = 0.0;
+                slot.top_glide = None;
+            }
+        }
+        self.table_top = 0.0;
+        if moving {
+            self.unhover();
+            cx.notify();
+        }
+        moving
     }
 
     fn scroll_home(&mut self, path: &Path, cx: &mut Context<Self>) {

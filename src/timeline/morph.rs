@@ -49,6 +49,14 @@ struct Frame {
     e: f32,
 }
 
+/// Where a tree's newest commit is at progress `e`, and the unit vectors
+/// along its history and across its lanes: the frame its header parts ride
+/// in, so they turn with it.
+pub fn pose(ends: Ends, e: f32) -> (P, P, P) {
+    let f = Frame::new(ends, e.clamp(0.0, 1.0));
+    (f.origin, f.along, f.across)
+}
+
 impl Frame {
     fn new(ends: Ends, e: f32) -> Self {
         let lerp = |a: f32, b: f32| a + (b - a) * e;
@@ -222,6 +230,67 @@ pub fn paint_tree(
         } else {
             disc(window, c, dot, Some(color), None);
         }
+    }
+}
+
+/// The strip's fade at the end of its history, carried with the tree as
+/// it turns and narrowing to nothing by the column, which has none.
+/// Where a still strip's tail fade ends, at the start of the flip, in x:
+/// left of this, the view draws its own fade.
+pub fn tail_fade_end(ends: Ends) -> f32 {
+    let f = Frame::new(ends, 0.0);
+    let w = super::FADE.min(f.len);
+    f.origin.0 + f.len * f.along.0 - w * f.along.0
+}
+
+pub fn paint_tail_fade(ends: Ends, e: f32, bg: Hsla, window: &mut Window) {
+    let e = e.clamp(0.0, 1.0);
+    let f = Frame::new(ends, e);
+    let w = super::FADE.min(f.len) * (1.0 - e);
+    if w <= 0.0 {
+        return;
+    }
+    let half = super::STRIP_HEIGHT / 2.0;
+    // From the end of the drawn history, back towards the newest.
+    let tail = (
+        f.origin.0 + f.len * f.along.0,
+        f.origin.1 + f.len * f.along.1,
+    );
+    let at = |u: f32, v: f32| {
+        pt((
+            tail.0 - u * f.along.0 + v * f.across.0,
+            tail.1 - u * f.along.1 + v * f.across.1,
+        ))
+    };
+    if e <= 0.0 {
+        // Still, exactly the strip's own.
+        let b = Bounds::new(at(0.0, -half), size(px(w), px(2.0 * half)));
+        window.paint_quad(gpui::fill(
+            b,
+            gpui::linear_gradient(
+                90.,
+                gpui::linear_color_stop(bg, 0.),
+                gpui::linear_color_stop(bg.opacity(0.), 1.),
+            ),
+        ));
+        return;
+    }
+    let mut path = PathBuilder::fill();
+    path.move_to(at(0.0, -half));
+    path.line_to(at(w, -half));
+    path.line_to(at(w, half));
+    path.line_to(at(0.0, half));
+    path.close();
+    if let Ok(path) = path.build() {
+        // Towards the newest: right in the strip, up in the column.
+        window.paint_path(
+            path,
+            gpui::linear_gradient(
+                90. * (1.0 - e),
+                gpui::linear_color_stop(bg, 0.),
+                gpui::linear_color_stop(bg.opacity(0.), 1.),
+            ),
+        );
     }
 }
 

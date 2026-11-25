@@ -172,6 +172,10 @@ pub struct Config {
     pub panel_slide_ms: u32,
     /// How long the flip between the panel and the window takes, in ms.
     pub flip_ms: u32,
+    /// For checking the flip: a folder where each flip saves every frame
+    /// of the screen under it, and a few after, as numbered PNGs. Empty
+    /// is off; not in the settings window.
+    pub flip_frames: String,
     /// Which sections of the repo list are folded, in the panel and the
     /// big window alike.
     pub folds: Folds,
@@ -205,7 +209,7 @@ pub struct NotifyConfig {
 /// The sections the panel lists, and the big window shows as groups of
 /// columns (the pull requests as the list under them).
 #[cfg_attr(not(windows), allow(dead_code))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Section {
     /// Repos with something to do: dirty, ahead, behind, erroring.
     NeedsYou,
@@ -289,6 +293,7 @@ impl Default for Config {
             flip_animation: true,
             panel_slide_ms: 150,
             flip_ms: 560,
+            flip_frames: String::new(),
             folds: Folds::default(),
             ignore: Vec::new(),
             notify: NotifyConfig::default(),
