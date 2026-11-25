@@ -1654,10 +1654,12 @@ impl Render for MorphView {
             if since >= slide.max(HOLD) && (since >= DRAW_WAIT || drawn) {
                 self.reveal_from = Some(Instant::now());
                 // The ending window and its shadow show as this frame,
-                // without the sheet's, does.
+                // without the sheet's, does: uncloaked as the next one
+                // starts, since a cloak takes effect a frame sooner than
+                // a drawn frame reaches the screen.
                 self.framed.1 = self.frames;
                 if let Some(h) = cx.default_global::<MorphSlot>().ending.take() {
-                    win::uncloak(h);
+                    window.on_next_frame(move |_, _| win::uncloak(h));
                 }
             }
         }
@@ -2123,16 +2125,16 @@ impl Render for MorphView {
                                 // even one all round and a deep one
                                 // below.
                                 gpui::BoxShadow {
-                                    color: gpui::black().opacity(0.39 * framed),
-                                    offset: point(px(0.0), px(0.0)),
-                                    blur_radius: px(12.0),
-                                    spread_radius: px(4.8),
+                                    color: gpui::black().opacity(0.33 * framed),
+                                    offset: point(px(0.0), px(-0.5)),
+                                    blur_radius: px(12.4),
+                                    spread_radius: px(4.4),
                                 },
                                 gpui::BoxShadow {
-                                    color: gpui::black().opacity(0.50 * framed),
-                                    offset: point(px(0.0), px(42.5)),
-                                    blur_radius: px(24.4),
-                                    spread_radius: px(-12.6),
+                                    color: gpui::black().opacity(0.36 * framed),
+                                    offset: point(px(0.0), px(45.0)),
+                                    blur_radius: px(20.2),
+                                    spread_radius: px(0.4),
                                 },
                             ],
                         );
@@ -2159,6 +2161,26 @@ impl Render for MorphView {
                     paint_band(window, body, p.surface.opacity(fill));
                     window.with_content_mask(Some(gpui::ContentMask { bounds: body }), |window| {
                         for (graph, dirty, ends, alpha) in &trees {
+                            if e <= 0.0 && fill < 1.0 {
+                                // While the panel still shows through, its own
+                                // tail fade stays: the tree is drawn right of it,
+                                // so nothing is painted twice there.
+                                let x = px(crate::timeline::tail_fade_end(*ends));
+                                let right = body.right().max(x);
+                                let clip = Bounds::new(
+                                    point(x, body.top()),
+                                    size(right - x, body.size.height),
+                                );
+                                window.with_content_mask(
+                                    Some(gpui::ContentMask { bounds: clip }),
+                                    |window| {
+                                        crate::timeline::paint_tree(
+                                            graph, *dirty, *ends, e, *alpha, dark, &p, window,
+                                        );
+                                    },
+                                );
+                                continue;
+                            }
                             crate::timeline::paint_tree(
                                 graph, *dirty, *ends, e, *alpha, dark, &p, window,
                             );

@@ -235,6 +235,14 @@ pub fn paint_tree(
 
 /// The strip's fade at the end of its history, carried with the tree as
 /// it turns and narrowing to nothing by the column, which has none.
+/// Where a still strip's tail fade ends, at the start of the flip, in x:
+/// left of this, the view draws its own fade.
+pub fn tail_fade_end(ends: Ends) -> f32 {
+    let f = Frame::new(ends, 0.0);
+    let w = super::FADE.min(f.len);
+    f.origin.0 + f.len * f.along.0 - w * f.along.0
+}
+
 pub fn paint_tail_fade(ends: Ends, e: f32, bg: Hsla, window: &mut Window) {
     let e = e.clamp(0.0, 1.0);
     let f = Frame::new(ends, e);
