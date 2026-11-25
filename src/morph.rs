@@ -493,7 +493,7 @@ pub fn open_window(panel: &mut Window, focus: Option<PathBuf>, cx: &mut App) {
             .and_then(win::client_rect)
             .and_then(|rect| {
                 let plan = plan(rect, panel.scale_factor(), None, focus.as_deref(), cx)?;
-                Some(launch(plan, Direction::Open, cx))
+                Some(launch(plan, Direction::Open, win::hwnd(panel), cx))
             })
             .unwrap_or(false);
     if !started {
@@ -569,7 +569,7 @@ fn flip_back_now(big: &mut Window, minimized: bool, cx: &mut App) -> bool {
     } else {
         Direction::Close
     };
-    launch(plan, direction, cx)
+    launch(plan, direction, win::hwnd(big), cx)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1404,7 +1404,7 @@ fn same_words(a: &Seen, b: &Seen) -> Option<(Words, Words)> {
 }
 
 /// Opens the flip's window for `plan`. False if it couldn't.
-fn launch(plan: Plan, direction: Direction, cx: &mut App) -> bool {
+fn launch(plan: Plan, direction: Direction, from: Option<isize>, cx: &mut App) -> bool {
     let union = plan.union;
     let stretch = stretch(cx);
     debug_assert_eq!((FADE + TURN + HOLD + REVEAL).as_millis(), 450);
@@ -1429,8 +1429,16 @@ fn launch(plan: Plan, direction: Direction, cx: &mut App) -> bool {
             .ok()
             .flatten();
         if let Some(h) = hwnd {
-            cx.spawn(async move |_| unsafe { win::place_morph(h, union) })
-                .detach();
+            // Sized while hidden, and shown once it has drawn a frame of
+            // this flip at that size: never a frame of what it was before.
+            unsafe { win::size_morph(h, union) };
+            spare
+                .update(cx, |view, window, _| {
+                    view.show_at = Some(union);
+                    view.from = from;
+                    window.refresh();
+                })
+                .ok();
             let old = cx.default_global::<MorphSlot>().handle.replace(spare);
             if let Some(old) = old {
                 old.update(cx, |_, window, _| window.remove_window()).ok();
@@ -1469,7 +1477,11 @@ fn launch(plan: Plan, direction: Direction, cx: &mut App) -> bool {
                 })
                 .detach();
             }
-            cx.new(|_| MorphView::new(plan.take(), direction, stretch, win::hwnd(window)))
+            cx.new(|_| {
+                let mut view = MorphView::new(plan.take(), direction, stretch, win::hwnd(window));
+                view.from = from;
+                view
+            })
         },
     ) else {
         return false;
@@ -1510,6 +1522,12 @@ pub struct MorphView {
     framed: (u32, u32),
     /// Hidden, to be removed next frame.
     hiding: bool,
+    /// Where to show it once it has drawn its first frame: a window opened
+    /// ahead, hidden.
+    show_at: Option<Rect>,
+    /// The window the flip starts from: hidden when the turn starts, and
+    /// closed once the window it ends in has opened.
+    from: Option<isize>,
 }
 
 impl MorphView {
@@ -1531,6 +1549,8 @@ impl MorphView {
             drew: (0.0, 0.0),
             framed: (u32::MAX, u32::MAX),
             hiding: false,
+            show_at: None,
+            from: None,
         }
     }
 }
@@ -1586,6 +1606,12 @@ impl Render for MorphView {
         if self.plan.is_none() {
             // Waiting to be handed a flip.
             return div();
+        }
+        if self.frames == 1
+            && let (Some(r), Some(h)) = (self.show_at.take(), self.hwnd)
+        {
+            cx.spawn(async move |_, _| unsafe { win::place_morph(h, r) })
+                .detach();
         }
         // Shown once its first frame is drawn; the clock starts then.
         self.frames += 1;
@@ -1646,22 +1672,35 @@ impl Render for MorphView {
 
         if elapsed >= turn_at && !self.left {
             self.left = true;
-            self.framed.0 = self.frames + 1;
-            if open {
-                cx.defer(crate::panel::close);
-            } else {
-                cx.defer(view::close_window);
+            // The starting window vanishes, its shadow too, as this frame,
+            // which draws the sheet's shadow, shows: never both, or
+            // neither. It stays open (and active) until the ending window
+            // opens, so that one comes to the front.
+            self.framed.0 = self.frames;
+            match self.from {
+                Some(h) => win::cloak(h),
+                None if open => cx.defer(crate::panel::close),
+                None => cx.defer(view::close_window),
             }
         }
         if elapsed >= hold_at && self.arrived.is_none() {
             self.arrived = Some(Instant::now());
             self.framed.1 = self.frames + 1;
+            let cloaked = self.from.is_some();
             if open {
-                cx.defer(view::show_window);
+                cx.defer(move |cx| {
+                    view::show_window(cx);
+                    if cloaked {
+                        crate::panel::close(cx);
+                    }
+                });
             } else {
                 let me = self.hwnd;
                 cx.defer(move |cx| {
                     crate::panel::reopen(cx);
+                    if cloaked {
+                        view::close_window(cx);
+                    }
                     // The panel goes topmost as it opens; the flip stays
                     // over it until the reveal.
                     if let Some(h) = me {
@@ -2060,14 +2099,14 @@ impl Render for MorphView {
                             gpui::Corners::all(px(RADIUS)),
                             &[
                                 gpui::BoxShadow {
-                                    color: gpui::black().opacity(0.14 * framed),
+                                    color: gpui::black().opacity(0.19 * framed),
                                     offset: point(px(0.0), px(2.0)),
                                     blur_radius: px(4.0),
                                     spread_radius: px(0.0),
                                 },
                                 gpui::BoxShadow {
                                     color: gpui::black()
-                                        .opacity(if dark { 0.40 } else { 0.26 } * framed),
+                                        .opacity(if dark { 0.54 } else { 0.35 } * framed),
                                     offset: point(px(0.0), px(8.0)),
                                     blur_radius: px(24.0),
                                     spread_radius: px(0.0),

@@ -317,6 +317,36 @@ pub unsafe fn style_morph(h: isize) {
     }
 }
 
+/// Hides `h` from the screen, shadow and all, at the next composition,
+/// without hiding it from Windows: it stays the active window, so the
+/// window that follows it can still come to the front.
+pub fn cloak(h: isize) {
+    let Some(hwnd) = live(h) else { return };
+    // DWMWA_CLOAK
+    unsafe { dwm_set(hwnd, 13, 1) };
+}
+
+/// Puts the hidden flip window's client area at `r`, still hidden, so it
+/// draws its first frame at its size before it shows.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn size_morph(h: isize, r: Rect) {
+    let Some(hwnd) = live(h) else { return };
+    unsafe {
+        let (dx, dy, bw, bh) = frame(hwnd);
+        SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            r.left - dx,
+            r.top - dy,
+            r.width() + bw,
+            r.height() + bh,
+            SWP_NOACTIVATE,
+        );
+    }
+}
+
 /// Puts the flip's client area at `r`, topmost and shown without activation.
 ///
 /// # Safety
