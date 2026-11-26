@@ -122,6 +122,17 @@ impl Default for OverlayConfig {
     }
 }
 
+/// What becomes of one of the config's folders: see [`Config::folders`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Folder {
+    Watched(PathBuf),
+    /// A blank entry of `more_paths`.
+    Blank,
+    /// The same as, inside, or holding this earlier folder, which already
+    /// covers it.
+    Overlaps(PathBuf),
+}
+
 /// `PartialEq` lets the app ignore reloads of its own writes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -346,13 +357,26 @@ impl Config {
     /// same as, inside, or around one already listed, so no repo is listed
     /// twice.
     pub fn roots(&self) -> Vec<PathBuf> {
-        let mut roots: Vec<PathBuf> = Vec::new();
-        let mut keys: Vec<String> = Vec::new();
+        self.folders()
+            .into_iter()
+            .filter_map(|f| match f {
+                Folder::Watched(dir) => Some(dir),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `path` then each of `more_paths`, and what becomes of it: watched,
+    /// blank, or left out because it is, holds or sits in an earlier one.
+    pub fn folders(&self) -> Vec<Folder> {
+        let mut out = Vec::new();
+        let mut keys: Vec<(String, PathBuf)> = Vec::new();
         let candidates =
             std::iter::once(self.path.as_str()).chain(self.more_paths.iter().map(String::as_str));
         for (i, raw) in candidates.enumerate() {
             // `path` always counts, even blank, as it always has.
             if i > 0 && raw.trim().is_empty() {
+                out.push(Folder::Blank);
                 continue;
             }
             let dir = if i == 0 {
@@ -361,15 +385,18 @@ impl Config {
                 PathBuf::from(expand(raw.trim()))
             };
             let key = path_key(&dir);
-            let overlaps = keys.iter().any(|k| {
+            let overlap = keys.iter().find(|(k, _)| {
                 k == &key || key.starts_with(&format!("{k}/")) || k.starts_with(&format!("{key}/"))
             });
-            if !overlaps {
-                keys.push(key);
-                roots.push(dir);
+            match overlap {
+                Some((_, earlier)) => out.push(Folder::Overlaps(earlier.clone())),
+                None => {
+                    keys.push((key, dir.clone()));
+                    out.push(Folder::Watched(dir));
+                }
             }
         }
-        roots
+        out
     }
 
     /// The folder at `slot` in [`Config::roots`].
@@ -1089,7 +1116,7 @@ mod tests {
         let base = Config::default();
         base.save(&file).unwrap();
         let mut edit = base.clone();
-        edit.depth = 3;
+        edit.interval_minutes += 7.0;
         edit.save(&file).unwrap();
         let mut change = base.clone();
         change.watch = !change.watch;

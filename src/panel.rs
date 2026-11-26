@@ -500,10 +500,24 @@ pub fn slide_away_now(cx: &mut App) {
         close(cx);
         return;
     }
-    let (edge, work) = slide_from(anchor);
+    let len = Duration::from_millis(u64::from(ms.min(2000)));
+    // A panel still sliding in leaves from where it is, back the way it
+    // came, rather than jumping fully in first.
+    let (edge, work, start) = match slot.slide {
+        Some(inward) => {
+            let shown = inward.progress();
+            let back = len.mul_f32(1.0 - shown);
+            let now = Instant::now();
+            (inward.edge, inward.work, now.checked_sub(back).unwrap_or(now))
+        }
+        None => {
+            let (edge, work) = slide_from(anchor);
+            (edge, work, Instant::now())
+        }
+    };
     let slide = Slide {
-        start: Instant::now(),
-        len: Duration::from_millis(u64::from(ms.min(2000))),
+        start,
+        len,
         edge,
         work,
     };

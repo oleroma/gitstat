@@ -161,18 +161,30 @@ impl Monitor {
 }
 
 impl Drop for Monitor {
-    /// Waits briefly for the scheduler; running `git` workers are left to finish.
+    /// Tells the scheduler to stop; running `git` workers are left to
+    /// finish. The app drops a monitor on the UI thread, so the wait for
+    /// the scheduler runs on a thread of its own; tests wait here, so a
+    /// test's folder is let go before it is removed.
     fn drop(&mut self) {
         self.send(Command::Shutdown);
         let Some(thread) = self.thread.take() else {
             return;
         };
-        let deadline = Instant::now() + SHUTDOWN_WAIT;
-        while !thread.is_finished() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
-        }
-        if thread.is_finished() {
-            let _ = thread.join();
+        let reap = move || {
+            let deadline = Instant::now() + SHUTDOWN_WAIT;
+            while !thread.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if thread.is_finished() {
+                let _ = thread.join();
+            }
+        };
+        if cfg!(test) {
+            reap();
+        } else {
+            let _ = thread::Builder::new()
+                .name("gitstat-monitor-reap".into())
+                .spawn(reap);
         }
     }
 }
@@ -255,6 +267,8 @@ struct Scheduler {
     last_mono: Instant,
     /// The deadline the loop last waited for, to notice oversleeping.
     waited_until: Option<Instant>,
+    /// When that wait ended.
+    woke: Option<Instant>,
 }
 
 impl Scheduler {
@@ -315,6 +329,7 @@ impl Scheduler {
             last_wall: SystemTime::now(),
             last_mono: Instant::now(),
             waited_until: None,
+            woke: None,
         }
     }
 
@@ -343,6 +358,9 @@ impl Scheduler {
                 Some(at) => rx.recv_timeout(at.saturating_duration_since(Instant::now())),
                 None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
             };
+            // Only how late the wait itself ended counts toward a resume,
+            // not the work done for the message after it.
+            self.woke = Some(Instant::now());
             match msg {
                 Ok(Msg::Cmd(Command::Shutdown)) | Err(RecvTimeoutError::Disconnected) => break,
                 Ok(Msg::Cmd(Command::RefreshAll)) => {
@@ -410,9 +428,10 @@ impl Scheduler {
         let wall = SystemTime::now();
         let mono = now.saturating_duration_since(self.last_mono);
         let wall_delta = wall.duration_since(self.last_wall).unwrap_or_default();
+        let woke = self.woke.take().unwrap_or(now);
         let late = self
             .waited_until
-            .map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
+            .map_or(Duration::ZERO, |at| woke.saturating_duration_since(at));
         self.last_wall = wall;
         self.last_mono = now;
         self.waited_until = None;

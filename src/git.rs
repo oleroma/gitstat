@@ -480,7 +480,7 @@ pub fn check_repo_detailed(root: &Path, repo: &Path, fetch: bool) -> (RepoStatus
 /// The repo's git dir and common dir read straight from disk, without
 /// running git: `.git` is the git dir, or a file naming it (a linked
 /// worktree), whose `commondir` file names the shared one.
-fn quick_git_dirs(repo: &Path) -> Option<(PathBuf, PathBuf)> {
+pub(crate) fn quick_git_dirs(repo: &Path) -> Option<(PathBuf, PathBuf)> {
     let dot_git = repo.join(".git");
     let git_dir = if dot_git.is_dir() {
         dot_git

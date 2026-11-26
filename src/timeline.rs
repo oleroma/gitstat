@@ -83,6 +83,8 @@ const GLIDE: Duration = Duration::from_millis(140);
 const GROW: Duration = Duration::from_millis(110);
 /// A card fades in over this long.
 const CARD_FADE: Duration = Duration::from_millis(120);
+/// How long a failed page of older history waits before it is asked again.
+const MORE_RETRY: Duration = Duration::from_secs(10);
 
 #[derive(Default)]
 struct Slot {
@@ -96,6 +98,8 @@ struct Slot {
     /// A reload is queued or running.
     loading: bool,
     loading_more: bool,
+    /// When a page of older history last failed: the next waits a while.
+    more_failed: Option<Instant>,
     /// Px the strip is scrolled into the past from the newest row; HEAD's
     /// row, `RepoGraph::home`, is where it rests.
     scroll: f32,
@@ -498,6 +502,7 @@ impl Timelines {
                 }
                 slot.graph = Some(Arc::new(g));
                 slot.error = None;
+                slot.more_failed = None;
                 if self.hover.as_ref().is_some_and(|h| h.repo == path) {
                     self.unhover();
                 }
@@ -515,6 +520,16 @@ impl Timelines {
                 }
             }
             Ok(Loaded::Page(More::Reload)) => self.reload(path, cx),
+            // A repo with a graph keeps it, and its status label: a page
+            // of older history that failed (or a reload) is no reason to
+            // call the whole history unreadable.
+            Err(_) if slot.graph.is_some() => {
+                if slot.loading_more && !slot.loading {
+                    slot.more_failed = Some(Instant::now());
+                }
+                slot.loading = false;
+                slot.loading_more = false;
+            }
             Err(e) => {
                 slot.loading = false;
                 slot.loading_more = false;
@@ -533,6 +548,12 @@ impl Timelines {
         };
         // A reload under way would land under the page, or the page on it.
         if slot.loading || slot.loading_more || graph.end {
+            return;
+        }
+        if slot
+            .more_failed
+            .is_some_and(|at| at.elapsed() < MORE_RETRY)
+        {
             return;
         }
         slot.loading_more = true;
