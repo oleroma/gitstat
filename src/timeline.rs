@@ -569,10 +569,7 @@ impl Timelines {
         if slot.loading || slot.loading_more || graph.end {
             return;
         }
-        if slot
-            .more_failed
-            .is_some_and(|at| at.elapsed() < MORE_RETRY)
-        {
+        if slot.more_failed.is_some_and(|at| at.elapsed() < MORE_RETRY) {
             return;
         }
         slot.loading_more = true;

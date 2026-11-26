@@ -1545,6 +1545,12 @@ impl Render for StatusView {
         let timelines = self.timelines.clone();
         // Pictures only: the panel's words move into tooltips.
         let icons_only = mode == Mode::Panel && self.state.read(cx).config.icons_only;
+        // Sliding clipped, the panel draws its own frame (`win::slide_panel`):
+        // its sheet, rim and shadow, in the room its window keeps around it.
+        let drawn = (mode == Mode::Panel)
+            .then(|| panel::drawn_frame(cx))
+            .flatten()
+            .map(|room| DrawnFrame::new(room, window));
         // A repo row: a timeline strip in the panel, a plain row elsewhere.
         let row = |i: usize, s: &RepoStatus, cx: &App| match (&timelines, mode) {
             (Some(t), Mode::Panel) => Timelines::strip(t, i, s, &p, dark, icons_only, cx),
@@ -1931,6 +1937,11 @@ impl Render for StatusView {
             .overflow_y_scroll()
             .track_scroll(&self.list)
             .bg(p.surface)
+            // With no footer it reaches the panel's bottom corners: rounded
+            // as they are, where the panel draws them itself.
+            .when_some(drawn.filter(|_| icons_only), |list, f| {
+                list.rounded_b(f.inner_radius())
+            })
             .children(rows)
             .when(no_local, |list| {
                 list.child(div().p_4().text_sm().text_color(p.muted).child(empty_text))
@@ -2024,12 +2035,16 @@ impl Render for StatusView {
                 // Header, rows, footer: grow or shrink the panel to them
                 // whenever they change (a section folded, repos or pull
                 // requests come or go), with no empty space below.
+                // Past the frame drawn under them, while there is one.
+                let first = usize::from(drawn.is_some());
                 d.on_children_prepainted(move |parts, _, cx| {
-                    let header = parts.first().map_or(0.0, |b| f32::from(b.size.height));
+                    let header = parts.get(first).map_or(0.0, |b| f32::from(b.size.height));
                     let footer = if icons_only {
                         0.0
                     } else {
-                        parts.get(2).map_or(0.0, |b| f32::from(b.size.height))
+                        parts
+                            .get(first + 2)
+                            .map_or(0.0, |b| f32::from(b.size.height))
                     };
                     panel::fit(header + content_h.get() + footer, cx);
                 })
@@ -2066,7 +2081,36 @@ impl Render for StatusView {
             .flex()
             .flex_col()
             .size_full()
-            .bg(p.bg)
+            .map(|d| match drawn {
+                // The room around the panel stays clear but for the
+                // shadow; the panel's sheet is drawn under its parts.
+                Some(f) => d.relative().p(f.room()).child(
+                    canvas(
+                        |_, _, _| {},
+                        move |_, _, window, _| {
+                            let sheet = f.sheet(window);
+                            if window.is_window_active() {
+                                window.paint_shadows(
+                                    sheet,
+                                    gpui::Corners::all(px(win::PANEL_RADIUS)),
+                                    &crate::morph::window_shadow(),
+                                );
+                            }
+                            window.paint_quad(gpui::quad(
+                                sheet,
+                                px(win::PANEL_RADIUS),
+                                p.bg,
+                                px(0.0),
+                                gpui::transparent_black(),
+                                gpui::BorderStyle::Solid,
+                            ));
+                        },
+                    )
+                    .absolute()
+                    .inset_0(),
+                ),
+                None => d.bg(p.bg),
+            })
             .text_color(p.text)
             .child(sideways(header, mode, cx))
             .map(|d| match table {
@@ -2076,17 +2120,18 @@ impl Render for StatusView {
             .children(window_prs)
             .when(!icons_only, |d| d.child(sideways(footer, mode, cx)))
             // Windows draws no rim while the panel slides clipped (the
-            // badge's slide): drawn here meanwhile, along the panel's edge.
-            .when(mode == Mode::Panel && panel::drawn_rim(cx), |d| {
-                d.relative().child(
+            // badge's slide): drawn here meanwhile, over the panel's edge,
+            // just where Windows draws it.
+            .when_some(drawn, |d, f| {
+                d.child(
                     canvas(
                         |_, _, _| {},
-                        move |bounds, _, window, _| {
+                        move |_, _, window, _| {
                             window.paint_quad(gpui::quad(
-                                bounds,
+                                f.sheet(window),
                                 px(win::PANEL_RADIUS),
                                 gpui::transparent_black(),
-                                px(rim_width(window.scale_factor()) / window.scale_factor()),
+                                f.rim,
                                 rim(dark),
                                 gpui::BorderStyle::Solid,
                             ));
@@ -2183,6 +2228,45 @@ fn sideways(part: impl IntoElement, mode: Mode, cx: &mut Context<StatusView>) ->
             }
         }))
         .into_any_element()
+}
+
+/// The panel's own frame while it slides clipped, logical px: the room
+/// its window keeps around it, and its rim, which Windows draws just
+/// outside the panel, as thick as it draws it.
+#[derive(Clone, Copy)]
+struct DrawnFrame {
+    room: gpui::Pixels,
+    rim: gpui::Pixels,
+}
+
+impl DrawnFrame {
+    fn new(room: i32, window: &Window) -> Self {
+        let s = window.scale_factor();
+        Self {
+            room: px(room as f32 / s),
+            rim: px(rim_width(s).round() / s),
+        }
+    }
+
+    fn room(self) -> gpui::Pixels {
+        self.room
+    }
+
+    /// The panel's visible frame, rim and all, in the window: the window
+    /// less the room around it, plus the rim. On whole physical px.
+    fn sheet(self, window: &Window) -> Bounds<gpui::Pixels> {
+        let inset = self.room - self.rim;
+        let size = window.viewport_size();
+        Bounds {
+            origin: point(inset, inset),
+            size: gpui::size(size.width - inset * 2.0, size.height - inset * 2.0),
+        }
+    }
+
+    /// The corners of what the panel shows, inside its rim.
+    fn inner_radius(self) -> gpui::Pixels {
+        px(win::PANEL_RADIUS) - self.rim
+    }
 }
 
 /// The light rim Windows 11 draws around a window, for where gitstat

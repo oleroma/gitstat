@@ -15,10 +15,9 @@ use windows_sys::Win32::Graphics::Dwm::{
     DWMWCP_ROUND, DwmGetWindowAttribute, DwmSetWindowAttribute,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    ClientToScreen, CombineRgn, CreateEllipticRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject,
-    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST,
-    MONITOR_DEFAULTTONULL, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
-    MonitorFromRect, RGN_AND, SetWindowRgn,
+    ClientToScreen, CreateEllipticRgn, CreateRectRgn, DeleteObject, EnumDisplayMonitors,
+    GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL,
+    MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, MonitorFromRect, SetWindowRgn,
 };
 use windows_sys::Win32::UI::Controls::{
     ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, TOOLTIPS_CLASSW, TTDT_AUTOPOP,
@@ -545,6 +544,9 @@ pub fn frame_insets(h: isize) -> Option<(i32, i32, i32, i32)> {
 /// The panel whose DWM border and shadow are off for its slide.
 static BARE_PANEL: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
+/// The bare panel's room around itself, physical px ([`bare_margin`]).
+static BARE_MARGIN: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
 /// `s` as a NUL-ended UTF-16 string.
 fn w(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
@@ -610,6 +612,11 @@ fn taskbar_over(r: Rect) -> Option<HWND> {
     }
 }
 
+/// Room the panel keeps around itself while it slides clipped, logical
+/// px: for the shadow it draws itself meanwhile, as far as Windows' own
+/// reaches (the flip keeps as much around its sheet).
+pub const PANEL_SHADOW_ROOM: f32 = 72.0;
+
 /// Moves the panel's client area to `moved` without resizing it, showing
 /// only the part inside `shown` (screen px), for its slide in or out.
 /// `None` shows it whole again, on top.
@@ -618,7 +625,12 @@ fn taskbar_over(r: Rect) -> Option<HWND> {
 /// z-order, keeping its own rim and shadow. Elsewhere (the badge, a hidden
 /// taskbar) it is clipped to `shown`, with DWM's border, rounded corners
 /// and shadow off meanwhile: they follow the whole window, not the part
-/// shown, so they'd draw a frame around the hidden part.
+/// shown, so they'd draw a frame around the hidden part. The panel then
+/// draws them itself, exactly where Windows does: its window grows by
+/// [`bare_margin`] on every side, and it draws its sheet, rim and shadow
+/// in that room (`view`), anti-aliased, clipped only along the edge it
+/// slides out of. Call [`draw_now`] when [`is_bare`] changes, so the
+/// grown or shrunk window and what it draws show in the same frame.
 ///
 /// # Safety
 /// Call only from a spawned task outside `update`.
@@ -650,6 +662,8 @@ pub unsafe fn slide_panel(h: isize, moved: Rect, shown: Option<Rect>) {
     unsafe {
         let bare = BARE_PANEL.load(Relaxed) == h;
         if clip.is_some() && !bare {
+            let dpi = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
+            BARE_MARGIN.store((PANEL_SHADOW_ROOM * dpi).ceil() as i32, Relaxed);
             BARE_PANEL.store(h, Relaxed);
             dwm_set(hwnd, DWMWA_NCRENDERING_POLICY, DWMNCRP_DISABLED as u32);
             dwm_set(
@@ -659,8 +673,15 @@ pub unsafe fn slide_panel(h: isize, moved: Rect, shown: Option<Rect>) {
             );
             dwm_set(hwnd, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE);
         }
+        // Clipped, the client area takes in the room around the panel.
+        let room = if clip.is_some() {
+            BARE_MARGIN.load(Relaxed)
+        } else {
+            0
+        };
+        let client = moved.outset(room);
         let (dx, dy, bw, bh) = frame(hwnd);
-        let (wl, wt) = (moved.left - dx, moved.top - dy);
+        let (wl, wt) = (client.left - dx, client.top - dy);
         // Behind a taskbar, or whole again beside one: placed after it,
         // below it but still topmost, so its shadow never jumps over the
         // taskbar. Clipped, or away from taskbars: on top.
@@ -671,31 +692,23 @@ pub unsafe fn slide_panel(h: isize, moved: Rect, shown: Option<Rect>) {
             after,
             wl,
             wt,
-            moved.width() + bw,
-            moved.height() + bh,
+            client.width() + bw,
+            client.height() + bh,
             SWP_NOACTIVATE,
         );
         let rgn = match clip {
-            // Region coordinates are relative to the window.
-            // The part shown, with the panel's own rounded corners, which
-            // the panel draws its rim along (`panel::drawn_rim`).
-            Some(r) => {
-                let shown = CreateRectRgn(r.left - wl, r.top - wt, r.right - wl, r.bottom - wt);
-                let d = (2.0 * PANEL_RADIUS * GetDpiForWindow(hwnd).max(96) as f32 / 96.0).round()
-                    as i32;
-                let round = CreateRoundRectRgn(
-                    dx,
-                    dy,
-                    dx + moved.width() + 1,
-                    dy + moved.height() + 1,
-                    d,
-                    d,
+            // Region coordinates are relative to the window. Cut only
+            // where `shown` cuts the panel: elsewhere the room around it,
+            // with the rim, corners and shadow it draws there, shows.
+            Some(s) => {
+                let side = |cut: i32, edge: i32, out: i32| if cut == edge { out } else { cut };
+                let r = Rect::new(
+                    side(s.left, moved.left, client.left),
+                    side(s.top, moved.top, client.top),
+                    side(s.right, moved.right, client.right),
+                    side(s.bottom, moved.bottom, client.bottom),
                 );
-                if !round.is_null() {
-                    CombineRgn(shown, shown, round, RGN_AND);
-                    DeleteObject(round);
-                }
-                shown
+                CreateRectRgn(r.left - wl, r.top - wt, r.right - wl, r.bottom - wt)
             }
             None => std::ptr::null_mut(),
         };
@@ -706,6 +719,7 @@ pub unsafe fn slide_panel(h: isize, moved: Rect, shown: Option<Rect>) {
         }
         if clip.is_none() && bare {
             BARE_PANEL.store(0, Relaxed);
+            BARE_MARGIN.store(0, Relaxed);
             dwm_set(
                 hwnd,
                 DWMWA_NCRENDERING_POLICY,
@@ -718,6 +732,41 @@ pub unsafe fn slide_panel(h: isize, moved: Rect, shown: Option<Rect>) {
                 PANEL_RIM.load(std::sync::atomic::Ordering::Relaxed),
             );
         }
+    }
+}
+
+/// The room, physical px, the bare panel `h` keeps around itself on every
+/// side while it slides clipped; `None` while Windows draws its frame.
+pub fn bare_margin(h: isize) -> Option<i32> {
+    use std::sync::atomic::Ordering::Relaxed;
+    is_bare(h).then(|| BARE_MARGIN.load(Relaxed))
+}
+
+/// Forgets that `h` slid clipped, as it closes: a later window given the
+/// same handle starts with Windows' own frame.
+pub fn forget_bare(h: isize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if BARE_PANEL.compare_exchange(h, 0, Relaxed, Relaxed).is_ok() {
+        BARE_MARGIN.store(0, Relaxed);
+    }
+}
+
+/// Draws and presents `h`'s next frame now, rather than at the next
+/// screen refresh: after its window grew or shrank, so the new size and
+/// what it draws at that size reach the screen together.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn draw_now(h: isize) {
+    use windows_sys::Win32::Graphics::Gdi::{RDW_INVALIDATE, RDW_UPDATENOW, RedrawWindow};
+    let Some(hwnd) = live(h) else { return };
+    unsafe {
+        RedrawWindow(
+            hwnd,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            RDW_INVALIDATE | RDW_UPDATENOW,
+        );
     }
 }
 

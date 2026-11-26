@@ -462,8 +462,7 @@ fn other_gitstats() -> Vec<u32> {
 fn stop_gitstat(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
-        WaitForSingleObject,
+        OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
     };
     let stopped = unsafe {
         let process = OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid);

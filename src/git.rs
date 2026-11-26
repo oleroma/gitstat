@@ -1787,7 +1787,10 @@ mod tests {
         std::fs::write(repo.join("untracked.ini"), "x").unwrap();
         assert_eq!(is_tracked(&repo, Path::new("untracked.ini")), Some(false));
         // Can't tell.
-        assert_eq!(is_tracked(&root.join("missing"), Path::new("desktop.ini")), None);
+        assert_eq!(
+            is_tracked(&root.join("missing"), Path::new("desktop.ini")),
+            None
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

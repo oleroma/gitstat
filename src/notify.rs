@@ -311,7 +311,10 @@ mod tests {
         let mut a = RepoStatus {
             name: "x".into(),
             branch: Some("main".into()),
-            tips: vec![tip("refs/heads/main", "1"), tip("refs/remotes/origin/main", "1")],
+            tips: vec![
+                tip("refs/heads/main", "1"),
+                tip("refs/remotes/origin/main", "1"),
+            ],
             ..Default::default()
         };
         let mut b = a.clone();

@@ -180,7 +180,9 @@ pub fn reopen_cloaked(cx: &mut App) -> bool {
 
 pub fn close(cx: &mut App) {
     let slot = cx.default_global::<PanelSlot>();
-    slot.hwnd = None;
+    if let Some(h) = slot.hwnd.take() {
+        win::forget_bare(h);
+    }
     slot.leaving = false;
     if let Some(handle) = slot.handle.take() {
         slot.toggled_at = Some(Instant::now());
@@ -204,10 +206,10 @@ pub fn activate(cx: &mut App) {
         .detach();
 }
 
-/// Whether the panel draws its own rim: while it slides clipped, with
-/// Windows' own off, and only then.
-pub fn drawn_rim(cx: &App) -> bool {
-    hwnd(cx).is_some_and(win::is_bare)
+/// While the panel slides clipped, with Windows' frame off, the room it
+/// keeps around itself to draw its own in, physical px (`win::slide_panel`).
+pub fn drawn_frame(cx: &App) -> Option<i32> {
+    hwnd(cx).and_then(win::bare_margin)
 }
 
 pub fn is_open(cx: &App) -> bool {
@@ -408,9 +410,11 @@ fn run_slide(slide: Slide, handle: WindowHandle<StatusView>, h: isize, cx: &mut 
                     let (moved, shown) = layout::slide(rect, slide.work, slide.edge, t);
                     unsafe { win::slide_panel(h, moved, Some(shown)) };
                 }
-                // Windows' rim off or back: the panel's own follows.
+                // Windows' frame off or back, the window grown or shrunk:
+                // the panel's own frame follows in the same frame.
                 if was != win::is_bare(h) {
                     handle.update(cx, |_, _, cx| cx.notify()).ok();
+                    unsafe { win::draw_now(h) };
                 }
                 if shows {
                     win::uncloak(h);
@@ -508,7 +512,11 @@ pub fn slide_away_now(cx: &mut App) {
             let shown = inward.progress();
             let back = len.mul_f32(1.0 - shown);
             let now = Instant::now();
-            (inward.edge, inward.work, now.checked_sub(back).unwrap_or(now))
+            (
+                inward.edge,
+                inward.work,
+                now.checked_sub(back).unwrap_or(now),
+            )
         }
         None => {
             let (edge, work) = slide_from(anchor);
@@ -538,12 +546,14 @@ pub fn slide_away_now(cx: &mut App) {
             }
             let (moved, shown) = layout::slide(rect, work, edge, 1.0 - t);
             // Native window calls run outside the window's frame; its own
-            // rim, drawn while it slides clipped, follows.
+            // frame, drawn while it slides clipped, follows in the same
+            // frame.
             cx.spawn(async move |cx| {
                 let was = win::is_bare(h);
                 unsafe { win::slide_panel(h, moved, Some(shown)) };
                 if was != win::is_bare(h) {
                     handle.update(cx, |_, _, cx| cx.notify()).ok();
+                    unsafe { win::draw_now(h) };
                 }
             })
             .detach();

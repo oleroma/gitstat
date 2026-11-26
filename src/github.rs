@@ -106,7 +106,10 @@ impl Pr {
         if self.is_open() {
             return true;
         }
-        let refs = [format!("refs/heads/{name}"), format!("refs/remotes/origin/{name}")];
+        let refs = [
+            format!("refs/heads/{name}"),
+            format!("refs/remotes/origin/{name}"),
+        ];
         let mut known = tips.iter().filter(|(r, _)| refs.contains(r)).peekable();
         known.peek().is_none() || known.any(|(_, oid)| *oid == self.head_oid)
     }

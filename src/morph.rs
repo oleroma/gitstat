@@ -72,6 +72,28 @@ const RADIUS: f32 = 8.0;
 const CAPTION_GUESS: f32 = 32.0;
 /// Room left around the sheet for its shadow, logical px.
 const SHADOW_ROOM: f32 = 72.0;
+
+/// The shadow Windows 11 draws around an active window, logical px:
+/// fitted to its own, measured around the panel and the big window, an
+/// even one all round and a deep one below. Drawn around the flip's sheet
+/// and the clipped panel, so they hand over to Windows' own unseen.
+pub(crate) fn window_shadow() -> [gpui::BoxShadow; 2] {
+    [
+        gpui::BoxShadow {
+            color: gpui::black().opacity(0.33),
+            offset: point(px(0.0), px(-0.5)),
+            blur_radius: px(12.4),
+            spread_radius: px(4.4),
+        },
+        gpui::BoxShadow {
+            color: gpui::black().opacity(0.36),
+            offset: point(px(0.0), px(45.0)),
+            blur_radius: px(20.2),
+            spread_radius: px(0.4),
+        },
+    ]
+}
+
 /// Until the big window has been drawn once: its column header's height,
 /// logical px.
 const HEADER_GUESS: f32 = 110.0;
@@ -2764,24 +2786,7 @@ impl Render for MorphView {
                             window.paint_shadows(
                                 sheet,
                                 gpui::Corners::all(radius),
-                                &[
-                                    // Fitted to Windows 11's own, measured
-                                    // around the panel and the big window:
-                                    // an even one all round and a deep one
-                                    // below.
-                                    gpui::BoxShadow {
-                                        color: gpui::black().opacity(0.33),
-                                        offset: point(px(0.0), px(-0.5)),
-                                        blur_radius: px(12.4),
-                                        spread_radius: px(4.4),
-                                    },
-                                    gpui::BoxShadow {
-                                        color: gpui::black().opacity(0.36),
-                                        offset: point(px(0.0), px(45.0)),
-                                        blur_radius: px(20.2),
-                                        spread_radius: px(0.4),
-                                    },
-                                ],
+                                &window_shadow(),
                             );
                         }
                         // A piece of a band: the sheet's rounded shape, cut

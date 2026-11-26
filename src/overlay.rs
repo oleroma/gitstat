@@ -66,7 +66,6 @@ fn face(badge: Badge) -> (Hsla, String) {
     }
 }
 
-
 /// The icons-only face: a ring cut into the repos' tones, each arc as long
 /// as its share (red, amber, then green, clockwise from the top), around a
 /// dot in the most urgent one. Grey while the first check runs.

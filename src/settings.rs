@@ -1230,7 +1230,12 @@ fn text_button(
 }
 
 /// Folder `i` of the list (0 is `path`), with its buttons.
-fn folder_row(i: usize, path: &str, fate: Option<&crate::config::Folder>, p: &Palette) -> AnyElement {
+fn folder_row(
+    i: usize,
+    path: &str,
+    fate: Option<&crate::config::Folder>,
+    p: &Palette,
+) -> AnyElement {
     use crate::config::Folder;
     // A folder another one already covers is never looked in on its own.
     let desc = match fate {

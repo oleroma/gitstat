@@ -724,7 +724,11 @@ mod tests {
             Some("refs/remotes/origin/main")
         );
         assert_eq!(
-            default_ref(Some("refs/remotes/origin/trunk"), &["refs/remotes/origin/trunk"]).as_deref(),
+            default_ref(
+                Some("refs/remotes/origin/trunk"),
+                &["refs/remotes/origin/trunk"]
+            )
+            .as_deref(),
             Some("refs/remotes/origin/trunk")
         );
         let _ = std::fs::remove_dir_all(&dir);

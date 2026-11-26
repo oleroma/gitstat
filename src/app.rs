@@ -808,8 +808,7 @@ fn notify_remote(
     let task = cx.background_spawn(async move {
         first
             .into_iter()
-            .chain(changes.into_iter()
-            .map(|c| match c {
+            .chain(changes.into_iter().map(|c| match c {
                 RemoteChange::New { branch } => format!("{name}: new branch {branch}"),
                 RemoteChange::Moved { branch, from, to } => {
                     let range = format!("{from}..{to}");
