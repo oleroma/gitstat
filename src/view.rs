@@ -1859,7 +1859,10 @@ impl Render for StatusView {
             }
         }
 
-        let empty = state.has_result && state.statuses.is_empty() && problem.is_none();
+        // No repo found here: said in the list. The window's table still
+        // shows while there are GitHub repos with no clone.
+        let no_local = state.has_result && state.statuses.is_empty() && problem.is_none();
+        let empty = no_local && state.remote_statuses.is_empty();
         let empty_text = match state.config.depth() {
             1 => "No git repos directly inside this folder. Set \"path\" or \"depth\" in \
                   config.json."
@@ -1929,7 +1932,7 @@ impl Render for StatusView {
             .track_scroll(&self.list)
             .bg(p.surface)
             .children(rows)
-            .when(empty, |list| {
+            .when(no_local, |list| {
                 list.child(div().p_4().text_sm().text_color(p.muted).child(empty_text))
             });
 

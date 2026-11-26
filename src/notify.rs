@@ -63,6 +63,10 @@ pub fn pr_changes(
             continue;
         };
         let name = names.get(path).map_or("", String::as_str);
+        // Only the newest open PRs are read, so one missing before may just
+        // have been updated into the list; numbers only grow, so a new one
+        // is past every number seen before.
+        let newest = before.iter().map(|b| b.number).max().unwrap_or(0);
         for pr in prs.iter().filter(|p| p.is_open()) {
             let was = before.iter().find(|b| b.number == pr.number);
             let what = if cfg.review_requested
@@ -70,9 +74,10 @@ pub fn pr_changes(
                 && !was.is_some_and(|b| b.review_requested)
             {
                 "review asked"
-            } else if cfg.new_pr && was.is_none() {
+            } else if cfg.new_pr && was.is_none() && pr.number > newest {
                 "new pull request"
             } else if cfg.checks_failed
+                && (was.is_some() || pr.number > newest)
                 && pr.checks == Checks::Failing
                 && !was.is_some_and(|b| b.checks == Checks::Failing && b.head_oid == pr.head_oid)
             {
@@ -293,6 +298,13 @@ mod tests {
         );
         // The first poll says nothing.
         assert!(pr_changes(&on, &names, &HashMap::new(), &new).is_empty());
+        // An older PR updated into the newest read isn't new.
+        let later = HashMap::from([(
+            path.clone(),
+            vec![pr(3, false, Checks::Failing), pr(1, false, Checks::Failing)],
+        )]);
+        let before = HashMap::from([(path.clone(), vec![pr(3, false, Checks::Failing)])]);
+        assert!(pr_changes(&on, &names, &before, &later).is_empty());
         assert!(pr_changes(&NotifyConfig::default(), &names, &old, &new).is_empty());
 
         let tip = |r: &str, oid: &str| (r.to_string(), oid.to_string());

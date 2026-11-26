@@ -83,7 +83,9 @@ pub enum Update {
         #[cfg_attr(not(test), allow(dead_code))]
         fetch: bool,
     },
-    Status(RepoStatus),
+    /// A repo's status, and whether it comes right after gitstat's own
+    /// fetch: only then did gitstat move its remote branches.
+    Status(RepoStatus, bool),
     SweepStarted,
     SweepDone,
     Mode(WatchMode),
@@ -594,7 +596,8 @@ impl Scheduler {
             }
         }
         self.statuses.insert(repo.clone(), status.clone());
-        self.emit(Update::Status(status));
+        let fetched = need == Need::Fetch && !status.fetch_errored;
+        self.emit(Update::Status(status, fetched));
         if need == Need::Fetch && self.sweep.remove(&repo) {
             self.finish_sweep_if_done(now);
         }
@@ -1393,9 +1396,9 @@ mod tests {
             let path = self.root.join(repo);
             match self.wait_for(
                 timeout,
-                |u| matches!(u, Update::Status(s) if s.path == path),
+                |u| matches!(u, Update::Status(s, _) if s.path == path),
             ) {
-                Some(Update::Status(s)) => Some(s),
+                Some(Update::Status(s, _)) => Some(s),
                 _ => None,
             }
         }
@@ -1439,7 +1442,7 @@ mod tests {
         );
         assert!(updates.iter().any(|u| matches!(
             u,
-            Update::Status(s) if s.path == a && s.error.is_none() && !s.dirty
+            Update::Status(s, _) if s.path == a && s.error.is_none() && !s.dirty
         )));
     }
 
@@ -1453,7 +1456,7 @@ mod tests {
         let a = h.root.join("a");
         let dirty = h.wait_for(
             WAIT,
-            |u| matches!(u, Update::Status(s) if s.path == a && s.dirty),
+            |u| matches!(u, Update::Status(s, _) if s.path == a && s.dirty),
         );
         assert!(dirty.is_some(), "no dirty status after an edit");
     }
@@ -1474,7 +1477,7 @@ mod tests {
         git(&a, &["commit", "-q", "-m", "add"]);
         let clean = h.wait_for(
             WAIT,
-            |u| matches!(u, Update::Status(s) if s.path == a && !s.dirty && s.error.is_none()),
+            |u| matches!(u, Update::Status(s, _) if s.path == a && !s.dirty && s.error.is_none()),
         );
         assert!(clean.is_some(), "no clean status after the commit");
     }
@@ -1533,7 +1536,7 @@ mod tests {
         std::fs::write(b.join("README"), "changed\n").unwrap();
         let dirty = h.wait_for(
             WAIT,
-            |u| matches!(u, Update::Status(s) if s.path == b && s.dirty),
+            |u| matches!(u, Update::Status(s, _) if s.path == b && s.dirty),
         );
         assert!(dirty.is_some(), "no dirty status after an edit");
 
@@ -1715,7 +1718,7 @@ mod tests {
         assert!(
             refresh
                 .iter()
-                .any(|u| matches!(u, Update::Status(s) if s.path == a && s.is_synced()))
+                .any(|u| matches!(u, Update::Status(s, _) if s.path == a && s.is_synced()))
         );
         // ReadDirectoryChangesW can deliver the fetch's own ref writes after
         // it ends, which buys one local recheck (a push from a terminal looks
@@ -1835,7 +1838,7 @@ mod tests {
         assert!(
             !sweep
                 .iter()
-                .any(|u| matches!(u, Update::Status(s) if s.path == a)),
+                .any(|u| matches!(u, Update::Status(s, _) if s.path == a)),
             "{sweep:?}"
         );
         // The old root is no longer watched.

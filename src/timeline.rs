@@ -929,6 +929,13 @@ impl Timelines {
                 });
                 fade(bounds, surface, window);
 
+                // Only dots that show can be hovered: not ones past the
+                // strip's ends, nor ones the list clips away.
+                let shown = window.content_mask().bounds.intersect(&mask);
+                let dots: Vec<_> = dots
+                    .into_iter()
+                    .filter(|(at, _)| shown.contains(at))
+                    .collect();
                 let (e1, e2) = (entity.clone(), entity);
                 let (path1, path2) = (paint_path.clone(), paint_path);
                 let dots = Arc::new(dots);

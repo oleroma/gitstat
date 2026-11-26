@@ -243,7 +243,7 @@ fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
                 }
                 // A check that changed no status may still have moved refs
                 // the timeline shows; it observes the state for this.
-                checked |= matches!(update, Update::Status(_));
+                checked |= matches!(update, Update::Status(..));
                 let (c, s) = on_update(slot, update, cx);
                 changed |= c;
                 icons_stale |= s;
@@ -388,20 +388,26 @@ fn on_update(slot: usize, update: Update, cx: &mut App) -> (bool, bool) {
             state.update(cx, |s, _| s.in_flight.insert(repo));
             (false, false)
         }
-        Update::Status(status) => {
+        Update::Status(status, fetched) => {
             let (line, changes) = {
                 let s = state.read(cx);
                 let old = s.statuses.iter().find(|o| o.path == status.path);
                 (
                     crate::notify::behind(&s.config.notify, old, &status),
-                    crate::notify::remote_changes(&s.config.notify, old, &status),
+                    // Remote branches your own pull or fetch moved are no news.
+                    if fetched {
+                        crate::notify::remote_changes(&s.config.notify, old, &status)
+                    } else {
+                        Vec::new()
+                    },
                 )
             };
-            if let Some(line) = line {
-                notify(&[line], cx);
-            }
+            // One fetch, one notification: the behind line goes with
+            // what the fetch brought in.
             if !changes.is_empty() {
-                notify_remote(&status, changes, cx);
+                notify_remote(&status, line, changes, cx);
+            } else if let Some(line) = line {
+                notify(&[line], cx);
             }
             state.update(cx, |s, _| {
                 s.in_flight.remove(&status.path);
@@ -793,14 +799,16 @@ impl Render for Keepalive {
 /// thread first.
 fn notify_remote(
     status: &crate::git::RepoStatus,
+    first: Option<String>,
     changes: Vec<crate::notify::RemoteChange>,
     cx: &mut App,
 ) {
     use crate::notify::RemoteChange;
     let (repo, name) = (status.path.clone(), status.name.clone());
     let task = cx.background_spawn(async move {
-        changes
+        first
             .into_iter()
+            .chain(changes.into_iter()
             .map(|c| match c {
                 RemoteChange::New { branch } => format!("{name}: new branch {branch}"),
                 RemoteChange::Moved { branch, from, to } => {
@@ -825,7 +833,7 @@ fn notify_remote(
                         _ => format!("{name}: {branch} changed"),
                     }
                 }
-            })
+            }))
             .collect::<Vec<String>>()
     });
     cx.spawn(async move |cx| {

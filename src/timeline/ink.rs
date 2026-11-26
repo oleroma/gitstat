@@ -24,8 +24,26 @@ const MAX_KEPT: usize = 4096;
 
 type P = (f32, f32);
 
+/// How long after a picture is let go before a window drops it from its
+/// sprite atlas: long past the frame that let it go, which may still be
+/// drawing it.
+const DROP_AFTER: std::time::Duration = std::time::Duration::from_millis(500);
+
 thread_local! {
     static KEPT: RefCell<HashMap<u64, Arc<RenderImage>>> = RefCell::new(HashMap::new());
+    /// Pictures let go, until every window has dropped them from its
+    /// sprite atlas: each picture a window drew stays in its atlas until
+    /// the window drops it.
+    static LET_GO: RefCell<Evicted> = RefCell::new(Evicted::default());
+}
+
+#[derive(Default)]
+struct Evicted {
+    /// The pictures let go, by number, with when, oldest first.
+    images: std::collections::VecDeque<(u64, std::time::Instant, Arc<RenderImage>)>,
+    next: u64,
+    /// The number each window has dropped up to.
+    dropped: HashMap<gpui::WindowId, u64>,
 }
 
 /// `color`, with its alpha, laid over `bg`: the opaque colour it shows as.
@@ -169,7 +187,7 @@ fn stroke(window: &mut Window, pts: &[P], width: f32, color: Hsla, dash: Option<
         .hash(&mut h);
     let key = h.finish();
 
-    let Some(image) = kept(key, || {
+    let Some(image) = kept(window, key, || {
         draw(&local, w, dash.map(|d| (d.on * s, d.off * s)), rgba, iw, ih)
     }) else {
         return;
@@ -178,7 +196,12 @@ fn stroke(window: &mut Window, pts: &[P], width: f32, color: Hsla, dash: Option<
 }
 
 /// The picture kept under `key`, made with `make` the first time.
-fn kept(key: u64, make: impl FnOnce() -> Option<Arc<RenderImage>>) -> Option<Arc<RenderImage>> {
+fn kept(
+    window: &mut Window,
+    key: u64,
+    make: impl FnOnce() -> Option<Arc<RenderImage>>,
+) -> Option<Arc<RenderImage>> {
+    drop_let_go(window);
     if let Some(image) = KEPT.with(|kept| kept.borrow().get(&key).cloned()) {
         return Some(image);
     }
@@ -186,11 +209,64 @@ fn kept(key: u64, make: impl FnOnce() -> Option<Arc<RenderImage>>) -> Option<Arc
     KEPT.with(|kept| {
         let mut kept = kept.borrow_mut();
         if kept.len() >= MAX_KEPT {
-            kept.clear();
+            let now = std::time::Instant::now();
+            LET_GO.with(|l| {
+                let mut l = l.borrow_mut();
+                for (_, image) in kept.drain() {
+                    let n = l.next;
+                    l.next += 1;
+                    l.images.push_back((n, now, image));
+                }
+                // A window that hasn't drawn for this long (or has
+                // closed) isn't waited for.
+                while l.images.len() > 2 * MAX_KEPT {
+                    l.images.pop_front();
+                }
+                let oldest = l.images.front().map_or(l.next, |(n, _, _)| *n);
+                l.dropped.retain(|_, upto| *upto >= oldest);
+            });
         }
         kept.insert(key, image.clone());
     });
     Some(image)
+}
+
+/// Drops from `window`'s sprite atlas the pictures let go since it last
+/// did, once they are [`DROP_AFTER`] old. GPUI paints every frame afresh,
+/// so a later frame never draws one of them again.
+fn drop_let_go(window: &mut Window) {
+    let id = window.window_handle().window_id();
+    LET_GO.with(|l| {
+        let mut l = l.borrow_mut();
+        let Evicted {
+            images,
+            next,
+            dropped,
+        } = &mut *l;
+        // A window new since: it never drew what was let go before it.
+        let from = *dropped.entry(id).or_insert(*next);
+        let now = std::time::Instant::now();
+        let mut upto = from;
+        for (n, at, image) in images.iter() {
+            if *n < from {
+                continue;
+            }
+            if now.duration_since(*at) < DROP_AFTER {
+                break;
+            }
+            window.drop_image(image.clone()).ok();
+            upto = n + 1;
+        }
+        if upto == from {
+            return;
+        }
+        dropped.insert(id, upto);
+        // Pictures every window has dropped are of no more use.
+        let done = dropped.values().copied().min().unwrap_or(upto);
+        while images.front().is_some_and(|(n, _, _)| *n < done) {
+            images.pop_front();
+        }
+    });
 }
 
 /// Paints a picture 1:1 with its corner at device px `at`.
@@ -235,7 +311,7 @@ pub fn circle(
     ("circle", q(lx), q(ly), q(rd), iw, ih).hash(&mut h);
     fill.map(byte).hash(&mut h);
     ring.map(|(w, c, d)| (q(w), byte(c), d)).hash(&mut h);
-    let Some(image) = kept(h.finish(), || {
+    let Some(image) = kept(window, h.finish(), || {
         let mut pixmap = tiny_skia::Pixmap::new(iw, ih)?;
         let solid = |c: Rgba| {
             let mut paint = tiny_skia::Paint::default();
