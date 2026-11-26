@@ -10,9 +10,10 @@
 //!    capture differs from the picture before. Two controls, which leave a
 //!    refresh between the two changes on purpose, show that a one-refresh
 //!    gap or overlap would be caught.
-//! 2. The bends: a window-sized picture of a few hundred curves, drawn
-//!    afresh by tiny-skia every frame and the last one dropped, to see
-//!    what crisp bends in every frame of a turn would cost.
+//! 2. The bends: a few hundred curves drawn afresh by tiny-skia every
+//!    frame, each in its own tile of one small picture, and the last
+//!    picture dropped, to see what crisp bends in every frame of a turn
+//!    would cost. (A window-sized picture per frame was too slow: 13 ms.)
 
 use crate::layout::Rect;
 use crate::view::Palette;
@@ -64,25 +65,42 @@ impl ProbeView {
     }
 }
 
-/// One frame's curves, `n` frames in: each a little further turned, as
+/// A bend's tile in the packed picture, device px, and tiles per row.
+const TILE: u32 = 48;
+const COLS: u32 = 20;
+/// Room in a tile around its bend.
+const INSET: f32 = 4.0;
+
+/// Where bend `i` sits `n` frames in, device px in a `fw` by `fh` window,
+/// and how far it runs across and down: each a little further turned, as
 /// they would be in a flip.
-fn draw_bends(w: u32, h: u32, n: usize) -> Option<Arc<RenderImage>> {
-    let mut pixmap = tiny_skia::Pixmap::new(w.max(1), h.max(1))?;
-    let (fw, fh) = (w as f32, h as f32);
+fn bend_at(i: usize, n: usize, fw: f32, fh: f32) -> (f32, f32, f32, f32) {
+    let k = i as f32 / BENDS as f32;
     let turn = n as f32 / BEND_FRAMES as f32;
+    let x = fw * (0.08 + 0.84 * ((k * 7.0 + turn * 0.3) % 1.0));
+    let y = fh * (0.1 + 0.8 * ((k * 13.0) % 1.0));
+    (
+        x.round(),
+        y.round(),
+        40.0 * (1.0 - turn) + 12.0 * turn,
+        12.0 * (1.0 - turn) + 40.0 * turn,
+    )
+}
+
+/// One frame's bends, `n` frames in, each drawn in its own tile of one
+/// small picture.
+fn draw_bends(w: u32, h: u32, n: usize) -> Option<Arc<RenderImage>> {
+    let rows = (BENDS as u32).div_ceil(COLS);
+    let mut pixmap = tiny_skia::Pixmap::new(COLS * TILE, rows * TILE)?;
     let stroke = tiny_skia::Stroke {
         width: 2.0,
         line_cap: tiny_skia::LineCap::Round,
         ..Default::default()
     };
     for i in 0..BENDS {
-        let k = i as f32 / BENDS as f32;
-        let x = fw * (0.05 + 0.9 * ((k * 7.0 + turn * 0.3) % 1.0));
-        let y = fh * (0.05 + 0.9 * ((k * 13.0) % 1.0));
-        let (dx, dy) = (
-            40.0 * (1.0 - turn) + 12.0 * turn,
-            12.0 * (1.0 - turn) + 40.0 * turn,
-        );
+        let (_, _, dx, dy) = bend_at(i, n, w as f32, h as f32);
+        let x = (i as u32 % COLS * TILE) as f32 + INSET;
+        let y = (i as u32 / COLS * TILE) as f32 + INSET;
         let mut path = tiny_skia::PathBuilder::new();
         path.move_to(x, y);
         path.cubic_to(x + dx / 2.0, y, x + dx / 2.0, y + dy, x + dx, y + dy);
@@ -111,6 +129,7 @@ impl Render for ProbeView {
             (f32::from(view.height) * s).round() as u32,
         );
         let mut images = (None, None);
+        let frame = self.bends.as_ref().map_or(0, |b| b.at.len());
         if let Some(b) = self.bends.as_mut()
             && b.at.len() < BEND_FRAMES
         {
@@ -152,10 +171,41 @@ impl Render for ProbeView {
                     if let Some(old) = old {
                         window.drop_image(old).ok();
                     }
+                    // Each bend's tile, 1:1 on whole device px where its
+                    // bend goes: the whole picture placed so that tile
+                    // lands there, masked to the tile.
                     if let Some(image) = image {
-                        window
-                            .paint_image(bounds, Default::default(), image, 0, false)
-                            .ok();
+                        let rows = (BENDS as u32).div_ceil(COLS);
+                        let whole =
+                            size(px((COLS * TILE) as f32 / s), px((rows * TILE) as f32 / s));
+                        let tile = size(px(TILE as f32 / s), px(TILE as f32 / s));
+                        for i in 0..BENDS {
+                            let (x, y, _, _) = bend_at(i, frame, w as f32, h as f32);
+                            let at = point(
+                                bounds.left() + px((x - INSET) / s),
+                                bounds.top() + px((y - INSET) / s),
+                            );
+                            let origin = point(
+                                at.x - px((i as u32 % COLS * TILE) as f32 / s),
+                                at.y - px((i as u32 / COLS * TILE) as f32 / s),
+                            );
+                            window.with_content_mask(
+                                Some(gpui::ContentMask {
+                                    bounds: Bounds::new(at, tile),
+                                }),
+                                |window| {
+                                    window
+                                        .paint_image(
+                                            Bounds::new(origin, whole),
+                                            Default::default(),
+                                            image.clone(),
+                                            0,
+                                            false,
+                                        )
+                                        .ok();
+                                },
+                            );
+                        }
                     }
                 },
             )
@@ -327,38 +377,59 @@ pub fn run(cx: &mut App) {
         cx.background_executor().timer(Duration::from_millis(300)).await;
         let reference = win::capture(strip).map(|c| c.2);
         let (mut shown, mut hidden) = (ha, hb);
-        if let Some(reference) = reference {
+        if let Some(reference) = reference.map(Arc::new) {
             let _ = writeln!(report, "\nSWAP: {SWAPS} swaps each, screen watched {WATCH:?} after each");
             for (name, way) in WAYS {
                 let (mut captures, mut bad, mut darker, mut lighter, mut worst) = (0, 0, 0, 0, 0);
                 let mut bad_swaps = 0;
                 let mut spent = Duration::ZERO;
                 for _ in 0..SWAPS {
-                    swap(way, shown, hidden);
-                    std::mem::swap(&mut shown, &mut hidden);
-                    let until = Instant::now() + WATCH;
-                    let mut any = false;
-                    while Instant::now() < until {
-                        let t = Instant::now();
-                        let Some((_, _, now)) = win::capture(strip) else {
-                            break;
-                        };
-                        spent += t.elapsed();
-                        captures += 1;
-                        let (count, luma) = differs(&reference, &now);
-                        if count > 0 {
-                            bad += 1;
-                            any = true;
-                            worst = worst.max(count);
-                            if luma < 0 {
-                                darker += 1;
-                            } else {
-                                lighter += 1;
+                    // Watched from before the swap until a moment after
+                    // it, on a thread of its own, so nothing in between
+                    // is missed.
+                    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let (stopped, reference) = (stop.clone(), reference.clone());
+                    let watcher = std::thread::spawn(move || {
+                        let mut seen = (0u32, 0u32, 0u32, 0u32, 0usize, Duration::ZERO);
+                        while !stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                            let t = Instant::now();
+                            let Some((_, _, now)) = win::capture(strip) else {
+                                break;
+                            };
+                            seen.5 += t.elapsed();
+                            seen.0 += 1;
+                            let (count, luma) = differs(&reference, &now);
+                            if count > 0 {
+                                seen.1 += 1;
+                                seen.4 = seen.4.max(count);
+                                if luma < 0 {
+                                    seen.2 += 1;
+                                } else {
+                                    seen.3 += 1;
+                                }
                             }
                         }
+                        seen
+                    });
+                    cx.background_executor()
+                        .timer(Duration::from_millis(20))
+                        .await;
+                    swap(way, shown, hidden);
+                    std::mem::swap(&mut shown, &mut hidden);
+                    cx.background_executor().timer(WATCH).await;
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    if let Ok(seen) = watcher.join() {
+                        captures += seen.0;
+                        bad += seen.1;
+                        darker += seen.2;
+                        lighter += seen.3;
+                        worst = worst.max(seen.4);
+                        spent += seen.5;
+                        bad_swaps += usize::from(seen.1 > 0);
                     }
-                    bad_swaps += usize::from(any);
-                    cx.background_executor().timer(Duration::from_millis(50)).await;
+                    cx.background_executor()
+                        .timer(Duration::from_millis(50))
+                        .await;
                 }
                 let _ = writeln!(
                     report,
@@ -430,7 +501,7 @@ pub fn run(cx: &mut App) {
             .flatten();
         let _ = writeln!(
             report,
-            "\nBENDS: a {}x{} px picture drawn afresh each frame, the last one dropped\n{}",
+            "\nBENDS: over a {}x{} px window, only the bends drawn afresh each frame, packed in one small picture, the last one dropped\n{}",
             rect.width(),
             rect.height(),
             stats.unwrap_or_else(|| "did not run".into())
