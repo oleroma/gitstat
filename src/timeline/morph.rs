@@ -137,7 +137,7 @@ pub fn paint_tree(
     let hi = (((f.len / f.step).ceil() as usize) + 2).min(rows);
     let stroke = f.blend(super::STROKE, column::STROKE);
     let dot = f.blend(super::DOT, column::DOT);
-    let a = |c: Hsla| c.opacity(c.a * alpha);
+    let a = |c: Hsla| c.opacity(alpha);
     let folded = |lane: f32| lane.round() as usize >= super::LANES;
 
     // Under everything, a soft band along each other worktree's line.
@@ -192,17 +192,25 @@ pub fn paint_tree(
             None => (0.0, 0),
         };
         let c = f.at(wip, lane as f32);
+        // Dashed, noodle and ring, as both views draw them.
         if let Some(h) = head {
             let to = f.at(pos(h as f32), g.layout.nodes[h].lane as f32);
             let color = a(super::ink::over(colors.unpushed.opacity(0.8), colors.bg));
-            cubic(window, graph::noodle(c, to, f.along), 1.0, color);
+            super::ink::cubic(
+                window,
+                graph::noodle(c, to, f.along),
+                1.0,
+                color,
+                Some(super::ink::Dash { on: 2.0, off: 2.0 }),
+            );
         }
-        disc(
+        let r = f.blend(super::DOT + 0.5, column::DOT);
+        super::ink::circle(
             window,
             c,
-            dot + 0.5,
+            r,
             Some(a(colors.bg)),
-            Some((1.0, a(colors.unpushed))),
+            Some((1.0, a(colors.unpushed), true)),
         );
     }
 
@@ -235,14 +243,6 @@ pub fn paint_tree(
 
 /// The strip's fade at the end of its history, carried with the tree as
 /// it turns and narrowing to nothing by the column, which has none.
-/// Where a still strip's tail fade ends, at the start of the flip, in x:
-/// left of this, the view draws its own fade.
-pub fn tail_fade_end(ends: Ends) -> f32 {
-    let f = Frame::new(ends, 0.0);
-    let w = super::FADE.min(f.len);
-    f.origin.0 + f.len * f.along.0 - w * f.along.0
-}
-
 pub fn paint_tail_fade(ends: Ends, e: f32, bg: Hsla, window: &mut Window) {
     let e = e.clamp(0.0, 1.0);
     let f = Frame::new(ends, e);

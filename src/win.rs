@@ -15,10 +15,9 @@ use windows_sys::Win32::Graphics::Dwm::{
     DWMWCP_ROUND, DwmGetWindowAttribute, DwmSetWindowAttribute,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    ClientToScreen, CombineRgn, CreateEllipticRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject,
-    GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL,
-    MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, MonitorFromRect, RGN_AND,
-    SetWindowRgn,
+    ClientToScreen, CreateEllipticRgn, CreateRectRgn, DeleteObject, EnumDisplayMonitors,
+    GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL,
+    MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, MonitorFromRect, SetWindowRgn,
 };
 use windows_sys::Win32::UI::Controls::{
     ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, TOOLTIPS_CLASSW, TTDT_AUTOPOP,
@@ -326,6 +325,78 @@ pub fn cloak(h: isize) {
     unsafe { dwm_set(hwnd, 13, 1) };
 }
 
+/// Lets clicks through the flip's window to what is beneath it, or
+/// takes them: while it draws in place of the windows, a click lands on
+/// it rather than on whatever lies behind them.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn click_through(h: isize, through: bool) {
+    let Some(hwnd) = live(h) else { return };
+    unsafe {
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let ex = if through {
+            ex | WS_EX_TRANSPARENT as isize
+        } else {
+            ex & !(WS_EX_TRANSPARENT as isize)
+        };
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex);
+    }
+}
+
+/// Every monitor's work area, physical px.
+pub fn work_areas() -> Vec<Rect> {
+    unsafe extern "system" fn each(
+        mon: HMONITOR,
+        _: HDC,
+        _: *mut RECT,
+        data: LPARAM,
+    ) -> windows_sys::core::BOOL {
+        let out = unsafe { &mut *(data as *mut Vec<Rect>) };
+        out.push(monitor_info(mon).work);
+        1
+    }
+    let mut out: Vec<Rect> = Vec::new();
+    unsafe {
+        EnumDisplayMonitors(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            Some(each),
+            (&raw mut out) as LPARAM,
+        )
+    };
+    if out.is_empty() {
+        out.push(primary_monitor().work);
+    }
+    out
+}
+
+/// The scale `h` draws at, from its monitor's DPI.
+pub fn window_scale(h: isize) -> Option<f32> {
+    let hwnd = live(h)?;
+    let dpi = unsafe { GetDpiForWindow(hwnd) };
+    (dpi > 0).then(|| dpi as f32 / 96.0)
+}
+
+/// Whether the panel `h` is sliding clipped now, with DWM's rim off, so
+/// it draws its own.
+pub fn is_bare(h: isize) -> bool {
+    BARE_PANEL.load(std::sync::atomic::Ordering::Relaxed) == h
+}
+
+/// Makes `h` the foreground window unless it is already. During a flip a
+/// click lands on the flip's window (gitstat's own), so Windows lets
+/// gitstat bring the window it ends on in front of the app that was.
+pub fn to_front(h: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SetForegroundWindow};
+    let Some(hwnd) = live(h) else { return };
+    unsafe {
+        if GetForegroundWindow() != hwnd {
+            SetForegroundWindow(hwnd);
+        }
+    }
+}
+
 /// Shows a window [`cloak`] hid, at the next composition.
 pub fn uncloak(h: isize) {
     let Some(hwnd) = live(h) else { return };
@@ -402,12 +473,6 @@ pub unsafe fn panel_restack(h: isize) {
     };
 }
 
-/// Whether a slide from `hidden` (the panel's place out of sight, screen
-/// px) is clipped rather than from behind a taskbar.
-pub fn slide_clips(hidden: Rect) -> bool {
-    taskbar_over(hidden).is_none() && on_a_monitor(hidden)
-}
-
 /// Whether any of `r` (screen px) is on a monitor; past every screen's
 /// edge, a sliding panel needs no clip.
 fn on_a_monitor(r: Rect) -> bool {
@@ -479,6 +544,9 @@ pub fn frame_insets(h: isize) -> Option<(i32, i32, i32, i32)> {
 /// The panel whose DWM border and shadow are off for its slide.
 static BARE_PANEL: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
+/// The bare panel's room around itself, physical px ([`bare_margin`]).
+static BARE_MARGIN: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
 /// `s` as a NUL-ended UTF-16 string.
 fn w(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
@@ -544,6 +612,11 @@ fn taskbar_over(r: Rect) -> Option<HWND> {
     }
 }
 
+/// Room the panel keeps around itself while it slides clipped, logical
+/// px: for the shadow it draws itself meanwhile, as far as Windows' own
+/// reaches (the flip keeps as much around its sheet).
+pub const PANEL_SHADOW_ROOM: f32 = 72.0;
+
 /// Moves the panel's client area to `moved` without resizing it, showing
 /// only the part inside `shown` (screen px), for its slide in or out.
 /// `None` shows it whole again, on top.
@@ -552,16 +625,35 @@ fn taskbar_over(r: Rect) -> Option<HWND> {
 /// z-order, keeping its own rim and shadow. Elsewhere (the badge, a hidden
 /// taskbar) it is clipped to `shown`, with DWM's border, rounded corners
 /// and shadow off meanwhile: they follow the whole window, not the part
-/// shown, so they'd draw a frame around the hidden part.
+/// shown, so they'd draw a frame around the hidden part. The panel then
+/// draws them itself, exactly where Windows does: its window grows by
+/// [`bare_margin`] on every side, and it draws its sheet, rim and shadow
+/// in that room (`view`), anti-aliased, clipped only along the edge it
+/// slides out of. Call [`draw_now`] when [`is_bare`] changes, so the
+/// grown or shrunk window and what it draws show in the same frame.
 ///
 /// # Safety
 /// Call only from a spawned task outside `update`.
 pub unsafe fn slide_panel(h: isize, moved: Rect, shown: Option<Rect>) {
     use std::sync::atomic::Ordering::Relaxed;
     let Some(hwnd) = live(h) else { return };
+    // Behind a taskbar that edges onto another monitor, the part past it
+    // would show on that monitor: clipped instead, like a slide from a
+    // screen's edge.
     let behind = shown
         .filter(|s| *s != moved)
-        .and_then(|_| taskbar_over(moved));
+        .and_then(|_| taskbar_over(moved))
+        .filter(|_| {
+            let (x, y) = shown.map_or(moved.centre(), |s| s.centre());
+            let mon = monitor_at(x, y).rect;
+            let inside = Rect::new(
+                moved.left.max(mon.left),
+                moved.top.max(mon.top),
+                moved.right.min(mon.right),
+                moved.bottom.min(mon.bottom),
+            );
+            inside == moved || !on_a_monitor(hidden_part(moved, inside))
+        });
     // Past a screen's edge with nothing beyond, it needs no clip either:
     // Windows keeps its own rim and shadow on all the way.
     let clip = shown
@@ -570,6 +662,8 @@ pub unsafe fn slide_panel(h: isize, moved: Rect, shown: Option<Rect>) {
     unsafe {
         let bare = BARE_PANEL.load(Relaxed) == h;
         if clip.is_some() && !bare {
+            let dpi = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
+            BARE_MARGIN.store((PANEL_SHADOW_ROOM * dpi).ceil() as i32, Relaxed);
             BARE_PANEL.store(h, Relaxed);
             dwm_set(hwnd, DWMWA_NCRENDERING_POLICY, DWMNCRP_DISABLED as u32);
             dwm_set(
@@ -579,8 +673,15 @@ pub unsafe fn slide_panel(h: isize, moved: Rect, shown: Option<Rect>) {
             );
             dwm_set(hwnd, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE);
         }
+        // Clipped, the client area takes in the room around the panel.
+        let room = if clip.is_some() {
+            BARE_MARGIN.load(Relaxed)
+        } else {
+            0
+        };
+        let client = moved.outset(room);
         let (dx, dy, bw, bh) = frame(hwnd);
-        let (wl, wt) = (moved.left - dx, moved.top - dy);
+        let (wl, wt) = (client.left - dx, client.top - dy);
         // Behind a taskbar, or whole again beside one: placed after it,
         // below it but still topmost, so its shadow never jumps over the
         // taskbar. Clipped, or away from taskbars: on top.
@@ -591,31 +692,23 @@ pub unsafe fn slide_panel(h: isize, moved: Rect, shown: Option<Rect>) {
             after,
             wl,
             wt,
-            moved.width() + bw,
-            moved.height() + bh,
+            client.width() + bw,
+            client.height() + bh,
             SWP_NOACTIVATE,
         );
         let rgn = match clip {
-            // Region coordinates are relative to the window.
-            // The part shown, with the panel's own rounded corners, which
-            // the panel draws its rim along (`panel::drawn_rim`).
-            Some(r) => {
-                let shown = CreateRectRgn(r.left - wl, r.top - wt, r.right - wl, r.bottom - wt);
-                let d = (2.0 * PANEL_RADIUS * GetDpiForWindow(hwnd).max(96) as f32 / 96.0).round()
-                    as i32;
-                let round = CreateRoundRectRgn(
-                    dx,
-                    dy,
-                    dx + moved.width() + 1,
-                    dy + moved.height() + 1,
-                    d,
-                    d,
+            // Region coordinates are relative to the window. Cut only
+            // where `shown` cuts the panel: elsewhere the room around it,
+            // with the rim, corners and shadow it draws there, shows.
+            Some(s) => {
+                let side = |cut: i32, edge: i32, out: i32| if cut == edge { out } else { cut };
+                let r = Rect::new(
+                    side(s.left, moved.left, client.left),
+                    side(s.top, moved.top, client.top),
+                    side(s.right, moved.right, client.right),
+                    side(s.bottom, moved.bottom, client.bottom),
                 );
-                if !round.is_null() {
-                    CombineRgn(shown, shown, round, RGN_AND);
-                    DeleteObject(round);
-                }
-                shown
+                CreateRectRgn(r.left - wl, r.top - wt, r.right - wl, r.bottom - wt)
             }
             None => std::ptr::null_mut(),
         };
@@ -626,6 +719,7 @@ pub unsafe fn slide_panel(h: isize, moved: Rect, shown: Option<Rect>) {
         }
         if clip.is_none() && bare {
             BARE_PANEL.store(0, Relaxed);
+            BARE_MARGIN.store(0, Relaxed);
             dwm_set(
                 hwnd,
                 DWMWA_NCRENDERING_POLICY,
@@ -638,6 +732,41 @@ pub unsafe fn slide_panel(h: isize, moved: Rect, shown: Option<Rect>) {
                 PANEL_RIM.load(std::sync::atomic::Ordering::Relaxed),
             );
         }
+    }
+}
+
+/// The room, physical px, the bare panel `h` keeps around itself on every
+/// side while it slides clipped; `None` while Windows draws its frame.
+pub fn bare_margin(h: isize) -> Option<i32> {
+    use std::sync::atomic::Ordering::Relaxed;
+    is_bare(h).then(|| BARE_MARGIN.load(Relaxed))
+}
+
+/// Forgets that `h` slid clipped, as it closes: a later window given the
+/// same handle starts with Windows' own frame.
+pub fn forget_bare(h: isize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if BARE_PANEL.compare_exchange(h, 0, Relaxed, Relaxed).is_ok() {
+        BARE_MARGIN.store(0, Relaxed);
+    }
+}
+
+/// Draws and presents `h`'s next frame now, rather than at the next
+/// screen refresh: after its window grew or shrank, so the new size and
+/// what it draws at that size reach the screen together.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn draw_now(h: isize) {
+    use windows_sys::Win32::Graphics::Gdi::{RDW_INVALIDATE, RDW_UPDATENOW, RedrawWindow};
+    let Some(hwnd) = live(h) else { return };
+    unsafe {
+        RedrawWindow(
+            hwnd,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            RDW_INVALIDATE | RDW_UPDATENOW,
+        );
     }
 }
 
@@ -750,11 +879,6 @@ pub unsafe fn panel_topmost(h: isize, under: Option<isize>, sliding: bool) {
 /// Off-screen, where a forced show of the keepalive draws nothing visible.
 const PARKED: i32 = -32000;
 
-/// Makes the never-shown keepalive harmless if GPUI ever shows it (its
-/// `WM_DISPLAYCHANGE` handling does when a monitor disconnects): 1×1,
-/// off-screen, click-through and never activated. `SW_SHOWNORMAL` restores
-/// the normal position, which is this one: it is never minimised or maximised.
-///
 /// Makes minimising the window close it instead (the minimise button, the
 /// taskbar button, Win+Down), so it goes the same way as closing: through
 /// GPUI's should-close callback.
@@ -801,6 +925,11 @@ unsafe extern "system" fn minimize_closes_proc(
     unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
 }
 
+/// Makes the never-shown keepalive harmless if GPUI ever shows it (its
+/// `WM_DISPLAYCHANGE` handling does when a monitor disconnects): 1×1,
+/// off-screen, click-through and never activated. `SW_SHOWNORMAL` restores
+/// the normal position, which is this one: it is never minimised or maximised.
+///
 /// # Safety
 /// Call only from a spawned task outside `update`.
 pub unsafe fn harden_keepalive(h: isize) {

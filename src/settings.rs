@@ -33,6 +33,7 @@ pub enum Setting {
     GithubRepos,
     ScrollTogether,
     FlipAnimation,
+    RecordFrames,
     NotifyReview,
     NotifyChecks,
     NotifyBehind,
@@ -56,6 +57,7 @@ impl Setting {
             Setting::GithubRepos => cfg.github_repos,
             Setting::ScrollTogether => cfg.scroll_together,
             Setting::FlipAnimation => cfg.flip_animation,
+            Setting::RecordFrames => cfg.record_frames,
             Setting::NotifyReview => cfg.notify.review_requested,
             Setting::NotifyChecks => cfg.notify.checks_failed,
             Setting::NotifyBehind => cfg.notify.behind,
@@ -79,6 +81,7 @@ impl Setting {
             Setting::GithubRepos => &mut cfg.github_repos,
             Setting::ScrollTogether => &mut cfg.scroll_together,
             Setting::FlipAnimation => &mut cfg.flip_animation,
+            Setting::RecordFrames => &mut cfg.record_frames,
             Setting::NotifyReview => &mut cfg.notify.review_requested,
             Setting::NotifyChecks => &mut cfg.notify.checks_failed,
             Setting::NotifyBehind => &mut cfg.notify.behind,
@@ -98,14 +101,16 @@ enum Page {
     Badges,
     FolderIcons,
     Github,
+    Diagnostics,
 }
 
-const PAGES: [(Page, &str, &str); 5] = [
+const PAGES: [(Page, &str, &str); 6] = [
     (Page::General, "⚙", "General"),
     (Page::Views, "▤", "Status views"),
     (Page::Badges, "◉", "Icon and badge"),
     (Page::FolderIcons, "▣", "Folder icons"),
     (Page::Github, "⑂", "GitHub"),
+    (Page::Diagnostics, "⚑", "Diagnostics"),
 ];
 
 const SORTS: [(RepoSort, &str, &str); 7] = [
@@ -355,6 +360,7 @@ impl Render for SettingsView {
             Page::Badges => ("Icon and badge", badges(&cfg, &p)),
             Page::FolderIcons => ("Folder icons", folder_icons(&cfg, &p)),
             Page::Github => ("GitHub", github(&cfg, github_problem.as_deref(), &p)),
+            Page::Diagnostics => ("Diagnostics", diagnostics(&cfg, &p)),
         };
         let content = div()
             .id("content")
@@ -395,10 +401,11 @@ impl Render for SettingsView {
 
 impl SettingsView {
     fn general(&self, cfg: &Config, p: &Palette) -> Vec<AnyElement> {
+        let fates = cfg.folders();
         let mut folders: Vec<AnyElement> = std::iter::once(&cfg.path)
             .chain(&cfg.more_paths)
             .enumerate()
-            .map(|(i, path)| folder_row(i, path, p))
+            .map(|(i, path)| folder_row(i, path, fates.get(i), p))
             .collect();
         folders.push(
             row_base()
@@ -486,6 +493,38 @@ impl SettingsView {
             ),
         ]
     }
+}
+
+/// Tools for looking into how gitstat behaves, all off by default.
+fn diagnostics(cfg: &Config, p: &Palette) -> Vec<AnyElement> {
+    let folder = cfg.frames_folder();
+    let shown = folder.display().to_string();
+    vec![group_with_note(
+        "Animations",
+        "For checking the flip and the panel's slide frame by frame.",
+        vec![
+            flag(
+                "record-frames",
+                "Record frames",
+                "Each flip and slide saves every frame of the screen under it as \
+                 pictures. Grabbing the screen slows the animations a little while on.",
+                Setting::RecordFrames,
+                true,
+                cfg,
+                p,
+            ),
+            row_base()
+                .child(row_text("Recordings folder", shown, p))
+                .child(
+                    text_button("open-frames", "Open", p).on_click(move |_, _, cx| {
+                        let _ = std::fs::create_dir_all(&folder);
+                        cx.open_with_system(&folder);
+                    }),
+                )
+                .into_any_element(),
+        ],
+        p,
+    )]
 }
 
 fn views(cfg: &Config, p: &Palette) -> Vec<AnyElement> {
@@ -844,8 +883,16 @@ fn github(cfg: &Config, problem: Option<&str>, p: &Palette) -> Vec<AnyElement> {
 }
 
 /// Opens a folder picker; the folder replaces entry `replace` of the
-/// folder list (0 is `path`), or is added to it.
+/// folder list (0 is `path`), or is added to it. The entry is found again
+/// by its value once the dialog closes: the list may have changed meanwhile.
 fn pick_folder(replace: Option<usize>, cx: &mut App) {
+    let replace = replace.and_then(|i| {
+        let cfg = &cx.global::<Ui>().state.read(cx).config;
+        std::iter::once(&cfg.path)
+            .chain(&cfg.more_paths)
+            .nth(i)
+            .map(|old| (i, old.clone()))
+    });
     let picked = cx.prompt_for_paths(PathPromptOptions {
         files: false,
         directories: true,
@@ -863,6 +910,15 @@ fn pick_folder(replace: Option<usize>, cx: &mut App) {
         let dir = dir.to_string_lossy().replace('\\', "/");
         cx.update(|cx| {
             let cfg = cx.global::<Ui>().state.read(cx).config.clone();
+            // The entry's place now, if it is still listed; else the folder is added.
+            let replace = replace.and_then(|(i, old)| {
+                let now: Vec<&String> = std::iter::once(&cfg.path).chain(&cfg.more_paths).collect();
+                if now.get(i) == Some(&&old) {
+                    Some(i)
+                } else {
+                    now.iter().position(|f| **f == old)
+                }
+            });
             if let Some(folders) = with_folder(&cfg, replace, dir) {
                 send(TrayAction::SetFolders(folders.0, folders.1), cx);
             }
@@ -1212,8 +1268,21 @@ fn text_button(
 }
 
 /// Folder `i` of the list (0 is `path`), with its buttons.
-fn folder_row(i: usize, path: &str, p: &Palette) -> AnyElement {
-    let desc = if i == 0 { "Main folder" } else { "" };
+fn folder_row(
+    i: usize,
+    path: &str,
+    fate: Option<&crate::config::Folder>,
+    p: &Palette,
+) -> AnyElement {
+    use crate::config::Folder;
+    // A folder another one already covers is never looked in on its own.
+    let desc = match fate {
+        Some(Folder::Overlaps(earlier)) => {
+            format!("Not looked in: {} already covers it", earlier.display())
+        }
+        _ if i == 0 => "Main folder".to_string(),
+        _ => String::new(),
+    };
     let shown = if path.trim().is_empty() {
         "(none)".to_string()
     } else {

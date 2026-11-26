@@ -1,13 +1,12 @@
 //! A recorder for checking the flip by eye, frame by frame: with config's
-//! `flip_frames` set to a folder, each flip saves the screen under it on
-//! every frame it draws, and for a moment after it closes, as numbered
-//! PNGs in a folder of their own. Off by default and not in the settings
-//! window. The screen is captured and saved on a thread of its own, so
-//! recording barely slows the flip.
+//! `record_frames` on (Settings › Diagnostics), each flip saves the screen
+//! under it on every frame it draws, and for a moment after it closes, as
+//! numbered PNGs in a folder of their own under `Config::frames_folder`.
+//! Off by default. The screen is captured and saved on threads of their
+//! own, but grabbing it every frame still slows the flip.
 
 use crate::layout::Rect;
 use std::cell::RefCell;
-use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -68,15 +67,16 @@ fn start_named(rect: Rect, name: &str, cx: &gpui::App) {
     let Some(ui) = cx.try_global::<crate::view::Ui>() else {
         return;
     };
-    let folder = ui.state.read(cx).config.flip_frames.trim().to_string();
-    if folder.is_empty() {
+    let config = &ui.state.read(cx).config;
+    if !config.record_frames {
         RECORDER.with(|r| r.borrow_mut().take());
         return;
     }
+    let folder = config.frames_folder();
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis());
-    let dir = PathBuf::from(folder).join(format!("{name}-{stamp}"));
+    let dir = folder.join(format!("{name}-{stamp}"));
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
@@ -135,13 +135,21 @@ pub fn finish(cx: &mut gpui::App) {
     if RECORDER.with(|r| r.borrow().is_none()) {
         return;
     }
+    // Only this flip's recording: a flip starting meanwhile records its
+    // own, which this leaves alone.
+    let mine = RECORDER.with(|r| r.borrow().as_ref().map(|r| r.start));
+    let still = move || RECORDER.with(|r| r.borrow().as_ref().map(|r| r.start)) == mine;
     cx.spawn(async move |cx| {
         let end = Instant::now() + AFTER;
-        while Instant::now() < end {
+        while Instant::now() < end && still() {
             cx.background_executor().timer(AFTER_EVERY).await;
-            frame("after");
+            if still() {
+                frame("after");
+            }
         }
-        RECORDER.with(|r| r.borrow_mut().take());
+        if still() {
+            RECORDER.with(|r| r.borrow_mut().take());
+        }
     })
     .detach();
 }

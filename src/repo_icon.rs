@@ -195,6 +195,9 @@ struct Late {
     key: u64,
     /// `None` while it is still going.
     result: Option<Result<Images, String>>,
+    /// Its caller stopped waiting for it. Until then it is a drawing under
+    /// way, which keeps a second one of the same repo from starting.
+    given_up: bool,
 }
 
 impl Default for Renderer {
@@ -240,6 +243,7 @@ impl Renderer {
                 Some(Late {
                     key: k,
                     result: Some(result),
+                    ..
                 }) if k == key => return result.map_err(Error::file),
                 Some(going @ Late { result: None, .. }) => {
                     late.insert(repo.to_string(), going);
@@ -250,11 +254,26 @@ impl Renderer {
                 // A result for another file or tone: of no more use.
                 _ => {}
             }
-            if late.values().filter(|l| l.result.is_none()).count() >= MAX_LATE {
+            if late
+                .values()
+                .filter(|l| l.result.is_none() && l.given_up)
+                .count()
+                >= MAX_LATE
+            {
                 return Err(Error::transient(format!(
                     "{DIR}/{FILE} must wait: other repos' icons are still being drawn"
                 )));
             }
+            // Noted before it starts, so a second call for this repo while
+            // it draws waits for it rather than drawing alongside.
+            late.insert(
+                repo.to_string(),
+                Late {
+                    key,
+                    result: None,
+                    given_up: false,
+                },
+            );
         }
         let (tx, rx) = mpsc::channel();
         let svg = svg.to_vec();
@@ -279,14 +298,29 @@ impl Renderer {
                 }
             })
             .map_err(|e| Error::transient(format!("can't draw {DIR}/{FILE}: {e}")))?;
+        // This call's own note, once it has its answer.
+        let done = |late: &mut HashMap<String, Late>| {
+            if late
+                .get(repo)
+                .is_some_and(|l| l.key == key && l.result.is_none() && !l.given_up)
+            {
+                late.remove(repo);
+            }
+        };
         match rx.recv_timeout(self.timeout) {
-            Ok(result) => result.map_err(Error::file),
+            Ok(result) => {
+                done(&mut lock(&self.late));
+                result.map_err(Error::file)
+            }
             Err(RecvTimeoutError::Timeout) => {
                 let mut late = lock(&self.late);
                 if let Ok(result) = rx.try_recv() {
+                    done(&mut late);
                     return result.map_err(Error::file);
                 }
-                late.insert(repo.to_string(), Late { key, result: None });
+                if let Some(l) = late.get_mut(repo).filter(|l| l.key == key) {
+                    l.given_up = true;
+                }
                 drop(rx);
                 drop(late);
                 Err(Error::transient(format!(
@@ -295,6 +329,7 @@ impl Renderer {
             }
             // It panicked outside `catch_unwind`, so nothing was sent.
             Err(RecvTimeoutError::Disconnected) => {
+                done(&mut lock(&self.late));
                 Err(Error::file(format!("{DIR}/{FILE} couldn't be drawn")))
             }
         }
@@ -577,10 +612,19 @@ impl<'a, 'input> Expansion<'a, 'input> {
             depth: 0,
         };
         let mut inner: Vec<_> = node.children().filter(is_svg_element).collect();
-        if tag == "use"
-            && let Some(id) = node.attribute("href").and_then(local_iri)
-        {
-            inner.extend(self.ids.get(id).into_iter().flatten().copied());
+        if tag == "use" {
+            // Both `href` and `xlink:href`: usvg prefers the plain one
+            // wherever it sits, while roxmltree's `attribute("href")`
+            // returns whichever comes first. Counting both can only
+            // overestimate.
+            let ids: Vec<_> = node
+                .attributes()
+                .filter(|a| a.name() == "href")
+                .filter_map(|a| local_iri(a.value()))
+                .collect();
+            for id in ids {
+                inner.extend(self.ids.get(id).into_iter().flatten().copied());
+            }
         }
         for child in inner {
             cost.contain(self.cost(child, depth + 1)?);
@@ -1233,6 +1277,19 @@ mod tests {
                 "too many shapes",
             ),
             ("10⁵ copies", fan_out(5, 0), "too many shapes"),
+            // usvg follows the plain href wherever it sits; the checker
+            // must not be shown a harmless xlink:href in front of it.
+            (
+                "href behind a harmless xlink:href",
+                fan_out(5, 0).replace(
+                    "<use href=",
+                    r##"<use xlink:href="#none" href="##,
+                ).replace(
+                    r#"<svg xmlns="http://www.w3.org/2000/svg""#,
+                    r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink""#,
+                ),
+                "too many shapes",
+            ),
             // Each shape gets its own copy of a pattern or gradient...
             (
                 "pattern",
@@ -1399,7 +1456,11 @@ mod tests {
         let renderer = Renderer::default();
         let late = || vec![(16, b"late".to_vec())];
         let going = |repo: &str| {
-            let late = Late { key, result: None };
+            let late = Late {
+                key,
+                result: None,
+                given_up: true,
+            };
             lock(&renderer.late).insert(repo.into(), late);
         };
         // One still going: that repo waits, others don't.

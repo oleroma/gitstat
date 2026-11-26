@@ -62,9 +62,11 @@ impl Shared {
         }
     }
 
-    fn start_monitor(&self, slot: usize) -> Monitor {
+    /// A monitor for `slot`, starting from the app's `config`: the file may
+    /// be broken, or hold less than memory when a save was refused.
+    fn start_monitor(&self, slot: usize, config: Config) -> Monitor {
         let tx = self.monitor_input.clone();
-        Monitor::start_slot(self.config_file.clone(), slot, move |u| {
+        Monitor::start_slot(self.config_file.clone(), slot, Some(config), move |u| {
             let _ = tx.unbounded_send(Input::Monitor(slot, u));
         })
     }
@@ -74,10 +76,11 @@ impl Shared {
 /// and forgets the repos of folders no longer watched.
 fn sync_monitors(cx: &mut App) {
     let state = cx.global::<Ui>().state.clone();
-    let want = state.read(cx).config.roots().len().max(1);
+    let config = state.read(cx).config.clone();
+    let want = config.roots().len().max(1);
     cx.update_global::<Shared, _>(|shared, _| {
         while shared.monitors.len() < want {
-            let m = shared.start_monitor(shared.monitors.len());
+            let m = shared.start_monitor(shared.monitors.len(), config.clone());
             shared.monitors.push(m);
         }
         // Dropping a monitor shuts it down.
@@ -123,11 +126,24 @@ pub fn run(config_file: PathBuf) {
         )
         .ok();
 
-        let (cfg, config_error) = match Config::load_or_create(&config_file) {
-            Ok(cfg) => (cfg, None),
-            Err(e) => (Config::default(), Some(config_problem(&e))),
+        // A file that won't parse runs on the last config that did; with
+        // none, on the defaults, but folder icons are left alone until a
+        // good config says what they should be.
+        let (cfg, config_error, held) = match Config::load_or_create(&config_file) {
+            Ok(cfg) => {
+                cfg.remember_good(&config_file);
+                (cfg, None, false)
+            }
+            Err(e) => match Config::last_good(&config_file) {
+                Some(good) => (good, Some(config_problem(&e)), false),
+                None => (Config::default(), Some(config_problem(&e)), true),
+            },
         };
-        let state = cx.new(|_| AppState::new(config_file.clone(), cfg.clone(), config_error));
+        let state = cx.new(|_| {
+            let mut s = AppState::new(config_file.clone(), cfg.clone(), config_error);
+            s.config_held = held;
+            s
+        });
 
         let tray = match Tray::new() {
             Ok(tray) => tray,
@@ -139,7 +155,7 @@ pub fn run(config_file: PathBuf) {
         };
 
         let monitor_tx = tx.clone();
-        let monitor = Monitor::start(config_file.clone(), move |u| {
+        let monitor = Monitor::start_slot(config_file.clone(), 0, Some(cfg.clone()), move |u| {
             let _ = monitor_tx.unbounded_send(Input::Monitor(0, u));
         });
         let icons_tx = tx.clone();
@@ -227,7 +243,7 @@ fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
                 }
                 // A check that changed no status may still have moved refs
                 // the timeline shows; it observes the state for this.
-                checked |= matches!(update, Update::Status(_));
+                checked |= matches!(update, Update::Status(..));
                 let (c, s) = on_update(slot, update, cx);
                 changed |= c;
                 icons_stale |= s;
@@ -345,7 +361,12 @@ fn on_update(slot: usize, update: Update, cx: &mut App) -> (bool, bool) {
     };
     match update {
         Update::Config(Ok(new)) => {
-            state.update(cx, |s, _| s.config_error = None);
+            let file = state.update(cx, |s, _| {
+                s.config_error = None;
+                s.config_held = false;
+                s.config_file.clone()
+            });
+            new.remember_good(&file);
             let old = state.read(cx).config.clone();
             // Our own writes come back equal, and are not re-applied.
             if new != old {
@@ -367,20 +388,26 @@ fn on_update(slot: usize, update: Update, cx: &mut App) -> (bool, bool) {
             state.update(cx, |s, _| s.in_flight.insert(repo));
             (false, false)
         }
-        Update::Status(status) => {
+        Update::Status(status, fetched) => {
             let (line, changes) = {
                 let s = state.read(cx);
                 let old = s.statuses.iter().find(|o| o.path == status.path);
                 (
                     crate::notify::behind(&s.config.notify, old, &status),
-                    crate::notify::remote_changes(&s.config.notify, old, &status),
+                    // Remote branches your own pull or fetch moved are no news.
+                    if fetched {
+                        crate::notify::remote_changes(&s.config.notify, old, &status)
+                    } else {
+                        Vec::new()
+                    },
                 )
             };
-            if let Some(line) = line {
-                notify(&[line], cx);
-            }
+            // One fetch, one notification: the behind line goes with
+            // what the fetch brought in.
             if !changes.is_empty() {
-                notify_remote(&status, changes, cx);
+                notify_remote(&status, line, changes, cx);
+            } else if let Some(line) = line {
+                notify(&[line], cx);
             }
             state.update(cx, |s, _| {
                 s.in_flight.remove(&status.path);
@@ -399,8 +426,7 @@ fn on_update(slot: usize, update: Update, cx: &mut App) -> (bool, bool) {
             // The first result: the folder-icon worker can start now.
             // Every sweep has another look at the repos' own icons, which
             // covers a missed event and `watch: false`.
-            let first = !s.has_result;
-            s.has_result = true;
+            let first = s.swept(slot);
             (true, first || repo_svgs)
         }),
         Update::RepoIcons => (false, repo_svgs),
@@ -430,7 +456,7 @@ fn update_outputs(sync_icons: bool, cx: &mut App) {
             s.badge(),
             note.as_deref(),
         );
-        if sync_icons && s.has_result {
+        if sync_icons && s.has_result && !s.config_held {
             let config = &s.config;
             shared.icons.sync(
                 s.statuses.clone(),
@@ -562,11 +588,13 @@ fn quit(cx: &mut App) {
 /// or, run from outside the install folder, starts the installed build an
 /// install asked it to hand over to, and quits. Returns true when quitting.
 /// A failed swap leaves this gitstat running and is tried again on the next
-/// poll.
+/// poll; a failed handover is not.
 fn update_and_restart(cx: &mut App) -> bool {
     use crate::self_update;
+    let mut handover = None;
     let result = std::env::current_exe().and_then(|exe| {
         if let Some(installed) = self_update::handover(&exe) {
+            handover = Some(installed.clone());
             // Taken first, so a failed start isn't tried on every poll.
             std::fs::remove_file(self_update::handover_file(&exe))?;
             self_update::restart(&installed)?;
@@ -593,10 +621,18 @@ fn update_and_restart(cx: &mut App) -> bool {
             let shared = cx.global_mut::<Shared>();
             if !shared.update_error_shown {
                 shared.update_error_shown = true;
-                crate::error_box(format!(
-                    "A new gitstat build is waiting, but gitstat couldn't switch to it: {e}\n\n\
-                     It will keep trying. Quitting and starting gitstat also picks it up."
-                ));
+                crate::error_box(match handover {
+                    Some(installed) => format!(
+                        "gitstat was installed at {}, but this gitstat couldn't hand over \
+                         to it: {e}\n\nQuit this gitstat and start the installed one.",
+                        installed.display()
+                    ),
+                    None => format!(
+                        "A new gitstat build is waiting, but gitstat couldn't switch to it: \
+                         {e}\n\nIt will keep trying. Quitting and starting gitstat also picks \
+                         it up."
+                    ),
+                });
             }
             false
         }
@@ -647,13 +683,13 @@ fn change_setting(f: impl FnOnce(&mut Config), cx: &mut App) {
     if new == old {
         return;
     }
-    if let Err(e) = new.save(&file) {
+    if let Err(e) = new.save_over(&file, &old) {
         let shared = cx.global_mut::<Shared>();
         if !shared.save_notice_shown {
             shared.save_notice_shown = true;
             crate::error_box(format!(
                 "Couldn't save config.json, so this change lasts only until config.json \
-                 is fixed and reloaded, or gitstat quits.\n\n{e}"
+                 is reloaded, or gitstat quits.\n\n{e}"
             ));
         }
     }
@@ -689,7 +725,7 @@ fn apply_config(old: &Config, new: Config, cx: &mut App) {
     // matters only while they are on.
     let icons_changed = new.folder_icons != old.folder_icons
         || (new.folder_icons && new.folder_icon_mode != old.folder_icon_mode);
-    let sync_icons = icons_changed && (s.has_result || !new.folder_icons);
+    let sync_icons = icons_changed && (s.has_result || !new.folder_icons) && !s.config_held;
     let statuses = s.statuses.clone();
     let shared = cx.global::<Shared>();
     if sync_icons {
@@ -731,7 +767,9 @@ fn sync_pr_colors(cx: &mut App) {
             .map(|r| {
                 let prs = s.prs.get(&r.path).map(Vec::as_slice).unwrap_or_default();
                 let colors = crate::graph::PrColors::from_prs(
-                    prs.iter().map(|p| (p.head_branch.as_str(), p.state)),
+                    prs.iter()
+                        .filter(|p| p.is_for(&p.head_branch, &r.tips))
+                        .map(|p| (p.head_branch.as_str(), p.state)),
                 );
                 (r.path.clone(), colors)
             })
@@ -761,15 +799,16 @@ impl Render for Keepalive {
 /// thread first.
 fn notify_remote(
     status: &crate::git::RepoStatus,
+    first: Option<String>,
     changes: Vec<crate::notify::RemoteChange>,
     cx: &mut App,
 ) {
     use crate::notify::RemoteChange;
     let (repo, name) = (status.path.clone(), status.name.clone());
     let task = cx.background_spawn(async move {
-        changes
+        first
             .into_iter()
-            .map(|c| match c {
+            .chain(changes.into_iter().map(|c| match c {
                 RemoteChange::New { branch } => format!("{name}: new branch {branch}"),
                 RemoteChange::Moved { branch, from, to } => {
                     let range = format!("{from}..{to}");
@@ -793,7 +832,7 @@ fn notify_remote(
                         _ => format!("{name}: {branch} changed"),
                     }
                 }
-            })
+            }))
             .collect::<Vec<String>>()
     });
     cx.spawn(async move |cx| {

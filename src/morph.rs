@@ -72,6 +72,28 @@ const RADIUS: f32 = 8.0;
 const CAPTION_GUESS: f32 = 32.0;
 /// Room left around the sheet for its shadow, logical px.
 const SHADOW_ROOM: f32 = 72.0;
+
+/// The shadow Windows 11 draws around an active window, logical px:
+/// fitted to its own, measured around the panel and the big window, an
+/// even one all round and a deep one below. Drawn around the flip's sheet
+/// and the clipped panel, so they hand over to Windows' own unseen.
+pub(crate) fn window_shadow() -> [gpui::BoxShadow; 2] {
+    [
+        gpui::BoxShadow {
+            color: gpui::black().opacity(0.33),
+            offset: point(px(0.0), px(-0.5)),
+            blur_radius: px(12.4),
+            spread_radius: px(4.4),
+        },
+        gpui::BoxShadow {
+            color: gpui::black().opacity(0.36),
+            offset: point(px(0.0), px(45.0)),
+            blur_radius: px(20.2),
+            spread_radius: px(0.4),
+        },
+    ]
+}
+
 /// Until the big window has been drawn once: its column header's height,
 /// logical px.
 const HEADER_GUESS: f32 = 110.0;
@@ -123,6 +145,8 @@ struct Seen {
     /// The window's height then, logical px: a part kept to the bottom
     /// (the bottom bar, the pull requests) is placed from there.
     height: f32,
+    /// The window's scale then.
+    scale: f32,
 }
 
 /// Where one view draws a part.
@@ -206,12 +230,17 @@ pub fn tag(
                 return;
             }
             if part == Part::Bar {
-                LAST_PAINT.with(|t| t.set(Some(Instant::now())));
+                let paint = match side {
+                    Side::Panel => &PANEL_PAINT,
+                    Side::Column => &COLUMN_PAINT,
+                };
+                paint.with(|t| t.set(Some(Instant::now())));
             }
             let seen = Seen {
                 bounds,
                 text: text.clone(),
                 height: f32::from(window.viewport_size().height),
+                scale: window.scale_factor(),
             };
             let map = match side {
                 Side::Panel => &PANEL_PARTS,
@@ -246,6 +275,13 @@ pub fn tag_header(path: &Path) -> impl IntoElement {
 pub fn clear_strips() {
     STRIPS.with(|s| s.borrow_mut().clear());
     PANEL_PARTS.with(|s| s.borrow_mut().clear());
+}
+
+/// Forgets the big window's header parts; it is opening afresh, and a
+/// flip back must never land on where an earlier one drew them.
+pub fn clear_column_parts() {
+    COLUMN_PARTS.with(|s| s.borrow_mut().clear());
+    HEADER_AT.with(|s| s.borrow_mut().clear());
 }
 
 /// Notes a column body the big window drew, for the flip.
@@ -331,6 +367,23 @@ pub fn big_settled() {
     SETTLED.with(|s| s.set(Some(Instant::now())));
 }
 
+/// Something asked for while a flip runs, done once it has ended: the
+/// windows the flip is turning between are its own until then, so nothing
+/// opens, closes or moves them under it.
+#[derive(Clone)]
+enum Pending {
+    /// Open the big window (the tray, the badge), through the panel.
+    ShowWindow(crate::panel::Anchor),
+    /// Open the big window from the panel the flip revealed, at a repo.
+    FromPanel(Option<PathBuf>),
+    /// Open or close the panel (the tray, the badge).
+    TogglePanel(crate::panel::Anchor),
+    /// The panel the flip ends in goes again (Esc, a click elsewhere).
+    PanelLeaves,
+    /// The big window the flip ends in closes again (its close button).
+    WindowCloses,
+}
+
 #[derive(Default)]
 struct MorphSlot {
     handle: Option<WindowHandle<MorphView>>,
@@ -338,14 +391,18 @@ struct MorphSlot {
     hwnd: Option<isize>,
     /// When it opened.
     since: Option<Instant>,
-    /// Waiting for the trees to glide back to their newest commits before
-    /// it starts, since then.
+    /// Waiting for the trees to glide back to their newest commits (or the
+    /// panel to be laid out) before it starts, since then.
     waiting: Option<Instant>,
     /// A flip window opened ahead, hidden, while the views glide home.
     spare: Option<WindowHandle<MorphView>>,
     /// The window the flip ends in, cloaked until the reveal, when it
     /// takes over the shadow from the sheet's in one frame.
     ending: Option<isize>,
+    /// Which way the flip runs.
+    direction: Option<Direction>,
+    /// What was asked for meanwhile, in order.
+    pending: Vec<Pending>,
 }
 
 /// Opens a hidden flip window ahead of the flip, so starting it needn't
@@ -388,13 +445,96 @@ fn drop_spare(cx: &mut App) {
 
 impl Global for MorphSlot {}
 
-/// Whether a flip is drawing now.
+/// Whether a flip is drawing now, or about to.
 pub fn running(cx: &App) -> bool {
     cx.try_global::<MorphSlot>().is_some_and(|s| {
         s.waiting.is_some_and(|t| t.elapsed() < STUCK)
             || s.handle.is_some_and(|h| view::is_live(h.into(), cx))
                 && s.since.is_some_and(|t| t.elapsed() < STUCK)
     })
+}
+
+/// Keeps `what` for when the flip under way has ended.
+fn queue(what: Pending, cx: &mut App) {
+    cx.default_global::<MorphSlot>().pending.push(what);
+}
+
+/// The flip has ended (or never started): does what was asked meanwhile.
+fn run_pending(cx: &mut App) {
+    let pending = std::mem::take(&mut cx.default_global::<MorphSlot>().pending);
+    for what in pending {
+        // One may start another flip: the rest wait for that one.
+        if running(cx) {
+            queue(what, cx);
+            continue;
+        }
+        match what {
+            Pending::ShowWindow(anchor) => show_window(anchor, cx),
+            Pending::FromPanel(focus) => {
+                if let Some(handle) = cx
+                    .try_global::<crate::panel::PanelSlot>()
+                    .and_then(|s| s.handle())
+                {
+                    handle
+                        .update(cx, |_, window, cx| open_window(window, focus, cx))
+                        .ok();
+                }
+            }
+            Pending::TogglePanel(anchor) => crate::panel::toggle(anchor, cx),
+            Pending::PanelLeaves => crate::panel::slide_away(cx),
+            Pending::WindowCloses => {
+                if let Some(handle) = view::window_handle(cx) {
+                    handle
+                        .update(cx, |_, window, cx| {
+                            if !flip_back(window, cx) {
+                                window.remove_window();
+                            }
+                        })
+                        .ok();
+                }
+            }
+        }
+    }
+}
+
+/// The panel is asked to toggle (the tray, the badge): true when a flip
+/// under way takes that for after it ends.
+pub fn hold_toggle(anchor: crate::panel::Anchor, cx: &mut App) -> bool {
+    if !running(cx) {
+        return false;
+    }
+    queue(Pending::TogglePanel(anchor), cx);
+    true
+}
+
+/// The panel is to go (Esc, a click elsewhere, focus lost): true when a
+/// flip under way owns it, and lets it go once that ends. A panel the flip
+/// starts from goes with the flip anyway; one it ends in goes after.
+pub fn hold_leave(cx: &mut App) -> bool {
+    let Some(slot) = cx.try_global::<MorphSlot>() else {
+        return false;
+    };
+    if !running(cx) {
+        return false;
+    }
+    // Waiting to start from the panel: the flip is called off, and the
+    // panel goes as asked.
+    if slot.handle.is_none() && slot.direction == Some(Direction::Open) {
+        cx.default_global::<MorphSlot>().direction = None;
+        return false;
+    }
+    let ends_in_panel = matches!(slot.direction, Some(Direction::Close | Direction::Minimize));
+    if ends_in_panel {
+        let slot = cx.default_global::<MorphSlot>();
+        if !slot
+            .pending
+            .iter()
+            .any(|p| matches!(p, Pending::PanelLeaves))
+        {
+            slot.pending.push(Pending::PanelLeaves);
+        }
+    }
+    true
 }
 
 /// How long the trees take to scroll back to their newest commits before
@@ -412,36 +552,81 @@ fn stretch(cx: &App) -> f32 {
 
 /// Glides every tree back to its newest commits, where the flip starts
 /// from: true when they were elsewhere, after which `then` runs once
-/// they're there.
-fn newest_first(from_panel: bool, then: impl FnOnce(&mut App) + 'static, cx: &mut App) -> bool {
+/// they're there and drawn there.
+fn newest_first(direction: Direction, then: impl FnOnce(&mut App) + 'static, cx: &mut App) -> bool {
     let Some(t) = cx.try_global::<Ui>().map(|ui| ui.timelines.clone()) else {
         return false;
     };
+    let from_panel = direction == Direction::Open;
     // A scroll you can follow, paced with the flip: the trees to their
     // newest commits, and the view the flip starts from to its start, the
-    // panel's list to its top or the window's table to its left edge.
+    // panel's list to its top or the window's table to its left edge (and
+    // its pull requests to their top).
     let wait = SCROLL_HOME.mul_f32(stretch(cx));
     let trees = t.update(cx, |t, cx| t.glide_newest(wait, cx));
     let view = view::glide_to_start(from_panel, wait, cx);
     if !trees && !view {
         return false;
     }
-    cx.default_global::<MorphSlot>().waiting = Some(Instant::now());
+    begin_wait(direction, cx);
     open_spare(cx);
+    after_glides(wait, then, cx);
+    true
+}
+
+/// Marks the flip as about to start, so nothing else moves its windows.
+fn begin_wait(direction: Direction, cx: &mut App) {
+    let slot = cx.default_global::<MorphSlot>();
+    slot.waiting = Some(Instant::now());
+    slot.direction = Some(direction);
+}
+
+/// Runs `then` once the glides started for `over` have ended and the
+/// views have drawn their last step: polled each frame or so, never on a
+/// guess of when that is.
+fn after_glides(over: Duration, then: impl FnOnce(&mut App) + 'static, cx: &mut App) {
+    let start = Instant::now();
     cx.spawn(async move |cx| {
-        // A frame more, so the last of the glide is drawn.
-        cx.background_executor()
-            .timer(wait + Duration::from_millis(8))
-            .await;
+        cx.background_executor().timer(over).await;
+        loop {
+            let done = cx
+                .update(|cx| {
+                    let gliding = view::gliding()
+                        || cx
+                            .try_global::<Ui>()
+                            .is_some_and(|ui| ui.timelines.read(cx).gliding());
+                    let drawn = view::last_glide_end()
+                        .is_none_or(|end| last_paint().is_some_and(|t| t > end));
+                    (!gliding && drawn) || start.elapsed() > over + DRAW_WAIT
+                })
+                .unwrap_or(true);
+            if done {
+                break;
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(4))
+                .await;
+        }
         cx.update(|cx| {
+            let called_off = cx.default_global::<MorphSlot>().direction.is_none();
             cx.default_global::<MorphSlot>().waiting = None;
+            if called_off {
+                drop_spare(cx);
+                run_pending(cx);
+                return;
+            }
             then(cx);
-            drop_spare(cx);
+            // `then` may have waited again, for the spare.
+            if cx.default_global::<MorphSlot>().waiting.is_none() {
+                drop_spare(cx);
+            }
+            if !running(cx) {
+                run_pending(cx);
+            }
         })
         .ok();
     })
     .detach();
-    true
 }
 
 /// The flip's HWND while it draws.
@@ -463,31 +648,76 @@ fn enabled(cx: &App) -> bool {
     })
 }
 
+/// A filter typed in one view would be cleared by the other as it opens:
+/// cleared before the flip instead, so the flip turns what that one shows.
+fn clear_filter(cx: &mut App) {
+    if let Some(state) = cx.try_global::<Ui>().map(|ui| ui.state.clone())
+        && !state.read(cx).filter.is_empty()
+    {
+        state.update(cx, |s, cx| {
+            s.filter.clear();
+            cx.notify();
+        });
+    }
+}
+
 /// Opens the big window from the panel, scrolled to `focus` if given, with
 /// the flip when it's on. Called from the panel's own handlers; closes the
 /// panel either way.
 pub fn open_window(panel: &mut Window, focus: Option<PathBuf>, cx: &mut App) {
+    if running(cx) {
+        // The panel a flip back is revealing: once that flip has ended.
+        let back = cx
+            .try_global::<MorphSlot>()
+            .is_some_and(|s| matches!(s.direction, Some(Direction::Close | Direction::Minimize)));
+        if back {
+            queue(Pending::FromPanel(focus), cx);
+        }
+        return;
+    }
+    // A panel still sliding in finishes first, so the flip starts from it
+    // where it rests; one sliding away is going, and takes the click with it.
+    match crate::panel::slide_state(cx) {
+        crate::panel::SlideState::Leaving => return,
+        crate::panel::SlideState::Arriving(left) => {
+            let handle = panel.window_handle();
+            cx.spawn(async move |cx| {
+                cx.background_executor()
+                    .timer(left + Duration::from_millis(20))
+                    .await;
+                handle
+                    .update(cx, |_, window, cx| open_window(window, focus, cx))
+                    .ok();
+            })
+            .detach();
+            return;
+        }
+        crate::panel::SlideState::Still => {}
+    }
     if let Some(path) = &focus
         && let Some(t) = cx.try_global::<Ui>().map(|ui| ui.timelines.clone())
     {
         t.update(cx, |t, _| t.focus(path));
     }
-    if running(cx) {
-        return;
-    }
     let flip = enabled(cx) && !view::window_open(cx);
     if flip {
+        clear_filter(cx);
         let handle = panel.window_handle();
         let again = focus.clone();
         if newest_first(
-            true,
+            Direction::Open,
             move |cx| {
+                // Dismissed meanwhile: it goes, and nothing opens.
+                if !crate::panel::is_open(cx) || crate::panel::is_leaving(cx) {
+                    return;
+                }
                 handle
                     .update(cx, |_, window, cx| open_window(window, again, cx))
                     .ok();
             },
             cx,
         ) {
+            panel.refresh();
             return;
         }
     }
@@ -495,20 +725,29 @@ pub fn open_window(panel: &mut Window, focus: Option<PathBuf>, cx: &mut App) {
         && win::hwnd(panel)
             .and_then(win::client_rect)
             .and_then(|rect| {
-                let plan = plan(rect, panel.scale_factor(), None, focus.as_deref(), cx)?;
+                let plan = plan(rect, None, focus.as_deref(), cx)?;
                 Some(launch(plan, Direction::Open, win::hwnd(panel), cx))
             })
             .unwrap_or(false);
-    if !started {
+    if started {
+        // Its hovered row and buttons lose their hover as it starts, in
+        // the frame before the sheet comes, not while it fades.
+        panel.refresh();
+    } else {
         crate::panel::dismiss(panel, cx);
         view::show_window(cx);
     }
 }
 
 /// Opens the big window from the tray or the badge: through the panel at
-/// `anchor` when the flip is on, else straight away.
+/// `anchor` when the flip is on, else straight away. During a flip, once
+/// it has ended.
 pub fn show_window(anchor: crate::panel::Anchor, cx: &mut App) {
-    if !enabled(cx) || view::window_open(cx) || running(cx) {
+    if running(cx) {
+        queue(Pending::ShowWindow(anchor), cx);
+        return;
+    }
+    if !enabled(cx) || view::window_open(cx) {
         if !view::window_open(cx) {
             crate::panel::close(cx);
         }
@@ -524,36 +763,106 @@ pub fn show_window(anchor: crate::panel::Anchor, cx: &mut App) {
 /// off or can't run, so the caller closes it.
 pub fn flip_back(big: &mut Window, cx: &mut App) -> bool {
     let minimized = win::take_minimized();
-    // Opens there again next time.
-    view::remember_place(big, cx);
     if running(cx) {
-        // Mid-flip; the flip closes it.
+        // Opening into it: closed once it has opened. Closing already:
+        // the flip closes it.
+        let opening = cx
+            .try_global::<MorphSlot>()
+            .is_some_and(|s| s.direction == Some(Direction::Open));
+        if opening
+            && !cx
+                .default_global::<MorphSlot>()
+                .pending
+                .iter()
+                .any(|p| matches!(p, Pending::WindowCloses))
+        {
+            queue(Pending::WindowCloses, cx);
+        }
         return true;
     }
+    // Opens there again next time.
+    view::remember_place(big, cx);
     if !enabled(cx) || crate::panel::guess_place(cx).is_none() {
         return false;
     }
-    // The columns back at their newest commits first; then the flip, or,
-    // should it not start, the window just closes.
+    clear_filter(cx);
+    // The columns back at their newest commits first; then the panel laid
+    // out, hidden, where the flip lands; then the flip, or, should it not
+    // start, the window just closes.
     let handle = big.window_handle();
+    let start = move |cx: &mut App| {
+        let started = handle
+            .update(cx, |_, window, cx| flip_back_now(window, minimized, cx))
+            .unwrap_or(false);
+        if !started {
+            crate::panel::close(cx);
+            view::close_window(cx);
+        }
+    };
     if newest_first(
-        false,
-        move |cx| {
-            let started = handle
-                .update(cx, |_, window, cx| flip_back_now(window, minimized, cx))
-                .unwrap_or(false);
-            if !started {
-                view::close_window(cx);
-            }
+        if minimized {
+            Direction::Minimize
+        } else {
+            Direction::Close
         },
+        move |cx| panel_first(start, cx),
         cx,
     ) {
         return true;
     }
-    flip_back_now(big, minimized, cx)
+    begin_wait(
+        if minimized {
+            Direction::Minimize
+        } else {
+            Direction::Close
+        },
+        cx,
+    );
+    panel_first(start, cx);
+    true
 }
 
-/// Starts the flip back into the panel, the trees at their newest.
+/// Opens the panel the flip back lands in, cloaked, and runs `then` once
+/// it is laid out and drawn as it now is, so the flip lands on it exactly.
+fn panel_first(then: impl FnOnce(&mut App) + 'static, cx: &mut App) {
+    let opened = Instant::now();
+    if !crate::panel::reopen_cloaked(cx) {
+        cx.default_global::<MorphSlot>().waiting = None;
+        then(cx);
+        return;
+    }
+    cx.default_global::<MorphSlot>().waiting = Some(opened);
+    cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(4))
+                .await;
+            let ready = cx
+                .update(|cx| {
+                    let fitted = crate::panel::fitted_at(cx).unwrap_or(opened);
+                    PANEL_PAINT.with(Cell::get).is_some_and(|t| t > fitted)
+                        || opened.elapsed() > DRAW_WAIT
+                })
+                .unwrap_or(true);
+            if ready {
+                break;
+            }
+        }
+        cx.update(|cx| {
+            cx.default_global::<MorphSlot>().waiting = None;
+            then(cx);
+            if !running(cx) {
+                drop_spare(cx);
+                run_pending(cx);
+            }
+        })
+        .ok();
+    })
+    .detach();
+}
+
+/// Starts the flip back into the panel, the trees at their newest and the
+/// panel laid out, cloaked, where the flip lands.
 fn flip_back_now(big: &mut Window, minimized: bool, cx: &mut App) -> bool {
     let Some(panel_rect) = crate::panel::last_rect(cx) else {
         return false;
@@ -561,10 +870,9 @@ fn flip_back_now(big: &mut Window, minimized: bool, cx: &mut App) -> bool {
     let Some(big_rect) = win::hwnd(big).and_then(win::client_rect) else {
         return false;
     };
-    // The panel draws at the primary monitor's scale, like the big window.
-    let ps = big.scale_factor();
-    let scroll = view::table_scroll(cx) * ps;
-    let Some(plan) = plan(panel_rect, ps, Some((big_rect, scroll)), None, cx) else {
+    let ws = big.scale_factor();
+    let scroll = view::table_scroll(cx) * ws;
+    let Some(plan) = plan(panel_rect, Some((big_rect, scroll, ws)), None, cx) else {
         return false;
     };
     let direction = if minimized {
@@ -591,6 +899,15 @@ struct Tree {
     dirty: bool,
     /// Physical px, from the flip window's top-left corner.
     ends: Ends,
+    /// Where the panel draws its strip, and the big window its column's
+    /// body, physical px from the flip window's corner.
+    strip: Bounds<f32>,
+    column: Bounds<f32>,
+    /// How wide the column's tree is, from its left edge, physical px.
+    lanes: f32,
+    /// Where the strip has what only the panel shows (tags and stashes),
+    /// physical px.
+    marks: Vec<Bounds<f32>>,
 }
 
 /// A part's words: text, colour, size in px, and whether bold.
@@ -603,6 +920,10 @@ type Line = (gpui::SharedString, Hsla, f32, f32);
 struct Drawn {
     bounds: Bounds<Pixels>,
     image: Option<Arc<gpui::RenderImage>>,
+    /// A repo with no picture: the dot its icon is, in its status colour.
+    dot: Option<Hsla>,
+    /// A button's fill, as far as it has come.
+    fill: Option<Hsla>,
     words: Option<Line>,
     kind: Kind,
 }
@@ -631,6 +952,9 @@ struct Carried {
     /// The words at each end: text, colour, size and boldness.
     words: Option<(Words, Words)>,
     kind: Kind,
+    /// The big window's Refresh button, which has a fill the panel's
+    /// glyph hasn't: carried with it, there by the window's end.
+    button: bool,
 }
 
 /// Everything a flip draws, laid out.
@@ -650,10 +974,13 @@ struct Plan {
     caption: (f32, f32, f32, f32),
     /// The big window is maximised (or will be): it has no rim.
     maximized: bool,
-    /// The work areas the flip may draw in, physical px from its top-left
-    /// corner: never over a taskbar, which the windows' own shadows stay
-    /// under.
-    work: Bounds<f32>,
+    /// The work areas the flip may draw in, one per monitor, physical px
+    /// from its top-left corner: never over a taskbar, which the windows'
+    /// own shadows stay under.
+    work: Vec<Bounds<f32>>,
+    /// The rim's thickness on the panel and on the big window, physical
+    /// px, as Windows draws each on its monitor.
+    rims: (f32, f32),
     /// The top bar and the bottom bar in each view, physical px.
     bar: Option<(Bounds<f32>, Bounds<f32>)>,
     footer: Option<(Bounds<f32>, Bounds<f32>)>,
@@ -788,13 +1115,13 @@ enum Slid {
 }
 
 /// Lays out a flip between the panel at `panel_rect` (client area,
-/// physical px, drawn at `ps`) and the big window: at `big`'s client rect
-/// with its table scrolled that far (physical px), or where show_window
-/// will open it, scrolled to `focus`. None when nothing would turn.
+/// physical px) and the big window: at `big`'s client rect with its table
+/// scrolled that far (physical px) and drawn at its scale, or where
+/// show_window will open it, scrolled to `focus`. None when nothing would
+/// turn.
 fn plan(
     panel_rect: Rect,
-    ps: f32,
-    big: Option<(Rect, f32)>,
+    big: Option<(Rect, f32, f32)>,
     focus: Option<&Path>,
     cx: &App,
 ) -> Option<Plan> {
@@ -802,23 +1129,36 @@ fn plan(
     let state = ui.state.read(cx);
     let timelines = ui.timelines.read(cx);
     let mut strips = STRIPS.with(|s| s.borrow().clone());
+    let open = big.is_none();
+    // Each view's own scale: the panel's as it last drew (its monitor's),
+    // the big window's as it is, or as the monitor it will open on has it.
+    let ps = PANEL_PARTS
+        .with(|m| {
+            m.borrow()
+                .get(&(app().to_path_buf(), Part::Bar))
+                .map(|s| s.scale)
+        })
+        .unwrap_or_else(|| {
+            let (x, y) = panel_rect.centre();
+            view::sane_scale(win::monitor_at(x, y).scale)
+        });
 
     let cells = view::table_cells(state);
     let lefts = view::cell_lefts(&cells);
-    let repos = cells
-        .iter()
-        .filter(|c| matches!(c, view::Cell::Repo(_)))
-        .count();
+    let table: f32 = cells.iter().map(view::Cell::width).sum();
     let (target, ws) = match big {
-        Some((rect, _)) => (rect, ps),
+        Some((rect, _, ws)) => (rect, ws),
         None => {
-            // Where show_window will put it.
-            let (place, ws) = view::window_place(repos, cx);
+            // Where show_window will put it: GPUI places it at its bounds
+            // in the primary monitor's scale, and a monitor of another
+            // scale then grows or shrinks it about its top-left corner,
+            // to draw at that monitor's scale.
+            let (place, primary) = view::window_place(table, cx);
             let bounds = place.get_bounds();
-            let at = |v: Pixels| (f32::from(v) * ws).round() as i32;
+            let at = |v: Pixels| (f32::from(v) * primary).round() as i32;
             let (area, delta) = match place {
                 WindowBounds::Maximized(_) => (
-                    view::maximized_area(bounds, ws),
+                    view::maximized_area(bounds, primary),
                     MAXIMIZED_DELTA.with(Cell::get).unwrap_or_default(),
                 ),
                 _ => (
@@ -830,6 +1170,18 @@ fn plan(
                     ),
                     CLIENT_DELTA.with(Cell::get).unwrap_or_default(),
                 ),
+            };
+            let (cx_, cy_) = area.centre();
+            let ws = view::sane_scale(win::monitor_at(cx_, cy_).scale);
+            let area = match place {
+                WindowBounds::Maximized(_) => area,
+                _ if (ws - primary).abs() > 0.01 => Rect::new(
+                    area.left,
+                    area.top,
+                    area.left + (f32::from(bounds.size.width) * ws).round() as i32,
+                    area.top + (f32::from(bounds.size.height) * ws).round() as i32,
+                ),
+                _ => area,
             };
             let (dl, dt, dr, db) = delta;
             (
@@ -845,7 +1197,7 @@ fn plan(
     };
 
     // The big window's title bar, above its client area.
-    let maximized = matches!(view::window_place(0, cx).0, WindowBounds::Maximized(_));
+    let maximized = matches!(view::window_place(0.0, cx).0, WindowBounds::Maximized(_));
     let caption = if maximized {
         MAXIMIZED_CAPTION.with(Cell::get)
     } else {
@@ -853,7 +1205,7 @@ fn plan(
     }
     .unwrap_or((0, (CAPTION_GUESS * ws).round() as i32, 0, 0));
     // Room around both for the sheet's shadow.
-    let m = (SHADOW_ROOM * ps).ceil() as i32;
+    let m = (SHADOW_ROOM * ps.max(ws)).ceil() as i32;
     let union = Rect::new(
         panel_rect.left.min(target.left - caption.0) - m,
         panel_rect.top.min(target.top - caption.1) - m,
@@ -866,25 +1218,27 @@ fn plan(
     };
     let (from, to) = (local(panel_rect), local(target));
     // The panel's visible frame: its rim, which Windows draws just outside
-    // its client area, too.
-    let rim = view::rim_width(ps).round();
+    // its client area, too, as thick as on the panel's monitor.
+    let rims = (view::rim_width(ps).round(), view::rim_width(ws).round());
+    let rim = rims.0;
     let from_frame = Bounds {
         origin: point(from.origin.x - rim, from.origin.y - rim),
         size: size(from.size.width + 2.0 * rim, from.size.height + 2.0 * rim),
     };
-    let work = {
-        let (a, b) = (panel_rect.centre(), target.centre());
-        let (a, b) = (
-            win::monitor_at(a.0, a.1).work,
-            win::monitor_at(b.0, b.1).work,
-        );
-        local(Rect::new(
-            a.left.min(b.left),
-            a.top.min(b.top),
-            a.right.max(b.right),
-            a.bottom.max(b.bottom),
-        ))
-    };
+    // Every monitor's work area the flip reaches into, each on its own:
+    // never over a taskbar, wherever the monitors sit.
+    let work: Vec<Bounds<f32>> = win::work_areas()
+        .into_iter()
+        .filter_map(|w| {
+            let w = Rect::new(
+                w.left.max(union.left),
+                w.top.max(union.top),
+                w.right.min(union.right),
+                w.bottom.min(union.bottom),
+            );
+            (w.width() > 0 && w.height() > 0).then(|| local(w))
+        })
+        .collect();
     // In the panel, logical px to the flip window's physical px.
     let in_panel = |b: &Bounds<Pixels>| Bounds {
         origin: point(
@@ -896,7 +1250,7 @@ fn plan(
 
     // The table's scroll: as it is, or bringing the focused column in.
     let mut scroll = match big {
-        Some((_, scroll)) => scroll,
+        Some((_, scroll, _)) => scroll,
         None => focus
             .and_then(|f| view::cell_of(&cells, f))
             .map_or(0.0, |i| {
@@ -961,9 +1315,10 @@ fn plan(
                 .zip(cells.last())
                 .map_or(0.0, |(l, c)| l + c.width());
             let wide = to.size.width / ws;
+            // With the spines just before it: its own section's, and any
+            // folded ones above it, which the panel shows as headings.
             let x = match topmost.and_then(|s| cell_of_repo(&s.path)) {
-                Some(i) if i > 0 && matches!(cells[i - 1], view::Cell::Spine(..)) => lefts[i - 1],
-                Some(i) => lefts[i],
+                Some(i) => lefts[first_of_run(&cells, i)],
                 None => 0.0,
             };
             let x = x.min(total - wide).max(0.0);
@@ -991,9 +1346,11 @@ fn plan(
                 _ => None,
             });
             if let Some(b) = leftmost.and_then(|s| strip_of.get(s.path.as_path())) {
-                // Its section's heading too, when it heads it.
+                // The headings just above it too: its section's, and any
+                // folded ones before it, which the window shows as spines.
                 let i = leftmost.and_then(|s| cell_of_repo(&s.path)).unwrap_or(0);
-                let heading = match (i > 0).then(|| cells[i - 1]) {
+                let j = first_of_run(&cells, i);
+                let heading = match (j < i).then(|| cells[j]) {
                     Some(view::Cell::Spine(section, _)) => panel_parts
                         .get(&(app().to_path_buf(), Part::Heading(section)))
                         .map(|h| f32::from(h.bounds.origin.y)),
@@ -1045,7 +1402,12 @@ fn plan(
 
     for (cell, left) in cells.iter().zip(&lefts) {
         // Past the big window's edges too: a column out of sight still
-        // takes its tree, which turns out of the sheet's side.
+        // takes its tree, which turns out of the sheet's side. Exactly
+        // where the window draws it: GPUI lays the columns out on whole
+        // logical px and scrolls them by the unrounded offset, so at a
+        // fractional scale a column can sit between device px, and its
+        // tree snaps to them as it does (`ink::pos`). Rounding here put
+        // trees a px off.
         let x = to.origin.x + left * ws - scroll;
         match *cell {
             view::Cell::Repo(status) => {
@@ -1088,7 +1450,7 @@ fn plan(
                     // the one that did, for a repo out of the other's
                     // sight (where nobody sees them change).
                     let words = match (a, column_parts.get(&key)) {
-                        (Some(a), Some(b)) => same_words(a, b),
+                        (Some(a), Some(b)) => carried_words(a, b, open, part),
                         (Some(one), None) | (None, Some(one)) => {
                             one.text.clone().map(|w| (w.clone(), w))
                         }
@@ -1124,18 +1486,35 @@ fn plan(
                         } else {
                             Kind::Words
                         },
+                        button: false,
                     });
                 }
+                let mut marks = crate::timeline::strip_marks(strip, &graph, status.dirty);
+                // The edge in the status colour along a repo that needs
+                // something, which only the panel draws: faded with the
+                // sheet, not dropped as the turn starts.
+                if !status.is_synced() && !status.remote_only {
+                    marks.push(crate::timeline::status_edge(strip).dilate(px(1.0)));
+                }
+                let marks = marks.iter().map(&in_panel).collect();
                 let strip = in_panel(&strip);
                 let newest = strip.origin.x + strip.size.width - crate::timeline::STRIP_PAD * ps;
+                let column_len = (to.size.height - body_top).max(0.0);
                 trees.push(Tree {
+                    strip,
+                    marks,
+                    column: Bounds {
+                        origin: point(x, to.origin.y + body_top),
+                        size: size(COLUMN_WIDTH * ws, column_len),
+                    },
+                    lanes: crate::timeline::tree_width(&graph, status.dirty) * ws,
                     graph,
                     dirty: status.dirty,
                     ends: Ends {
                         strip: (newest, strip.origin.y + strip.size.height / 2.0),
                         strip_len: newest - strip.origin.x,
                         column: (x, to.origin.y + body_top),
-                        column_len: (to.size.height - body_top).max(0.0),
+                        column_len,
                     },
                 });
             }
@@ -1202,7 +1581,7 @@ fn plan(
         let Some((a, b)) = both(part) else {
             continue;
         };
-        let words = same_words(a, b);
+        let words = carried_words(a, b, open, part);
         let kind = match part {
             Part::Health => Kind::Health(health),
             // A glyph in the middle of its button.
@@ -1218,6 +1597,7 @@ fn plan(
             tree: None,
             words,
             kind,
+            button: part == Part::Refresh,
         });
     }
     // The bars that slide: each view's body runs from under its top bar to
@@ -1285,7 +1665,8 @@ fn plan(
                         .get(&key(Part::Label(section)))
                         .zip(on_spine(Part::Label(section)))
                         .and_then(|(a, (z, z_at))| {
-                            let ((text, color, a_size, _), (_, _, z_size, _)) = same_words(a, z)?;
+                            let ((text, color, a_size, _), (_, _, z_size, _)) =
+                                carried_words(a, z, open, Part::Label(section))?;
                             Some(TurnWords {
                                 text,
                                 color,
@@ -1350,6 +1731,7 @@ fn plan(
         ),
         maximized,
         work,
+        rims,
         bar,
         footer,
         trees,
@@ -1360,6 +1742,15 @@ fn plan(
         list_to,
         focus_to,
     })
+}
+
+/// The first of the cells just before `i` that are spines, or `i`.
+fn first_of_run(cells: &[view::Cell], i: usize) -> usize {
+    let mut j = i;
+    while j > 0 && matches!(cells[j - 1], view::Cell::Spine(..)) {
+        j -= 1;
+    }
+    j
 }
 
 /// Strips as the panel drew them, with the ones it didn't filled in: rows
@@ -1397,13 +1788,31 @@ fn fill_rows(known: &[Option<Bounds<Pixels>>]) -> Vec<Option<Bounds<Pixels>>> {
         .collect()
 }
 
-/// A part's words at each end, when both say the same: words that differ
-/// aren't carried but fade with their own view, before or after the turn.
-fn same_words(a: &Seen, b: &Seen) -> Option<(Words, Words)> {
-    a.text
-        .clone()
-        .zip(b.text.clone())
-        .filter(|(a, b)| a.0 == b.0)
+/// A part's words at each end, the panel's `a` and the window's `b`. The
+/// view the flip ends in last drew them a while ago, while the one it
+/// starts from drew them just now, from the same state: its words and
+/// their colour are carried, each view's size and weight. (Both views say
+/// the same thing in the same colour, but for the checkout, which the
+/// panel mutes.)
+fn carried_words(a: &Seen, b: &Seen, open: bool, part: Part) -> Option<(Words, Words)> {
+    let (wa, wb) = a.text.clone().zip(b.text.clone())?;
+    // A button shows its own glyph or words at each end (↻ in the panel,
+    // "Refresh now" in the window): never one view's in the other's box.
+    if matches!(part, Part::Settings | Part::Refresh) {
+        return Some((wa, wb));
+    }
+    let now = if open { &wa } else { &wb };
+    let (text, color) = (now.0.clone(), now.1);
+    let keep_color = matches!(part, Part::Checkout | Part::Label(_));
+    Some((
+        (
+            text.clone(),
+            if keep_color { wa.1 } else { color },
+            wa.2,
+            wa.3,
+        ),
+        (text, if keep_color { wb.1 } else { color }, wb.2, wb.3),
+    ))
 }
 
 /// Opens the flip's window for `plan`. False if it couldn't.
@@ -1416,7 +1825,16 @@ fn launch(plan: Plan, direction: Direction, from: Option<isize>, cx: &mut App) -
     }
     if let Some(y) = plan.list_to {
         view::scroll_list_to(y);
+        // The panel the flip back lands in is laid out already, cloaked:
+        // scrolled there now.
+        if let Some(handle) = cx
+            .try_global::<crate::panel::PanelSlot>()
+            .and_then(|s| s.handle())
+        {
+            handle.update(cx, |_, window, _| window.refresh()).ok();
+        }
     }
+    cx.default_global::<MorphSlot>().direction = Some(direction);
     crate::frames::start(union, cx);
     crate::frames::frame("before");
     let mut plan = Some(plan);
@@ -1483,6 +1901,10 @@ fn launch(plan: Plan, direction: Direction, from: Option<isize>, cx: &mut App) -
             cx.new(|_| {
                 let mut view = MorphView::new(plan.take(), direction, stretch, win::hwnd(window));
                 view.from = from;
+                // Placed again as it first draws: shown on a monitor of
+                // another scale, Windows resizes it for that, and it must
+                // cover the flip's place exactly.
+                view.show_at = Some(union);
                 view
             })
         },
@@ -1559,8 +1981,16 @@ impl MorphView {
 }
 
 thread_local! {
-    /// When a panel or big window last drew its top bar.
-    static LAST_PAINT: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// When the panel and the big window last drew their top bars.
+    static PANEL_PAINT: Cell<Option<Instant>> = const { Cell::new(None) };
+    static COLUMN_PAINT: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// When either view last drew.
+fn last_paint() -> Option<Instant> {
+    PANEL_PAINT
+        .with(Cell::get)
+        .max(COLUMN_PAINT.with(Cell::get))
 }
 
 /// The longest the flip waits for the window it ends in to draw.
@@ -1578,6 +2008,9 @@ pub(crate) fn ease(t: f32) -> f32 {
 
 /// How far `elapsed` is into the phase that starts `at` and lasts `len`.
 fn phase(elapsed: Duration, at: Duration, len: Duration) -> f32 {
+    if len.is_zero() {
+        return if elapsed >= at { 1.0 } else { 0.0 };
+    }
     (elapsed.saturating_sub(at).as_secs_f32() / len.as_secs_f32()).clamp(0.0, 1.0)
 }
 
@@ -1600,6 +2033,56 @@ fn snapped(b: Bounds<Pixels>, s: f32) -> Bounds<Pixels> {
     Bounds::new(point(px(l), px(t)), size(px(rt - l), px(bt - t)))
 }
 
+/// A tree as a frame draws it: its graph, whether dirty, its ends as it
+/// turns, and where the strip and the column body rest, logical px.
+type FlipTree = (
+    Arc<crate::repo_graph::RepoGraph>,
+    bool,
+    Ends,
+    Bounds<Pixels>,
+    Bounds<Pixels>,
+);
+
+/// `r` less each of `holes`: the pieces left, which don't overlap.
+fn cut_out(r: Bounds<Pixels>, holes: &[Bounds<Pixels>]) -> Vec<Bounds<Pixels>> {
+    let mut pieces = vec![r];
+    for h in holes {
+        let mut next = Vec::with_capacity(pieces.len() + 4);
+        for p in pieces {
+            let (l, t) = (p.left().max(h.left()), p.top().max(h.top()));
+            let (rt, b) = (p.right().min(h.right()), p.bottom().min(h.bottom()));
+            if rt <= l || b <= t {
+                next.push(p);
+                continue;
+            }
+            let mut push = |x0: Pixels, y0: Pixels, x1: Pixels, y1: Pixels| {
+                if x1 > x0 && y1 > y0 {
+                    next.push(Bounds::new(point(x0, y0), size(x1 - x0, y1 - y0)));
+                }
+            };
+            // Above and below the hole, full width; beside it, its height.
+            push(p.left(), p.top(), p.right(), t);
+            push(p.left(), b, p.right(), p.bottom());
+            push(p.left(), t, l, b);
+            push(rt, t, p.right(), b);
+        }
+        pieces = next;
+    }
+    pieces
+}
+
+/// The part of `a` inside `b`, if any.
+fn overlap(a: Bounds<Pixels>, b: Bounds<Pixels>) -> Option<Bounds<Pixels>> {
+    let (l, t) = (a.left().max(b.left()), a.top().max(b.top()));
+    let (r, bt) = (a.right().min(b.right()), a.bottom().min(b.bottom()));
+    (r > l && bt > t).then(|| Bounds::new(point(l, t), size(r - l, bt - t)))
+}
+
+/// Physical px from the flip window's corner as logical px at `s`.
+fn logical_at(b: Bounds<f32>, s: f32) -> Bounds<Pixels> {
+    lerp_bounds(b, b, 0.0, s)
+}
+
 impl Render for MorphView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.hiding {
@@ -1620,6 +2103,12 @@ impl Render for MorphView {
         self.frames += 1;
         if self.frames == 2 {
             self.start = Instant::now();
+            // Drawn in place of the windows, it takes the clicks meant for
+            // them, rather than letting them through to whatever is behind.
+            if let Some(h) = self.hwnd {
+                cx.spawn(async move |_, _| unsafe { win::click_through(h, false) })
+                    .detach();
+            }
         }
         let elapsed = if self.frames < 2 {
             Duration::ZERO
@@ -1629,11 +2118,21 @@ impl Render for MorphView {
         let k = self.stretch;
         let (fade, turn, reveal_len) = (FADE.mul_f32(k), TURN.mul_f32(k), REVEAL.mul_f32(k));
         let slide = SLIDE.mul_f32(k);
-        // The fade and the slide out run together, so the turn follows the
-        // glide home at once.
-        let turn_at = fade;
-        let hold_at = turn_at + turn;
         let open = self.direction == Direction::Open;
+        // What the starting view alone shows slides out first, over that
+        // view still on screen and with the sheet clear, as long as what
+        // the ending view alone shows slides in at the other end; then the
+        // sheet fades in, and turns.
+        let in_panel =
+            |sl: &Slider| matches!(sl.what, Slid::Prs(view::Mode::Panel) | Slid::Heading(_));
+        let slide_out = if self.p().sliders.iter().any(|sl| in_panel(sl) == open) {
+            slide
+        } else {
+            Duration::ZERO
+        };
+        let fade_at = slide_out;
+        let turn_at = fade_at + fade;
+        let hold_at = turn_at + turn;
         // The reveal waits for the window underneath to have drawn, so it
         // never shows that window empty.
         if self.reveal_from.is_none()
@@ -1647,8 +2146,9 @@ impl Render for MorphView {
             } else {
                 Some(arrived)
             };
+            let painted = if open { &COLUMN_PAINT } else { &PANEL_PAINT };
             let drawn = ready
-                .zip(LAST_PAINT.with(Cell::get))
+                .zip(painted.with(Cell::get))
                 .is_some_and(|(r, t)| t > r.max(arrived + Duration::from_millis(30)));
             // And the slide in has ended.
             if since >= slide.max(HOLD) && (since >= DRAW_WAIT || drawn) {
@@ -1659,7 +2159,17 @@ impl Render for MorphView {
                 // a drawn frame reaches the screen.
                 self.framed.1 = self.frames;
                 if let Some(h) = cx.default_global::<MorphSlot>().ending.take() {
-                    window.on_next_frame(move |_, _| win::uncloak(h));
+                    window.on_next_frame(move |_, _| {
+                        win::uncloak(h);
+                        // In front of whatever a click during the flip
+                        // may have brought up.
+                        win::to_front(h);
+                    });
+                }
+                // The window revealed under it takes clicks from now.
+                if let Some(h) = self.hwnd {
+                    cx.spawn(async move |_, _| unsafe { win::click_through(h, true) })
+                        .detach();
                 }
             }
         }
@@ -1674,10 +2184,10 @@ impl Render for MorphView {
                 "hold"
             } else if elapsed >= turn_at {
                 "turn"
-            } else if elapsed >= fade {
-                "slide"
-            } else {
+            } else if elapsed >= fade_at {
                 "fade"
+            } else {
+                "slide"
             }
         ));
 
@@ -1685,11 +2195,13 @@ impl Render for MorphView {
             self.left = true;
             // The starting window vanishes, its shadow too, as this frame,
             // which draws the sheet's shadow, shows: never both, or
-            // neither. It stays open (and active) until the ending window
+            // neither. A cloak takes effect a frame sooner than a drawn
+            // frame reaches the screen, so it's cloaked as the next frame
+            // starts. It stays open (and active) until the ending window
             // opens, so that one comes to the front.
             self.framed.0 = self.frames;
             match self.from {
-                Some(h) => win::cloak(h),
+                Some(h) => window.on_next_frame(move |_, _| win::cloak(h)),
                 None if open => cx.defer(crate::panel::close),
                 None => cx.defer(view::close_window),
             }
@@ -1701,12 +2213,9 @@ impl Render for MorphView {
             let cloaked = self.from.is_some();
             if open {
                 cx.defer(move |cx| {
-                    view::show_window(cx);
-                    let h = view::window_hwnd(cx);
-                    if let Some(h) = h {
-                        win::cloak(h);
-                    }
-                    cx.default_global::<MorphSlot>().ending = h;
+                    // Cloaked as it's made, before Windows ever shows it.
+                    view::show_window_cloaked(cx);
+                    cx.default_global::<MorphSlot>().ending = view::window_hwnd(cx);
                     if cloaked {
                         crate::panel::close(cx);
                     }
@@ -1714,20 +2223,38 @@ impl Render for MorphView {
             } else {
                 let me = self.hwnd;
                 cx.defer(move |cx| {
-                    crate::panel::reopen(cx);
-                    let h = crate::panel::hwnd(cx);
-                    if let Some(h) = h {
-                        win::cloak(h);
+                    // Opened, cloaked and drawn before the flip began; again
+                    // here only should that have failed.
+                    if !crate::panel::is_open(cx) {
+                        crate::panel::reopen_cloaked(cx);
                     }
-                    cx.default_global::<MorphSlot>().ending = h;
+                    // The big window is off the screen: the panel takes
+                    // the keyboard, out of sight.
+                    crate::panel::activate(cx);
+                    cx.default_global::<MorphSlot>().ending = crate::panel::hwnd(cx);
                     if cloaked {
                         view::close_window(cx);
                     }
-                    // The panel goes topmost as it opens; the flip stays
-                    // over it until the reveal.
+                    // The panel is topmost; the flip stays over it until
+                    // the reveal.
                     if let Some(h) = me {
                         cx.spawn(async move |_| unsafe { win::reassert_topmost(h) })
                             .detach();
+                    }
+                    // The reveal waits for the panel to draw once it is in
+                    // place; with nothing changed it wouldn't, and the flip
+                    // would sit out its whole wait.
+                    if let Some(panel) = cx
+                        .try_global::<crate::panel::PanelSlot>()
+                        .and_then(|s| s.handle())
+                    {
+                        cx.spawn(async move |cx| {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(40))
+                                .await;
+                            panel.update(cx, |_, _, cx| cx.notify()).ok();
+                        })
+                        .detach();
                     }
                 });
             }
@@ -1751,39 +2278,56 @@ impl Render for MorphView {
             })
             .detach();
             crate::frames::finish(cx);
+            // The flip has ended: the windows are the app's again, and
+            // what was asked for meanwhile is done now.
+            let close = self.direction == Direction::Close;
+            let slot = cx.default_global::<MorphSlot>();
+            slot.handle = None;
+            slot.since = None;
+            slot.hwnd = None;
+            slot.ending = None;
+            slot.direction = None;
+            if close {
+                // It goes anyway.
+                slot.pending.retain(|p| !matches!(p, Pending::PanelLeaves));
+            }
             if let Some(x) = self.p().focus_to {
                 let over = SCROLL_HOME.mul_f32(self.stretch);
                 cx.defer(move |cx| {
                     view::glide_table_to(x, over, cx);
                 });
             }
-            if self.direction == Direction::Close {
+            if close {
                 // Back in the panel, which then goes the way it came.
-                cx.defer(crate::panel::slide_away);
+                cx.defer(crate::panel::slide_away_now);
             }
+            cx.defer(run_pending);
             window.request_animation_frame();
             return div();
         }
 
-        let sheet_alpha = ease(phase(elapsed, Duration::ZERO, fade));
+        let sheet_alpha = ease(phase(elapsed, fade_at, fade));
         let turned = ease(phase(elapsed, turn_at, turn));
         // 0 is the panel's layout, 1 the big window's.
         let e = if open { turned } else { 1.0 - turned };
         let reveal = 1.0 - ease(phase(revealed, Duration::ZERO, reveal_len));
         // The sheet's own fills: faded in over the starting window and out
-        // over the ending one. Everything both views show (words, icons,
-        // trees, the health bar) is drawn whole all through, right over
-        // its twin in the window beneath, so it never fades or blinks;
-        // only what one view alone shows fades in or out.
+        // over the ending one.
         let fill = sheet_alpha * reveal;
         self.drew = (e, fill);
         // The windows' own shadow, drawn around the sheet while neither
         // window is on screen to show its own.
-        let framed = if (self.framed.0..self.framed.1).contains(&self.frames) {
-            1.0
-        } else {
-            0.0
-        };
+        let framed = (self.framed.0..self.framed.1).contains(&self.frames);
+        // A window is on screen under the sheet: the starting one before
+        // the turn, the ending one in the reveal.
+        let real = !framed;
+        let still = e <= 0.0 || e >= 1.0;
+        let at_end = e >= 1.0;
+        // Over a window on screen, the sheet fades in or out only what
+        // the two views draw differently; where they draw the same (the
+        // carried words and icons, the trees, the labelled headings) the
+        // window's own shows through, so nothing there is drawn twice.
+        let through = still && real;
         let appearance = window.appearance();
         let dark = matches!(
             appearance,
@@ -1791,6 +2335,9 @@ impl Render for MorphView {
         );
         let p = Palette::for_appearance(appearance);
         let s = window.scale_factor();
+        let scroll_together = cx
+            .try_global::<Ui>()
+            .is_some_and(|ui| ui.state.read(cx).config.scroll_together);
         // The sheet grows to the big window's whole visible frame, title
         // bar and border too, so its rim lands where Windows draws that
         // window's own.
@@ -1805,7 +2352,15 @@ impl Render for MorphView {
         // On whole physical px, so its rim stays crisp and even rather
         // than smearing across two px as it moves.
         let sheet = snapped(lerp_bounds(self.p().from_frame, to_sheet, e, s), s);
-        let work = lerp_bounds(self.p().work, self.p().work, 0.0, s);
+        // A maximised window is square: the corners straighten as the
+        // sheet grows into it.
+        let radius = if self.p().maximized {
+            px(RADIUS * (1.0 - e))
+        } else {
+            px(RADIUS)
+        };
+        // One clip per monitor's work area: never over a taskbar.
+        let work: Vec<Bounds<Pixels>> = self.p().work.iter().map(|w| logical_at(*w, s)).collect();
 
         // The sheet in bands, top to bottom, each its view's colour: the
         // title bar (as tall as the turn has gone), the top bar, the body
@@ -1839,23 +2394,91 @@ impl Render for MorphView {
             bands.push((band(edge, bar_end), p.border));
         }
         let body = band(bar_end, footer_at);
+        bands.push((body, p.surface));
         if self.p().footer.is_some() {
             let edge = (footer_at + line).min(bottom);
             bands.push((band(footer_at, edge), p.border));
             bands.push((band(edge, bottom), p.bg));
         }
 
-        // The rim is drawn from the first frame to the last, right over the
-        // windows' own of the same colour and thickness at either end, so
-        // it never blinks: the sheet covers the starting window's own as
-        // it fades in. A maximised big window has none: there it fades
-        // with that window, in before the turn or out after it.
-        let rim_alpha = match (self.p().maximized, open) {
-            (true, false) => sheet_alpha,
-            (true, true) => reveal,
-            (false, _) => 1.0,
-        };
-        let trees: Vec<(Arc<crate::repo_graph::RepoGraph>, bool, Ends, f32)> = self
+        // Where the window on screen shows through, and, inside that,
+        // what the sheet still fades: tags and stashes, which only the
+        // panel draws, and the big window's row lines across its trees.
+        let mut holes = Vec::new();
+        let mut cuts = Vec::new();
+        if through {
+            let pick = |a: Bounds<f32>, z: Bounds<f32>| {
+                snapped(logical_at(if at_end { z } else { a }, s), s)
+            };
+            for c in &self.p().parts {
+                holes.push(pick(c.from, c.to));
+            }
+            for t in &self.p().turning {
+                if t.label.is_some() {
+                    holes.push(pick(t.from, t.to));
+                }
+            }
+            // In the reveal, the bars that slid in rest in the window too.
+            if self.arrived.is_some() {
+                for sl in self.p().sliders.iter().filter(|sl| in_panel(sl) != open) {
+                    holes.push(snapped(logical_at(sl.at, s), s));
+                }
+            }
+            for t in &self.p().trees {
+                if at_end {
+                    let mut lanes = t.column;
+                    lanes.size.width = t.lanes.min(lanes.size.width);
+                    let hole = snapped(logical_at(lanes, s), s);
+                    holes.push(hole);
+                    if scroll_together {
+                        let h = f32::from(hole.size.height);
+                        for y in crate::timeline::row_line_tops(h) {
+                            let y = f32::from(hole.top()) + y;
+                            cuts.push(snapped(
+                                Bounds::new(
+                                    point(hole.left(), px(y - 1.0)),
+                                    size(hole.size.width, px(3.0)),
+                                ),
+                                s,
+                            ));
+                        }
+                    }
+                } else {
+                    let strip = logical_at(t.strip, s);
+                    let bleed = px(crate::timeline::BLEED);
+                    holes.push(snapped(
+                        Bounds::new(
+                            point(strip.left(), strip.top() - bleed),
+                            size(strip.size.width, strip.size.height + bleed * 2.0),
+                        ),
+                        s,
+                    ));
+                    cuts.extend(t.marks.iter().map(|m| snapped(logical_at(*m, s), s)));
+                }
+            }
+        }
+        // Each band less the holes, with its colour as faded.
+        let band_pieces: Vec<(Bounds<Pixels>, Hsla)> = bands
+            .iter()
+            .flat_map(|(b, color)| {
+                let color = color.opacity(fill);
+                cut_out(*b, &holes)
+                    .into_iter()
+                    .map(move |piece| (piece, color))
+            })
+            .collect();
+        let cuts: Vec<Bounds<Pixels>> = cuts.into_iter().filter_map(|c| overlap(c, body)).collect();
+
+        // The rim, as thick as Windows draws each window's own on its
+        // monitor. Over a window on screen it fades with the sheet, over
+        // that window's own; a maximised window has none, so there it
+        // goes as the sheet grows into that window.
+        let rims = self.p().rims;
+        let rim_px = (rims.0 + (rims.1 - rims.0) * e).round() / s;
+        let rim_alpha =
+            if real { fill } else { 1.0 } * if self.p().maximized { 1.0 - e } else { 1.0 };
+
+        let trees: Vec<FlipTree> = self
             .p()
             .trees
             .iter()
@@ -1867,7 +2490,13 @@ impl Render for MorphView {
                     column: k(t.ends.column),
                     column_len: t.ends.column_len / s,
                 };
-                (t.graph.clone(), t.dirty, ends, 1.0)
+                (
+                    t.graph.clone(),
+                    t.dirty,
+                    ends,
+                    logical_at(t.strip, s),
+                    logical_at(t.column, s),
+                )
             })
             .collect();
 
@@ -1881,6 +2510,7 @@ impl Render for MorphView {
             .p()
             .turning
             .iter()
+            .filter(|t| !(through && t.label.is_some()))
             .map(|t| {
                 let tint = view::section_tint(t.section, &p);
                 // Carried whole when its words are: opaque, over its twin
@@ -1888,7 +2518,7 @@ impl Render for MorphView {
                 let wash = if t.label.is_some() {
                     p.surface.blend(tint)
                 } else {
-                    tint.opacity(tint.a * fill)
+                    tint.opacity(fill)
                 };
                 let (a, z) = (t.from, t.to);
                 // Each end's arrow: the heading's points down when open,
@@ -1899,35 +2529,34 @@ impl Render for MorphView {
                     ('▾', '▸')
                 };
                 let (arrow_size_a, arrow_size_z) = (14.0, view::SPINE_TEXT);
-                if e <= 0.0 || e >= 1.0 {
-                    let end = e >= 1.0;
-                    let b = if end { z } else { a };
-                    let still = snapped(lerp_bounds(b, b, 0.0, s), s);
+                if still {
+                    let b = if at_end { z } else { a };
+                    let still = snapped(logical_at(b, s), s);
                     // The spine's edge line, as the window draws it.
-                    let border = end.then(|| {
+                    let border = at_end.then(|| {
                         Bounds::new(
                             point(still.right() - px(1.0), still.top()),
                             size(px(1.0), still.size.height),
                         )
                     });
                     let label = t.label.as_ref().map(|w| {
-                        let at = if end { w.at.1 } else { w.at.0 };
-                        let at = lerp_bounds(at, at, 0.0, s);
-                        if end {
+                        let at = if at_end { w.at.1 } else { w.at.0 };
+                        let at = logical_at(at, s);
+                        if at_end {
                             BarWords::Turned(at, w.text.to_string(), w.size.1, w.color)
                         } else {
                             BarWords::Upright(at, (w.text.clone(), w.color, w.size.0, 400.0))
                         }
                     });
                     let arrow = t.arrow.map(|(aa, zz)| {
-                        let at = if end { zz } else { aa };
-                        let (c, size) = if end {
+                        let at = if at_end { zz } else { aa };
+                        let (c, size) = if at_end {
                             (arrow_z, arrow_size_z)
                         } else {
                             (arrow_a, arrow_size_a)
                         };
                         BarWords::Upright(
-                            lerp_bounds(at, at, 0.0, s),
+                            logical_at(at, s),
                             (c.to_string().into(), muted, size, 400.0),
                         )
                     });
@@ -1975,16 +2604,22 @@ impl Render for MorphView {
                 let label = t.label.as_ref().map(|w| {
                     let (la, lz) = w.at;
                     let size = mix(w.size.0, w.size.1);
-                    // Where each starts, on the middle of its line.
+                    // Where each starts, on the middle of its line: the
+                    // spine's picture sets its pen one device px above
+                    // its box's bottom.
                     let start = carry(
                         (la.origin.x, la.origin.y + la.size.height / 2.0),
                         (
                             lz.origin.x + lz.size.width / 2.0,
-                            lz.origin.y + lz.size.height - s,
+                            lz.origin.y + lz.size.height - 1.0,
                         ),
                     );
                     let m = crate::glyph_path::middle(size);
-                    let baseline = (start.0 - m * up.0, start.1 - m * up.1);
+                    // On whole device px, as both ends' words are: the
+                    // turn starts and ends where they sit, with no half-px
+                    // step as the renderer changes over.
+                    let snap = |v: f32| (v * s).round() / s;
+                    let baseline = (snap(start.0 - m * up.0), snap(start.1 - m * up.1));
                     BarWords::Path(w.text.to_string(), size, baseline, dir, up, w.color)
                 });
                 let arrow = t.arrow.map(|(aa, zz)| {
@@ -2006,7 +2641,8 @@ impl Render for MorphView {
                     let start = (c.0 - gx * dir.0 - gy * up.0, c.1 - gx * dir.1 - gy * up.1);
                     BarWords::Path(arrow_a.to_string(), size, start, dir, up, muted)
                 });
-                // The spine's edge line, drawn as it turns into place.
+                // The spine's edge line, whole as it turns: it rides the
+                // bar, which covers its ends' own.
                 let line = 1.0;
                 let border = [
                     pt(at(0.0, half - line)),
@@ -2022,7 +2658,7 @@ impl Render for MorphView {
                             pt(at(len, half)),
                             pt(at(0.0, half)),
                         ],
-                        Some((border, p.border.opacity(p.border.a * e))),
+                        Some((border, p.border)),
                     ),
                     wash,
                     border: None,
@@ -2033,248 +2669,132 @@ impl Render for MorphView {
             .collect();
 
         // The parts both views show, moving and growing from one to the
-        // other, over the sheet.
+        // other, over the sheet; over a window on screen, its own show.
         // A check under way dims the health bar, in the views and here.
         let checking = cx
             .try_global::<Ui>()
             .is_some_and(|ui| ui.state.read(cx).sweeping);
-        let parts: Vec<Drawn> = self
-            .p()
-            .parts
-            .iter()
-            .map(|c| {
-                let image = match &c.kind {
-                    Kind::Icon(st) => {
-                        let a = c.from.size.width.round() as u32;
-                        let z = c.to.size.width.round() as u32;
-                        crate::repo_marks::picture(st, &[a.max(z), a.min(z)], cx)
-                    }
-                    _ => None,
-                };
-                // The same words at both ends: their size, colour and
-                // weight move from one view's to the other's.
-                let words = c.words.as_ref().map(|(a, z)| {
-                    let color = Hsla {
-                        h: if e < 0.5 { a.1.h } else { z.1.h },
-                        s: mix(a.1.s, z.1.s),
-                        l: mix(a.1.l, z.1.l),
-                        a: mix(a.1.a, z.1.a),
+        let parts: Vec<Drawn> = if through {
+            Vec::new()
+        } else {
+            self.p()
+                .parts
+                .iter()
+                .map(|c| {
+                    let (image, dot) = match &c.kind {
+                        Kind::Icon(st) => {
+                            let a = c.from.size.width.round() as u32;
+                            let z = c.to.size.width.round() as u32;
+                            let sides = [a.max(z), a.min(z)];
+                            let image = crate::repo_marks::picture(st, &sides, cx);
+                            let dot = (image.is_none()
+                                && crate::repo_marks::shows_dot(st, &sides, cx))
+                            .then(|| view::status_color(st, &p));
+                            (image, dot)
+                        }
+                        _ => (None, None),
                     };
-                    let weight = |bold: bool| if bold { 600.0 } else { 400.0 };
-                    (
-                        a.0.clone(),
-                        color,
-                        mix(a.2, z.2),
-                        mix(weight(a.3), weight(z.3)),
-                    )
-                });
-                // Riding with its tree: where it sits in the tree's frame
-                // at each end, blended, in the tree's frame now.
-                let bounds = match c.tree.and_then(|i| trees.get(i)) {
-                    Some((_, _, ends, _)) if e > 0.0 && e < 1.0 => {
-                        let centre = |b: Bounds<f32>| {
-                            (
-                                (b.origin.x + b.size.width / 2.0) / s,
-                                (b.origin.y + b.size.height / 2.0) / s,
-                            )
+                    // The same words at both ends: their size, colour and
+                    // weight move from one view's to the other's.
+                    let words = c.words.as_ref().map(|(a, z)| {
+                        let color = Hsla {
+                            h: if e < 0.5 { a.1.h } else { z.1.h },
+                            s: mix(a.1.s, z.1.s),
+                            l: mix(a.1.l, z.1.l),
+                            a: mix(a.1.a, z.1.a),
                         };
-                        let dot = |a: (f32, f32), b: (f32, f32)| a.0 * b.0 + a.1 * b.1;
-                        let local = |p: (f32, f32), at: f32| {
-                            let (o, al, ac) = crate::timeline::pose(*ends, at);
-                            let d = (p.0 - o.0, p.1 - o.1);
-                            (dot(d, al), dot(d, ac))
-                        };
-                        let (ua, va) = local(centre(c.from), 0.0);
-                        let (uz, vz) = local(centre(c.to), 1.0);
-                        let (u, v) = (mix(ua, uz), mix(va, vz));
-                        let (o, al, ac) = crate::timeline::pose(*ends, e);
-                        let (cx_, cy_) = (o.0 + u * al.0 + v * ac.0, o.1 + u * al.1 + v * ac.1);
-                        let (w, h) = (
-                            mix(c.from.size.width, c.to.size.width) / s,
-                            mix(c.from.size.height, c.to.size.height) / s,
-                        );
-                        Bounds::new(
-                            point(px(cx_ - w / 2.0), px(cy_ - h / 2.0)),
-                            size(px(w), px(h)),
+                        let weight = |bold: bool| if bold { 600.0 } else { 400.0 };
+                        (
+                            // The same at both ends but for a button's,
+                            // which takes the ending view's halfway.
+                            if e < 0.5 { a.0.clone() } else { z.0.clone() },
+                            color,
+                            mix(a.2, z.2),
+                            mix(weight(a.3), weight(z.3)),
                         )
-                    }
-                    _ => lerp_bounds(c.from, c.to, e, s),
-                };
-                Drawn {
-                    bounds,
-                    image,
-                    words,
-                    kind: c.kind.clone(),
-                }
-            })
-            .collect();
-
-        let painter = canvas(
-            |_, _, _| {},
-            move |_, _, window, cx| {
-                // Never over a taskbar.
-                window.with_content_mask(Some(gpui::ContentMask { bounds: work }), |window| {
-                    window.request_animation_frame();
-                    if framed > 0.0 {
-                        window.paint_shadows(
-                            sheet,
-                            gpui::Corners::all(px(RADIUS)),
-                            &[
-                                // Fitted to Windows 11's own, measured
-                                // around the panel and the big window: an
-                                // even one all round and a deep one
-                                // below.
-                                gpui::BoxShadow {
-                                    color: gpui::black().opacity(0.33 * framed),
-                                    offset: point(px(0.0), px(-0.5)),
-                                    blur_radius: px(12.4),
-                                    spread_radius: px(4.4),
-                                },
-                                gpui::BoxShadow {
-                                    color: gpui::black().opacity(0.36 * framed),
-                                    offset: point(px(0.0), px(45.0)),
-                                    blur_radius: px(20.2),
-                                    spread_radius: px(0.4),
-                                },
-                            ],
-                        );
-                    }
-                    // A band: the sheet's rounded shape, cut to the band.
-                    let paint_band = |window: &mut Window, b: Bounds<Pixels>, color: Hsla| {
-                        if b.size.width <= px(0.0) || b.size.height <= px(0.0) || color.a <= 0.0 {
-                            return;
-                        }
-                        window.with_content_mask(Some(gpui::ContentMask { bounds: b }), |window| {
-                            window.paint_quad(quad(
-                                sheet,
-                                px(RADIUS),
-                                color,
-                                px(0.0),
-                                gpui::transparent_black(),
-                                gpui::BorderStyle::Solid,
-                            ));
-                        });
-                    };
-                    for (b, color) in &bands {
-                        paint_band(window, *b, color.opacity(color.a * fill));
-                    }
-                    paint_band(window, body, p.surface.opacity(fill));
-                    window.with_content_mask(Some(gpui::ContentMask { bounds: body }), |window| {
-                        for (graph, dirty, ends, alpha) in &trees {
-                            if e <= 0.0 && fill < 1.0 {
-                                // While the panel still shows through, its own
-                                // tail fade stays: the tree is drawn right of it,
-                                // so nothing is painted twice there.
-                                let x = px(crate::timeline::tail_fade_end(*ends));
-                                let right = body.right().max(x);
-                                let clip = Bounds::new(
-                                    point(x, body.top()),
-                                    size(right - x, body.size.height),
-                                );
-                                window.with_content_mask(
-                                    Some(gpui::ContentMask { bounds: clip }),
-                                    |window| {
-                                        crate::timeline::paint_tree(
-                                            graph, *dirty, *ends, e, *alpha, dark, &p, window,
-                                        );
-                                    },
-                                );
-                                continue;
-                            }
-                            crate::timeline::paint_tree(
-                                graph, *dirty, *ends, e, *alpha, dark, &p, window,
+                    });
+                    // Riding with its tree: where it sits in the tree's frame
+                    // at each end, blended, in the tree's frame now.
+                    let bounds = match c.tree.and_then(|i| trees.get(i)) {
+                        Some((_, _, ends, _, _)) if !still => {
+                            let centre = |b: Bounds<f32>| {
+                                (
+                                    (b.origin.x + b.size.width / 2.0) / s,
+                                    (b.origin.y + b.size.height / 2.0) / s,
+                                )
+                            };
+                            let dot = |a: (f32, f32), b: (f32, f32)| a.0 * b.0 + a.1 * b.1;
+                            let local = |p: (f32, f32), at: f32| {
+                                let (o, al, ac) = crate::timeline::pose(*ends, at);
+                                let d = (p.0 - o.0, p.1 - o.1);
+                                (dot(d, al), dot(d, ac))
+                            };
+                            let (ua, va) = local(centre(c.from), 0.0);
+                            let (uz, vz) = local(centre(c.to), 1.0);
+                            let (u, v) = (mix(ua, uz), mix(va, vz));
+                            let (o, al, ac) = crate::timeline::pose(*ends, e);
+                            let (cx_, cy_) = (o.0 + u * al.0 + v * ac.0, o.1 + u * al.1 + v * ac.1);
+                            let (w, h) = (
+                                mix(c.from.size.width, c.to.size.width) / s,
+                                mix(c.from.size.height, c.to.size.height) / s,
                             );
-                            crate::timeline::paint_tail_fade(*ends, e, p.surface, window);
+                            Bounds::new(
+                                point(px(cx_ - w / 2.0), px(cy_ - h / 2.0)),
+                                size(px(w), px(h)),
+                            )
                         }
-                        // The headings over the trees, solid as they turn.
-                        for bar in &turning {
-                            paint_bar(window, cx, bar);
-                        }
-                    });
-                    window.with_content_mask(Some(gpui::ContentMask { bounds: sheet }), |window| {
-                        for d in &parts {
-                            let b = d.bounds;
-                            if let Kind::Health(counts) = d.kind {
-                                paint_health(window, b, counts, checking, &p);
-                                continue;
-                            }
-                            if let Some(image) = &d.image {
-                                window
-                                    .paint_image(b, Default::default(), image.clone(), 0, false)
-                                    .ok();
-                            }
-                            if let Kind::Icon(st) = &d.kind
-                                && st.off_trunk()
-                            {
-                                crate::repo_marks::paint_branch_badge(
-                                    b,
-                                    f32::from(b.size.width),
-                                    window,
-                                );
-                            }
-                            if let Some(words) = &d.words {
-                                let centred = matches!(d.kind, Kind::Glyph);
-                                paint_words(window, cx, b, words, centred);
-                            }
-                        }
-                    });
-                });
-            },
-        )
-        .size_full();
-        // The rim, as thick as Windows draws the windows' own, over the
-        // sliding bars too.
-        let rim = canvas(
-            |_, _, _| {},
-            move |_, _, window, _| {
-                if rim_alpha <= 0.0 {
-                    return;
-                }
-                window.with_content_mask(Some(gpui::ContentMask { bounds: work }), |window| {
-                    let s = window.scale_factor();
-                    window.paint_quad(quad(
-                        sheet,
-                        px(RADIUS),
-                        gpui::transparent_black(),
-                        px(view::rim_width(s) / s),
-                        view::rim(dark).opacity(rim_alpha),
-                        gpui::BorderStyle::Solid,
-                    ));
-                });
-            },
-        )
-        .absolute()
-        .inset_0();
+                        // At rest, on the px its view draws it on.
+                        _ if still => snapped(lerp_bounds(c.from, c.to, e, s), s),
+                        _ => lerp_bounds(c.from, c.to, e, s),
+                    };
+                    Drawn {
+                        bounds,
+                        image,
+                        dot,
+                        fill: c.button.then(|| p.button.opacity(e)),
+                        words,
+                        kind: c.kind.clone(),
+                    }
+                })
+                .collect()
+        };
 
         // The bars that slide, the views' own elements: the starting
-        // view's slide out with the fade, the ending view's in before the
-        // reveal, both under the sheet's bars.
-        let p = Palette::for_appearance(appearance);
-        let out = ease(phase(elapsed, Duration::ZERO, fade));
+        // view's slide out before the fade, the ending view's in before
+        // the reveal, both under the sheet's bars. While the starting one
+        // is on screen, where they rest is washed as it is once they've
+        // gone.
+        let out = ease(phase(elapsed, Duration::ZERO, slide_out));
         let into = self
             .arrived
             .map(|a| 1.0 - ease(phase(a.elapsed(), Duration::ZERO, slide)));
+        let mut homes = Vec::new();
         let app: &App = cx;
         let mut slid = Vec::new();
         if let Some(ui) = app.try_global::<Ui>() {
             let state = ui.state.read(app);
             let icons_only = state.config.icons_only;
             for sl in &self.p().sliders {
-                let in_panel = matches!(sl.what, Slid::Prs(view::Mode::Panel) | Slid::Heading(_));
-                let k = if in_panel == open {
+                let panel_side = in_panel(sl);
+                let k = if panel_side == open {
+                    if !self.left {
+                        homes.push(snapped(logical_at(sl.at, s), s));
+                    }
                     if out >= 1.0 {
                         continue;
                     }
                     out
                 } else {
                     match into {
+                        // Revealed, the window shows its own.
+                        Some(_) if through => continue,
                         Some(k) => k,
                         None => continue,
                     }
                 };
                 let element = match sl.what {
                     Slid::Prs(mode) => {
-                        view::prs_block(state, mode, icons_only && in_panel, &p, app)
+                        view::prs_block(state, mode, icons_only && panel_side, &p, app)
                     }
                     Slid::Heading(section) => {
                         view::panel_heading(section, state, icons_only, &p, app)
@@ -2298,6 +2818,227 @@ impl Render for MorphView {
                 );
             }
         }
+        let homes: Vec<Bounds<Pixels>> =
+            homes.into_iter().filter_map(|h| overlap(h, body)).collect();
+
+        let painter = canvas(
+            |_, _, _| {},
+            move |_, _, window, cx| {
+                window.request_animation_frame();
+                for w in &work {
+                    // Never over a taskbar.
+                    window.with_content_mask(Some(gpui::ContentMask { bounds: *w }), |window| {
+                        if framed {
+                            window.paint_shadows(
+                                sheet,
+                                gpui::Corners::all(radius),
+                                &window_shadow(),
+                            );
+                        }
+                        // A piece of a band: the sheet's rounded shape, cut
+                        // to the piece.
+                        let paint_piece = |window: &mut Window, b: Bounds<Pixels>, color: Hsla| {
+                            if color.a <= 0.0 {
+                                return;
+                            }
+                            window.with_content_mask(
+                                Some(gpui::ContentMask { bounds: b }),
+                                |window| {
+                                    window.paint_quad(quad(
+                                        sheet,
+                                        radius,
+                                        color,
+                                        px(0.0),
+                                        gpui::transparent_black(),
+                                        gpui::BorderStyle::Solid,
+                                    ));
+                                },
+                            );
+                        };
+                        for (b, color) in &band_pieces {
+                            paint_piece(window, *b, *color);
+                        }
+                        // Where the slid bars rest, as their view is once
+                        // they've gone.
+                        for h in &homes {
+                            paint_piece(window, *h, p.surface);
+                        }
+                        window.with_content_mask(
+                            Some(gpui::ContentMask { bounds: body }),
+                            |window| {
+                                if through {
+                                    // Over the window on screen: only where the
+                                    // two views' trees differ, faded as the
+                                    // sheet, the tree drawn whole over it.
+                                    for c in &cuts {
+                                        paint_piece(window, *c, p.surface.opacity(fill));
+                                    }
+                                    if fill > 0.0 {
+                                        for c in &cuts {
+                                            window.with_content_mask(
+                                                Some(gpui::ContentMask { bounds: *c }),
+                                                |window| {
+                                                    // Only the tree the cut is in:
+                                                    // a cut is a row's line or a
+                                                    // mark, inside one tree.
+                                                    let under = |b: &Bounds<Pixels>| {
+                                                        let bleed = px(crate::timeline::BLEED);
+                                                        let b = Bounds::new(
+                                                            point(b.left(), b.top() - bleed),
+                                                            size(
+                                                                b.size.width,
+                                                                b.size.height + bleed * 2.0,
+                                                            ),
+                                                        );
+                                                        b.intersects(c)
+                                                    };
+                                                    for (graph, dirty, _, strip, column) in trees
+                                                        .iter()
+                                                        .filter(|(_, _, _, strip, column)| {
+                                                            under(if at_end {
+                                                                column
+                                                            } else {
+                                                                strip
+                                                            })
+                                                        })
+                                                    {
+                                                        if at_end {
+                                                            crate::timeline::paint_still_column(
+                                                                *column, graph, *dirty, dark, &p,
+                                                                window,
+                                                            );
+                                                        } else {
+                                                            crate::timeline::paint_still_strip(
+                                                                *strip, graph, *dirty, dark, &p,
+                                                                window,
+                                                            );
+                                                        }
+                                                    }
+                                                },
+                                            );
+                                        }
+                                    }
+                                } else if still {
+                                    // At rest under no window: drawn as the
+                                    // view at that end draws it.
+                                    for (graph, dirty, _, strip, column) in &trees {
+                                        if at_end {
+                                            crate::timeline::paint_still_column(
+                                                *column, graph, *dirty, dark, &p, window,
+                                            );
+                                        } else {
+                                            crate::timeline::paint_still_strip(
+                                                *strip, graph, *dirty, dark, &p, window,
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    for (graph, dirty, ends, _, _) in &trees {
+                                        crate::timeline::paint_tree(
+                                            graph, *dirty, *ends, e, 1.0, dark, &p, window,
+                                        );
+                                        crate::timeline::paint_tail_fade(
+                                            *ends, e, p.surface, window,
+                                        );
+                                    }
+                                }
+                                // The headings over the trees, solid as they turn.
+                                for bar in &turning {
+                                    paint_bar(window, cx, bar);
+                                }
+                            },
+                        );
+                        window.with_content_mask(
+                            Some(gpui::ContentMask { bounds: sheet }),
+                            |window| {
+                                for d in &parts {
+                                    let b = d.bounds;
+                                    if let Kind::Health(counts) = d.kind {
+                                        paint_health(window, b, counts, checking, &p);
+                                        continue;
+                                    }
+                                    if let Some(image) = &d.image {
+                                        window
+                                            .paint_image(
+                                                b,
+                                                Default::default(),
+                                                image.clone(),
+                                                0,
+                                                false,
+                                            )
+                                            .ok();
+                                    }
+                                    // As the window's `rounded_md`.
+                                    if let Some(color) = d.fill.filter(|c| c.a > 0.0) {
+                                        window.paint_quad(quad(
+                                            b,
+                                            px(6.0),
+                                            color,
+                                            px(0.0),
+                                            gpui::transparent_black(),
+                                            gpui::BorderStyle::Solid,
+                                        ));
+                                    }
+                                    if let Some(color) = d.dot {
+                                        crate::repo_marks::paint_dot(
+                                            b,
+                                            f32::from(b.size.width),
+                                            color,
+                                            window,
+                                        );
+                                    }
+                                    if let Kind::Icon(st) = &d.kind
+                                        && st.off_trunk()
+                                    {
+                                        crate::repo_marks::paint_branch_badge(
+                                            b,
+                                            f32::from(b.size.width),
+                                            window,
+                                        );
+                                    }
+                                    if let Some(words) = &d.words {
+                                        let centred = matches!(d.kind, Kind::Glyph);
+                                        paint_words(window, cx, b, words, centred);
+                                    }
+                                }
+                            },
+                        );
+                    });
+                }
+            },
+        )
+        .size_full();
+        // The rim, over the sliding bars too.
+        let rim_work = self
+            .p()
+            .work
+            .iter()
+            .map(|w| logical_at(*w, s))
+            .collect::<Vec<_>>();
+        let rim = canvas(
+            |_, _, _| {},
+            move |_, _, window, _| {
+                if rim_alpha <= 0.0 {
+                    return;
+                }
+                for w in &rim_work {
+                    window.with_content_mask(Some(gpui::ContentMask { bounds: *w }), |window| {
+                        window.paint_quad(quad(
+                            sheet,
+                            radius,
+                            gpui::transparent_black(),
+                            px(rim_px),
+                            view::rim(dark).opacity(rim_alpha),
+                            gpui::BorderStyle::Solid,
+                        ));
+                    });
+                }
+            },
+        )
+        .absolute()
+        .inset_0();
+
+        let p = Palette::for_appearance(appearance);
         div()
             .size_full()
             .relative()
@@ -2336,6 +3077,9 @@ fn paint_words(
     let (color, size) = (*color, *size);
     let mut font = window.text_style().font();
     font.weight = gpui::FontWeight(*weight);
+    // Digits of one width, as the views draw them (`StatusView`'s root):
+    // otherwise counts set a hair wider or narrower than their twins.
+    font.features = gpui::FontFeatures(std::sync::Arc::new(vec![("tnum".to_string(), 1)]));
     let run = gpui::TextRun {
         len: text.len(),
         font,
@@ -2366,7 +3110,7 @@ fn paint_health(
     p: &Palette,
 ) {
     // Dimmed while a check runs, as the views dim it.
-    let dim = |c: Hsla| if checking { c.opacity(c.a * 0.6) } else { c };
+    let dim = |c: Hsla| if checking { c.opacity(0.6) } else { c };
     let r = b.size.height / 2.0;
     // The track shows only with no repos: the segments cover it all, and
     // dimmed over it they would show it through.

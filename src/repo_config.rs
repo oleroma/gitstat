@@ -11,7 +11,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
+
+/// How long the guard of a repo whose config includes other files is
+/// trusted: an included file can change without the repo's own changing.
+const INCLUDES_FRESH: Duration = Duration::from_secs(10);
 
 /// What gitstat may run in a repo.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,22 +52,26 @@ impl Guard {
 /// The repo's guard, read again whenever its config files change.
 pub fn guard(repo: &Path) -> Guard {
     let stamp = stamp(repo);
+    let now = Instant::now();
     if let Some(stamp) = &stamp
-        && let Some(hit) = cache()
-            .lock()
-            .ok()
-            .and_then(|c| c.get(repo).filter(|h| &h.stamp == stamp).cloned())
+        && let Some(hit) = cache().lock().ok().and_then(|c| {
+            c.get(repo)
+                .filter(|h| &h.stamp == stamp && h.until.is_none_or(|u| now < u))
+                .cloned()
+        })
     {
         return hit.guard;
     }
-    let Some((guard, includes)) = read(repo) else {
-        // git couldn't read the config, so it can't run anything from it
+    let (guard, includes) = match read(repo) {
+        Read::Done(guard, includes) => (guard, includes),
+        // git refused the config, so it can't run anything from it
         // either; ask again next time.
-        return Guard::Safe;
+        Read::Refused => return Guard::Safe,
+        // Timed out or couldn't start: the next call might read it fine
+        // and run what it names, so nothing runs until it can be read.
+        Read::Failed => return Guard::Blocked("config unreadable".to_string()),
     };
-    // An included file can change without `.git/config` changing, so a
-    // repo with includes is read again every time.
-    if let Some(stamp) = stamp.filter(|_| !includes)
+    if let Some(stamp) = stamp
         && let Ok(mut c) = cache().lock()
     {
         c.insert(
@@ -71,6 +79,7 @@ pub fn guard(repo: &Path) -> Guard {
             Cached {
                 stamp,
                 guard: guard.clone(),
+                until: includes.then(|| now + INCLUDES_FRESH),
             },
         );
     }
@@ -81,47 +90,59 @@ pub fn guard(repo: &Path) -> Guard {
 struct Cached {
     stamp: Stamp,
     guard: Guard,
+    /// Until when it holds, for a config with includes.
+    until: Option<Instant>,
 }
 
-/// Modification times of `.git/config` and `.git/config.worktree`.
-type Stamp = (Option<SystemTime>, Option<SystemTime>);
+/// The git dir and modification times of the common dir's `config` and
+/// the git dir's `config.worktree`.
+type Stamp = (PathBuf, Option<SystemTime>, Option<SystemTime>);
 
 fn cache() -> &'static Mutex<HashMap<PathBuf, Cached>> {
     static CACHE: OnceLock<Mutex<HashMap<PathBuf, Cached>>> = OnceLock::new();
     CACHE.get_or_init(Default::default)
 }
 
-/// `None` when `.git` isn't a plain folder (a linked worktree or a
-/// submodule keeps its config elsewhere): then the config is always read.
+/// A linked worktree or submodule (a `.git` file) is stamped through the
+/// dirs it names. `None` when they can't be found: then the config is
+/// always read.
 fn stamp(repo: &Path) -> Option<Stamp> {
-    let dot_git = repo.join(".git");
-    if !dot_git.is_dir() {
-        return None;
-    }
-    let mtime = |name: &str| {
-        std::fs::metadata(dot_git.join(name))
-            .and_then(|m| m.modified())
-            .ok()
-    };
-    Some((mtime("config"), mtime("config.worktree")))
+    let (git_dir, common_dir) = crate::git::quick_git_dirs(repo)?;
+    let mtime = |path: PathBuf| std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    Some((
+        git_dir.clone(),
+        mtime(common_dir.join("config")),
+        mtime(git_dir.join("config.worktree")),
+    ))
+}
+
+enum Read {
+    /// The guard, and whether the config includes other files.
+    Done(Guard, bool),
+    /// git ran and refused the config.
+    Refused,
+    /// git didn't answer: a timeout, or it couldn't start.
+    Failed,
 }
 
 /// `git config --list` of the repo's own config (local and worktree, with
 /// their includes), classified; also whether it has includes.
-fn read(repo: &Path) -> Option<(Guard, bool)> {
+fn read(repo: &Path) -> Read {
     let scoped = crate::git::supports_show_scope();
     let args: &[&str] = if scoped {
         &["config", "--list", "--includes", "--show-scope", "-z"]
     } else {
         &["config", "--local", "--list", "--includes", "-z"]
     };
-    let out = crate::git::git_unguarded(repo, args).ok()?;
+    let Ok(out) = crate::git::git_unguarded(repo, args) else {
+        return Read::Failed;
+    };
     if !out.status.success() {
-        return None;
+        return Read::Refused;
     }
     let entries = parse(&out.stdout, scoped);
     let includes = entries.iter().any(|(key, _)| is_include(key));
-    Some((classify(&entries), includes))
+    Read::Done(classify(&entries), includes)
 }
 
 /// Entries of `config --list -z`, `key\nvalue\0` each (`key\0` for a key

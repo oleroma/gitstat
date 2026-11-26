@@ -443,7 +443,8 @@ gitstat --remove-folder-icons   turn folder icons off, restore every folder that
 exits with code 1 if some folder couldn't be restored (it lists them, and they
 stay on the list for the next try), and refuses to run while the tray app is
 running. gitstat.exe is a windowed app, so run it from PowerShell as
-`.\gitstat.exe --once | Out-Host` to have the terminal wait for its output.
+`.\gitstat.exe --once | Out-Host` to have the terminal wait for its output
+and set `$LASTEXITCODE`, or from cmd as `start /wait gitstat.exe --once`.
 
 ## Build from source
 

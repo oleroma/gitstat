@@ -339,8 +339,36 @@ pub fn message(repo: &Path, id: &str) -> Result<String, String> {
 }
 
 /// Line stats of several commits in one git call, for a column of rows.
-/// Commits git can't show are left out.
+/// Commits git can't show are left out. When git refuses the batch (one id
+/// it can't show fails them all), each is asked alone; an error is left
+/// for git not answering at all.
 pub fn stats(repo: &Path, ids: &[String]) -> Result<HashMap<String, Stat>, String> {
+    // Only full hashes, so an id can't be read as an option.
+    let ids: Vec<&str> = ids
+        .iter()
+        .filter(|t| t.len() >= 40 && t.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(String::as_str)
+        .collect();
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    match stats_of(repo, &ids)? {
+        Some(found) => Ok(found),
+        None if ids.len() == 1 => Ok(HashMap::new()),
+        None => {
+            let mut found = HashMap::new();
+            for id in ids {
+                if let Some(one) = stats_of(repo, &[id])? {
+                    found.extend(one);
+                }
+            }
+            Ok(found)
+        }
+    }
+}
+
+/// One `git show` of `ids`: `None` when git refused them.
+fn stats_of(repo: &Path, ids: &[&str]) -> Result<Option<HashMap<String, Stat>>, String> {
     let mut args = vec![
         "show",
         "--no-color",
@@ -348,21 +376,13 @@ pub fn stats(repo: &Path, ids: &[String]) -> Result<HashMap<String, Stat>, Strin
         "--format=%x1e%H",
         "--diff-merges=first-parent",
     ];
-    // Only full hashes, so an id can't be read as an option.
-    args.extend(
-        ids.iter()
-            .filter(|t| t.len() >= 40 && t.bytes().all(|b| b.is_ascii_hexdigit()))
-            .map(String::as_str),
-    );
-    if args.len() == 5 {
-        return Ok(HashMap::new());
-    }
+    args.extend(ids);
     args.push("--");
     let out = git::git(repo, &args, git::LOCAL_TIMEOUT)?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
-    }
-    Ok(parse_stats(&String::from_utf8_lossy(&out.stdout)))
+    Ok(out
+        .status
+        .success()
+        .then(|| parse_stats(&String::from_utf8_lossy(&out.stdout))))
 }
 
 /// Records of a hash line and its shortstat, each after a `\x1e`.
@@ -817,6 +837,12 @@ pub(crate) mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[&page.commits[0].id], st);
         assert!(stats(&dir, &[]).unwrap().is_empty());
+        // One id git can't show doesn't cost the others theirs.
+        let gone = "0".repeat(40);
+        let all = stats(&dir, &[gone.clone(), page.commits[0].id.clone()]).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[&page.commits[0].id], st);
+        assert!(stats(&dir, &[gone]).unwrap().is_empty());
         assert_eq!((st.files, st.added, st.removed), (1, 1, 0));
         assert!(stat(&dir, "--help").is_err());
         let _ = std::fs::remove_dir_all(&dir);

@@ -122,6 +122,17 @@ impl Default for OverlayConfig {
     }
 }
 
+/// What becomes of one of the config's folders: see [`Config::folders`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Folder {
+    Watched(PathBuf),
+    /// A blank entry of `more_paths`.
+    Blank,
+    /// The same as, inside, or holding this earlier folder, which already
+    /// covers it.
+    Overlaps(PathBuf),
+}
+
 /// `PartialEq` lets the app ignore reloads of its own writes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -172,9 +183,13 @@ pub struct Config {
     pub panel_slide_ms: u32,
     /// How long the flip between the panel and the window takes, in ms.
     pub flip_ms: u32,
-    /// For checking the flip: a folder where each flip saves every frame
-    /// of the screen under it, and a few after, as numbered PNGs. Empty
-    /// is off; not in the settings window.
+    /// For checking the flip and the panel's slide: each saves every frame
+    /// of the screen under it, and a few after, as numbered PNGs, into
+    /// [`Config::frames_folder`]. Settings › Diagnostics. Recording slows
+    /// the animations it records.
+    pub record_frames: bool,
+    /// Where `record_frames` saves them; empty is `frames` in gitstat's
+    /// data folder.
     pub flip_frames: String,
     /// Which sections of the repo list are folded, in the panel and the
     /// big window alike.
@@ -293,6 +308,7 @@ impl Default for Config {
             flip_animation: true,
             panel_slide_ms: 150,
             flip_ms: 560,
+            record_frames: false,
             flip_frames: String::new(),
             folds: Folds::default(),
             ignore: Vec::new(),
@@ -311,6 +327,15 @@ pub enum ClickAction {
 }
 
 impl Config {
+    /// Where frame recordings go (`record_frames`).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn frames_folder(&self) -> PathBuf {
+        match self.flip_frames.trim() {
+            "" => data_dir().join("frames"),
+            f => PathBuf::from(f),
+        }
+    }
+
     /// Whether the repo named `name` is on the `ignore` list.
     pub fn is_ignored(&self, name: &str) -> bool {
         self.ignore.iter().any(|pattern| glob_match(pattern, name))
@@ -346,13 +371,26 @@ impl Config {
     /// same as, inside, or around one already listed, so no repo is listed
     /// twice.
     pub fn roots(&self) -> Vec<PathBuf> {
-        let mut roots: Vec<PathBuf> = Vec::new();
-        let mut keys: Vec<String> = Vec::new();
+        self.folders()
+            .into_iter()
+            .filter_map(|f| match f {
+                Folder::Watched(dir) => Some(dir),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `path` then each of `more_paths`, and what becomes of it: watched,
+    /// blank, or left out because it is, holds or sits in an earlier one.
+    pub fn folders(&self) -> Vec<Folder> {
+        let mut out = Vec::new();
+        let mut keys: Vec<(String, PathBuf)> = Vec::new();
         let candidates =
             std::iter::once(self.path.as_str()).chain(self.more_paths.iter().map(String::as_str));
         for (i, raw) in candidates.enumerate() {
             // `path` always counts, even blank, as it always has.
             if i > 0 && raw.trim().is_empty() {
+                out.push(Folder::Blank);
                 continue;
             }
             let dir = if i == 0 {
@@ -361,15 +399,18 @@ impl Config {
                 PathBuf::from(expand(raw.trim()))
             };
             let key = path_key(&dir);
-            let overlaps = keys.iter().any(|k| {
+            let overlap = keys.iter().find(|(k, _)| {
                 k == &key || key.starts_with(&format!("{k}/")) || k.starts_with(&format!("{key}/"))
             });
-            if !overlaps {
-                keys.push(key);
-                roots.push(dir);
+            match overlap {
+                Some((_, earlier)) => out.push(Folder::Overlaps(earlier.clone())),
+                None => {
+                    keys.push((key, dir.clone()));
+                    out.push(Folder::Watched(dir));
+                }
             }
         }
-        roots
+        out
     }
 
     /// The folder at `slot` in [`Config::roots`].
@@ -420,13 +461,76 @@ impl Config {
             // Locked or unreadable: we can't tell whether it holds an edit, so leave it.
             Err(e) => return Err(format!("{}: {e}", file.display())),
         }
-        let text = serde_json::to_string_pretty(self).map_err(|e| e.to_string())? + "\n";
+        let text = serde_json::to_string_pretty(&self.finite()).map_err(|e| e.to_string())? + "\n";
         let tmp = file.with_extension("json.tmp");
         std::fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
         std::fs::rename(&tmp, file).map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
             format!("{}: {e}", file.display())
         })
+    }
+
+    /// A copy whose floats are all finite. A hand-edited `1e39` reads as an
+    /// infinite f32, which JSON writes as `null`, a file that won't load.
+    fn finite(&self) -> Config {
+        let mut c = self.clone();
+        let defaults = (Config::default(), OverlayConfig::default());
+        if !c.interval_minutes.is_finite() {
+            c.interval_minutes = defaults.0.interval_minutes;
+        }
+        if !c.overlay.size.is_finite() {
+            c.overlay.size = defaults.1.size;
+        }
+        if !c.overlay.margin.is_finite() {
+            c.overlay.margin = defaults.1.margin;
+        }
+        c.overlay.offset_x = c.overlay.offset_x.filter(|v| v.is_finite());
+        c.overlay.offset_y = c.overlay.offset_y.filter(|v| v.is_finite());
+        c
+    }
+
+    /// Writes `file` like [`save`](Self::save), but only while `file` still
+    /// holds `base` (what the app last read or wrote): a hand edit the app
+    /// hasn't reloaded yet is never overwritten. The reload that follows
+    /// brings the edit in.
+    pub fn save_over(&self, file: &Path, base: &Config) -> Result<(), String> {
+        if let Ok(text) = std::fs::read_to_string(file)
+            && let Ok(on_disk) = serde_json::from_str::<Config>(&text)
+            && on_disk != *base
+            && on_disk != *self
+        {
+            return Err(format!(
+                "{} was changed outside gitstat; not overwriting it",
+                file.display()
+            ));
+        }
+        self.save(file)?;
+        self.remember_good(file);
+        Ok(())
+    }
+
+    /// Keeps a copy of a config that loaded or saved cleanly beside `file`,
+    /// so a start with a broken `file` runs on it instead of the defaults.
+    /// Best effort.
+    pub fn remember_good(&self, file: &Path) {
+        let Ok(text) = serde_json::to_string_pretty(self) else {
+            return;
+        };
+        let text = text + "\n";
+        let good = last_good_file(file);
+        if std::fs::read_to_string(&good).is_ok_and(|old| old == text) {
+            return;
+        }
+        let tmp = good.with_extension("tmp");
+        if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &good).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    /// The copy [`remember_good`](Self::remember_good) kept for `file`.
+    pub fn last_good(file: &Path) -> Option<Config> {
+        let text = std::fs::read_to_string(last_good_file(file)).ok()?;
+        serde_json::from_str(&text).ok()
     }
 
     /// The panel, else the window, else the menu, so a click always does something.
@@ -492,6 +596,12 @@ fn clamp_minutes(minutes: f64) -> f64 {
     } else {
         Config::default().interval_minutes
     }
+}
+
+/// `config.json` -> `config.last-good.json`, beside it.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn last_good_file(file: &Path) -> PathBuf {
+    file.with_extension("last-good.json")
 }
 
 /// Default location: `config.json` beside the executable.
@@ -998,6 +1108,40 @@ mod tests {
             .collect();
         assert_eq!(names, [FILE_NAME]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_writes_no_null_for_an_infinite_float() {
+        let file = temp_dir("finite").join("config.json");
+        let mut config = Config::default();
+        config.overlay.size = f32::INFINITY;
+        config.overlay.offset_x = Some(f32::NAN);
+        config.interval_minutes = f64::NAN;
+        config.save(&file).unwrap();
+        let loaded = Config::load_or_create(&file).unwrap();
+        assert_eq!(loaded.overlay.size, OverlayConfig::default().size);
+        assert_eq!(loaded.overlay.offset_x, None);
+        assert_eq!(loaded.interval_minutes, Config::default().interval_minutes);
+    }
+
+    #[test]
+    fn save_over_keeps_an_unreloaded_hand_edit() {
+        let file = temp_dir("save-over").join("config.json");
+        let base = Config::default();
+        base.save(&file).unwrap();
+        let mut edit = base.clone();
+        edit.interval_minutes += 7.0;
+        edit.save(&file).unwrap();
+        let mut change = base.clone();
+        change.watch = !change.watch;
+        assert!(change.save_over(&file, &base).is_err());
+        assert_eq!(Config::load_or_create(&file).unwrap(), edit);
+        // Once the edit is the base, saves go through, and are remembered.
+        let mut change = edit.clone();
+        change.watch = !change.watch;
+        change.save_over(&file, &edit).unwrap();
+        assert_eq!(Config::load_or_create(&file).unwrap(), change);
+        assert_eq!(Config::last_good(&file), Some(change));
     }
 
     #[test]

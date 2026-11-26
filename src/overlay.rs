@@ -66,19 +66,6 @@ fn face(badge: Badge) -> (Hsla, String) {
     }
 }
 
-/// Repos synced, with local work, and needing action.
-fn tone_counts(statuses: &[crate::git::RepoStatus]) -> [usize; 3] {
-    let mut counts = [0; 3];
-    for s in statuses {
-        counts[match icon::FolderState::of(s).tone() {
-            icon::Tone::Synced => 0,
-            icon::Tone::Local => 1,
-            icon::Tone::Attention => 2,
-        }] += 1;
-    }
-    counts
-}
-
 /// The icons-only face: a ring cut into the repos' tones, each arc as long
 /// as its share (red, amber, then green, clockwise from the top), around a
 /// dot in the most urgent one. Grey while the first check runs.
@@ -158,7 +145,7 @@ impl Render for OverlayView {
         let state = self.state.read(cx);
         let badge = state.badge();
         let icons_only = state.config.icons_only;
-        let tones = tone_counts(&state.statuses);
+        let tones = crate::view::tone_counts(&state.statuses);
         let (fill, text) = face(badge);
         // Pictures only: a dark disc whose ring shows the repos' tones.
         let fill = if icons_only {
@@ -427,10 +414,15 @@ pub fn sync(cx: &mut App) {
         let window = rect.outset(pad);
         // Also shows it, topmost and without activation. An open panel goes
         // back above it in the same task, so the badge never covers it.
+        // A flip drawing stays over both.
+        let flip = crate::morph::flip_hwnd(cx);
         cx.spawn(async move |_| unsafe {
             win::place_overlay(h, window);
             if let Some(p) = panel {
                 win::panel_restack(p);
+            }
+            if let Some(f) = flip {
+                win::reassert_topmost(f);
             }
         })
         .detach();
@@ -637,11 +629,16 @@ fn tick(id: u64, cx: &mut App) -> bool {
     }
     if let Some(h) = slot.hwnd.filter(|_| slot.visible) {
         let panel = panel::hwnd(cx);
+        // A flip drawing stays over both.
+        let flip = crate::morph::flip_hwnd(cx);
         cx.spawn(async move |_| unsafe {
             win::reassert_topmost(h);
             // Topmost puts the badge above the panel; put the panel back.
             if let Some(p) = panel {
                 win::panel_restack(p);
+            }
+            if let Some(f) = flip {
+                win::reassert_topmost(f);
             }
         })
         .detach();

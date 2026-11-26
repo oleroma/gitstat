@@ -13,8 +13,8 @@ mod column;
 pub(crate) mod ink;
 mod morph;
 
-pub use column::COLUMN_WIDTH;
-pub use morph::{Ends, paint_tail_fade, paint_tree, pose, tail_fade_end};
+pub use column::{COLUMN_WIDTH, paint_still_column, row_line_tops, tree_width};
+pub use morph::{Ends, paint_tail_fade, paint_tree, pose};
 
 use crate::git::RepoStatus;
 use crate::graph::{self, Class, PrColors, PrState, Seg};
@@ -53,7 +53,7 @@ const LANE: f32 = 5.0;
 const LANES: usize = 5;
 /// Px a strip may paint past its top and bottom, into its neighbours'
 /// empty margins, so nothing near its edge is cut flat.
-const BLEED: f32 = 6.0;
+pub const BLEED: f32 = 6.0;
 const DOT: f32 = 3.0;
 const DOT_HOVER: f32 = 4.5;
 const STROKE: f32 = 1.5;
@@ -83,6 +83,8 @@ const GLIDE: Duration = Duration::from_millis(140);
 const GROW: Duration = Duration::from_millis(110);
 /// A card fades in over this long.
 const CARD_FADE: Duration = Duration::from_millis(120);
+/// How long a failed page of older history waits before it is asked again.
+const MORE_RETRY: Duration = Duration::from_secs(10);
 
 #[derive(Default)]
 struct Slot {
@@ -96,6 +98,8 @@ struct Slot {
     /// A reload is queued or running.
     loading: bool,
     loading_more: bool,
+    /// When a page of older history last failed: the next waits a while.
+    more_failed: Option<Instant>,
     /// Px the strip is scrolled into the past from the newest row; HEAD's
     /// row, `RepoGraph::home`, is where it rests.
     scroll: f32,
@@ -272,7 +276,26 @@ pub struct Timelines {
     messages_pending: HashSet<String>,
 }
 
+/// How many commits' line stats and messages are kept: past that, the
+/// cache starts over, and the rows in view ask again.
+const MAX_STATS: usize = 50_000;
+const MAX_MESSAGES: usize = 2_000;
+
 impl Timelines {
+    fn keep_stat(&mut self, id: String, stat: Stat) {
+        if self.stats.len() >= MAX_STATS {
+            self.stats.clear();
+        }
+        self.stats.insert(id, stat);
+    }
+
+    fn keep_message(&mut self, id: String, message: Arc<str>) {
+        if self.messages.len() >= MAX_MESSAGES {
+            self.messages.clear();
+        }
+        self.messages.insert(id, message);
+    }
+
     pub fn new(state: &Entity<AppState>, cx: &mut Context<Self>) -> Self {
         cx.observe(state, |this, state, cx| this.sync(&state, cx))
             .detach();
@@ -301,12 +324,12 @@ impl Timelines {
         }
     }
 
-    /// Whether `path`'s column header shows its details.
     /// A repo's loaded graph, for the flip.
     pub fn graph_of(&self, path: &Path) -> Option<Arc<RepoGraph>> {
         self.slots.get(path)?.graph.clone()
     }
 
+    /// Whether `path`'s column header shows its details.
     pub fn header_open(&self, path: &Path) -> bool {
         self.expanded.contains(path)
     }
@@ -451,6 +474,24 @@ impl Timelines {
         result: Result<Loaded, String>,
         cx: &mut Context<Self>,
     ) {
+        // Never under a flip, or the glide home before one: the trees it
+        // turns stay as it planned them, and the new ones land after.
+        if crate::morph::running(cx) {
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(50))
+                        .await;
+                    if !cx.update(|cx| crate::morph::running(cx)).unwrap_or(false) {
+                        break;
+                    }
+                }
+                this.update(cx, |this, cx| this.landed(path, generation, result, cx))
+                    .ok();
+            })
+            .detach();
+            return;
+        }
         let Some(slot) = self.slots.get_mut(&path) else {
             return;
         };
@@ -480,6 +521,7 @@ impl Timelines {
                 }
                 slot.graph = Some(Arc::new(g));
                 slot.error = None;
+                slot.more_failed = None;
                 if self.hover.as_ref().is_some_and(|h| h.repo == path) {
                     self.unhover();
                 }
@@ -497,6 +539,16 @@ impl Timelines {
                 }
             }
             Ok(Loaded::Page(More::Reload)) => self.reload(path, cx),
+            // A repo with a graph keeps it, and its status label: a page
+            // of older history that failed (or a reload) is no reason to
+            // call the whole history unreadable.
+            Err(_) if slot.graph.is_some() => {
+                if slot.loading_more && !slot.loading {
+                    slot.more_failed = Some(Instant::now());
+                }
+                slot.loading = false;
+                slot.loading_more = false;
+            }
             Err(e) => {
                 slot.loading = false;
                 slot.loading_more = false;
@@ -515,6 +567,9 @@ impl Timelines {
         };
         // A reload under way would land under the page, or the page on it.
         if slot.loading || slot.loading_more || graph.end {
+            return;
+        }
+        if slot.more_failed.is_some_and(|at| at.elapsed() < MORE_RETRY) {
             return;
         }
         slot.loading_more = true;
@@ -566,6 +621,14 @@ impl Timelines {
         self.table_top = 0.0;
         self.unhover();
         cx.notify();
+    }
+
+    /// Whether any strip or column is gliding now.
+    pub fn gliding(&self) -> bool {
+        let now = Instant::now();
+        self.slots
+            .values()
+            .any(|s| s.shown_scroll(now).1 || s.shown_top(now).1)
     }
 
     /// Every strip and column scrolls back to its newest commits over
@@ -750,7 +813,7 @@ impl Timelines {
             this.update(cx, |this, cx| {
                 this.messages_pending.remove(&id);
                 if let Ok(message) = result {
-                    this.messages.insert(id, message.into());
+                    this.keep_message(id, message.into());
                     cx.notify();
                 }
             })
@@ -778,7 +841,7 @@ impl Timelines {
             this.update(cx, |this, cx| {
                 this.stats_pending.remove(&id);
                 if let Ok(stat) = result {
-                    this.stats.insert(id, stat);
+                    this.keep_stat(id, stat);
                     cx.notify();
                 }
             })
@@ -844,10 +907,10 @@ impl Timelines {
                 window.insert_hitbox(bounds, HitboxBehavior::Normal)
             },
             move |bounds, hitbox, window, _cx| {
-                // Where the flip starts this repo's tree, if it's in view.
-                if window.content_mask().bounds.intersects(&bounds) {
-                    crate::morph::seen_strip(&paint_path, bounds);
-                }
+                // Where the flip starts this repo's tree: every strip, in
+                // view or not, so a tree out of sight turns from its own
+                // row rather than from where it last showed.
+                crate::morph::seen_strip(&paint_path, bounds);
                 let Some(g) = graph else { return };
                 if moving {
                     window.request_animation_frame();
@@ -857,10 +920,19 @@ impl Timelines {
                     size(bounds.size.width, bounds.size.height + px(2.0 * BLEED)),
                 );
                 let dots = window.with_content_mask(Some(ContentMask { bounds: mask }), |window| {
-                    paint_strip(bounds, &g, scroll, grow, copied, dirty, &colors, window)
+                    paint_strip(
+                        bounds, &g, scroll, grow, copied, dirty, true, &colors, window,
+                    )
                 });
                 fade(bounds, surface, window);
 
+                // Only dots that show can be hovered: not ones past the
+                // strip's ends, nor ones the list clips away.
+                let shown = window.content_mask().bounds.intersect(&mask);
+                let dots: Vec<_> = dots
+                    .into_iter()
+                    .filter(|(at, _)| shown.contains(at))
+                    .collect();
                 let (e1, e2) = (entity.clone(), entity);
                 let (path1, path2) = (paint_path.clone(), paint_path);
                 let dots = Arc::new(dots);
@@ -1131,15 +1203,16 @@ impl Timelines {
             .relative()
             .child(painter)
             .child(label)
-            // An edge in the status colour on a repo that needs something.
+            // An edge in the status colour on a repo that needs something
+            // (`status_edge`).
             .when(!status.is_synced() && !status.remote_only, |d| {
                 d.child(
                     div()
                         .absolute()
                         .left_0()
-                        .top(px(3.))
-                        .bottom(px(3.))
-                        .w(px(3.))
+                        .top(px(EDGE_INSET))
+                        .bottom(px(EDGE_INSET))
+                        .w(px(EDGE_WIDTH))
                         .rounded_r_sm()
                         .bg(crate::view::status_color(status, p)),
                 )
@@ -1531,6 +1604,7 @@ fn paint_strip(
     grow: Grow,
     copied: Option<usize>,
     dirty: bool,
+    marks: bool,
     colors: &Colors,
     window: &mut Window,
 ) -> Vec<(Point<Pixels>, Dot)> {
@@ -1681,6 +1755,9 @@ fn paint_strip(
         } else {
             ink::circle(window, c, r, Some(color), None);
         }
+        if !marks {
+            continue;
+        }
         if g.ctx.refs.at(id).iter().any(|r| matches!(r, Ref::Tag(_))) {
             diamond(point(center.x, center.y - px(r + 4.0)), 2.5, color, window);
         }
@@ -1729,6 +1806,99 @@ fn diamond(c: Point<Pixels>, r: f32, color: Hsla, window: &mut Window) {
     if let Ok(path) = path.build() {
         window.paint_path(path, color);
     }
+}
+
+/// A strip at rest, for the flip: exactly as the panel draws it with its
+/// newest commits home and nothing hovered, tail fade and all, but
+/// without the tag and stash marks only the panel shows (the flip fades
+/// those with the panel). `bounds` are the strip's, logical px.
+pub fn paint_still_strip(
+    bounds: Bounds<Pixels>,
+    g: &RepoGraph,
+    dirty: bool,
+    dark: bool,
+    p: &crate::view::Palette,
+    window: &mut Window,
+) {
+    let colors = Colors::new(dark, p);
+    let mask = Bounds::new(
+        point(bounds.left(), bounds.top() - px(BLEED)),
+        size(bounds.size.width, bounds.size.height + px(2.0 * BLEED)),
+    );
+    window.with_content_mask(Some(ContentMask { bounds: mask }), |window| {
+        paint_strip(
+            bounds,
+            g,
+            0.0,
+            Grow::default(),
+            None,
+            dirty,
+            false,
+            &colors,
+            window,
+        );
+    });
+    fade(bounds, p.surface, window);
+}
+
+/// The status edge along a strip's left side: its width, and how far in
+/// from the strip's top and bottom it stops, logical px.
+const EDGE_WIDTH: f32 = 3.0;
+const EDGE_INSET: f32 = 3.0;
+
+/// Where a strip whose graph sits at `bounds` draws its status edge: at
+/// the strip's left, which is its graph's.
+pub fn status_edge(bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+    Bounds::new(
+        point(bounds.left(), bounds.top() + px(EDGE_INSET)),
+        size(
+            px(EDGE_WIDTH),
+            (bounds.size.height - px(2.0 * EDGE_INSET)).max(px(0.0)),
+        ),
+    )
+}
+
+/// Where a strip at rest (`paint_still_strip`) draws what only the panel
+/// shows, its tag and stash marks, logical px: boxes around each, with a
+/// px to spare for their soft edges.
+pub fn strip_marks(bounds: Bounds<Pixels>, g: &RepoGraph, dirty: bool) -> Vec<Bounds<Pixels>> {
+    let rows = g.layout.nodes.len();
+    let right = f32::from(bounds.right());
+    let left = f32::from(bounds.left());
+    let head = g.head_row.filter(|&row| row < rows);
+    let gap = head
+        .filter(|&row| dirty && row > 0)
+        .map_or(0.0, |row| row as f32);
+    let top_x = right - PAD - if dirty { STEP } else { 0.0 };
+    let cy = f32::from(bounds.center().y);
+    let x = |row: f32| top_x - row * STEP + if row < gap - 0.5 { STEP } else { 0.0 };
+    let hi = ((((top_x - left) / STEP).ceil() + 1.0).max(0.0) as usize).min(rows);
+    let mut out = Vec::new();
+    let r = DOT;
+    for row in 0..hi {
+        let node = &g.layout.nodes[row];
+        let (cx, cy) = (x(row as f32), cy + lane_offset(node.lane));
+        let id = &g.commits[row].id;
+        if g.ctx.refs.at(id).iter().any(|r| matches!(r, Ref::Tag(_))) {
+            let (dx, dy) = (cx, cy - (r + 4.0));
+            out.push(Bounds::new(
+                point(px(dx - 4.0), px(dy - 4.0)),
+                size(px(8.0), px(8.0)),
+            ));
+        }
+        if g.stashes_at(row).next().is_some() {
+            let s = 2.5;
+            let (ax, ay) = (cx + STEP * 0.6, cy + r + 5.0);
+            out.push(Bounds::new(
+                point(px(cx - 1.0), px(cy + r - 1.0)),
+                size(
+                    px(ax + s + 1.0 - (cx - 1.0)),
+                    px(ay + s + 1.0 - (cy + r - 1.0)),
+                ),
+            ));
+        }
+    }
+    out
 }
 
 /// Fades the tail into the background at the strip's left edge.

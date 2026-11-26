@@ -159,10 +159,12 @@ impl Timelines {
                     // Git failed as a whole (timed out, busy): ask again a
                     // little later instead of keeping no change for good.
                     retry.timer(STATS_RETRY).await;
-                    this.update(cx, |this, _| {
+                    // Drawn again, the column asks for them again.
+                    this.update(cx, |this, cx| {
                         for id in &ids {
                             this.stats_pending.remove(id);
                         }
+                        cx.notify();
                     })
                     .ok();
                     return;
@@ -174,7 +176,7 @@ impl Timelines {
                     // A commit git couldn't show counts as no change, so it
                     // isn't asked for again on every frame.
                     let stat = found.get(&id).copied().unwrap_or_default();
-                    this.stats.insert(id, stat);
+                    this.keep_stat(id, stat);
                 }
                 cx.notify();
             })
@@ -996,6 +998,43 @@ impl Geometry {
         let n = (f32::from(height) / ROW).ceil() as usize + 1;
         first..first + n
     }
+}
+
+/// A column body at rest, for the flip: its tree exactly as the big
+/// window draws it at its newest commits with nothing hovered. `bounds`
+/// are the body's, logical px.
+pub fn paint_still_column(
+    bounds: Bounds<Pixels>,
+    g: &RepoGraph,
+    dirty: bool,
+    dark: bool,
+    p: &Palette,
+    window: &mut Window,
+) {
+    let colors = Colors::new(dark, p);
+    let geo = Geometry::new(g, dirty, 0.0);
+    window.with_content_mask(Some(ContentMask { bounds }), |window| {
+        paint_column(bounds, g, &geo, Grow::default(), None, &colors, window);
+    });
+}
+
+/// How wide a column's tree is, from the body's left edge to where its
+/// rows' words start, logical px.
+pub fn tree_width(g: &RepoGraph, dirty: bool) -> f32 {
+    Geometry::new(g, dirty, 0.0).text_left()
+}
+
+/// Where the rows' lines cross a column body `height` logical px tall at
+/// its newest commits, from its top, logical px (as `paint_row_lines`
+/// puts them, before snapping to device px).
+pub fn row_line_tops(height: f32) -> Vec<f32> {
+    let mut out = Vec::new();
+    let mut y = ROW;
+    while y < height {
+        out.push(y);
+        y += ROW;
+    }
+    out
 }
 
 /// The rows' thin lines across a column, one between each two rows, the
