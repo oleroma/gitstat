@@ -1402,9 +1402,13 @@ fn plan(
 
     for (cell, left) in cells.iter().zip(&lefts) {
         // Past the big window's edges too: a column out of sight still
-        // takes its tree, which turns out of the sheet's side. On whole px,
-        // as the window lays its columns out and scrolls them.
-        let x = to.origin.x + (left * ws).round() - scroll.round();
+        // takes its tree, which turns out of the sheet's side. Exactly
+        // where the window draws it: GPUI lays the columns out on whole
+        // logical px and scrolls them by the unrounded offset, so at a
+        // fractional scale a column can sit between device px, and its
+        // tree snaps to them as it does (`ink::pos`). Rounding here put
+        // trees a px off.
+        let x = to.origin.x + left * ws - scroll;
         match *cell {
             view::Cell::Repo(status) => {
                 let (Some(&strip), Some(graph)) = (
