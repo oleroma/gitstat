@@ -385,6 +385,19 @@ pub fn is_bare(h: isize) -> bool {
     BARE_PANEL.load(std::sync::atomic::Ordering::Relaxed) == h
 }
 
+/// Makes `h` the foreground window unless it is already. During a flip a
+/// click lands on the flip's window (gitstat's own), so Windows lets
+/// gitstat bring the window it ends on in front of the app that was.
+pub fn to_front(h: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SetForegroundWindow};
+    let Some(hwnd) = live(h) else { return };
+    unsafe {
+        if GetForegroundWindow() != hwnd {
+            SetForegroundWindow(hwnd);
+        }
+    }
+}
+
 /// Shows a window [`cloak`] hid, at the next composition.
 pub fn uncloak(h: isize) {
     let Some(hwnd) = live(h) else { return };

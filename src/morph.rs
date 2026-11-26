@@ -2115,7 +2115,12 @@ impl Render for MorphView {
                 // a drawn frame reaches the screen.
                 self.framed.1 = self.frames;
                 if let Some(h) = cx.default_global::<MorphSlot>().ending.take() {
-                    window.on_next_frame(move |_, _| win::uncloak(h));
+                    window.on_next_frame(move |_, _| {
+                        win::uncloak(h);
+                        // In front of whatever a click during the flip
+                        // may have brought up.
+                        win::to_front(h);
+                    });
                 }
                 // The window revealed under it takes clicks from now.
                 if let Some(h) = self.hwnd {
@@ -2551,7 +2556,11 @@ impl Render for MorphView {
                         ),
                     );
                     let m = crate::glyph_path::middle(size);
-                    let baseline = (start.0 - m * up.0, start.1 - m * up.1);
+                    // On whole device px, as both ends' words are: the
+                    // turn starts and ends where they sit, with no half-px
+                    // step as the renderer changes over.
+                    let snap = |v: f32| (v * s).round() / s;
+                    let baseline = (snap(start.0 - m * up.0), snap(start.1 - m * up.1));
                     BarWords::Path(w.text.to_string(), size, baseline, dir, up, w.color)
                 });
                 let arrow = t.arrow.map(|(aa, zz)| {
