@@ -33,6 +33,7 @@ pub enum Setting {
     GithubRepos,
     ScrollTogether,
     FlipAnimation,
+    RecordFrames,
     NotifyReview,
     NotifyChecks,
     NotifyBehind,
@@ -56,6 +57,7 @@ impl Setting {
             Setting::GithubRepos => cfg.github_repos,
             Setting::ScrollTogether => cfg.scroll_together,
             Setting::FlipAnimation => cfg.flip_animation,
+            Setting::RecordFrames => cfg.record_frames,
             Setting::NotifyReview => cfg.notify.review_requested,
             Setting::NotifyChecks => cfg.notify.checks_failed,
             Setting::NotifyBehind => cfg.notify.behind,
@@ -79,6 +81,7 @@ impl Setting {
             Setting::GithubRepos => &mut cfg.github_repos,
             Setting::ScrollTogether => &mut cfg.scroll_together,
             Setting::FlipAnimation => &mut cfg.flip_animation,
+            Setting::RecordFrames => &mut cfg.record_frames,
             Setting::NotifyReview => &mut cfg.notify.review_requested,
             Setting::NotifyChecks => &mut cfg.notify.checks_failed,
             Setting::NotifyBehind => &mut cfg.notify.behind,
@@ -98,14 +101,16 @@ enum Page {
     Badges,
     FolderIcons,
     Github,
+    Diagnostics,
 }
 
-const PAGES: [(Page, &str, &str); 5] = [
+const PAGES: [(Page, &str, &str); 6] = [
     (Page::General, "⚙", "General"),
     (Page::Views, "▤", "Status views"),
     (Page::Badges, "◉", "Icon and badge"),
     (Page::FolderIcons, "▣", "Folder icons"),
     (Page::Github, "⑂", "GitHub"),
+    (Page::Diagnostics, "⚑", "Diagnostics"),
 ];
 
 const SORTS: [(RepoSort, &str, &str); 7] = [
@@ -355,6 +360,7 @@ impl Render for SettingsView {
             Page::Badges => ("Icon and badge", badges(&cfg, &p)),
             Page::FolderIcons => ("Folder icons", folder_icons(&cfg, &p)),
             Page::Github => ("GitHub", github(&cfg, github_problem.as_deref(), &p)),
+            Page::Diagnostics => ("Diagnostics", diagnostics(&cfg, &p)),
         };
         let content = div()
             .id("content")
@@ -487,6 +493,38 @@ impl SettingsView {
             ),
         ]
     }
+}
+
+/// Tools for looking into how gitstat behaves, all off by default.
+fn diagnostics(cfg: &Config, p: &Palette) -> Vec<AnyElement> {
+    let folder = cfg.frames_folder();
+    let shown = folder.display().to_string();
+    vec![group_with_note(
+        "Animations",
+        "For checking the flip and the panel's slide frame by frame.",
+        vec![
+            flag(
+                "record-frames",
+                "Record frames",
+                "Each flip and slide saves every frame of the screen under it as \
+                 pictures. Grabbing the screen slows the animations a little while on.",
+                Setting::RecordFrames,
+                true,
+                cfg,
+                p,
+            ),
+            row_base()
+                .child(row_text("Recordings folder", shown, p))
+                .child(
+                    text_button("open-frames", "Open", p).on_click(move |_, _, cx| {
+                        let _ = std::fs::create_dir_all(&folder);
+                        cx.open_with_system(&folder);
+                    }),
+                )
+                .into_any_element(),
+        ],
+        p,
+    )]
 }
 
 fn views(cfg: &Config, p: &Palette) -> Vec<AnyElement> {

@@ -183,9 +183,13 @@ pub struct Config {
     pub panel_slide_ms: u32,
     /// How long the flip between the panel and the window takes, in ms.
     pub flip_ms: u32,
-    /// For checking the flip: a folder where each flip saves every frame
-    /// of the screen under it, and a few after, as numbered PNGs. Empty
-    /// is off; not in the settings window.
+    /// For checking the flip and the panel's slide: each saves every frame
+    /// of the screen under it, and a few after, as numbered PNGs, into
+    /// [`Config::frames_folder`]. Settings › Diagnostics. Recording slows
+    /// the animations it records.
+    pub record_frames: bool,
+    /// Where `record_frames` saves them; empty is `frames` in gitstat's
+    /// data folder.
     pub flip_frames: String,
     /// Which sections of the repo list are folded, in the panel and the
     /// big window alike.
@@ -304,6 +308,7 @@ impl Default for Config {
             flip_animation: true,
             panel_slide_ms: 150,
             flip_ms: 560,
+            record_frames: false,
             flip_frames: String::new(),
             folds: Folds::default(),
             ignore: Vec::new(),
@@ -322,6 +327,15 @@ pub enum ClickAction {
 }
 
 impl Config {
+    /// Where frame recordings go (`record_frames`).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn frames_folder(&self) -> PathBuf {
+        match self.flip_frames.trim() {
+            "" => data_dir().join("frames"),
+            f => PathBuf::from(f),
+        }
+    }
+
     /// Whether the repo named `name` is on the `ignore` list.
     pub fn is_ignored(&self, name: &str) -> bool {
         self.ignore.iter().any(|pattern| glob_match(pattern, name))

@@ -2457,7 +2457,7 @@ impl Render for MorphView {
         let band_pieces: Vec<(Bounds<Pixels>, Hsla)> = bands
             .iter()
             .flat_map(|(b, color)| {
-                let color = color.opacity(color.a * fill);
+                let color = color.opacity(fill);
                 cut_out(*b, &holes)
                     .into_iter()
                     .map(move |piece| (piece, color))
@@ -2514,7 +2514,7 @@ impl Render for MorphView {
                 let wash = if t.label.is_some() {
                     p.surface.blend(tint)
                 } else {
-                    tint.opacity(tint.a * fill)
+                    tint.opacity(fill)
                 };
                 let (a, z) = (t.from, t.to);
                 // Each end's arrow: the heading's points down when open,
@@ -2747,7 +2747,7 @@ impl Render for MorphView {
                         bounds,
                         image,
                         dot,
-                        fill: c.button.then(|| p.button.opacity(p.button.a * e)),
+                        fill: c.button.then(|| p.button.opacity(e)),
                         words,
                         kind: c.kind.clone(),
                     }
@@ -3106,7 +3106,7 @@ fn paint_health(
     p: &Palette,
 ) {
     // Dimmed while a check runs, as the views dim it.
-    let dim = |c: Hsla| if checking { c.opacity(c.a * 0.6) } else { c };
+    let dim = |c: Hsla| if checking { c.opacity(0.6) } else { c };
     let r = b.size.height / 2.0;
     // The track shows only with no repos: the segments cover it all, and
     // dimmed over it they would show it through.

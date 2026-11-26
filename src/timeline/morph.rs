@@ -137,7 +137,7 @@ pub fn paint_tree(
     let hi = (((f.len / f.step).ceil() as usize) + 2).min(rows);
     let stroke = f.blend(super::STROKE, column::STROKE);
     let dot = f.blend(super::DOT, column::DOT);
-    let a = |c: Hsla| c.opacity(c.a * alpha);
+    let a = |c: Hsla| c.opacity(alpha);
     let folded = |lane: f32| lane.round() as usize >= super::LANES;
 
     // Under everything, a soft band along each other worktree's line.
