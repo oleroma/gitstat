@@ -1203,15 +1203,16 @@ impl Timelines {
             .relative()
             .child(painter)
             .child(label)
-            // An edge in the status colour on a repo that needs something.
+            // An edge in the status colour on a repo that needs something
+            // (`status_edge`).
             .when(!status.is_synced() && !status.remote_only, |d| {
                 d.child(
                     div()
                         .absolute()
                         .left_0()
-                        .top(px(3.))
-                        .bottom(px(3.))
-                        .w(px(3.))
+                        .top(px(EDGE_INSET))
+                        .bottom(px(EDGE_INSET))
+                        .w(px(EDGE_WIDTH))
                         .rounded_r_sm()
                         .bg(crate::view::status_color(status, p)),
                 )
@@ -1838,6 +1839,23 @@ pub fn paint_still_strip(
         );
     });
     fade(bounds, p.surface, window);
+}
+
+/// The status edge along a strip's left side: its width, and how far in
+/// from the strip's top and bottom it stops, logical px.
+const EDGE_WIDTH: f32 = 3.0;
+const EDGE_INSET: f32 = 3.0;
+
+/// Where a strip whose graph sits at `bounds` draws its status edge: at
+/// the strip's left, which is its graph's.
+pub fn status_edge(bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+    Bounds::new(
+        point(bounds.left(), bounds.top() + px(EDGE_INSET)),
+        size(
+            px(EDGE_WIDTH),
+            (bounds.size.height - px(2.0 * EDGE_INSET)).max(px(0.0)),
+        ),
+    )
 }
 
 /// Where a strip at rest (`paint_still_strip`) draws what only the panel

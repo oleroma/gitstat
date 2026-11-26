@@ -216,20 +216,7 @@ pub fn mark(marks: &Entity<RepoMarks>, status: &RepoStatus, side: f32, dot: Hsla
                         .paint_image(at, Default::default(), image, 0, false)
                         .ok();
                 }
-                Look::Dot => {
-                    let r = (side * 0.22).max(3.0);
-                    let c = bounds.center();
-                    window.paint_quad(
-                        fill(
-                            Bounds::new(
-                                point(c.x - px(r), c.y - px(r)),
-                                size(px(2.0 * r), px(2.0 * r)),
-                            ),
-                            dot,
-                        )
-                        .corner_radii(px(r)),
-                    );
-                }
+                Look::Dot => paint_dot(bounds, side, dot, window),
                 Look::Drawing => {}
             }
             if off_trunk {
@@ -318,6 +305,35 @@ pub fn picture(status: &RepoStatus, sides: &[u32], cx: &App) -> Option<Arc<Rende
             Look::Image(image) => Some(image),
             _ => None,
         })
+}
+
+/// Whether [`mark`] draws `status`'s icon as a plain dot in its status
+/// colour (a repo with no picture) at any of `sides` device px.
+pub fn shows_dot(status: &RepoStatus, sides: &[u32], cx: &App) -> bool {
+    let Some(ui) = cx.try_global::<crate::view::Ui>() else {
+        return false;
+    };
+    let marks = ui.marks.read(cx);
+    let tone = FolderState::of(status).tone();
+    sides
+        .iter()
+        .any(|&n| matches!(marks.look(&status.path, (tone, n)), Look::Dot))
+}
+
+/// The dot [`mark`] draws in a box `side` logical px across.
+pub fn paint_dot(bounds: Bounds<gpui::Pixels>, side: f32, dot: Hsla, window: &mut Window) {
+    let r = (side * 0.22).max(3.0);
+    let c = bounds.center();
+    window.paint_quad(
+        fill(
+            Bounds::new(
+                point(c.x - px(r), c.y - px(r)),
+                size(px(2.0 * r), px(2.0 * r)),
+            ),
+            dot,
+        )
+        .corner_radii(px(r)),
+    );
 }
 
 fn device_px(side: f32, window: &Window) -> u32 {

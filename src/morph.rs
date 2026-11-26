@@ -920,6 +920,10 @@ type Line = (gpui::SharedString, Hsla, f32, f32);
 struct Drawn {
     bounds: Bounds<Pixels>,
     image: Option<Arc<gpui::RenderImage>>,
+    /// A repo with no picture: the dot its icon is, in its status colour.
+    dot: Option<Hsla>,
+    /// A button's fill, as far as it has come.
+    fill: Option<Hsla>,
     words: Option<Line>,
     kind: Kind,
 }
@@ -948,6 +952,9 @@ struct Carried {
     /// The words at each end: text, colour, size and boldness.
     words: Option<(Words, Words)>,
     kind: Kind,
+    /// The big window's Refresh button, which has a fill the panel's
+    /// glyph hasn't: carried with it, there by the window's end.
+    button: bool,
 }
 
 /// Everything a flip draws, laid out.
@@ -1475,12 +1482,17 @@ fn plan(
                         } else {
                             Kind::Words
                         },
+                        button: false,
                     });
                 }
-                let marks = crate::timeline::strip_marks(strip, &graph, status.dirty)
-                    .iter()
-                    .map(&in_panel)
-                    .collect();
+                let mut marks = crate::timeline::strip_marks(strip, &graph, status.dirty);
+                // The edge in the status colour along a repo that needs
+                // something, which only the panel draws: faded with the
+                // sheet, not dropped as the turn starts.
+                if !status.is_synced() && !status.remote_only {
+                    marks.push(crate::timeline::status_edge(strip).dilate(px(1.0)));
+                }
+                let marks = marks.iter().map(&in_panel).collect();
                 let strip = in_panel(&strip);
                 let newest = strip.origin.x + strip.size.width - crate::timeline::STRIP_PAD * ps;
                 let column_len = (to.size.height - body_top).max(0.0);
@@ -1581,6 +1593,7 @@ fn plan(
             tree: None,
             words,
             kind,
+            button: part == Part::Refresh,
         });
     }
     // The bars that slide: each view's body runs from under its top bar to
@@ -1779,6 +1792,11 @@ fn fill_rows(known: &[Option<Bounds<Pixels>>]) -> Vec<Option<Bounds<Pixels>>> {
 /// panel mutes.)
 fn carried_words(a: &Seen, b: &Seen, open: bool, part: Part) -> Option<(Words, Words)> {
     let (wa, wb) = a.text.clone().zip(b.text.clone())?;
+    // A button shows its own glyph or words at each end (↻ in the panel,
+    // "Refresh now" in the window): never one view's in the other's box.
+    if matches!(part, Part::Settings | Part::Refresh) {
+        return Some((wa, wb));
+    }
     let now = if open { &wa } else { &wb };
     let (text, color) = (now.0.clone(), now.1);
     let keep_color = matches!(part, Part::Checkout | Part::Label(_));
@@ -2219,6 +2237,21 @@ impl Render for MorphView {
                         cx.spawn(async move |_| unsafe { win::reassert_topmost(h) })
                             .detach();
                     }
+                    // The reveal waits for the panel to draw once it is in
+                    // place; with nothing changed it wouldn't, and the flip
+                    // would sit out its whole wait.
+                    if let Some(panel) = cx
+                        .try_global::<crate::panel::PanelSlot>()
+                        .and_then(|s| s.handle())
+                    {
+                        cx.spawn(async move |cx| {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(40))
+                                .await;
+                            panel.update(cx, |_, _, cx| cx.notify()).ok();
+                        })
+                        .detach();
+                    }
                 });
             }
         }
@@ -2644,13 +2677,18 @@ impl Render for MorphView {
                 .parts
                 .iter()
                 .map(|c| {
-                    let image = match &c.kind {
+                    let (image, dot) = match &c.kind {
                         Kind::Icon(st) => {
                             let a = c.from.size.width.round() as u32;
                             let z = c.to.size.width.round() as u32;
-                            crate::repo_marks::picture(st, &[a.max(z), a.min(z)], cx)
+                            let sides = [a.max(z), a.min(z)];
+                            let image = crate::repo_marks::picture(st, &sides, cx);
+                            let dot = (image.is_none()
+                                && crate::repo_marks::shows_dot(st, &sides, cx))
+                            .then(|| view::status_color(st, &p));
+                            (image, dot)
                         }
-                        _ => None,
+                        _ => (None, None),
                     };
                     // The same words at both ends: their size, colour and
                     // weight move from one view's to the other's.
@@ -2663,7 +2701,9 @@ impl Render for MorphView {
                         };
                         let weight = |bold: bool| if bold { 600.0 } else { 400.0 };
                         (
-                            a.0.clone(),
+                            // The same at both ends but for a button's,
+                            // which takes the ending view's halfway.
+                            if e < 0.5 { a.0.clone() } else { z.0.clone() },
                             color,
                             mix(a.2, z.2),
                             mix(weight(a.3), weight(z.3)),
@@ -2706,6 +2746,8 @@ impl Render for MorphView {
                     Drawn {
                         bounds,
                         image,
+                        dot,
+                        fill: c.button.then(|| p.button.opacity(p.button.a * e)),
                         words,
                         kind: c.kind.clone(),
                     }
@@ -2922,6 +2964,25 @@ impl Render for MorphView {
                                             )
                                             .ok();
                                     }
+                                    // As the window's `rounded_md`.
+                                    if let Some(color) = d.fill.filter(|c| c.a > 0.0) {
+                                        window.paint_quad(quad(
+                                            b,
+                                            px(6.0),
+                                            color,
+                                            px(0.0),
+                                            gpui::transparent_black(),
+                                            gpui::BorderStyle::Solid,
+                                        ));
+                                    }
+                                    if let Some(color) = d.dot {
+                                        crate::repo_marks::paint_dot(
+                                            b,
+                                            f32::from(b.size.width),
+                                            color,
+                                            window,
+                                        );
+                                    }
                                     if let Kind::Icon(st) = &d.kind
                                         && st.off_trunk()
                                     {
@@ -3012,6 +3073,9 @@ fn paint_words(
     let (color, size) = (*color, *size);
     let mut font = window.text_style().font();
     font.weight = gpui::FontWeight(*weight);
+    // Digits of one width, as the views draw them (`StatusView`'s root):
+    // otherwise counts set a hair wider or narrower than their twins.
+    font.features = gpui::FontFeatures(std::sync::Arc::new(vec![("tnum".to_string(), 1)]));
     let run = gpui::TextRun {
         len: text.len(),
         font,
