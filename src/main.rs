@@ -53,6 +53,8 @@ mod overlay;
 #[cfg(windows)]
 mod panel;
 #[cfg(windows)]
+mod probe;
+#[cfg(windows)]
 mod repo_marks;
 #[cfg(windows)]
 mod repo_menu;

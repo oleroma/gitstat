@@ -12,7 +12,7 @@ use windows_sys::Win32::Graphics::Dwm::{
     DWMNCRP_DISABLED, DWMNCRP_USEWINDOWSTYLE, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR,
     DWMWA_COLOR_DEFAULT, DWMWA_COLOR_NONE, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_NCRENDERING_POLICY,
     DWMWA_VISIBLE_FRAME_BORDER_THICKNESS, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
-    DWMWCP_ROUND, DwmGetWindowAttribute, DwmSetWindowAttribute,
+    DWMWCP_ROUND, DwmFlush, DwmGetWindowAttribute, DwmSetWindowAttribute,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     ClientToScreen, CreateEllipticRgn, CreateRectRgn, DeleteObject, EnumDisplayMonitors,
@@ -395,6 +395,12 @@ pub fn to_front(h: isize) {
             SetForegroundWindow(hwnd);
         }
     }
+}
+
+/// Waits for Windows to put the next frame on the screen. Changes made to
+/// windows right after it returns have a whole refresh to land together.
+pub fn dwm_flush() {
+    unsafe { DwmFlush() };
 }
 
 /// Shows a window [`cloak`] hid, at the next composition.

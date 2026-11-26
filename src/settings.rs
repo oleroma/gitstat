@@ -522,6 +522,18 @@ fn diagnostics(cfg: &Config, p: &Palette) -> Vec<AnyElement> {
                     }),
                 )
                 .into_any_element(),
+            row_base()
+                .child(row_text(
+                    "Measure",
+                    "Opens two test windows for about fifteen seconds and writes what it \
+                     measured (window swaps, drawing speed) into the recordings folder. \
+                     Leave the mouse and the screen under them alone meanwhile.",
+                    p,
+                ))
+                .child(
+                    text_button("run-probes", "Run", p).on_click(|_, _, cx| crate::probe::run(cx)),
+                )
+                .into_any_element(),
         ],
         p,
     )]

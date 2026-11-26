@@ -288,7 +288,7 @@ pub fn circle(
 }
 
 /// A tiny-skia picture as the straight-alpha BGRA GPUI takes.
-fn to_image(pixmap: tiny_skia::Pixmap) -> Option<Arc<RenderImage>> {
+pub(crate) fn to_image(pixmap: tiny_skia::Pixmap) -> Option<Arc<RenderImage>> {
     let (iw, ih) = (pixmap.width(), pixmap.height());
     let mut data = pixmap.take_demultiplied();
     for px in data.as_chunks_mut::<4>().0 {
