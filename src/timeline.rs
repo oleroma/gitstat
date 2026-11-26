@@ -35,14 +35,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// A strip's height; the panel's row height in `layout`.
-pub const STRIP_HEIGHT: f32 = 36.0;
+pub const STRIP_HEIGHT: f32 = crate::scene::panel::STRIP;
 /// The label column at the strip's right.
-pub const LABEL_WIDTH: f32 = 168.0;
+pub const LABEL_WIDTH: f32 = crate::scene::panel::LABEL;
 /// The label column in icons-only mode: the repo's icon alone.
-pub const ICON_LABEL_WIDTH: f32 = 40.0;
-/// A repo icon beside its name, and alone in icons-only mode; logical px.
-const MARK: f32 = 16.0;
-const ICON_MARK: f32 = 22.0;
+pub const ICON_LABEL_WIDTH: f32 = crate::scene::panel::ICON_LABEL;
 /// Px between commits along a strip.
 const STEP: f32 = 14.0;
 /// Px between lanes across a strip.
@@ -274,6 +271,15 @@ pub struct Timelines {
     /// Full commit messages by id, read on first hover.
     messages: HashMap<String, Arc<str>>,
     messages_pending: HashSet<String>,
+}
+
+/// A repo's strip in the panel ([`Timelines::strip`]).
+pub struct Strip {
+    /// What lies under the row's parts, as big as the row.
+    pub slot: AnyElement,
+    /// Its label's second line: what is checked out, and how it stands.
+    pub checkout: String,
+    pub status: String,
 }
 
 /// How many commits' line stats and messages are kept: past that, the
@@ -855,7 +861,9 @@ impl Timelines {
         Some(g.commits.get(row)?.id.clone())
     }
 
-    /// One repo's strip: the graph, then the name, checkout and status.
+    /// One repo's strip in the panel: what lies under its row's parts (its
+    /// tree, and where the mouse finds its label), and its label's words
+    /// for the scene to draw.
     pub fn strip(
         this: &Entity<Timelines>,
         index: usize,
@@ -864,7 +872,7 @@ impl Timelines {
         dark: bool,
         icons_only: bool,
         cx: &App,
-    ) -> AnyElement {
+    ) -> Strip {
         let t = this.read(cx);
         let path = status.path.clone();
         let slot = t.slots.get(&path);
@@ -1007,8 +1015,6 @@ impl Timelines {
         };
         let label = div()
             .id(("label", index))
-            .flex()
-            .items_center()
             .flex_none()
             .h_full()
             .cursor_pointer()
@@ -1031,149 +1037,25 @@ impl Timelines {
                     crate::view::open_repo(&open_path, cx);
                 }
             });
-        let label = if icons_only {
-            // The icon alone; its words in a tooltip.
-            let mut lines = vec![
-                (status.name.clone(), p.text),
-                (checkout, p.muted),
-                (status_text, status_color),
-            ];
-            lines.extend(crate::view::status_details(status, p));
-            label
-                .justify_center()
-                .w(px(ICON_LABEL_WIDTH))
-                .tooltip(crate::view::tip(lines, p))
-                .child(
-                    div()
-                        .relative()
-                        .flex_none()
-                        .child(crate::repo_marks::global_mark(
-                            status,
-                            ICON_MARK,
-                            status_color,
-                            cx,
-                        ))
-                        .child(crate::morph::tag(
-                            crate::morph::Side::Panel,
-                            &status.path,
-                            crate::morph::Part::Icon,
-                            None,
-                        )),
-                )
-        } else {
-            let mut lines = vec![
-                (status.name.clone(), p.text),
-                (status_text.clone(), status_color),
-            ];
-            lines.extend(crate::view::status_details(status, p));
-            label
-                .tooltip(crate::view::tip(lines, p))
-                .gap_2()
-                .w(px(LABEL_WIDTH))
-                .pl_2()
-                .pr_4()
-                .child(
-                    div()
-                        .relative()
-                        .flex_none()
-                        .child(crate::repo_marks::global_mark(
-                            status,
-                            MARK,
-                            status_color,
-                            cx,
-                        ))
-                        .child(crate::morph::tag(
-                            crate::morph::Side::Panel,
-                            &status.path,
-                            crate::morph::Part::Icon,
-                            None,
-                        )),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .justify_center()
-                        .flex_1()
-                        .min_w_0()
-                        .child(
-                            div()
-                                .relative()
-                                .truncate()
-                                .text_sm()
-                                .text_color(p.text)
-                                .child(status.name.clone())
-                                .child(crate::morph::tag(
-                                    crate::morph::Side::Panel,
-                                    &status.path,
-                                    crate::morph::Part::Name,
-                                    Some((
-                                        status.name.clone().into(),
-                                        crate::morph::Look {
-                                            color: p.text,
-                                            size: 14.0,
-                                            bold: false,
-                                        },
-                                    )),
-                                )),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .gap_1()
-                                .text_xs()
-                                .child(
-                                    div()
-                                        .relative()
-                                        .flex_shrink()
-                                        .min_w_0()
-                                        .truncate()
-                                        .text_color(p.muted)
-                                        .child(checkout.clone())
-                                        .child(crate::morph::tag(
-                                            crate::morph::Side::Panel,
-                                            &status.path,
-                                            crate::morph::Part::Checkout,
-                                            Some((
-                                                checkout.into(),
-                                                crate::morph::Look {
-                                                    color: p.muted,
-                                                    size: 12.0,
-                                                    bold: false,
-                                                },
-                                            )),
-                                        )),
-                                )
-                                .child(
-                                    div()
-                                        .relative()
-                                        .flex_none()
-                                        .max_w(px(LABEL_WIDTH * 0.6))
-                                        .truncate()
-                                        .text_color(status_color)
-                                        .child(status_text.clone())
-                                        .child(crate::morph::tag(
-                                            crate::morph::Side::Panel,
-                                            &status.path,
-                                            crate::morph::Part::Status,
-                                            Some((
-                                                status_text.into(),
-                                                crate::morph::Look {
-                                                    color: status_color,
-                                                    size: 12.0,
-                                                    bold: false,
-                                                },
-                                            )),
-                                        )),
-                                ),
-                        ),
-                )
-        };
-        div()
+        // Its icon and words are the scene's parts, drawn over this: here
+        // only where the mouse finds them, and what it says when it rests.
+        let mut lines = vec![(status.name.clone(), p.text)];
+        if icons_only {
+            lines.push((checkout.clone(), p.muted));
+        }
+        lines.push((status_text.clone(), status_color));
+        lines.extend(crate::view::status_details(status, p));
+        let label = label
+            .tooltip(crate::view::tip(lines, p))
+            .w(px(if icons_only {
+                ICON_LABEL_WIDTH
+            } else {
+                LABEL_WIDTH
+            }));
+        let slot = div()
             .id(("strip", index))
             .flex()
-            .items_center()
-            .h(px(STRIP_HEIGHT))
+            .size_full()
             .on_scroll_wheel(move |e: &ScrollWheelEvent, _, cx| {
                 let d = e.delta.pixel_delta(px(STEP * 3.0));
                 let (x, y) = (f32::from(d.x), f32::from(d.y));
@@ -1200,24 +1082,14 @@ impl Timelines {
                 cx.stop_propagation();
                 entity.update(cx, |t, cx| t.scroll(&wheel_path, dx, all, cx));
             })
-            .relative()
             .child(painter)
             .child(label)
-            // An edge in the status colour on a repo that needs something
-            // (`status_edge`).
-            .when(!status.is_synced() && !status.remote_only, |d| {
-                d.child(
-                    div()
-                        .absolute()
-                        .left_0()
-                        .top(px(EDGE_INSET))
-                        .bottom(px(EDGE_INSET))
-                        .w(px(EDGE_WIDTH))
-                        .rounded_r_sm()
-                        .bg(crate::view::status_color(status, p)),
-                )
-            })
-            .into_any_element()
+            .into_any_element();
+        Strip {
+            slot,
+            checkout,
+            status: status_text,
+        }
     }
 
     /// The card for the dot under the mouse, drawn above everything once

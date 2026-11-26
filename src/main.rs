@@ -32,6 +32,8 @@ mod repo_icon;
 #[cfg(any(windows, test))]
 mod repo_info;
 #[cfg(any(windows, test))]
+mod scene;
+#[cfg(any(windows, test))]
 mod self_update;
 #[cfg(any(windows, test))]
 mod state;

@@ -6,6 +6,7 @@ use crate::git::RepoStatus;
 use crate::github::{Checks, Mergeable, Pr, PrState, Review};
 use crate::monitor::WatchMode;
 use crate::panel;
+use crate::scene::text::text;
 use crate::state::{AppState, Input};
 use crate::timeline::Timelines;
 use crate::tray::TraySnapshot;
@@ -19,6 +20,8 @@ use gpui::{
 };
 use std::path::PathBuf;
 use std::rc::Rc;
+
+mod panel_scene;
 
 /// The window's smallest opening size; big mode grows it to fit columns.
 const WINDOW_SIZE: (f32, f32) = (420.0, 520.0);
@@ -159,9 +162,7 @@ fn show_window_as(cloaked: bool, cx: &mut App) {
                         // Its rim and title bar in colours the flip draws,
                         // as thick as Windows draws it.
                         seen_rim(h);
-                        unsafe {
-                            win::set_frame_colors(h, rim_rgb(dark), Some(title_bar_rgb(dark)))
-                        };
+                        unsafe { win::set_frame_colors(h, rim_rgb(dark), title_bar_rgb(dark)) };
                         // A maximised window shows at its normal size and
                         // maximises a moment later: measure it, and let
                         // the flip reveal it, once it has.
@@ -663,11 +664,13 @@ impl StatusView {
                     window.appearance(),
                     WindowAppearance::Dark | WindowAppearance::VibrantDark
                 );
-                let caption = (mode == Mode::Window).then(|| title_bar_rgb(dark));
-                cx.spawn(async move |_, _| unsafe {
-                    win::set_frame_colors(h, rim_rgb(dark), caption)
-                })
-                .detach();
+                // The panel draws its own rim.
+                if mode == Mode::Window {
+                    cx.spawn(async move |_, _| unsafe {
+                        win::set_frame_colors(h, rim_rgb(dark), title_bar_rgb(dark))
+                    })
+                    .detach();
+                }
             }
             cx.notify()
         })
@@ -893,15 +896,6 @@ pub(crate) fn section_color(section: Section, p: &Palette) -> Hsla {
         Section::GithubOnly | Section::PullRequests => p.muted,
     }
 }
-
-/// Room under an open section's heading, so a tag's diamond over a dot in
-/// the first strip's top lane stays clear of the heading.
-fn heading_gap() -> AnyElement {
-    div().h(px(HEADING_GAP)).flex_none().into_any_element()
-}
-
-/// How tall that room is, logical px.
-const HEADING_GAP: f32 = 4.0;
 
 /// A panel section heading's words.
 /// A section's heading words, alike in the panel and on its spine.
@@ -1196,7 +1190,7 @@ fn pr_row(
                         .border_color(c),
                     _ => div()
                         .text_color(c)
-                        .child(if icons_only { glyph } else { words }),
+                        .child(text(if icons_only { glyph } else { words })),
                 }),
         );
     div()
@@ -1221,7 +1215,7 @@ fn pr_row(
                 .flex_none()
                 .text_sm()
                 .text_color(p.muted)
-                .child(format!("#{}", pr.number)),
+                .child(text(format!("#{}", pr.number))),
         )
         .child(
             div()
@@ -1229,7 +1223,7 @@ fn pr_row(
                 .min_w_0()
                 .truncate()
                 .text_color(p.text)
-                .when(!icons_only, |d| d.child(pr.title.clone())),
+                .when(!icons_only, |d| d.child(text(pr.title.clone()))),
         )
         .child(right)
         .into_any_element()
@@ -1273,17 +1267,17 @@ fn pr_rows(
             .text_xs()
             .font_weight(gpui::FontWeight::SEMIBOLD)
             .text_color(if asked > 0 { p.amber } else { p.muted })
-            .child(div().flex_1().min_w_0().truncate().child(heading));
+            .child(div().flex_1().min_w_0().truncate().child(text(heading)));
         let head = match fold {
             Some((folded, toggle)) => head
                 .when(folded, |d| d.pb_3())
                 .cursor_pointer()
                 .hover(|style| style.bg(p.hover))
-                .child(div().flex_none().text_color(p.muted).child(if folded {
+                .child(div().flex_none().text_color(p.muted).child(text(if folded {
                     "▸"
                 } else {
                     "▾"
-                }))
+                })))
                 .on_click(toggle),
             None => head,
         };
@@ -1301,7 +1295,7 @@ fn pr_rows(
                 .text_xs()
                 .text_color(p.muted)
                 .truncate()
-                .child(format!("Pull requests: {problem}"))
+                .child(text(format!("Pull requests: {problem}")))
                 .into_any_element(),
         );
     }
@@ -1319,7 +1313,7 @@ fn remote_problem_row(problem: &str, p: &Palette) -> AnyElement {
         .text_xs()
         .text_color(p.muted)
         .truncate()
-        .child(format!("GitHub repos: {problem}"))
+        .child(text(format!("GitHub repos: {problem}")))
         .into_any_element()
 }
 
@@ -1530,51 +1524,81 @@ fn icon_button(
         .child(glyph)
 }
 
+/// The top bar's words: the headline in its colour, and the line under it.
+fn titles(state: &AppState, p: &Palette) -> (SharedString, Hsla, String) {
+    let unsynced = state.unsynced();
+    let problem = state.problem();
+    let sweeping = state.sweeping;
+    let headline: SharedString = crate::tray::summary(
+        &TraySnapshot {
+            statuses: &state.statuses,
+            checking: sweeping,
+            has_result: state.has_result,
+            problem: problem.as_deref(),
+            incomplete: state.capped.is_some(),
+        },
+        unsynced,
+    )
+    .into();
+    let headline_color = if problem.is_some() || unsynced > 0 {
+        p.red
+    } else if state.has_result {
+        p.green
+    } else {
+        p.muted
+    };
+    let roots = state.config.roots();
+    let mut subline = roots
+        .first()
+        .map(|r| r.display().to_string())
+        .unwrap_or_default();
+    if roots.len() > 1 {
+        subline.push_str(&format!(" + {} more", roots.len() - 1));
+    }
+    if let Some(time) = &state.last_checked {
+        subline.push_str(&format!(" · checked {time}"));
+    }
+    if sweeping {
+        subline.push_str(" · checking…");
+    }
+    if !state.filter.is_empty() {
+        let found =
+            state.sorted(&state.statuses).len() + state.sorted(&state.remote_statuses).len();
+        subline = format!(
+            "Filter “{}”: {found} {} · Esc clears",
+            state.filter,
+            if found == 1 { "repo" } else { "repos" }
+        );
+    }
+    (headline, headline_color, subline)
+}
+
 impl Render for StatusView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.mode == Mode::Panel {
+            return self.render_panel(window, cx);
+        }
+        self.render_window(window, cx)
+    }
+}
+
+impl StatusView {
+    /// The big window.
+    fn render_window(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::for_appearance(window.appearance());
         let dark = matches!(
             window.appearance(),
             WindowAppearance::Dark | WindowAppearance::VibrantDark
         );
         let mode = self.mode;
-        // The panel's rows measured as laid out, so the panel can be made
-        // exactly as tall as what it shows.
-        let content_h = Rc::new(std::cell::Cell::new(0.0f32));
         let filter_state = self.state.clone();
         let timelines = self.timelines.clone();
-        // Pictures only: the panel's words move into tooltips.
-        let icons_only = mode == Mode::Panel && self.state.read(cx).config.icons_only;
-        // Sliding clipped, the panel draws its own frame (`win::slide_panel`):
-        // its sheet, rim and shadow, in the room its window keeps around it.
-        let drawn = (mode == Mode::Panel)
-            .then(|| panel::drawn_frame(cx))
-            .flatten()
-            .map(|room| DrawnFrame::new(room, window));
-        // A repo row: a timeline strip in the panel, a plain row elsewhere.
-        let row = |i: usize, s: &RepoStatus, cx: &App| match (&timelines, mode) {
-            (Some(t), Mode::Panel) => Timelines::strip(t, i, s, &p, dark, icons_only, cx),
-            _ => repo_row(i, s, &p, mode, cx),
-        };
+        let icons_only = false;
         // A strip's label asked big mode for its repo's column.
         let focus = match (&self.timelines, mode) {
             (Some(t), Mode::Window) => t.update(cx, |t, _| t.take_focus()),
             _ => None,
         };
-        // The flip lines one view's scroll up with the other's: the
-        // panel's topmost repo is the window's leftmost column, and back.
-        match mode {
-            Mode::Panel => {
-                if let Some(y) = NEXT_LIST_SCROLL.take() {
-                    self.list.set_offset(point(px(0.), px(-y)));
-                }
-                crate::morph::seen_list_scroll(
-                    -f32::from(self.list.offset().y),
-                    f32::from(self.list.max_offset().height),
-                );
-            }
-            Mode::Window => {}
-        }
         // Set by the flip, which has brought any asked-for column into
         // sight already.
         let table_to = (mode == Mode::Window)
@@ -1585,50 +1609,9 @@ impl Render for StatusView {
         }
         let state = self.state.clone();
         let state = state.read(cx);
-        let unsynced = state.unsynced();
         let problem = state.problem();
         let sweeping = state.sweeping;
-        let headline: SharedString = crate::tray::summary(
-            &TraySnapshot {
-                statuses: &state.statuses,
-                checking: sweeping,
-                has_result: state.has_result,
-                problem: problem.as_deref(),
-                incomplete: state.capped.is_some(),
-            },
-            unsynced,
-        )
-        .into();
-        let headline_color = if problem.is_some() || unsynced > 0 {
-            p.red
-        } else if state.has_result {
-            p.green
-        } else {
-            p.muted
-        };
-        let roots = state.config.roots();
-        let mut subline = roots
-            .first()
-            .map(|r| r.display().to_string())
-            .unwrap_or_default();
-        if roots.len() > 1 {
-            subline.push_str(&format!(" + {} more", roots.len() - 1));
-        }
-        if let Some(time) = &state.last_checked {
-            subline.push_str(&format!(" · checked {time}"));
-        }
-        if sweeping {
-            subline.push_str(" · checking…");
-        }
-        if !state.filter.is_empty() {
-            let found =
-                state.sorted(&state.statuses).len() + state.sorted(&state.remote_statuses).len();
-            subline = format!(
-                "Filter “{}”: {found} {} · Esc clears",
-                state.filter,
-                if found == 1 { "repo" } else { "repos" }
-            );
-        }
+        let (headline, headline_color, subline) = titles(state, &p);
         // The top bar's parts, which the flip carries between the views.
         let side = match mode {
             Mode::Panel => crate::morph::Side::Panel,
@@ -1799,69 +1782,11 @@ impl Render for StatusView {
                 ),
         };
 
-        // The pull requests show a GitHub problem; without them, this does.
-        let remote_problem = if state.config.github_prs || !state.config.github_repos {
-            None
-        } else {
-            state.github_problem.as_deref()
-        };
+        // Without timelines (never, once the app is up) a plain list.
         let mut rows: Vec<AnyElement> = Vec::new();
-        match mode {
-            // Without timelines (never, once the app is up) a plain list.
-            Mode::Window if timelines.is_none() => {
-                for (i, s) in state.statuses.iter().enumerate() {
-                    rows.push(repo_row(i, s, &p, mode, cx));
-                }
-            }
-            Mode::Window => {}
-            Mode::Panel => {
-                let sorted = state.sorted_for_panel();
-                let (bad, good): (Vec<&RepoStatus>, Vec<&RepoStatus>) =
-                    sorted.into_iter().partition(|s| !s.is_synced());
-                if !bad.is_empty() {
-                    let open = !state.folded(Section::NeedsYou);
-                    rows.extend(panel_heading(Section::NeedsYou, state, icons_only, &p, cx));
-                    if open {
-                        rows.push(heading_gap());
-                        for (i, s) in bad.iter().enumerate() {
-                            rows.push(row(i, s, cx));
-                        }
-                    }
-                }
-                if !good.is_empty() {
-                    let open = !state.folded(Section::Synced);
-                    rows.extend(panel_heading(Section::Synced, state, icons_only, &p, cx));
-                    if open {
-                        rows.push(heading_gap());
-                        let offset = bad.len();
-                        for (i, s) in good.iter().enumerate() {
-                            rows.push(row(offset + i, s, cx));
-                        }
-                    }
-                }
-                // The GitHub repos with no clone, last, folded like the
-                // synced ones.
-                let remote = state.sorted(&state.remote_statuses);
-                if !remote.is_empty() {
-                    let open = !state.folded(Section::GithubOnly);
-                    rows.extend(panel_heading(
-                        Section::GithubOnly,
-                        state,
-                        icons_only,
-                        &p,
-                        cx,
-                    ));
-                    if open {
-                        rows.push(heading_gap());
-                        let offset = bad.len() + good.len();
-                        for (i, s) in remote.iter().enumerate() {
-                            rows.push(row(offset + i, s, cx));
-                        }
-                    }
-                } else if let Some(problem) = remote_problem {
-                    rows.push(remote_problem_row(problem, &p));
-                }
-                rows.extend(prs_block(state, Mode::Panel, icons_only, &p, cx));
+        if timelines.is_none() {
+            for (i, s) in state.statuses.iter().enumerate() {
+                rows.push(repo_row(i, s, &p, mode, cx));
             }
         }
 
@@ -1915,20 +1840,7 @@ impl Render for StatusView {
             }
             _ => None,
         };
-        let list_h = content_h.clone();
-        let measured = self.list.clone();
         let list = div()
-            .on_children_prepainted(move |_, _, _| {
-                // A list tracked by a scroll handle passes no bounds here:
-                // the handle has them.
-                let first = measured.bounds_for_item(0);
-                let last = (0..).map_while(|i| measured.bounds_for_item(i)).last();
-                let h = match (first, last) {
-                    (Some(first), Some(last)) => f32::from(last.bottom()) - f32::from(first.top()),
-                    _ => 0.0,
-                };
-                list_h.set(h);
-            })
             .id("repos")
             .flex()
             .flex_col()
@@ -1937,11 +1849,6 @@ impl Render for StatusView {
             .overflow_y_scroll()
             .track_scroll(&self.list)
             .bg(p.surface)
-            // With no footer it reaches the panel's bottom corners: rounded
-            // as they are, where the panel draws them itself.
-            .when_some(drawn.filter(|_| icons_only), |list, f| {
-                list.rounded_b(f.inner_radius())
-            })
             .children(rows)
             .when(no_local, |list| {
                 list.child(div().p_4().text_sm().text_color(p.muted).child(empty_text))
@@ -2031,24 +1938,6 @@ impl Render for StatusView {
         };
 
         div()
-            .when(mode == Mode::Panel, |d| {
-                // Header, rows, footer: grow or shrink the panel to them
-                // whenever they change (a section folded, repos or pull
-                // requests come or go), with no empty space below.
-                // Past the frame drawn under them, while there is one.
-                let first = usize::from(drawn.is_some());
-                d.on_children_prepainted(move |parts, _, cx| {
-                    let header = parts.get(first).map_or(0.0, |b| f32::from(b.size.height));
-                    let footer = if icons_only {
-                        0.0
-                    } else {
-                        parts
-                            .get(first + 2)
-                            .map_or(0.0, |b| f32::from(b.size.height))
-                    };
-                    panel::fit(header + content_h.get() + footer, cx);
-                })
-            })
             .id("root")
             // Digits of one width, so counts and ⬆⬇ numbers line up.
             .map(|mut d| {
@@ -2081,36 +1970,7 @@ impl Render for StatusView {
             .flex()
             .flex_col()
             .size_full()
-            .map(|d| match drawn {
-                // The room around the panel stays clear but for the
-                // shadow; the panel's sheet is drawn under its parts.
-                Some(f) => d.relative().p(f.room()).child(
-                    canvas(
-                        |_, _, _| {},
-                        move |_, _, window, _| {
-                            let sheet = f.sheet(window);
-                            if window.is_window_active() {
-                                window.paint_shadows(
-                                    sheet,
-                                    gpui::Corners::all(px(win::PANEL_RADIUS)),
-                                    &crate::morph::window_shadow(),
-                                );
-                            }
-                            window.paint_quad(gpui::quad(
-                                sheet,
-                                px(win::PANEL_RADIUS),
-                                p.bg,
-                                px(0.0),
-                                gpui::transparent_black(),
-                                gpui::BorderStyle::Solid,
-                            ));
-                        },
-                    )
-                    .absolute()
-                    .inset_0(),
-                ),
-                None => d.bg(p.bg),
-            })
+            .bg(p.bg)
             .text_color(p.text)
             .child(sideways(header, mode, cx))
             .map(|d| match table {
@@ -2119,33 +1979,12 @@ impl Render for StatusView {
             })
             .children(window_prs)
             .when(!icons_only, |d| d.child(sideways(footer, mode, cx)))
-            // Windows draws no rim while the panel slides clipped (the
-            // badge's slide): drawn here meanwhile, over the panel's edge,
-            // just where Windows draws it.
-            .when_some(drawn, |d, f| {
-                d.child(
-                    canvas(
-                        |_, _, _| {},
-                        move |_, _, window, _| {
-                            window.paint_quad(gpui::quad(
-                                f.sheet(window),
-                                px(win::PANEL_RADIUS),
-                                gpui::transparent_black(),
-                                f.rim,
-                                rim(dark),
-                                gpui::BorderStyle::Solid,
-                            ));
-                        },
-                    )
-                    .absolute()
-                    .inset_0(),
-                )
-            })
             .children(
                 self.timelines
                     .as_ref()
                     .and_then(|t| t.read(cx).hover_card(&p, dark, cx)),
             )
+            .into_any_element()
     }
 }
 
@@ -2228,45 +2067,6 @@ fn sideways(part: impl IntoElement, mode: Mode, cx: &mut Context<StatusView>) ->
             }
         }))
         .into_any_element()
-}
-
-/// The panel's own frame while it slides clipped, logical px: the room
-/// its window keeps around it, and its rim, which Windows draws just
-/// outside the panel, as thick as it draws it.
-#[derive(Clone, Copy)]
-struct DrawnFrame {
-    room: gpui::Pixels,
-    rim: gpui::Pixels,
-}
-
-impl DrawnFrame {
-    fn new(room: i32, window: &Window) -> Self {
-        let s = window.scale_factor();
-        Self {
-            room: px(room as f32 / s),
-            rim: px(rim_width(s).round() / s),
-        }
-    }
-
-    fn room(self) -> gpui::Pixels {
-        self.room
-    }
-
-    /// The panel's visible frame, rim and all, in the window: the window
-    /// less the room around it, plus the rim. On whole physical px.
-    fn sheet(self, window: &Window) -> Bounds<gpui::Pixels> {
-        let inset = self.room - self.rim;
-        let size = window.viewport_size();
-        Bounds {
-            origin: point(inset, inset),
-            size: gpui::size(size.width - inset * 2.0, size.height - inset * 2.0),
-        }
-    }
-
-    /// The corners of what the panel shows, inside its rim.
-    fn inner_radius(self) -> gpui::Pixels {
-        px(win::PANEL_RADIUS) - self.rim
-    }
 }
 
 /// The light rim Windows 11 draws around a window, for where gitstat
@@ -2494,6 +2294,7 @@ pub(crate) fn tip(
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct Palette {
     pub bg: Hsla,
     pub surface: Hsla,

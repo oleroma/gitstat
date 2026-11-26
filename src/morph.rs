@@ -641,11 +641,16 @@ pub fn flip_hwnd(cx: &App) -> Option<isize> {
 /// no longer holds up the windows.
 const STUCK: Duration = Duration::from_secs(12);
 
+/// The flip is being rebuilt on the scene the panel now draws from: off
+/// until it is, the views opening and closing plainly meanwhile.
+const ON_THE_SCENE: bool = false;
+
 fn enabled(cx: &App) -> bool {
-    cx.try_global::<Ui>().is_some_and(|ui| {
-        let cfg = &ui.state.read(cx).config;
-        cfg.flip_animation && cfg.window && cfg.panel
-    })
+    ON_THE_SCENE
+        && cx.try_global::<Ui>().is_some_and(|ui| {
+            let cfg = &ui.state.read(cx).config;
+            cfg.flip_animation && cfg.window && cfg.panel
+        })
 }
 
 /// A filter typed in one view would be cleared by the other as it opens:

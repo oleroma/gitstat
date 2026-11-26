@@ -1,14 +1,20 @@
 //! The flyout panel: opened next to the tray icon or the overlay badge,
 //! destroyed when it loses focus and recreated on the next open, so there is
 //! no hidden-window state to drift.
+//!
+//! Its window never moves or changes size while it is open: a see-through
+//! window over its monitor's whole work area, in which the panel draws
+//! itself, rim and shadow too, wherever it is to be. Sliding in or out and
+//! growing or shrinking are then only what it draws, each frame whole, and
+//! the work area's edge cuts it as a taskbar would.
 
 use crate::config::Corner;
 use crate::layout::{self, Rect};
 use crate::view::{self, Mode, StatusView, Ui};
 use crate::win;
 use gpui::{
-    App, AppContext, Bounds, Global, Window, WindowBounds, WindowHandle, WindowKind, WindowOptions,
-    point, px, size,
+    App, AppContext, Bounds, Global, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowHandle, WindowKind, WindowOptions, point, px, size,
 };
 use std::time::{Duration, Instant};
 
@@ -16,8 +22,7 @@ use std::time::{Duration, Instant};
 /// deactivates on the tray's mouse-down, then the click-up arrives, and a
 /// double-click sends two clicks.
 const DEBOUNCE: Duration = Duration::from_millis(400);
-/// Wide enough for a timeline strip next to each repo's name.
-const WIDTH: f32 = 480.0;
+const WIDTH: f32 = crate::scene::panel::WIDTH;
 /// Logical px between the panel and the taskbar or the badge.
 const GAP: f32 = 12.0;
 
@@ -37,17 +42,30 @@ pub struct PanelSlot {
     /// The open panel's HWND, so the badge can stay below it.
     hwnd: Option<isize>,
     toggled_at: Option<Instant>,
-    /// Where the open panel hangs from, and the content height in logical
-    /// px it was last fitted to.
+    /// Where the open panel hangs from, and its height in physical px as
+    /// last laid out.
     anchor: Option<Anchor>,
-    height: f32,
-    /// Where the open panel's client area goes, physical px.
+    height: i32,
+    /// Where the open panel is on screen once slid in (its sheet inside
+    /// the rim), physical px.
     rect: Option<Rect>,
+    /// Where its window's client area was put: its monitor's work area.
+    area: Option<Rect>,
+    /// Frames it has drawn, and whether it shows yet: it opens cloaked
+    /// and shows once it has drawn itself.
+    drawn: u32,
+    shown: bool,
+    /// Opened for a flip back to land on: cloaked until that reveals it.
+    held: bool,
+    /// Clicks go through its window to what is under it (the mouse is
+    /// off the panel itself).
+    through: bool,
     /// The slide in under way: when it began, how long it lasts, and the
     /// work area edge it comes from.
     slide: Option<Slide>,
-    /// It is sliding away to close.
+    /// It is sliding away to close, and has slid all the way.
     leaving: bool,
+    closing: bool,
     /// When it was last opened or refitted: the flip back waits for it to
     /// have drawn since.
     fitted: Option<Instant>,
@@ -180,10 +198,12 @@ pub fn reopen_cloaked(cx: &mut App) -> bool {
 
 pub fn close(cx: &mut App) {
     let slot = cx.default_global::<PanelSlot>();
-    if let Some(h) = slot.hwnd.take() {
-        win::forget_bare(h);
-    }
+    slot.hwnd = None;
     slot.leaving = false;
+    slot.closing = false;
+    slot.slide = None;
+    slot.shown = false;
+    slot.held = false;
     if let Some(handle) = slot.handle.take() {
         slot.toggled_at = Some(Instant::now());
         view::remove(handle.into(), cx);
@@ -191,25 +211,22 @@ pub fn close(cx: &mut App) {
 }
 
 /// Makes the open panel, cloaked under a flip back, the active window,
-/// once the big window has gone from the screen. Activating places it
-/// where it was opened, so it then goes back where it was fitted to since.
+/// once the big window has gone from the screen: the flip then shows it.
+/// Activating places it where it was opened, so it then goes back where
+/// its window belongs.
 pub fn activate(cx: &mut App) {
     let slot = cx.default_global::<PanelSlot>();
-    let (Some(handle), Some(h), Some(rect)) = (slot.handle, slot.hwnd, slot.rect) else {
+    let (Some(handle), Some(h), Some(area)) = (slot.handle, slot.hwnd, slot.area) else {
         return;
     };
+    slot.shown = true;
+    slot.held = false;
     handle
         .update(cx, |_, window, _| window.activate_window())
         .ok();
     // After the activation's own placement, which is queued first.
-    cx.spawn(async move |_| unsafe { win::place_window(h, rect) })
+    cx.spawn(async move |_| unsafe { win::place_window(h, area) })
         .detach();
-}
-
-/// While the panel slides clipped, with Windows' frame off, the room it
-/// keeps around itself to draw its own in, physical px (`win::slide_panel`).
-pub fn drawn_frame(cx: &App) -> Option<i32> {
-    hwnd(cx).and_then(win::bare_margin)
 }
 
 pub fn is_open(cx: &App) -> bool {
@@ -240,6 +257,34 @@ pub(crate) fn dismiss(window: &mut Window, cx: &mut App) {
     }
 }
 
+/// The window the panel at `anchor` draws in: its monitor's work area.
+/// Never a whole monitor, which Windows would take for a full-screen app
+/// and drop the taskbar behind: with no taskbar taking room, a px less.
+fn window_area(anchor: Anchor) -> Rect {
+    let (x, y) = anchor_rect(anchor).centre();
+    let mon = win::monitor_at(x, y);
+    if mon.work == mon.rect {
+        Rect::new(
+            mon.work.left,
+            mon.work.top + 1,
+            mon.work.right,
+            mon.work.bottom,
+        )
+    } else {
+        mon.work
+    }
+}
+
+fn anchor_rect(anchor: Anchor) -> Rect {
+    match anchor {
+        Anchor::Tray(Some(rect)) | Anchor::Overlay { rect, .. } => rect,
+        Anchor::Tray(None) => {
+            let (x, y) = win::cursor_pos();
+            Rect::new(x, y, x + 1, y + 1)
+        }
+    }
+}
+
 /// Opens the panel at `anchor`, sliding in when `slide`; `cloaked`, it
 /// stays off screen until the flip back reveals it.
 fn open(anchor: Anchor, slide: bool, cloaked: bool, cx: &mut App) {
@@ -249,10 +294,7 @@ fn open(anchor: Anchor, slide: bool, cloaked: bool, cx: &mut App) {
     // Without the tray icon's rect, the cursor stands in for it, kept so
     // a refit doesn't follow the mouse.
     let anchor = match anchor {
-        Anchor::Tray(None) => {
-            let (x, y) = win::cursor_pos();
-            Anchor::Tray(Some(Rect::new(x, y, x + 1, y + 1)))
-        }
+        Anchor::Tray(None) => Anchor::Tray(Some(anchor_rect(anchor))),
         a => a,
     };
     crate::morph::clear_strips();
@@ -281,63 +323,49 @@ fn open(anchor: Anchor, slide: bool, cloaked: bool, cx: &mut App) {
             work,
         }
     });
-    // Opened where the slide starts, out of sight.
-    let first = slide.map_or(rect, |s| layout::slide(rect, s.work, s.edge, 0.0).0);
-    let sliding = slide.is_some();
-    // Sliding, it stays cloaked until the slide has placed and clipped it,
-    // so it never shows whole where it starts.
-    let hide = sliding || cloaked;
-    let bounds = logical(first);
+    let area = window_area(anchor);
     let mut hwnd = None;
     let handle = cx
         .open_window(
             WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_bounds: Some(WindowBounds::Windowed(logical(area))),
                 titlebar: None,
-                // Hidden, it is placed and shown as it activates, after
-                // the cloak below.
-                show: !hide,
+                // Placed and shown as it activates, after the cloak below.
+                show: false,
                 kind: WindowKind::PopUp,
                 is_movable: false,
                 is_resizable: false,
                 is_minimizable: false,
+                window_background: WindowBackgroundAppearance::Transparent,
                 ..Default::default()
             },
             |window, cx| {
                 hwnd = win::hwnd(window);
-                if hide && let Some(h) = hwnd {
+                if let Some(h) = hwnd {
+                    // Out of sight until it has drawn itself, and with none
+                    // of Windows' frame: it draws its own.
                     win::cloak(h);
+                    win::bare(h);
                 }
-                if cloaked {
-                    // Shown where it goes without taking the foreground:
-                    // the big window stays active, title bar and all,
-                    // until the flip back has turned. Activated then.
-                    if let Some(h) = hwnd {
-                        cx.spawn(async move |_| unsafe {
-                            win::place_window(h, first);
-                            win::set_visible_noactivate(h, true);
-                        })
-                        .detach();
-                    }
-                } else {
+                if !cloaked {
                     // The tray click gave us the foreground right this needs.
                     window.activate_window();
                 }
                 if let Some(h) = hwnd {
-                    // Native z-order calls must run outside this update.
+                    // Native window calls must run outside this update. A
+                    // flip drawing over it stays above it.
                     let under = crate::morph::flip_hwnd(cx);
-                    let dark = matches!(
-                        window.appearance(),
-                        gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
-                    );
-                    // Its rim in the colour the flip and a clipped slide draw.
                     cx.spawn(async move |_| unsafe {
-                        win::set_frame_colors(h, view::rim_rgb(dark), None);
-                        view::seen_rim(h);
+                        win::place_panel(h, area, under);
+                        win::click_through(h, true);
+                        if cloaked {
+                            // Shown without taking the foreground: the big
+                            // window stays active, title bar and all, until
+                            // the flip back has turned. Activated then.
+                            win::set_visible_noactivate(h, true);
+                        }
                     })
                     .detach();
-                    cx.spawn(async move |_| unsafe { win::panel_topmost(h, under, sliding) })
-                        .detach();
                 }
                 cx.new(|cx| StatusView::new(state, Mode::Panel, window, cx))
             },
@@ -346,85 +374,160 @@ fn open(anchor: Anchor, slide: bool, cloaked: bool, cx: &mut App) {
     let slot = cx.default_global::<PanelSlot>();
     slot.handle = handle;
     slot.leaving = false;
+    slot.closing = false;
     slot.hwnd = handle.and(hwnd);
     slot.toggled_at = Some(Instant::now());
     slot.anchor = Some(anchor);
-    slot.height = 0.0;
+    slot.height = 0;
     slot.rect = Some(rect);
+    slot.area = Some(area);
+    slot.drawn = 0;
+    slot.shown = false;
+    slot.held = cloaked;
+    slot.through = true;
     slot.fitted = Some(Instant::now());
     slot.slide = slide.filter(|_| handle.is_some());
-    if let (Some(slide), Some(handle), Some(h)) = (slot.slide, handle, slot.hwnd) {
-        run_slide(slide, handle, h, cx);
+    if let Some(handle) = handle {
+        track_mouse(handle, cx);
     }
 }
 
-/// Runs `step` as each of `handle`'s frames starts, until it returns
-/// false or the window closes: paced by the screen, not a timer.
-fn each_frame(
-    handle: WindowHandle<StatusView>,
-    step: impl FnMut(&mut App) -> bool + 'static,
-    cx: &mut App,
-) {
-    fn again(window: &mut Window, mut step: Box<dyn FnMut(&mut App) -> bool>) {
-        window.on_next_frame(move |window, cx| {
-            if step(cx) {
-                again(window, step);
-            }
-        });
-    }
-    let step: Box<dyn FnMut(&mut App) -> bool> = Box::new(step);
-    // Outside any update of that window this may be called from.
+/// How often the mouse is looked for while the panel is open.
+const MOUSE_EVERY: Duration = Duration::from_millis(16);
+
+/// While the panel is open, lets clicks through its window wherever the
+/// panel itself isn't: the window covers the whole work area, and what is
+/// under the rest of it must stay as usable as ever. A click elsewhere
+/// then takes the focus, which closes the panel.
+fn track_mouse(handle: WindowHandle<StatusView>, cx: &mut App) {
     cx.spawn(async move |cx| {
-        handle.update(cx, |_, window, _| again(window, step)).ok();
+        loop {
+            cx.background_executor().timer(MOUSE_EVERY).await;
+            let open = cx.update(|cx| {
+                let slot = cx.default_global::<PanelSlot>();
+                if slot.handle != Some(handle) {
+                    return false;
+                }
+                let (Some(h), Some(rect)) = (slot.hwnd, slot.rect) else {
+                    return true;
+                };
+                let (x, y) = win::cursor_pos();
+                let on_panel = slot.shown
+                    && !slot.leaving
+                    && (rect.left..rect.right).contains(&x)
+                    && (rect.top..rect.bottom).contains(&y);
+                if slot.through == on_panel {
+                    slot.through = !on_panel;
+                    cx.spawn(async move |_| unsafe { win::click_through(h, !on_panel) })
+                        .detach();
+                    if !on_panel {
+                        // No mouse move reaches it from out there: told
+                        // where the mouse went, so nothing stays hovered.
+                        win::tell_mouse(h, x, y);
+                    }
+                }
+                true
+            });
+            if !open.unwrap_or(false) {
+                break;
+            }
+        }
     })
     .detach();
 }
 
-/// Moves the panel in, frame by frame, until its slide ends or the panel
-/// closes. Reads the panel's place each frame, so a refit while sliding
-/// lands where it should. The panel, opened cloaked, shows once the first
-/// step has placed and clipped it.
-fn run_slide(slide: Slide, handle: WindowHandle<StatusView>, h: isize, cx: &mut App) {
-    let mut first = true;
-    each_frame(
-        handle,
-        move |cx| {
-            let slot = cx.default_global::<PanelSlot>();
-            if slot.handle != Some(handle) || slot.leaving {
-                return false;
+/// How long a just opened panel waits for its window to be where it
+/// belongs before it shows anyway.
+const PLACED_BY: Duration = Duration::from_millis(300);
+
+/// Where the open panel draws itself this frame.
+pub struct Sheet {
+    /// Its top-left corner in its window now, physical px: where it rests,
+    /// or part way there while it slides.
+    pub at: (i32, i32),
+    /// It is sliding, or yet to show: the next frame differs.
+    pub moving: bool,
+}
+
+/// The panel's width and the most it may be tall, physical px: as wide as
+/// its rows need, and as tall as its monitor's work area less the gaps.
+pub fn room(cx: &App) -> Option<(i32, i32)> {
+    let anchor = cx.try_global::<PanelSlot>()?.anchor?;
+    let r = place(anchor, Height::Px(i32::MAX / 4), cx);
+    Some((r.width(), r.height()))
+}
+
+/// The open panel is `height` physical px tall as laid out now: where it
+/// goes, keeping it on its anchor, and where it draws itself this frame.
+/// Called as `window`, the panel's, lays itself out. None for any other.
+pub fn sheet(height: i32, window: &Window, cx: &mut App) -> Option<Sheet> {
+    let me = window.window_handle();
+    let slot = cx.default_global::<PanelSlot>();
+    if slot.handle.map(gpui::AnyWindowHandle::from) != Some(me) {
+        return None;
+    }
+    let (anchor, h) = (slot.anchor?, slot.hwnd?);
+    if slot.height != height {
+        slot.height = height;
+        slot.fitted = Some(Instant::now());
+    }
+    let rect = place(anchor, Height::Px(height), cx);
+    let slot = cx.default_global::<PanelSlot>();
+    slot.rect = Some(rect);
+    let client = win::client_rect(h).or(slot.area)?;
+    // Until its window is where it belongs (give or take, should Windows
+    // have its own idea of that), no frame counts as drawn.
+    let late = slot.toggled_at.is_some_and(|t| t.elapsed() > PLACED_BY);
+    if !slot.shown && Some(client) != slot.area && !late {
+        slot.drawn = 0;
+    }
+    let mut at = rect;
+    let mut moving = !slot.shown && !slot.held;
+    if let Some(slide) = slot.slide {
+        // Its slide starts once it shows.
+        let t = if slot.shown { slide.progress() } else { 0.0 };
+        let inside = if slot.leaving { 1.0 - t } else { t };
+        at = layout::slide(rect, slide.work, slide.edge, inside).0;
+        if t < 1.0 {
+            moving = true;
+        } else if slot.leaving {
+            // Slid away: closed, once, outside this draw of its window.
+            if !slot.closing {
+                slot.closing = true;
+                cx.spawn(async move |cx| cx.update(close).ok()).detach();
             }
-            let Some(rect) = slot.rect else {
-                return false;
-            };
-            let t = slide.progress();
-            if t >= 1.0 {
-                slot.slide = None;
-            }
-            let shows = std::mem::take(&mut first);
-            // Native window calls run outside the window's frame.
-            cx.spawn(async move |cx| {
-                let was = win::is_bare(h);
-                if t >= 1.0 {
-                    unsafe { win::slide_panel(h, rect, None) };
-                } else {
-                    let (moved, shown) = layout::slide(rect, slide.work, slide.edge, t);
-                    unsafe { win::slide_panel(h, moved, Some(shown)) };
-                }
-                // Windows' frame off or back, the window grown or shrunk:
-                // the panel's own frame follows in the same frame.
-                if was != win::is_bare(h) {
-                    handle.update(cx, |_, _, cx| cx.notify()).ok();
-                    unsafe { win::draw_now(h) };
-                }
-                if shows {
-                    win::uncloak(h);
-                }
-            })
-            .detach();
-            t < 1.0
-        },
-        cx,
-    );
+        } else {
+            slot.slide = None;
+        }
+    }
+    Some(Sheet {
+        at: (at.left - client.left, at.top - client.top),
+        moving,
+    })
+}
+
+/// The panel has drawn a frame: once it has drawn itself where it goes,
+/// it shows, and its slide in starts from there.
+pub fn drew(window: &mut Window, cx: &mut App) {
+    let me = window.window_handle();
+    let slot = cx.default_global::<PanelSlot>();
+    if slot.handle.map(gpui::AnyWindowHandle::from) != Some(me) {
+        return;
+    }
+    slot.drawn += 1;
+    // The second frame: the first may have been laid out before the
+    // window was where it belongs.
+    if slot.drawn == 2 && !slot.shown && !slot.held {
+        slot.shown = true;
+        if let Some(slide) = &mut slot.slide {
+            slide.start = Instant::now();
+        }
+        if let Some(h) = slot.hwnd {
+            // As the next frame starts: this one, drawn where the slide
+            // starts, is on its way to the screen by then.
+            window.on_next_frame(move |_, _| win::uncloak(h));
+        }
+    }
 }
 
 /// Opens the big window through the panel: slides the panel in at
@@ -494,13 +597,11 @@ pub fn slide_away_now(cx: &mut App) {
     if slot.leaving && slot.handle.is_some() {
         return;
     }
-    let (Some(handle), Some(h), Some(rect), Some(anchor)) =
-        (slot.handle, slot.hwnd, slot.rect, slot.anchor)
-    else {
+    let (Some(handle), Some(anchor)) = (slot.handle, slot.anchor) else {
         close(cx);
         return;
     };
-    if ms == 0 {
+    if ms == 0 || !slot.shown {
         close(cx);
         return;
     }
@@ -523,55 +624,36 @@ pub fn slide_away_now(cx: &mut App) {
             (edge, work, Instant::now())
         }
     };
-    let slide = Slide {
+    slot.slide = Some(Slide {
         start,
         len,
         edge,
         work,
-    };
-
-    // Keeps a refit from moving it back in.
-    slot.slide = Some(slide);
+    });
     slot.leaving = true;
-    each_frame(
-        handle,
-        move |cx| {
-            if cx.default_global::<PanelSlot>().handle != Some(handle) {
-                return false;
+    // It draws itself sliding out, a frame at a time, and closes as it
+    // gets there (`sheet`); outside any update of its window this may be
+    // called from.
+    cx.spawn(async move |cx| {
+        handle.update(cx, |_, window, _| window.refresh()).ok();
+        // Should it stop drawing (its screen gone, say), it closes anyway.
+        cx.background_executor()
+            .timer(len + Duration::from_millis(150))
+            .await;
+        cx.update(|cx| {
+            let slot = cx.default_global::<PanelSlot>();
+            if slot.handle == Some(handle) && slot.leaving {
+                close(cx);
             }
-            let t = slide.progress();
-            if t >= 1.0 {
-                cx.defer(close);
-                return false;
-            }
-            let (moved, shown) = layout::slide(rect, work, edge, 1.0 - t);
-            // Native window calls run outside the window's frame; its own
-            // frame, drawn while it slides clipped, follows in the same
-            // frame.
-            cx.spawn(async move |cx| {
-                let was = win::is_bare(h);
-                unsafe { win::slide_panel(h, moved, Some(shown)) };
-                if was != win::is_bare(h) {
-                    handle.update(cx, |_, _, cx| cx.notify()).ok();
-                    unsafe { win::draw_now(h) };
-                }
-            })
-            .detach();
-            true
-        },
-        cx,
-    );
+        })
+        .ok();
+    })
+    .detach();
 }
 
 /// The work area edge the panel slides in from, and that work area.
 fn slide_from(anchor: Anchor) -> (layout::Edge, Rect) {
-    let rect = match anchor {
-        Anchor::Tray(Some(rect)) | Anchor::Overlay { rect, .. } => rect,
-        Anchor::Tray(None) => {
-            let (x, y) = win::cursor_pos();
-            Rect::new(x, y, x + 1, y + 1)
-        }
-    };
+    let rect = anchor_rect(anchor);
     let (cx, cy) = rect.centre();
     let mon = win::monitor_at(cx, cy);
     let edge = match anchor {
@@ -584,39 +666,12 @@ fn slide_from(anchor: Anchor) -> (layout::Edge, Rect) {
     (edge, mon.work)
 }
 
-/// Resizes the open panel to `height` logical px of content, keeping it on
-/// its anchor, when that differs from its size. Safe to call while drawing.
-pub fn fit(height: f32, cx: &mut App) {
-    if !is_open(cx) || !height.is_finite() {
-        return;
-    }
-    let slot = cx.default_global::<PanelSlot>();
-    let (Some(anchor), Some(h)) = (slot.anchor, slot.hwnd) else {
-        return;
-    };
-    if (slot.height - height).abs() < 1.0 {
-        return;
-    }
-    slot.height = height;
-    let r = place(anchor, Height::Fit(height), cx);
-    let slot = cx.default_global::<PanelSlot>();
-    slot.rect = Some(r);
-    slot.fitted = Some(Instant::now());
-    // A slide under way moves it there itself.
-    if slot.slide.is_some() {
-        return;
-    }
-    // Native window calls must run outside this update.
-    cx.spawn(async move |_| unsafe { win::place_window(h, r) })
-        .detach();
-}
-
 /// How tall the panel is to be.
 enum Height {
     /// Estimated from the row count, before it is laid out.
     Rows(usize),
-    /// Measured, in logical px.
-    Fit(f32),
+    /// Laid out, in physical px.
+    Px(i32),
 }
 
 /// The panel's rect in physical px, `height` high, next to `anchor`.
@@ -626,24 +681,18 @@ fn place(anchor: Anchor, height: Height, cx: &App) -> Rect {
         .try_global::<Ui>()
         .is_some_and(|ui| ui.state.read(cx).config.icons_only);
     let width = if icons_only {
-        WIDTH - (crate::timeline::LABEL_WIDTH - crate::timeline::ICON_LABEL_WIDTH)
+        WIDTH - (crate::scene::panel::LABEL - crate::scene::panel::ICON_LABEL)
     } else {
         WIDTH
     };
-    let anchor_rect = match anchor {
-        Anchor::Tray(Some(rect)) | Anchor::Overlay { rect, .. } => rect,
-        Anchor::Tray(None) => {
-            let (x, y) = win::cursor_pos();
-            Rect::new(x, y, x + 1, y + 1)
-        }
-    };
+    let anchor_rect = anchor_rect(anchor);
     let (ax, ay) = anchor_rect.centre();
     let mon = win::monitor_at(ax, ay);
     let scale = view::sane_scale(mon.scale);
     let work_h = mon.work.height() as f32 / scale;
     let height = match height {
         Height::Rows(rows) => layout::panel_height(rows, work_h),
-        Height::Fit(h) => layout::fit_panel_height(h, work_h),
+        Height::Px(h) => layout::fit_panel_height(h as f32 / scale, work_h),
     };
     let (w, h, gap) = (
         (width * scale).round() as i32,
