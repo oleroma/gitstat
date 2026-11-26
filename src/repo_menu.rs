@@ -265,11 +265,19 @@ pub fn run(action: RepoAction, target: &Target, cx: &mut App) {
     }
 }
 
-/// The repo's GitHub page, read from its `origin` off the UI thread; its
-/// folder when it has none.
-fn open_github(path: &Path, cx: &mut App) {
+/// The repo's GitHub page: its slug for a repo with no clone, the one its
+/// drawn tree read, else read from its `origin` off the UI thread, which a
+/// slow or busy disk would otherwise freeze. Its folder when it has none.
+pub(crate) fn open_github(path: &Path, cx: &mut App) {
     if let Some(slug) = crate::github::remote_slug(path) {
         cx.open_url(&format!("https://github.com/{slug}"));
+        return;
+    }
+    let known = cx
+        .try_global::<Ui>()
+        .and_then(|ui| ui.timelines.read(cx).web(path));
+    if let Some(web) = known {
+        cx.open_url(&web);
         return;
     }
     let repo = path.to_path_buf();

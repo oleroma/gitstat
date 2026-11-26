@@ -159,10 +159,12 @@ impl Timelines {
                     // Git failed as a whole (timed out, busy): ask again a
                     // little later instead of keeping no change for good.
                     retry.timer(STATS_RETRY).await;
-                    this.update(cx, |this, _| {
+                    // Drawn again, the column asks for them again.
+                    this.update(cx, |this, cx| {
                         for id in &ids {
                             this.stats_pending.remove(id);
                         }
+                        cx.notify();
                     })
                     .ok();
                     return;
@@ -174,7 +176,7 @@ impl Timelines {
                     // A commit git couldn't show counts as no change, so it
                     // isn't asked for again on every frame.
                     let stat = found.get(&id).copied().unwrap_or_default();
-                    this.stats.insert(id, stat);
+                    this.keep_stat(id, stat);
                 }
                 cx.notify();
             })

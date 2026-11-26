@@ -408,8 +408,6 @@ pub fn window_open(cx: &App) -> bool {
         .is_some_and(|h| is_live(h.into(), cx))
 }
 
-/// Where the window goes for `repos` columns, in logical px, at the
-/// bottom-right of the primary work area, and that monitor's scale.
 /// Where the big window was left: its restored bounds in logical px, and
 /// whether it was maximised.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -548,6 +546,9 @@ pub(crate) fn table_width(state: &AppState) -> f32 {
     table_cells(state).iter().map(Cell::width).sum()
 }
 
+/// Where the window goes for a table `table` logical px wide, in logical
+/// px, at the bottom-right of the primary work area, and that monitor's
+/// scale.
 fn default_place(table: f32) -> (Bounds<gpui::Pixels>, f32) {
     let mon = win::primary_monitor();
     let scale = sane_scale(mon.scale);
@@ -883,8 +884,6 @@ fn shown_columns(
     first..last.max(first)
 }
 
-/// A section's spine in big mode: its fold arrow, count and name down a
-/// narrow column; a click folds or opens it.
 /// A section's colour: its heading's words in the panel and its spine's
 /// in the big window.
 pub(crate) fn section_color(section: Section, p: &Palette) -> Hsla {
@@ -925,8 +924,9 @@ pub(crate) fn section_tint(section: Section, p: &Palette) -> Hsla {
     section_color(section, p).opacity(0.10)
 }
 
-/// A section's spine in big mode; the flip slides it in and out from the
-/// window's sides.
+/// A section's spine in big mode: its fold arrow, count and name down a
+/// narrow column; a click folds or opens it. The flip slides it in and out
+/// from the window's sides.
 pub(crate) fn spine(section: Section, count: usize, folded: bool, p: &Palette) -> AnyElement {
     let color = match section {
         Section::NeedsYou => p.red,
@@ -1028,41 +1028,15 @@ fn column_placeholder(p: &Palette) -> AnyElement {
 /// Opens a repo the way config's `repo_click` says: its folder, or its
 /// GitHub page (the folder when it has none). Only opens; changes nothing.
 pub fn open_repo(path: &std::path::Path, cx: &mut App) {
-    // A repo with no clone has only its GitHub page.
-    if let Some(slug) = crate::github::remote_slug(path) {
-        cx.open_url(&format!("https://github.com/{slug}"));
-        return;
-    }
     let github = cx
         .try_global::<Ui>()
         .is_some_and(|ui| ui.state.read(cx).config.repo_click == crate::config::RepoClick::Github);
-    if github {
-        let web = cx
-            .try_global::<Ui>()
-            .and_then(|ui| ui.timelines.read(cx).web(path));
-        if let Some(web) = web {
-            cx.open_url(&web);
-            return;
-        }
-        // Not drawn yet: ask git off the UI thread, which a slow or busy
-        // disk would otherwise freeze.
-        let repo = path.to_path_buf();
-        let task = cx.background_spawn(async move {
-            let web = crate::repo_info::origin_web(&repo);
-            (repo, web)
-        });
-        cx.spawn(async move |cx| {
-            let (repo, web) = task.await;
-            cx.update(|cx| match web {
-                Some(web) => cx.open_url(&web),
-                None => cx.open_with_system(&repo),
-            })
-            .ok();
-        })
-        .detach();
-        return;
+    // A repo with no clone has only its GitHub page.
+    if github || crate::github::remote_slug(path).is_some() {
+        crate::repo_menu::open_github(path, cx);
+    } else {
+        cx.open_with_system(path);
     }
-    cx.open_with_system(path);
 }
 
 fn refresh(cx: &mut App) {
@@ -1719,7 +1693,7 @@ impl Render for StatusView {
                 .items_center()
                 .h(px(28.))
                 .tooltip(tip(lines, &p))
-                .child(summary_bar(&state.statuses, sweeping, &p))
+                .child(summary_bar(tone_counts(&state.statuses), sweeping, &p))
                 .into_any_element()
         } else {
             titles.into_any_element()
@@ -2127,9 +2101,6 @@ impl Render for StatusView {
     }
 }
 
-/// In the window, a wheel over `part` (the header or the footer) scrolls the
-/// table sideways, as it does over the columns' headers; only over a
-/// column's commits does it scroll up and down.
 /// Typing filters the repos: letters add to the filter, Backspace takes
 /// one off, Esc clears it, Enter opens the first repo listed. True when
 /// the key was the filter's.
@@ -2186,6 +2157,9 @@ fn filter_key(
     true
 }
 
+/// In the window, a wheel over `part` (the header or the footer) scrolls the
+/// table sideways, as it does over the columns' headers; only over a
+/// column's commits does it scroll up and down.
 fn sideways(part: impl IntoElement, mode: Mode, cx: &mut Context<StatusView>) -> AnyElement {
     if mode != Mode::Window {
         return part.into_any_element();
@@ -2260,8 +2234,6 @@ pub(crate) fn title_bar_rgb(dark: bool) -> u32 {
     if dark { 0x202020 } else { 0xf3f3f3 }
 }
 
-/// A bar of the repos' tones: green synced, amber local work, red needs
-/// action, each as wide as its share; dimmed while a check runs.
 /// Repos synced, with local work, and needing a look.
 pub(crate) fn tone_counts(statuses: &[RepoStatus]) -> [usize; 3] {
     let mut counts = [0usize; 3];
@@ -2316,7 +2288,7 @@ fn health_row(
         .pt_1()
         .text_xs()
         .child(
-            summary_bar(statuses, checking, p)
+            summary_bar(counts, checking, p)
                 .h(px(4.))
                 .relative()
                 .child(crate::morph::tag(
@@ -2331,9 +2303,10 @@ fn health_row(
         .child(count(2, counts[2], "! ", p.red))
 }
 
-fn summary_bar(statuses: &[RepoStatus], checking: bool, p: &Palette) -> gpui::Div {
-    let counts = tone_counts(statuses);
-    let total = statuses.len().max(1) as f32;
+/// A bar of the repos' tones: green synced, amber local work, red needs
+/// action, each as wide as its share; dimmed while a check runs.
+fn summary_bar(counts: [usize; 3], checking: bool, p: &Palette) -> gpui::Div {
+    let total = counts.iter().sum::<usize>().max(1) as f32;
     let bar = div()
         .flex()
         .flex_1()
@@ -2354,11 +2327,11 @@ fn summary_bar(statuses: &[RepoStatus], checking: bool, p: &Palette) -> gpui::Di
     })
 }
 
-/// A tooltip of coloured lines.
 /// The tooltip's widest, and the characters of `text_xs` that fit in it.
 const TIP_WIDTH: f32 = 320.;
 const TIP_LINE_CHARS: usize = 44;
 
+/// A tooltip of coloured lines.
 struct Tip {
     lines: Vec<(SharedString, Hsla)>,
     bg: Hsla,
@@ -2395,7 +2368,6 @@ impl Render for Tip {
     }
 }
 
-/// A tooltip builder showing `lines`, for icons-only mode.
 /// What a repo's tooltip adds below its name and status: the rest of a
 /// fetch error, the unpushed branches by name, the stash, and where the
 /// actions are.
@@ -2422,6 +2394,7 @@ pub(crate) fn status_details(s: &RepoStatus, p: &Palette) -> Vec<(String, Hsla)>
     lines
 }
 
+/// A tooltip builder showing `lines`, for icons-only mode.
 pub(crate) fn tip(
     lines: Vec<(String, Hsla)>,
     p: &Palette,

@@ -582,11 +582,13 @@ fn quit(cx: &mut App) {
 /// or, run from outside the install folder, starts the installed build an
 /// install asked it to hand over to, and quits. Returns true when quitting.
 /// A failed swap leaves this gitstat running and is tried again on the next
-/// poll.
+/// poll; a failed handover is not.
 fn update_and_restart(cx: &mut App) -> bool {
     use crate::self_update;
+    let mut handover = None;
     let result = std::env::current_exe().and_then(|exe| {
         if let Some(installed) = self_update::handover(&exe) {
+            handover = Some(installed.clone());
             // Taken first, so a failed start isn't tried on every poll.
             std::fs::remove_file(self_update::handover_file(&exe))?;
             self_update::restart(&installed)?;
@@ -613,10 +615,18 @@ fn update_and_restart(cx: &mut App) -> bool {
             let shared = cx.global_mut::<Shared>();
             if !shared.update_error_shown {
                 shared.update_error_shown = true;
-                crate::error_box(format!(
-                    "A new gitstat build is waiting, but gitstat couldn't switch to it: {e}\n\n\
-                     It will keep trying. Quitting and starting gitstat also picks it up."
-                ));
+                crate::error_box(match handover {
+                    Some(installed) => format!(
+                        "gitstat was installed at {}, but this gitstat couldn't hand over \
+                         to it: {e}\n\nQuit this gitstat and start the installed one.",
+                        installed.display()
+                    ),
+                    None => format!(
+                        "A new gitstat build is waiting, but gitstat couldn't switch to it: \
+                         {e}\n\nIt will keep trying. Quitting and starting gitstat also picks \
+                         it up."
+                    ),
+                });
             }
             false
         }

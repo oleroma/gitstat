@@ -276,7 +276,26 @@ pub struct Timelines {
     messages_pending: HashSet<String>,
 }
 
+/// How many commits' line stats and messages are kept: past that, the
+/// cache starts over, and the rows in view ask again.
+const MAX_STATS: usize = 50_000;
+const MAX_MESSAGES: usize = 2_000;
+
 impl Timelines {
+    fn keep_stat(&mut self, id: String, stat: Stat) {
+        if self.stats.len() >= MAX_STATS {
+            self.stats.clear();
+        }
+        self.stats.insert(id, stat);
+    }
+
+    fn keep_message(&mut self, id: String, message: Arc<str>) {
+        if self.messages.len() >= MAX_MESSAGES {
+            self.messages.clear();
+        }
+        self.messages.insert(id, message);
+    }
+
     pub fn new(state: &Entity<AppState>, cx: &mut Context<Self>) -> Self {
         cx.observe(state, |this, state, cx| this.sync(&state, cx))
             .detach();
@@ -305,12 +324,12 @@ impl Timelines {
         }
     }
 
-    /// Whether `path`'s column header shows its details.
     /// A repo's loaded graph, for the flip.
     pub fn graph_of(&self, path: &Path) -> Option<Arc<RepoGraph>> {
         self.slots.get(path)?.graph.clone()
     }
 
+    /// Whether `path`'s column header shows its details.
     pub fn header_open(&self, path: &Path) -> bool {
         self.expanded.contains(path)
     }
@@ -797,7 +816,7 @@ impl Timelines {
             this.update(cx, |this, cx| {
                 this.messages_pending.remove(&id);
                 if let Ok(message) = result {
-                    this.messages.insert(id, message.into());
+                    this.keep_message(id, message.into());
                     cx.notify();
                 }
             })
@@ -825,7 +844,7 @@ impl Timelines {
             this.update(cx, |this, cx| {
                 this.stats_pending.remove(&id);
                 if let Ok(stat) = result {
-                    this.stats.insert(id, stat);
+                    this.keep_stat(id, stat);
                     cx.notify();
                 }
             })

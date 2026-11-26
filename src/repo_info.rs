@@ -188,7 +188,7 @@ pub fn read(repo: &Path, refs: &Refs, setup: &Setup) -> Result<Info, String> {
         Default::default()
     };
 
-    let web = text(repo, &["remote", "get-url", "origin"]).and_then(|u| github_web(u.trim()));
+    let web = origin_web(repo);
 
     Ok(Info {
         web,

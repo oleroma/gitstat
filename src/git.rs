@@ -1,6 +1,6 @@
 //! Fetching repos and working out how each one compares to its upstream.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{OnceLock, mpsc};
@@ -454,7 +454,8 @@ pub fn check_repo_detailed(root: &Path, repo: &Path, fetch: bool) -> (RepoStatus
                 .iter()
                 .any(|(r, _)| r.starts_with("refs/remotes/"));
             if has_remotes {
-                status.unpushed_branches = unpushed_branches(repo);
+                status.unpushed_branches =
+                    unpushed_cached(repo, &status.tips, status.branch.as_deref());
             }
             status.fetch_failed = fetch_error.is_some();
             status.error = fetch_error;
@@ -587,6 +588,34 @@ fn ref_tips(repo: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
+/// [`unpushed_branches`], read again only when a ref or the checked-out
+/// branch moved since the last check: otherwise its answer can't change,
+/// and it can cost a `rev-list` per branch.
+fn unpushed_cached(
+    repo: &Path,
+    tips: &[(String, String)],
+    branch: Option<&str>,
+) -> Vec<(String, u32)> {
+    type Seen = (Vec<(String, String)>, Option<String>, Vec<(String, u32)>);
+    static CACHE: OnceLock<std::sync::Mutex<HashMap<PathBuf, Seen>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Ok(c) = cache.lock()
+        && let Some((t, b, found)) = c.get(repo)
+        && t == tips
+        && b.as_deref() == branch
+    {
+        return found.clone();
+    }
+    let found = unpushed_branches(repo);
+    if let Ok(mut c) = cache.lock() {
+        c.insert(
+            repo.to_path_buf(),
+            (tips.to_vec(), branch.map(str::to_string), found.clone()),
+        );
+    }
+    found
+}
+
 /// At most this many never-pushed branches get a `rev-list` each.
 const MAX_LOCAL_ONLY_CHECKS: usize = 30;
 
@@ -604,7 +633,9 @@ fn unpushed_branches(repo: &Path) -> Vec<(String, u32)> {
     };
     let Some(heads) = text(&[
         "for-each-ref",
-        "--format=%(HEAD)%1f%(refname:short)%1f%(upstream)%1f%(upstream:track)",
+        // The full refname: `refname:short` gives `heads/x` when a tag is
+        // also called x.
+        "--format=%(HEAD)%1f%(refname)%1f%(upstream)%1f%(upstream:track)",
         "refs/heads",
     ]) else {
         return Vec::new();
@@ -644,6 +675,7 @@ enum HeadLine {
 fn parse_head_line(line: &str) -> Option<HeadLine> {
     let mut f = line.split('\x1f');
     let (head, name, upstream, track) = (f.next()?, f.next()?, f.next()?, f.next().unwrap_or(""));
+    let name = name.strip_prefix("refs/heads/").unwrap_or(name);
     if head.trim() == "*" || name.is_empty() {
         return None;
     }
@@ -1276,6 +1308,11 @@ mod tests {
             Some(HeadLine::Ahead("wip".into(), 2))
         );
         assert_eq!(l(" |local||"), Some(HeadLine::NoUpstream("local".into())));
+        // Full refnames, which stay plain when a tag has the same name.
+        assert_eq!(
+            l(" |refs/heads/x||"),
+            Some(HeadLine::NoUpstream("x".into()))
+        );
     }
 
     #[test]
@@ -1318,6 +1355,10 @@ mod tests {
         assert_eq!(s.unpushed_branches, [("wip".to_string(), 1)]);
         assert!(!s.is_synced());
         assert_eq!(s.label(), "wip unpushed");
+        // A tag of the same name doesn't turn it into `heads/wip`.
+        run(&repo, &["tag", "wip"]);
+        assert_eq!(check().unpushed_branches, [("wip".to_string(), 1)]);
+        run(&repo, &["tag", "-d", "wip"]);
         // A stash shows but doesn't unsync.
         run(&repo, &["branch", "-q", "-D", "wip"]);
         std::fs::write(repo.join("f.txt"), "x").unwrap();

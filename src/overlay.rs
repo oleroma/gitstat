@@ -66,18 +66,6 @@ fn face(badge: Badge) -> (Hsla, String) {
     }
 }
 
-/// Repos synced, with local work, and needing action.
-fn tone_counts(statuses: &[crate::git::RepoStatus]) -> [usize; 3] {
-    let mut counts = [0; 3];
-    for s in statuses {
-        counts[match icon::FolderState::of(s).tone() {
-            icon::Tone::Synced => 0,
-            icon::Tone::Local => 1,
-            icon::Tone::Attention => 2,
-        }] += 1;
-    }
-    counts
-}
 
 /// The icons-only face: a ring cut into the repos' tones, each arc as long
 /// as its share (red, amber, then green, clockwise from the top), around a
@@ -158,7 +146,7 @@ impl Render for OverlayView {
         let state = self.state.read(cx);
         let badge = state.badge();
         let icons_only = state.config.icons_only;
-        let tones = tone_counts(&state.statuses);
+        let tones = crate::view::tone_counts(&state.statuses);
         let (fill, text) = face(badge);
         // Pictures only: a dark disc whose ring shows the repos' tones.
         let fill = if icons_only {

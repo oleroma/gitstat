@@ -89,10 +89,21 @@ impl Ledger {
         let parsed = std::str::from_utf8(&bytes)
             .ok()
             .and_then(|text| serde_json::from_str(text).ok());
-        Ok(parsed.unwrap_or_else(|| {
-            let _ = std::fs::rename(file, file.with_extension("json.bad"));
-            Self::default()
-        }))
+        match parsed {
+            Some(ledger) => Ok(ledger),
+            None => {
+                // An older `.bad` is replaced: the newest corrupt one is kept.
+                let bad = file.with_extension("json.bad");
+                std::fs::rename(file, &bad)
+                    .or_else(|_| {
+                        let _ = std::fs::remove_file(&bad);
+                        std::fs::rename(file, &bad)
+                    })
+                    // Still in place: starting empty would overwrite it.
+                    .map_err(|e| format!("can't move aside {}: {e}", file.display()))?;
+                Ok(Self::default())
+            }
+        }
     }
 
     /// Writes a temp file and renames it over the ledger, so a crash never
