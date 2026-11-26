@@ -7,10 +7,15 @@
 //! wherever it is drawn, to the pixel.
 //!
 //! - [`panel`]: where the panel's parts go.
+//! - [`window`]: where the big window's parts go.
 //! - [`text`]: words on whole device px, the same in every window.
 //! - [`paint`]: the other parts' painters.
 
 pub mod panel;
+// Laid out and tested ahead of the big window's own scene, which draws
+// from it next.
+#[allow(dead_code)]
+pub mod window;
 
 #[cfg(windows)]
 pub mod paint;
