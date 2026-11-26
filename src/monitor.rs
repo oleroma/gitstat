@@ -125,16 +125,20 @@ pub struct Monitor {
 }
 
 impl Monitor {
+    #[cfg(test)]
     pub fn start(config_file: PathBuf, sink: impl Fn(Update) + Send + 'static) -> Monitor {
-        Self::start_slot(config_file, 0, sink)
+        Self::start_slot(config_file, 0, None, sink)
     }
 
     /// A monitor for the folder at `slot` in the config's
-    /// [`Config::roots`]. Every monitor reads the config file itself; only
-    /// slot 0 reports it. A slot past the list watches nothing.
+    /// [`Config::roots`]. It starts from `config` when given (the app's,
+    /// which may hold more than the file), else from the file. Every
+    /// monitor rereads the config file itself; only slot 0 reports it. A
+    /// slot past the list watches nothing.
     pub fn start_slot(
         config_file: PathBuf,
         slot: usize,
+        config: Option<Config>,
         sink: impl Fn(Update) + Send + 'static,
     ) -> Monitor {
         let (tx, rx) = mpsc::channel();
@@ -144,7 +148,9 @@ impl Monitor {
         let scheduler_tx = tx.clone();
         let thread = thread::Builder::new()
             .name("gitstat-monitor".into())
-            .spawn(move || Scheduler::new(config_file, slot, Box::new(sink), scheduler_tx).run(rx))
+            .spawn(move || {
+                Scheduler::new(config_file, slot, config, Box::new(sink), scheduler_tx).run(rx)
+            })
             .ok();
         Monitor { tx, thread }
     }
@@ -255,11 +261,12 @@ impl Scheduler {
     fn new(
         config_file: PathBuf,
         slot: usize,
+        start: Option<Config>,
         sink: Box<dyn Fn(Update) + Send>,
         tx: mpsc::Sender<Msg>,
     ) -> Self {
         let loaded = Config::load_or_create(&config_file);
-        let config = loaded.clone().unwrap_or_default();
+        let config = start.unwrap_or_else(|| loaded.clone().unwrap_or_default());
         let root = config.root(slot).unwrap_or_default();
         let name_base = config.name_base(&root);
         let depth = config.depth();
@@ -640,7 +647,10 @@ impl Scheduler {
         if self.sweeping && self.sweep_walk.is_none() && self.sweep.is_empty() {
             self.sweeping = false;
             let interval = jittered(self.config.interval(), &self.root, self.sweeps);
-            self.next_sweep = Some(now + interval);
+            // Keep an earlier one: the fetch a resume asked for while this
+            // sweep was still running.
+            let at = now + interval;
+            self.next_sweep = Some(self.next_sweep.map_or(at, |n| n.min(at)));
             self.emit(Update::SweepDone);
         }
     }

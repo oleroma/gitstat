@@ -577,10 +577,19 @@ impl<'a, 'input> Expansion<'a, 'input> {
             depth: 0,
         };
         let mut inner: Vec<_> = node.children().filter(is_svg_element).collect();
-        if tag == "use"
-            && let Some(id) = node.attribute("href").and_then(local_iri)
-        {
-            inner.extend(self.ids.get(id).into_iter().flatten().copied());
+        if tag == "use" {
+            // Both `href` and `xlink:href`: usvg prefers the plain one
+            // wherever it sits, while roxmltree's `attribute("href")`
+            // returns whichever comes first. Counting both can only
+            // overestimate.
+            let ids: Vec<_> = node
+                .attributes()
+                .filter(|a| a.name() == "href")
+                .filter_map(|a| local_iri(a.value()))
+                .collect();
+            for id in ids {
+                inner.extend(self.ids.get(id).into_iter().flatten().copied());
+            }
         }
         for child in inner {
             cost.contain(self.cost(child, depth + 1)?);
@@ -1233,6 +1242,19 @@ mod tests {
                 "too many shapes",
             ),
             ("10⁵ copies", fan_out(5, 0), "too many shapes"),
+            // usvg follows the plain href wherever it sits; the checker
+            // must not be shown a harmless xlink:href in front of it.
+            (
+                "href behind a harmless xlink:href",
+                fan_out(5, 0).replace(
+                    "<use href=",
+                    r##"<use xlink:href="#none" href="##,
+                ).replace(
+                    r#"<svg xmlns="http://www.w3.org/2000/svg""#,
+                    r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink""#,
+                ),
+                "too many shapes",
+            ),
             // Each shape gets its own copy of a pattern or gradient...
             (
                 "pattern",

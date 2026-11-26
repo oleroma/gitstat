@@ -107,11 +107,11 @@ fn show_window_as(cloaked: bool, cx: &mut App) {
         t.update(cx, |t, cx| t.show_newest(cx));
     }
     let remembered = last_place(cx).is_some();
-    let (repos, known) = {
+    let (table, known) = {
         let s = state.read(cx);
-        (s.statuses.len(), s.has_result)
+        (table_width(s), s.has_result)
     };
-    let (place, scale) = window_place(repos, cx);
+    let (place, scale) = window_place(table, cx);
     let bounds = place.get_bounds();
     let maximized = matches!(place, WindowBounds::Maximized(_));
     let handle = cx
@@ -516,7 +516,9 @@ pub(crate) fn maximized_area(bounds: Bounds<gpui::Pixels>, scale: f32) -> crate:
 /// Where the big window opens: where it was left (maximised again if it
 /// was), else sized for `repos` columns at the primary monitor's corner.
 /// With the logical px' scale.
-pub(crate) fn window_place(repos: usize, cx: &App) -> (WindowBounds, f32) {
+/// Where the big window opens: where it last was, else wide enough for a
+/// `table` this wide (logical px).
+pub(crate) fn window_place(table: f32, cx: &App) -> (WindowBounds, f32) {
     let mon = win::primary_monitor();
     let scale = sane_scale(mon.scale);
     if let Some(p) = last_place(cx) {
@@ -536,11 +538,17 @@ pub(crate) fn window_place(repos: usize, cx: &App) -> (WindowBounds, f32) {
             );
         }
     }
-    let (b, s) = default_place(repos);
+    let (b, s) = default_place(table);
     (WindowBounds::Windowed(b), s)
 }
 
-fn default_place(repos: usize) -> (Bounds<gpui::Pixels>, f32) {
+/// The table's whole width, logical px: its columns and spines, as the
+/// window lays them out.
+pub(crate) fn table_width(state: &AppState) -> f32 {
+    table_cells(state).iter().map(Cell::width).sum()
+}
+
+fn default_place(table: f32) -> (Bounds<gpui::Pixels>, f32) {
     let mon = win::primary_monitor();
     let scale = sane_scale(mon.scale);
     let (left, top) = (mon.work.left as f32 / scale, mon.work.top as f32 / scale);
@@ -549,7 +557,7 @@ fn default_place(repos: usize) -> (Bounds<gpui::Pixels>, f32) {
         mon.work.height() as f32 / scale,
     );
     // Big mode: wide enough for every column, up to most of the screen.
-    let width = (repos.max(1) as f32 * crate::timeline::COLUMN_WIDTH + 2.0)
+    let width = (table.max(crate::timeline::COLUMN_WIDTH) + 2.0)
         .min(work_w * 0.9)
         .max(WINDOW_SIZE.0);
     let height = (work_h * 0.8).max(WINDOW_SIZE.1).min(work_h);
@@ -722,7 +730,7 @@ impl StatusView {
             && near(now.origin.y, opened.origin.y)
             && near(now.size.width, opened.size.width)
             && near(now.size.height, opened.size.height);
-        let (want, scale) = default_place(s.statuses.len());
+        let (want, scale) = default_place(table_width(s));
         if !untouched || near(want.size.width, opened.size.width) {
             return;
         }

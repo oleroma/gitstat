@@ -26,6 +26,12 @@ pub struct AppState {
     /// Each folder's watch mode; `mode` shows the worst.
     modes: Vec<WatchMode>,
     pub has_result: bool,
+    /// Running on the defaults because config.json didn't parse at start
+    /// and no good copy was kept: folder icons wait for a good config.
+    pub config_held: bool,
+    /// The folders (slots) whose first sweep is in: `has_result` waits for
+    /// all of them, so one fast folder can't show the rest as synced.
+    pub swept_slots: HashSet<usize>,
     /// A fetch sweep is running.
     pub sweeping: bool,
     /// Repos with a check running.
@@ -70,6 +76,8 @@ impl AppState {
             sweeping_slots: HashSet::new(),
             modes: Vec::new(),
             has_result: false,
+            config_held: false,
+            swept_slots: HashSet::new(),
             sweeping: false,
             in_flight: HashSet::new(),
             checks: HashMap::new(),
@@ -218,8 +226,23 @@ impl AppState {
     }
 
     /// Forgets the folders from `count` on. Returns whether repos went.
+    /// A folder's sweep is done. True when this is the first result: every
+    /// folder has now been swept once.
+    pub fn swept(&mut self, slot: usize) -> bool {
+        self.swept_slots.insert(slot);
+        if self.has_result {
+            return false;
+        }
+        let folders = self.config.roots().len().max(1);
+        self.has_result = (0..folders).all(|s| self.swept_slots.contains(&s));
+        self.has_result
+    }
+
     pub fn keep_slots(&mut self, count: usize) -> bool {
         self.sweeping_slots.retain(|&s| s < count);
+        self.swept_slots.retain(|&s| s < count);
+        // A removed folder may have been the last one still checking.
+        self.has_result |= (0..count).all(|s| self.swept_slots.contains(&s));
         self.sweeping = !self.sweeping_slots.is_empty();
         self.modes.truncate(count);
         self.mode = worst_mode(&self.modes).unwrap_or_else(|| self.mode.clone());
@@ -427,7 +450,7 @@ impl AppState {
             .iter()
             .filter(|b| {
                 !prs.iter().any(|p| {
-                    &p.head_branch == *b
+                    p.is_for(b, &s.tips)
                         && (p.is_open() || p.state == crate::github::PrState::Merged)
                 })
             })

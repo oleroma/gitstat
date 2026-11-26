@@ -78,6 +78,9 @@ pub struct Pr {
     /// The head branch's name, as in the head repo (maybe a fork).
     pub head_branch: String,
     pub head_oid: String,
+    /// The head branch is in another repo (a fork), so it isn't the
+    /// local or origin branch of the same name.
+    pub cross_repo: bool,
     pub review: Review,
     /// The signed-in user is asked to review it.
     pub review_requested: bool,
@@ -90,6 +93,22 @@ pub struct Pr {
 impl Pr {
     pub fn is_open(&self) -> bool {
         matches!(self.state, PrState::Open | PrState::Draft)
+    }
+
+    /// Whether this PR is the one for the branch `name`, given the repo's
+    /// branch `tips` (full refname, commit). A fork's PR never is. A merged
+    /// or closed one is only while the local or origin branch still points
+    /// at its head: a branch name used again later is a new branch.
+    pub fn is_for(&self, name: &str, tips: &[(String, String)]) -> bool {
+        if self.cross_repo || self.head_branch != name {
+            return false;
+        }
+        if self.is_open() {
+            return true;
+        }
+        let refs = [format!("refs/heads/{name}"), format!("refs/remotes/origin/{name}")];
+        let mut known = tips.iter().filter(|(r, _)| refs.contains(r)).peekable();
+        known.peek().is_none() || known.any(|(_, oid)| *oid == self.head_oid)
     }
 
     /// Something for the user to act on: a review asked of them, failing
@@ -445,13 +464,17 @@ pub fn remote_history(slug: &str) -> Result<RemoteHistory, String> {
 }
 
 fn history_query(owner: &str, name: &str) -> String {
-    format!(
-        "query{{repository(owner:\"{owner}\",name:\"{name}\"){{defaultBranchRef{{name}} \
-         refs(refPrefix:\"refs/heads/\",first:{REMOTE_BRANCHES},\
-         orderBy:{{field:TAG_COMMIT_DATE,direction:DESC}}){{nodes{{name \
-         target{{...on Commit{{oid history(first:{REMOTE_DEPTH}){{nodes{{oid \
+    // The default branch comes with its own history too: it may be older
+    // than the newest REMOTE_BRANCHES branches.
+    let target = format!(
+        "target{{...on Commit{{oid history(first:{REMOTE_DEPTH}){{nodes{{oid \
          committedDate messageHeadline message author{{name email}} \
-         parents(first:3){{nodes{{oid}}}}}}}}}}}}}}}}}}}}"
+         parents(first:3){{nodes{{oid}}}}}}}}}}}}"
+    );
+    format!(
+        "query{{repository(owner:\"{owner}\",name:\"{name}\"){{defaultBranchRef{{name {target}}} \
+         refs(refPrefix:\"refs/heads/\",first:{REMOTE_BRANCHES},\
+         orderBy:{{field:TAG_COMMIT_DATE,direction:DESC}}){{nodes{{name {target}}}}}}}}}"
     )
 }
 
@@ -467,7 +490,15 @@ fn parse_history(json: &Value) -> Option<RemoteHistory> {
         ..Default::default()
     };
     let mut seen = std::collections::HashSet::new();
-    for r in repo["refs"]["nodes"].as_array().into_iter().flatten() {
+    let default = &repo["defaultBranchRef"];
+    let refs = std::iter::once(default).chain(
+        repo["refs"]["nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|r| default["target"]["oid"].is_null() || r["name"] != default["name"]),
+    );
+    for r in refs {
         let (Some(branch), Some(tip)) = (r["name"].as_str(), r["target"]["oid"].as_str()) else {
             continue;
         };
@@ -629,7 +660,7 @@ fn query(slugs: &[&str]) -> String {
     }
     q.push_str(
         "}fragment pr on PullRequest{number title url state isDraft updatedAt \
-         author{login} headRefName headRefOid reviewDecision mergeable \
+         author{login} headRefName headRefOid isCrossRepository reviewDecision mergeable \
          reviewRequests(first:20){nodes{requestedReviewer{...on User{login}}}} \
          commits(last:1){nodes{commit{statusCheckRollup{state}}}}}",
     );
@@ -700,6 +731,7 @@ fn parse_pr(n: &Value, viewer: &str) -> Option<Pr> {
         author: s(&n["author"]["login"]),
         head_branch: s(&n["headRefName"]),
         head_oid: s(&n["headRefOid"]),
+        cross_repo: n["isCrossRepository"].as_bool().unwrap_or(false),
         review,
         review_requested,
         checks,
@@ -739,6 +771,7 @@ pub fn tests_pr() -> Pr {
         author: "a".into(),
         head_branch: "b".into(),
         head_oid: String::new(),
+        cross_repo: false,
         review: Review::None,
         review_requested: false,
         checks: Checks::None,
@@ -927,6 +960,23 @@ mod tests {
     }
 
     #[test]
+    fn a_pr_is_for_its_own_branch_only() {
+        let tips = |oid: &str| vec![("refs/heads/b".to_string(), oid.to_string())];
+        let mut pr = tests_pr();
+        pr.head_oid = "old".into();
+        assert!(pr.is_for("b", &tips("new")));
+        assert!(!pr.is_for("c", &tips("new")));
+        pr.state = PrState::Merged;
+        // A merged PR claims the branch only while it still points at its head.
+        assert!(pr.is_for("b", &tips("old")));
+        assert!(!pr.is_for("b", &tips("new")));
+        assert!(pr.is_for("b", &[]));
+        // A fork's PR with the same branch name never does.
+        pr.cross_repo = true;
+        assert!(!pr.is_for("b", &tips("old")));
+    }
+
+    #[test]
     fn reads_iso_times() {
         assert_eq!(unix_time("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(unix_time("2026-11-01T14:05:00Z"), Some(1_793_541_900));
@@ -962,6 +1012,20 @@ mod tests {
         assert_eq!(ids, ["f1", "m2", "m1", "root"]);
         assert_eq!(h.commits[0].parents, ["root", "gone"]);
         assert!(parse_history(&json!({"data": {"repository": null}})).is_none());
+
+        // A default branch older than the newest branches comes with
+        // defaultBranchRef, and isn't read twice when it is in both.
+        let old_main = json!({"name": "main", "target": {"oid": "m1", "history": {"nodes": [
+            c("m1", "2026-01-02T00:00:00Z", &[])]}}});
+        for refs in [vec![], vec![old_main.clone()]] {
+            let json = json!({"data": {"repository": {
+                "defaultBranchRef": old_main.clone(),
+                "refs": {"nodes": refs}
+            }}});
+            let h = parse_history(&json).unwrap();
+            assert_eq!(h.branches, [("main".to_string(), "m1".to_string())]);
+            assert_eq!(h.commits.len(), 1);
+        }
     }
 
     #[test]

@@ -709,7 +709,8 @@ mod shell {
         }
 
         fn ini_tracked(&self, p: &Path) -> bool {
-            crate::git::is_tracked(p, Path::new(INI))
+            // Can't tell: leave the folder alone.
+            crate::git::is_tracked(p, Path::new(INI)).unwrap_or(true)
         }
 
         fn foreign_ini(&self, p: &Path) -> bool {
@@ -1001,13 +1002,23 @@ mod shell {
             let ini = path.join(INI);
             // Committed or pulled in since: the user owns it now. Drop our
             // record and leave the file and the folder alone.
-            if ini.exists()
-                && path.join(".git").exists()
-                && crate::git::is_tracked(path, Path::new(INI))
-            {
-                self.ledger.forget(path);
-                self.ledger.save(&self.ledger_file)?;
-                return Ok(Reverted::Tracked);
+            if ini.exists() && path.join(".git").exists() {
+                match crate::git::is_tracked(path, Path::new(INI)) {
+                    Some(true) => {
+                        self.ledger.forget(path);
+                        self.ledger.save(&self.ledger_file)?;
+                        return Ok(Reverted::Tracked);
+                    }
+                    Some(false) => {}
+                    // A failed git call is no reason to forget our changes:
+                    // keep the entry, and the next sync tries again.
+                    None => {
+                        return Err(format!(
+                            "{}: couldn't tell whether git tracks it",
+                            ini.display()
+                        ));
+                    }
+                }
             }
             // Whatever is left in desktop.ini still needs the folder marked.
             let mut ini_in_use = false;

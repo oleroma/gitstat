@@ -1116,10 +1116,7 @@ fn plan(
 
     let cells = view::table_cells(state);
     let lefts = view::cell_lefts(&cells);
-    let repos = cells
-        .iter()
-        .filter(|c| matches!(c, view::Cell::Repo(_)))
-        .count();
+    let table: f32 = cells.iter().map(view::Cell::width).sum();
     let (target, ws) = match big {
         Some((rect, _, ws)) => (rect, ws),
         None => {
@@ -1127,7 +1124,7 @@ fn plan(
             // in the primary monitor's scale, and a monitor of another
             // scale then grows or shrinks it about its top-left corner,
             // to draw at that monitor's scale.
-            let (place, primary) = view::window_place(repos, cx);
+            let (place, primary) = view::window_place(table, cx);
             let bounds = place.get_bounds();
             let at = |v: Pixels| (f32::from(v) * primary).round() as i32;
             let (area, delta) = match place {
@@ -1171,7 +1168,7 @@ fn plan(
     };
 
     // The big window's title bar, above its client area.
-    let maximized = matches!(view::window_place(0, cx).0, WindowBounds::Maximized(_));
+    let maximized = matches!(view::window_place(0.0, cx).0, WindowBounds::Maximized(_));
     let caption = if maximized {
         MAXIMIZED_CAPTION.with(Cell::get)
     } else {

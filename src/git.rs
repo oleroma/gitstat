@@ -685,7 +685,15 @@ const MAX_IGNORED: usize = 2048;
 fn fetch_repo(repo: &Path) -> Result<(), String> {
     // Without these, every fetch writes FETCH_HEAD and may start a background
     // gc in the user's repo, both of which the watcher would see.
-    let mut args = vec!["fetch", "--quiet", "--all", "--prune"];
+    // No submodules: a fetch that recurses runs git inside each submodule,
+    // under that submodule's own config, which the guard never reads.
+    let mut args = vec![
+        "fetch",
+        "--quiet",
+        "--all",
+        "--prune",
+        "--no-recurse-submodules",
+    ];
     if supports(FETCH_QUIET_FLAGS) {
         args.extend(["--no-write-fetch-head", "--no-auto-maintenance"]);
     }
@@ -722,7 +730,16 @@ fn fetch_repo(repo: &Path) -> Result<(), String> {
 
 fn local_status(repo: &Path, v2: bool) -> Result<Parsed, String> {
     if v2 {
-        let base = ["status", "--porcelain=v2", "-z", "--branch"];
+        // `dirty` compares each submodule's HEAD only: a full check would
+        // run `git status` inside it, under its own config (fsmonitor,
+        // filters), which the guard never reads.
+        let base = [
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--branch",
+            "--ignore-submodules=dirty",
+        ];
         let out = git(
             repo,
             &[&base[..], &["--ignored=matching"]].concat(),
@@ -742,7 +759,11 @@ fn local_status(repo: &Path, v2: bool) -> Result<Parsed, String> {
     }
 
     let mut parsed = Parsed::default();
-    let out = git(repo, &["status", "--porcelain"], LOCAL_TIMEOUT)?;
+    let out = git(
+        repo,
+        &["status", "--porcelain", "--ignore-submodules=dirty"],
+        LOCAL_TIMEOUT,
+    )?;
     if !out.status.success() {
         return Err("not readable".to_string());
     }
@@ -928,11 +949,12 @@ pub fn ensure_excluded(repo: &Path, pattern: &str) -> Result<bool, String> {
     Ok(true)
 }
 
-/// Whether git tracks `rel` (relative to the repo). Case-insensitive, and
-/// any answer other than a clean "no" counts as tracked, so a caller that
-/// skips tracked files never writes into a repo it couldn't read.
+/// Whether git tracks `rel` (relative to the repo), case-insensitively.
+/// None when git couldn't say (a timeout, dubious ownership, a corrupt
+/// index): a caller that writes treats that as tracked, one that would
+/// forget its own changes treats it as "try again later".
 #[cfg(any(windows, test))]
-pub fn is_tracked(repo: &Path, rel: &Path) -> bool {
+pub fn is_tracked(repo: &Path, rel: &Path) -> Option<bool> {
     let rel = rel.to_string_lossy().replace('\\', "/");
     let spec = format!(":(literal,icase){rel}");
     match git(
@@ -940,8 +962,12 @@ pub fn is_tracked(repo: &Path, rel: &Path) -> bool {
         &["ls-files", "--error-unmatch", "--", &spec],
         LOCAL_TIMEOUT,
     ) {
-        Ok(out) => out.status.code() != Some(1),
-        Err(_) => true,
+        Ok(out) => match out.status.code() {
+            Some(0) => Some(true),
+            Some(1) => Some(false),
+            _ => None,
+        },
+        Err(_) => None,
     }
 }
 
@@ -1712,15 +1738,15 @@ mod tests {
         assert_eq!(canon(wt_common), main_git);
         assert_eq!(git_dirs(&root), None);
 
-        assert!(is_tracked(&repo, Path::new("Desktop.ini")));
-        assert!(is_tracked(&repo, Path::new("desktop.ini")));
-        assert!(!is_tracked(&repo, Path::new("other.ini")));
+        assert_eq!(is_tracked(&repo, Path::new("Desktop.ini")), Some(true));
+        assert_eq!(is_tracked(&repo, Path::new("desktop.ini")), Some(true));
+        assert_eq!(is_tracked(&repo, Path::new("other.ini")), Some(false));
         // Literal pathspec: a glob in the name matches nothing.
-        assert!(!is_tracked(&repo, Path::new("*.ini")));
+        assert_eq!(is_tracked(&repo, Path::new("*.ini")), Some(false));
         std::fs::write(repo.join("untracked.ini"), "x").unwrap();
-        assert!(!is_tracked(&repo, Path::new("untracked.ini")));
-        // Can't tell, so assume tracked and leave the folder alone.
-        assert!(is_tracked(&root.join("missing"), Path::new("desktop.ini")));
+        assert_eq!(is_tracked(&repo, Path::new("untracked.ini")), Some(false));
+        // Can't tell.
+        assert_eq!(is_tracked(&root.join("missing"), Path::new("desktop.ini")), None);
         let _ = std::fs::remove_dir_all(&root);
     }
 

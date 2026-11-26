@@ -239,9 +239,11 @@ pub fn run(action: RepoAction, target: &Target, cx: &mut App) {
         }
         RepoAction::Editor => {
             if let Some(code) = editor() {
-                let spawned = Command::new("cmd.exe")
-                    .arg("/c")
-                    .arg(code)
+                // Run directly, not through `cmd /c`: Rust quotes the
+                // arguments of a .cmd for cmd itself (so a `&` or a space
+                // in the folder name stays part of the path), but only when
+                // the program it runs is the .cmd.
+                let spawned = Command::new(code)
                     .arg(path)
                     .creation_flags(CREATE_NO_WINDOW)
                     .spawn();
