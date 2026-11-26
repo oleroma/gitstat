@@ -151,7 +151,7 @@ fn stroke(window: &mut Window, pts: &[P], width: f32, color: Hsla, dash: Option<
         ((x1 + pad).ceil() - ox) as u32,
         ((y1 + pad).ceil() - oy) as u32,
     );
-    if iw == 0 || ih == 0 || iw > 4096 || ih > 4096 {
+    if iw == 0 || ih == 0 || iw > 4096 || ih > 4096 || masked(window, (ox, oy), (iw, ih)) {
         return;
     }
     let local: Vec<P> = dev.iter().map(|&(x, y)| (x - ox, y - oy)).collect();
@@ -175,6 +175,19 @@ fn stroke(window: &mut Window, pts: &[P], width: f32, color: Hsla, dash: Option<
         return;
     };
     paint(window, (ox, oy), (iw, ih), image);
+}
+
+/// Whether a picture with its corner at device px `at` falls wholly
+/// outside what `window` draws into now: then it isn't made or kept at
+/// all. A picture painted many times under small masks (the flip's cuts)
+/// costs nothing where it doesn't show.
+fn masked(window: &Window, at: P, (iw, ih): (u32, u32)) -> bool {
+    let s = window.scale_factor();
+    let bounds = Bounds::new(
+        point(px(at.0 / s), px(at.1 / s)),
+        size(px(iw as f32 / s), px(ih as f32 / s)),
+    );
+    !window.content_mask().bounds.intersects(&bounds)
 }
 
 /// The picture kept under `key`, made with `make` the first time.
@@ -226,6 +239,9 @@ pub fn circle(
         ((cx + rd + 1.0).ceil() - ox) as u32,
         ((cy + rd + 1.0).ceil() - oy) as u32,
     );
+    if masked(window, (ox, oy), (iw, ih)) {
+        return;
+    }
     let (lx, ly) = (cx - ox, cy - oy);
     let ring = ring.map(|(w, c, dashed)| (w * s, c.to_rgb(), dashed));
     let fill = fill.map(|c| c.to_rgb());

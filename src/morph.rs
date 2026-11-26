@@ -2832,7 +2832,30 @@ impl Render for MorphView {
                                             window.with_content_mask(
                                                 Some(gpui::ContentMask { bounds: *c }),
                                                 |window| {
-                                                    for (graph, dirty, _, strip, column) in &trees {
+                                                    // Only the tree the cut is in:
+                                                    // a cut is a row's line or a
+                                                    // mark, inside one tree.
+                                                    let under = |b: &Bounds<Pixels>| {
+                                                        let bleed = px(crate::timeline::BLEED);
+                                                        let b = Bounds::new(
+                                                            point(b.left(), b.top() - bleed),
+                                                            size(
+                                                                b.size.width,
+                                                                b.size.height + bleed * 2.0,
+                                                            ),
+                                                        );
+                                                        b.intersects(c)
+                                                    };
+                                                    for (graph, dirty, _, strip, column) in trees
+                                                        .iter()
+                                                        .filter(|(_, _, _, strip, column)| {
+                                                            under(if at_end {
+                                                                column
+                                                            } else {
+                                                                strip
+                                                            })
+                                                        })
+                                                    {
                                                         if at_end {
                                                             crate::timeline::paint_still_column(
                                                                 *column, graph, *dirty, dark, &p,
