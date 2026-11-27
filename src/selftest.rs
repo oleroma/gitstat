@@ -814,7 +814,9 @@ async fn float(
         let outside = changed(&with, &plain, area) - changed(&with, &plain, sheet);
         // The view itself: what lies around it is whatever other app is
         // there, and may change on its own (a ticking clock did).
-        let left = changed(&after, &plain, sheet);
+        // Inside its corners, as every other check of it: what shows
+        // past their curve is the app behind.
+        let left = changed(&after, &plain, inner(sheet));
         let _ = writeln!(
             report,
             "float undo: the plate changes {outside} px beside the view; undone, it went in \
