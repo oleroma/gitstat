@@ -175,35 +175,31 @@ private fun RepoScreen(state: UiState) {
         if (System.currentTimeMillis() - read > 60_000) Hub.refresh(context)
     }
 
+    val menuButton: @Composable () -> Unit = {
+        Box {
+            TextButton(onClick = { menu = true }) { Text("⋮", fontSize = 20.sp, color = c.text) }
+            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                DropdownMenuItem(
+                    text = { Text(if (state.notify) "Turn notifications off" else "Turn notifications on") },
+                    onClick = {
+                        menu = false
+                        val on = !state.notify
+                        Hub.setNotify(context, on)
+                        if (on && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            askNotify.launch(Manifest.permission.POST_NOTIFICATIONS)
+                        }
+                    },
+                )
+                DropdownMenuItem(
+                    text = { Text("Sign out") },
+                    onClick = { menu = false; scope.launch { Hub.signOut(context) } },
+                )
+            }
+        }
+    }
+
     Scaffold(
         containerColor = c.bg,
-        topBar = {
-            TopAppBar(
-                title = { Text("gitstat", fontWeight = FontWeight.Bold) },
-                actions = {
-                    Box {
-                        TextButton(onClick = { menu = true }) { Text("⋮", fontSize = 20.sp, color = c.text) }
-                        DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                            DropdownMenuItem(
-                                text = { Text(if (state.notify) "Turn notifications off" else "Turn notifications on") },
-                                onClick = {
-                                    menu = false
-                                    val on = !state.notify
-                                    Hub.setNotify(context, on)
-                                    if (on && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                                        askNotify.launch(Manifest.permission.POST_NOTIFICATIONS)
-                                    }
-                                },
-                            )
-                            DropdownMenuItem(
-                                text = { Text("Sign out") },
-                                onClick = { menu = false; scope.launch { Hub.signOut(context) } },
-                            )
-                        }
-                    }
-                },
-            )
-        },
     ) { pad ->
         PullToRefreshBox(
             isRefreshing = state.refreshing,
@@ -215,9 +211,15 @@ private fun RepoScreen(state: UiState) {
                 Box(Modifier.padding(horizontal = 12.dp, vertical = 4.dp)) { Summary(snap, state.problem, state.refreshing) }
             }
             if (snap == null) {
-                Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) { summary() }
+                Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+                    Row(Modifier.fillMaxWidth().padding(start = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text("gitstat", fontWeight = FontWeight.Bold, fontSize = 20.sp, color = c.text, modifier = Modifier.weight(1f))
+                        menuButton()
+                    }
+                    summary()
+                }
             } else {
-                Board(snap, header = summary, onRepo = { sheet = it.slug }, onCommit = { picked = it })
+                Board(snap, menu = menuButton, summary = summary, onRepo = { sheet = it.slug }, onCommit = { picked = it })
             }
         }
     }

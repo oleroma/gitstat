@@ -70,6 +70,8 @@ data class Repo(
     val defaultTip: String = "",
     /** Recent commits of every branch read, newest first with children before parents. */
     val commits: List<Commit> = emptyList(),
+    /** The repo's own icon, `.gitstat/icon.svg` on the default branch, as on the PC. */
+    val icon: String? = null,
 ) {
     val name: String get() = slug.substringAfter('/')
     val owner: String get() = slug.substringBefore('/')

@@ -1,6 +1,15 @@
 package gitstat.phone
 
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.draw.clip
+import kotlinx.coroutines.launch
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -62,19 +71,67 @@ data class Picked(val repo: Repo, val commit: Commit, val branch: String?)
 @Composable
 fun Board(
     snap: Snapshot,
-    header: @Composable () -> Unit,
+    menu: @Composable () -> Unit,
+    summary: @Composable () -> Unit,
     onRepo: (Repo) -> Unit,
     onCommit: (Picked) -> Unit,
 ) {
     val repos = remember(snap) { snap.sorted() }
     val trees = remember(snap) { repos.associate { it.slug to it.tree() } }
     val pager = rememberPagerState { repos.size }
+    val pills = rememberLazyListState()
+    val scope = rememberCoroutineScope()
+    // The pill of the repo on screen stays in view as you swipe.
+    LaunchedEffect(pager.currentPage) {
+        if (repos.isNotEmpty()) pills.animateScrollToItem((pager.currentPage - 1).coerceAtLeast(0))
+    }
     Column(Modifier.fillMaxSize()) {
-        header()
+        Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+            LazyRow(
+                state = pills,
+                modifier = Modifier.weight(1f),
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                itemsIndexed(repos, key = { _, r -> r.slug }) { i, repo ->
+                    Pill(repo, selected = i == pager.currentPage) {
+                        scope.launch { pager.animateScrollToPage(i) }
+                    }
+                }
+            }
+            menu()
+        }
+        summary()
         HorizontalPager(state = pager, modifier = Modifier.fillMaxSize(), key = { repos[it].slug }) { page ->
             val repo = repos[page]
             RepoPage(repo, trees.getValue(repo.slug), snap.login, "${page + 1} / ${repos.size}", onRepo, onCommit)
         }
+    }
+}
+
+/** A repo's tab: its icon and name in a pill; the repo on screen has its pill filled. */
+@Composable
+private fun Pill(repo: Repo, selected: Boolean, onClick: () -> Unit) {
+    val c = LocalColors.current
+    val shape = RoundedCornerShape(50)
+    Row(
+        Modifier
+            .background(if (selected) c.text.copy(alpha = 0.12f) else c.surface, shape)
+            .border(1.dp, if (selected) c.of(repo.health) else c.border, shape)
+            .clip(shape)
+            .clickable(onClick = onClick)
+            .padding(start = 8.dp, end = 12.dp, top = 6.dp, bottom = 6.dp),
+        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+    ) {
+        RepoMark(repo, 18.dp)
+        Spacer(Modifier.width(6.dp))
+        Text(
+            repo.name,
+            color = c.text,
+            fontSize = 14.sp,
+            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+            maxLines = 1,
+        )
     }
 }
 
@@ -98,7 +155,7 @@ private fun RepoPage(
             Modifier.fillMaxWidth().clickable { onRepo(repo) }.padding(horizontal = 14.dp, vertical = 8.dp),
         ) {
             Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                Box(Modifier.size(12.dp).background(c.of(repo.health), CircleShape))
+                RepoMark(repo, 24.dp)
                 Spacer(Modifier.width(10.dp))
                 Text(
                     repo.name,

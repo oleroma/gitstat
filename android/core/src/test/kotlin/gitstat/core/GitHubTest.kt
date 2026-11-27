@@ -32,7 +32,8 @@ class GitHubTest {
                "compare":{"aheadBy":3,"behindBy":4}}
             ]},
             "open":{"nodes":[]},
-            "merged":{"nodes":[{"headRefName":"squashed","headRefOid":"c1","isCrossRepository":false}]}},
+            "merged":{"nodes":[{"headRefName":"squashed","headRefOid":"c1","isCrossRepository":false}]},
+            "icon":{"text":"<svg/>","byteSize":6,"isBinary":false}},
           "r1":{"defaultBranchRef":{"target":{"statusCheckRollup":null}},
             "refs":{"totalCount":3,"nodes":[
               {"name":"main","target":{"oid":"d1"},"compare":{"aheadBy":0,"behindBy":0}},
@@ -74,6 +75,7 @@ class GitHubTest {
         assertEquals(listOf("old-feature", "squashed"), tidy.branches.map { it.name })
         assertEquals(12, tidy.branches[0].mainAhead)
         assertTrue(tidy.branches[1].mergedByPr)
+        assertEquals("<svg/>", tidy.icon)
 
         val hanging = snap.repos[1]
         assertEquals(Health.RED, hanging.health)
@@ -89,6 +91,7 @@ class GitHubTest {
         assertFalse(hanging.branches[1].mergedByPr)
         assertEquals(null, hanging.branches[1].pr)
         assertEquals(listOf(7), hanging.openPrs.map { it.number })
+        assertEquals(null, hanging.icon)
     }
 
     @Test

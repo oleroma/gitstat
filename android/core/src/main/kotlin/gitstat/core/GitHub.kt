@@ -104,6 +104,8 @@ class GitHub(private val post: (query: String) -> String) {
         const val MAX_OPEN = 30
         const val MAX_MERGED = 50
         const val MAX_REPO_PAGES = 10
+        /** Larger repo icons are left out; the PC refuses ones over 1 MB, but these ride in every read. */
+        const val MAX_ICON_BYTES = 64 * 1024
         private val SLUG = Regex("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
         private val JSON = Json { ignoreUnknownKeys = true }
 
@@ -138,7 +140,8 @@ class GitHub(private val post: (query: String) -> String) {
                 append("{nodes{number title url isDraft headRefName isCrossRepository}} ")
                 append("merged:pullRequests(states:MERGED,first:$MAX_MERGED,")
                 append("orderBy:{field:UPDATED_AT,direction:DESC})")
-                append("{nodes{headRefName headRefOid isCrossRepository}}")
+                append("{nodes{headRefName headRefOid isCrossRepository}} ")
+                append("icon:object(expression:\"HEAD:.gitstat/icon.svg\"){...on Blob{text byteSize isBinary}}")
                 append("} ")
             }
             append("}")
@@ -207,7 +210,12 @@ class GitHub(private val post: (query: String) -> String) {
                     )
                 }
             }
+            val iconBlob = o.obj("icon")
+            val icon = iconBlob.str("text")?.takeIf {
+                !iconBlob.bool("isBinary") && (iconBlob.int("byteSize") ?: 0) <= MAX_ICON_BYTES
+            }
             return repo.copy(
+                icon = icon,
                 defaultTip = o.obj("defaultBranchRef").obj("target").str("oid") ?: "",
                 commits = Tree.order(commits),
                 checks = checks.name,
