@@ -36,7 +36,10 @@ import androidx.glance.layout.size
 import androidx.glance.layout.width
 import androidx.glance.text.FontWeight
 import androidx.glance.text.Text
+import androidx.glance.text.TextAlign
 import androidx.glance.text.TextStyle
+import androidx.glance.appwidget.lazy.LazyColumn
+import androidx.glance.appwidget.lazy.items
 import gitstat.core.Health
 import gitstat.core.Snapshot
 import gitstat.core.tree
@@ -99,45 +102,51 @@ private fun WidgetBody(snap: Snapshot?, signedIn: Boolean) {
             Text(summary, style = TextStyle(color = muted, fontSize = 12.sp))
         }
         if (snap == null || !signedIn) return@Column
-        val fit = ((size.height.value - 20 - 24) / ROW_DP).toInt().coerceAtLeast(1)
-        val stripDp = (size.width.value - 20 - 16 - 8 - NAME_DP - 6).coerceAtLeast(20f)
-        for (repo in snap.sorted().take(fit)) {
-            Row(
-                GlanceModifier.fillMaxWidth().height(ROW_DP.dp).clickable(open),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                val tone = when (repo.health) {
-                    Health.RED -> if (dark) Palette.redDark else Palette.redLight
-                    Health.GREEN -> if (dark) Palette.greenDark else Palette.greenLight
-                    Health.UNKNOWN -> if (dark) Color(0xFF9A9CA3) else Color(0xFF656D76)
-                }
-                val icon = RepoIcons.bitmap(repo, tone.toArgb(), (16 * density).toInt())
-                if (icon != null) {
-                    Image(ImageProvider(icon), contentDescription = null, modifier = GlanceModifier.size(16.dp))
-                } else {
-                    Box(GlanceModifier.size(16.dp), contentAlignment = Alignment.Center) {
-                        Box(GlanceModifier.size(10.dp).cornerRadius(5.dp).background(dot(repo.health))) {}
+        // The tree on the left and the name on the right, as on the PC's panel; every repo, scrolling.
+        val stripDp = (size.width.value - 20 - NAME_DP - 8 - 16 - 6).coerceAtLeast(20f)
+        // Strips are drawn at most 2 px per dp: sharp enough, and light on the launcher's memory.
+        val scale = minOf(density, 2f)
+        LazyColumn(GlanceModifier.fillMaxSize().padding(top = 4.dp)) {
+            items(snap.sorted()) { repo ->
+                Row(
+                    GlanceModifier.fillMaxWidth().height(ROW_DP.dp).clickable(open),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    if (repo.commits.isNotEmpty()) {
+                        val bmp = stripBitmap(
+                            repo.tree(), inks, bgArgb,
+                            (stripDp * scale).toInt(), (STRIP_DP * scale).toInt(), scale,
+                        )
+                        Image(
+                            provider = ImageProvider(bmp),
+                            contentDescription = null,
+                            contentScale = ContentScale.FillBounds,
+                            modifier = GlanceModifier.width(stripDp.dp).height(STRIP_DP.dp),
+                        )
+                    } else {
+                        Spacer(GlanceModifier.width(stripDp.dp))
                     }
-                }
-                Spacer(GlanceModifier.width(8.dp))
-                Text(
-                    repo.name,
-                    style = TextStyle(color = text, fontSize = 13.sp),
-                    maxLines = 1,
-                    modifier = GlanceModifier.width(NAME_DP.dp),
-                )
-                Spacer(GlanceModifier.width(6.dp))
-                if (repo.commits.isNotEmpty()) {
-                    val bmp = stripBitmap(
-                        repo.tree(), inks, bgArgb,
-                        (stripDp * density).toInt(), (STRIP_DP * density).toInt(), density,
+                    Spacer(GlanceModifier.width(8.dp))
+                    Text(
+                        repo.name,
+                        style = TextStyle(color = text, fontSize = 13.sp, textAlign = TextAlign.End),
+                        maxLines = 1,
+                        modifier = GlanceModifier.width(NAME_DP.dp),
                     )
-                    Image(
-                        provider = ImageProvider(bmp),
-                        contentDescription = null,
-                        contentScale = ContentScale.FillBounds,
-                        modifier = GlanceModifier.width(stripDp.dp).height(STRIP_DP.dp),
-                    )
+                    Spacer(GlanceModifier.width(6.dp))
+                    val tone = when (repo.health) {
+                        Health.RED -> if (dark) Palette.redDark else Palette.redLight
+                        Health.GREEN -> if (dark) Palette.greenDark else Palette.greenLight
+                        Health.UNKNOWN -> if (dark) Color(0xFF9A9CA3) else Color(0xFF656D76)
+                    }
+                    val icon = RepoIcons.bitmap(repo, tone.toArgb(), (16 * density).toInt())
+                    if (icon != null) {
+                        Image(ImageProvider(icon), contentDescription = null, modifier = GlanceModifier.size(16.dp))
+                    } else {
+                        Box(GlanceModifier.size(16.dp), contentAlignment = Alignment.Center) {
+                            Box(GlanceModifier.size(10.dp).cornerRadius(5.dp).background(dot(repo.health))) {}
+                        }
+                    }
                 }
             }
         }

@@ -117,15 +117,29 @@ fun RowsView(
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 24.dp)) {
         item { top() }
         items(repos, key = { it.slug }) { repo ->
+            // As on the PC's panel: the tree on the left running back into history, the
+            // newest commit next to the repo's name on the right.
             Row(
-                Modifier.fillMaxWidth().padding(start = 12.dp),
+                Modifier.fillMaxWidth().padding(end = 12.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Column(Modifier.width(NAME_W).clickable { onRepo(repo) }.padding(vertical = 6.dp)) {
+                Strip(repo, trees.getValue(repo.slug), onCommit, Modifier.weight(1f))
+                Spacer(Modifier.width(8.dp))
+                Column(
+                    Modifier.width(NAME_W).clickable { onRepo(repo) }.padding(vertical = 6.dp),
+                    horizontalAlignment = Alignment.End,
+                ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        RepoMark(repo, 20.dp)
+                        Text(
+                            repo.name,
+                            color = c.text,
+                            fontSize = 14.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false),
+                        )
                         Spacer(Modifier.width(6.dp))
-                        Text(repo.name, color = c.text, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        RepoMark(repo, 20.dp)
                     }
                     val n = repo.hanging.size
                     Text(
@@ -135,9 +149,8 @@ fun RowsView(
                         maxLines = 1,
                     )
                 }
-                Strip(repo, trees.getValue(repo.slug), onCommit, Modifier.weight(1f))
             }
-            Box(Modifier.fillMaxWidth().padding(start = 12.dp).height(1.dp).background(c.border))
+            Box(Modifier.fillMaxWidth().padding(end = 12.dp).height(1.dp).background(c.border))
         }
     }
 }
