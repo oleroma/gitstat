@@ -812,7 +812,9 @@ async fn float(
         // Under the view, or over it near the screen's bottom: anywhere
         // in the picture but the view itself.
         let outside = changed(&with, &plain, area) - changed(&with, &plain, sheet);
-        let left = changed(&after, &plain, area);
+        // The view itself: what lies around it is whatever other app is
+        // there, and may change on its own (a ticking clock did).
+        let left = changed(&after, &plain, sheet);
         let _ = writeln!(
             report,
             "float undo: the plate changes {outside} px beside the view; undone, it went in \
