@@ -84,10 +84,12 @@ fun Board(
         if (repos.isNotEmpty()) pills.animateScrollToItem((pager.currentPage - 1).coerceAtLeast(0))
     }
     Column(Modifier.fillMaxSize()) {
+        // The view switch and the menu on a row of their own, top right; the pills below get the whole width.
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) { menu() }
         Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
             LazyRow(
                 state = pills,
-                modifier = Modifier.weight(1f),
+                modifier = Modifier.fillMaxWidth(),
                 contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
@@ -98,7 +100,6 @@ fun Board(
                     }
                 }
             }
-            menu()
         }
         HorizontalPager(state = pager, modifier = Modifier.fillMaxSize(), key = { repos[it].slug }) { page ->
             val repo = repos[page]
