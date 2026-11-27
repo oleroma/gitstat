@@ -3,3 +3,8 @@
 
 # Everything made by building, testing or running the program
 /build/
+
+# The phone app's Gradle files, should a tool make them outside build/
+/android/.gradle/
+/android/.kotlin/
+/android/local.properties

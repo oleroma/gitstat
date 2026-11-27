@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# Quick tests, run by every branch build (PC and fallback) before building.
+# Quick tests, run by every branch build (PC and fallback) before building: those of the
+# parts this branch builds (hooks/parts).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 export CARGO_TARGET_DIR=build/target
+parts="$(bash .agents/hooks/parts)"
 
-cargo test --locked
+if grep -qx exe <<<"$parts"; then cargo test --locked; fi
+if grep -qx apk <<<"$parts"; then bash .agents/hooks/phone-gradle :core:test; fi

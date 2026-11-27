@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Runs the phone app's Gradle (android/) with its caches in build/, for the other hooks:
+#   bash .agents/hooks/phone-gradle <tasks and flags>
+# Java 17 comes from JAVA_HOME (D:\tools\jdk17 on the PC); a GitHub runner, whose default
+# Java may be older, names its Java 17 in JAVA_HOME_17_X64.
+set -euo pipefail
+cd "$(dirname "$0")/../../android"
+if [ -n "${JAVA_HOME_17_X64:-}" ]; then export JAVA_HOME="$JAVA_HOME_17_X64"; fi
+exec bash ./gradlew --project-cache-dir ../build/android/.gradle "$@"

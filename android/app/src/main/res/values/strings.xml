@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">gitstat</string>
+    <string name="widget_name">gitstat repos</string>
+    <string name="widget_description">Your repos, red when a branch isn\'t merged</string>
+    <string name="channel_red">Hanging branches</string>
+    <string name="channel_red_description">When a repo turns red because a branch has work that isn\'t on main</string>
+</resources>
