@@ -6,7 +6,9 @@ import android.content.Context
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -102,8 +104,10 @@ fun pick(repo: Repo, tree: Tree, row: Int, inks: TreeInks): Picked {
 /**
  * The horizontal view, like gitstat's panel on the PC: a row per repo, red ones first, each
  * with its icon and name and its tree as a strip, newest commit at the right. The list scrolls
- * down; each strip scrolls sideways through its own history.
+ * down; each strip scrolls sideways through its own history. Tapping a repo's name calls
+ * [onRepo] (its page in the vertical view); a long press opens it on GitHub.
  */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun RowsView(
     snap: Snapshot,
@@ -112,6 +116,7 @@ fun RowsView(
     onCommit: (Picked) -> Unit,
 ) {
     val c = LocalColors.current
+    val uri = LocalUriHandler.current
     val repos = remember(snap) { snap.sorted() }
     val trees = remember(snap) { repos.associate { it.slug to it.tree() } }
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 24.dp)) {
@@ -126,7 +131,9 @@ fun RowsView(
                 Strip(repo, trees.getValue(repo.slug), onCommit, Modifier.weight(1f))
                 Spacer(Modifier.width(8.dp))
                 Column(
-                    Modifier.width(NAME_W).clickable { onRepo(repo) }.padding(vertical = 6.dp),
+                    Modifier.width(NAME_W)
+                        .combinedClickable(onLongClick = { uri.openUri(repo.url) }) { onRepo(repo) }
+                        .padding(vertical = 6.dp),
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         RepoMark(repo, 20.dp)

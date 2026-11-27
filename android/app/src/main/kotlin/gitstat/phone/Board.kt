@@ -68,6 +68,8 @@ private val DOT = 5.dp
 @Composable
 fun Board(
     snap: Snapshot,
+    /** The repo to open at, such as one tapped in the horizontal view. */
+    focus: String?,
     problem: String?,
     menu: @Composable () -> Unit,
     onHealth: () -> Unit,
@@ -76,7 +78,9 @@ fun Board(
 ) {
     val repos = remember(snap) { snap.sorted() }
     val trees = remember(snap) { repos.associate { it.slug to it.tree() } }
-    val pager = rememberPagerState { repos.size }
+    val start = remember(snap, focus) { repos.indexOfFirst { it.slug == focus }.coerceAtLeast(0) }
+    val pager = rememberPagerState(initialPage = start) { repos.size }
+    LaunchedEffect(focus) { if (focus != null) pager.scrollToPage(start) }
     val pills = rememberLazyListState()
     val scope = rememberCoroutineScope()
     // The pill of the repo on screen stays in view as you swipe.

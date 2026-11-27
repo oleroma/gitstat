@@ -47,6 +47,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -161,6 +162,8 @@ private fun RepoScreen(state: UiState) {
     var sheet by remember { mutableStateOf<String?>(null) }
     var picked by remember { mutableStateOf<Picked?>(null) }
     var health by remember { mutableStateOf(false) }
+    // The repo the vertical view opens at, when one was tapped in the horizontal view.
+    var focus by rememberSaveable { mutableStateOf<String?>(null) }
 
     val askNotify = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (!granted) Hub.setNotify(context, false)
@@ -202,7 +205,7 @@ private fun RepoScreen(state: UiState) {
     // Top right: the switch between one repo per screen and a row per repo, then the menu.
     val actions: @Composable () -> Unit = {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            TextButton(onClick = { Hub.setRows(context, !state.rows) }) {
+            TextButton(onClick = { focus = null; Hub.setRows(context, !state.rows) }) {
                 Text(if (state.rows) "↕" else "↔", fontSize = 20.sp, color = c.text)
             }
             menuButton()
@@ -243,12 +246,13 @@ private fun RepoScreen(state: UiState) {
                             actions()
                         }
                     },
-                    onRepo = { sheet = it.slug },
+                    onRepo = { focus = it.slug; Hub.setRows(context, false) },
                     onCommit = { picked = it },
                 )
             } else {
                 Board(
                     snap,
+                    focus = focus,
                     problem = state.problem,
                     menu = actions,
                     onHealth = { health = true },
