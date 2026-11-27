@@ -157,6 +157,31 @@ pub fn toggle(anchor: Anchor, cx: &mut App) {
     open(anchor, true, false, cx);
 }
 
+/// Whether the open panel is on screen yet: drawn, and no longer cloaked.
+pub fn shows(cx: &App) -> bool {
+    is_open(cx) && cx.try_global::<PanelSlot>().is_some_and(|s| s.shown)
+}
+
+/// The open panel's state in words, for the self-test's report.
+pub fn facts(cx: &App) -> String {
+    let Some(slot) = cx.try_global::<PanelSlot>() else {
+        return "no panel yet".into();
+    };
+    format!(
+        "  rect {:?}\n  window area {:?}\n  client now {:?}\n  ex-style {:#x}\n  frames in place {} \
+         shown {} click-through {} leaving {} height {}",
+        slot.rect,
+        slot.area,
+        slot.hwnd.and_then(win::client_rect),
+        slot.hwnd.map_or(0, win::ex_style),
+        slot.drawn,
+        slot.shown,
+        slot.through,
+        slot.leaving,
+        slot.height,
+    )
+}
+
 /// The open panel's client area, or the last one's, physical px.
 pub fn last_rect(cx: &App) -> Option<Rect> {
     cx.try_global::<PanelSlot>()?.rect
@@ -631,6 +656,7 @@ pub fn slide_away_now(cx: &mut App) {
         work,
     });
     slot.leaving = true;
+    crate::frames::watch(win::primary_monitor().rect, "panel-out", cx);
     // It draws itself sliding out, a frame at a time, and closes as it
     // gets there (`sheet`); outside any update of its window this may be
     // called from.

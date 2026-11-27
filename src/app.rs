@@ -93,7 +93,7 @@ fn sync_monitors(cx: &mut App) {
     }
 }
 
-pub fn run(config_file: PathBuf) {
+pub fn run(config_file: PathBuf, self_test: Option<PathBuf>) {
     Application::new().run(move |cx: &mut App| {
         let (tx, rx) = unbounded::<Input>();
         // Before Tray::new: the handlers can be set only once.
@@ -197,11 +197,16 @@ pub fn run(config_file: PathBuf) {
         apply_config(&Config::default(), cfg, cx);
         update_outputs(false, cx);
 
-        if let Ok(exe) = std::env::current_exe() {
-            let update_tx = tx.clone();
-            crate::self_update::watch(exe, move || {
-                let _ = update_tx.unbounded_send(Input::NewBuild);
-            });
+        match self_test {
+            Some(out) => crate::selftest::start(out, cx),
+            None => {
+                if let Ok(exe) = std::env::current_exe() {
+                    let update_tx = tx.clone();
+                    crate::self_update::watch(exe, move || {
+                        let _ = update_tx.unbounded_send(Input::NewBuild);
+                    });
+                }
+            }
         }
 
         cx.spawn(async move |cx| input_loop(rx, cx).await).detach();

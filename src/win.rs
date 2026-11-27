@@ -445,6 +445,12 @@ pub unsafe fn place_morph(h: isize, r: Rect) {
     }
 }
 
+/// `h`'s extended window styles, for the self-test's report.
+pub fn ex_style(h: isize) -> u32 {
+    live(h).map_or(0, |hwnd| unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) }
+        as u32)
+}
+
 /// Tells `h` the mouse is at (`x`, `y`) on screen, as a mouse move would:
 /// for a window clicks pass through, which hears of no move itself.
 pub fn tell_mouse(h: isize, x: i32, y: i32) {
