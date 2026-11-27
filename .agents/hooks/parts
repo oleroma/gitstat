@@ -8,6 +8,12 @@ cd "$(dirname "$0")/../.."
 
 exe=0
 apk=0
+# A CI checkout holds only the branch's last commit: fetch main's history to compare with.
+if [ -n "${GITHUB_ACTIONS:-}" ] && ! git rev-parse --verify --quiet origin/main >/dev/null; then
+  unshallow=""
+  if [ "$(git rev-parse --is-shallow-repository)" = true ]; then unshallow=--unshallow; fi
+  git fetch --quiet --no-tags $unshallow origin +refs/heads/main:refs/remotes/origin/main >&2 || true
+fi
 base="$(git merge-base HEAD origin/main 2>/dev/null || true)"
 if [ -n "$base" ] && [ "$base" != "$(git rev-parse HEAD)" ]; then
   while IFS= read -r f; do
