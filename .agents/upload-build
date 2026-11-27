@@ -5,8 +5,8 @@
 # from the pre-release. Its log is build/logs/upload-build-*.log. In the background, a failed
 # upload is also posted on the feature's PR.
 # Usage: .agents/upload-build <sha> <n> <version> <release notes> <file>...
-# All of it is one function, read whole before it runs, so the next build checking out build/src
-# can't change it halfway.
+# All of it is one function, read whole before it runs, so the next build checking out another
+# commit can't change it halfway.
 main() {
   source "$(dirname "$0")/lib.sh"
   SHA="$1"
