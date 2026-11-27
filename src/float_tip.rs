@@ -372,7 +372,7 @@ pub fn holds_at(x: i32, y: i32, cx: &App) -> bool {
 
 /// How long what this shows waits for the mouse, after it left the view
 /// or what this shows, before it goes.
-const GRACE: Duration = Duration::from_millis(350);
+pub const GRACE: Duration = Duration::from_millis(350);
 
 /// The mouse left the view while this shows: it stays a moment for the
 /// mouse to get onto it, and as long as the mouse is on it. Once the mouse

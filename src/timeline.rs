@@ -85,11 +85,25 @@ impl gpui::Global for CardRect {}
 
 /// The mouse is on the card that shows.
 fn card_holds_mouse(cx: &App) -> bool {
+    if on_float_tip(cx) {
+        return true;
+    }
     let Some(CardRect(Some((l, t, r, b)))) = cx.try_global::<CardRect>() else {
         return false;
     };
     let (x, y) = crate::win::cursor_pos();
     x >= *l && x < *r && y >= *t && y < *b
+}
+
+/// The mouse is on the floating view's card, as its window drew it.
+#[cfg(windows)]
+fn on_float_tip(cx: &App) -> bool {
+    crate::float_tip::holds_mouse(cx)
+}
+
+#[cfg(not(windows))]
+fn on_float_tip(_: &App) -> bool {
+    false
 }
 /// How long a failed page of older history waits before it is asked again.
 const MORE_RETRY: Duration = Duration::from_secs(10);

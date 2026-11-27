@@ -1353,6 +1353,7 @@ pub fn let_go(cx: &mut App) {
     let slot = cx.default_global::<OverlaySlot>();
     slot.mouse_in = false;
     slot.spot = Spot::Off;
+    slot.tip_at = None;
     let own = slot.cur.as_ref().map(|cur| cur.hwnd);
     sync_tooltip(Vec::new(), cx);
     if let Some(t) = cx.try_global::<Ui>().map(|ui| ui.timelines.clone()) {
@@ -1363,7 +1364,10 @@ pub fn let_go(cx: &mut App) {
 
 /// A press: the tooltip goes, until the mouse moves on to something else.
 fn hush(cx: &mut App) {
-    cx.default_global::<OverlaySlot>().tip_hushed = true;
+    let slot = cx.default_global::<OverlaySlot>();
+    slot.tip_hushed = true;
+    // At once: no wait for the mouse to reach it.
+    slot.tip_at = None;
     sync_tooltip(Vec::new(), cx);
 }
 
@@ -2349,10 +2353,51 @@ fn sync_tooltip(lines: Lines, cx: &mut App) {
         crate::float_tip::set_lines(Some((lines, at)), cx);
         return;
     }
-    slot.tip_at = None;
     let asked = slot.tip_asked;
+    // One shows: the mouse may be on its way onto it. It stays a moment
+    // for the mouse to get there, and as long as the mouse is on it.
+    if slot.tip_at.is_some() && crate::float_tip::shown_hwnd(cx).is_some() {
+        cx.spawn(async move |cx| {
+            let tick = Duration::from_millis(40);
+            let mut off = Duration::ZERO;
+            loop {
+                cx.background_executor().timer(tick).await;
+                let done = cx
+                    .update(|cx| {
+                        if cx.default_global::<OverlaySlot>().tip_asked != asked {
+                            return true;
+                        }
+                        if crate::float_tip::holds_mouse(cx) {
+                            off = Duration::ZERO;
+                            return false;
+                        }
+                        off += tick;
+                        if off < crate::float_tip::GRACE {
+                            return false;
+                        }
+                        replace_tooltip(asked, cx);
+                        true
+                    })
+                    .unwrap_or(true);
+                if done {
+                    break;
+                }
+            }
+        })
+        .detach();
+        return;
+    }
+    replace_tooltip(asked, cx);
+}
+
+/// The tooltip that shows goes, and the one asked for (`asked`) shows
+/// once the mouse has rested a moment, where it is then.
+fn replace_tooltip(asked: u64, cx: &mut App) {
+    let slot = cx.default_global::<OverlaySlot>();
+    slot.tip_at = None;
+    let empty = slot.tip_text.is_empty();
     crate::float_tip::set_lines(None, cx);
-    if lines.is_empty() {
+    if empty {
         return;
     }
     cx.spawn(async move |cx| {
