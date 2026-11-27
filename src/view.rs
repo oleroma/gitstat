@@ -22,6 +22,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 mod panel_scene;
+mod stage;
 mod window_scene;
 
 /// The window's smallest opening size; big mode grows it to fit columns.
@@ -102,8 +103,6 @@ fn show_window_as(cloaked: bool, cx: &mut App) {
     {
         return;
     }
-    // Its header parts are noted afresh as it draws.
-    crate::morph::clear_column_parts();
     let Some(state) = cx.try_global::<Ui>().map(|ui| ui.state.clone()) else {
         return;
     };
@@ -115,9 +114,7 @@ fn show_window_as(cloaked: bool, cx: &mut App) {
         let s = state.read(cx);
         (table_width(s), s.has_result)
     };
-    let (place, scale) = window_place(table, cx);
-    let bounds = place.get_bounds();
-    let maximized = matches!(place, WindowBounds::Maximized(_));
+    let (place, _) = window_place(table, cx);
     let handle = cx
         .open_window(
             WindowOptions {
@@ -142,52 +139,18 @@ fn show_window_as(cloaked: bool, cx: &mut App) {
                 // Shown, there is no parked placement; cloaked, activating
                 // places and shows it, cloaked.
                 window.activate_window();
-                // Where the client area came out, so the flip lands on it.
                 if let Some(h) = win::hwnd(window) {
-                    let at = |v: gpui::Pixels| (f32::from(v) * scale).round() as i32;
-                    let requested = if maximized {
-                        maximized_area(bounds, scale)
-                    } else {
-                        crate::layout::Rect::new(
-                            at(bounds.origin.x),
-                            at(bounds.origin.y),
-                            at(bounds.origin.x + bounds.size.width),
-                            at(bounds.origin.y + bounds.size.height),
-                        )
-                    };
                     let dark = matches!(
                         window.appearance(),
                         WindowAppearance::Dark | WindowAppearance::VibrantDark
                     );
-                    cx.spawn(async move |cx| {
+                    cx.spawn(async move |_| {
                         // Minimising goes the way closing does.
                         unsafe { win::minimize_closes(h) };
                         // Its rim and title bar in colours the flip draws,
                         // as thick as Windows draws it.
                         seen_rim(h);
                         unsafe { win::set_frame_colors(h, rim_rgb(dark), title_bar_rgb(dark)) };
-                        // A maximised window shows at its normal size and
-                        // maximises a moment later: measure it, and let
-                        // the flip reveal it, once it has.
-                        for _ in 0..50 {
-                            if !maximized || win::is_zoomed(h) {
-                                break;
-                            }
-                            cx.background_executor()
-                                .timer(std::time::Duration::from_millis(8))
-                                .await;
-                        }
-                        if maximized == win::is_zoomed(h)
-                            && let Some(client) = win::client_rect(h)
-                        {
-                            crate::morph::seen_client(
-                                requested,
-                                client,
-                                maximized,
-                                win::frame_insets(h),
-                            );
-                        }
-                        crate::morph::big_settled();
                     })
                     .detach();
                 }
@@ -207,35 +170,12 @@ fn show_window_as(cloaked: bool, cx: &mut App) {
     cx.default_global::<WindowSlot>().handle = handle;
 }
 
-thread_local! {
-    /// Where the next panel's list and big window's table are to be
-    /// scrolled when they first draw, logical px: set by the flip.
-    static NEXT_LIST_SCROLL: std::cell::Cell<Option<f32>> = const { std::cell::Cell::new(None) };
-    static NEXT_TABLE_SCROLL: std::cell::Cell<Option<f32>> = const { std::cell::Cell::new(None) };
-}
-
-/// Scrolls the panel's list this far down when it next draws, logical px.
-pub fn scroll_list_to(y: f32) {
-    NEXT_LIST_SCROLL.set(Some(y));
-}
-
-/// Scrolls the big window's table this far sideways when it next draws,
-/// logical px.
-pub fn scroll_table_to(x: f32) {
-    NEXT_TABLE_SCROLL.set(Some(x));
-}
-
 /// Scrolls the panel's list to its top, or the big window's table to its
 /// left edge (and its pull requests to their top), over `over`, eased:
 /// true when it wasn't there already.
 pub fn glide_to_start(panel: bool, over: std::time::Duration, cx: &mut App) -> bool {
     let also = (!panel).then(|| PRS_SCROLL.with(Clone::clone));
     glide_scroll(panel, point(px(0.), px(0.)), also, over, cx)
-}
-
-/// Scrolls the big window's table sideways to `x` logical px over `over`.
-pub fn glide_table_to(x: f32, over: std::time::Duration, cx: &mut App) -> bool {
-    glide_scroll(false, point(px(-x), px(0.)), None, over, cx)
 }
 
 thread_local! {
@@ -285,7 +225,7 @@ fn glide_step(window: &mut Window, g: Glide) {
             return;
         }
         let t = (g.start.elapsed().as_secs_f32() / g.over.as_secs_f32().max(0.001)).min(1.0);
-        let k = crate::morph::ease(t);
+        let k = crate::flip::ease(t);
         let at = |from: gpui::Point<gpui::Pixels>, to: gpui::Point<gpui::Pixels>| {
             point(from.x + (to.x - from.x) * k, from.y + (to.y - from.y) * k)
         };
@@ -367,22 +307,6 @@ fn glide_scroll(
     true
 }
 
-/// How far the open big window's table is scrolled sideways, logical px.
-/// Read through its scroll handle, so it works from inside the window's
-/// own handlers too, where the window can't be read.
-pub fn table_scroll(cx: &App) -> f32 {
-    if cx
-        .try_global::<WindowSlot>()
-        .and_then(|s| s.handle)
-        .is_none()
-    {
-        return 0.0;
-    }
-    SCROLLS
-        .with(|s| s.borrow().get(false))
-        .map_or(0.0, |t| (-f32::from(t.offset().x)).max(0.0))
-}
-
 /// The open panel's list and big window's table scroll handles, kept apart
 /// from their views so they can be read and moved from anywhere.
 #[derive(Default)]
@@ -421,19 +345,6 @@ struct Place {
     w: f32,
     h: f32,
     maximized: bool,
-    /// The window's frame, normal and maximised, for the flip to land on
-    /// (`morph::Delta`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    frame: Option<crate::morph::Delta>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    maximized_frame: Option<crate::morph::Delta>,
-    /// Its title bar's height, normal and maximised, physical px.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "frame_insets")]
-    caption: Option<crate::morph::Delta>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "maximized_frame_insets")]
-    maximized_caption: Option<crate::morph::Delta>,
 }
 
 /// The last place, kept for this run and in window.json beside config.json.
@@ -452,54 +363,24 @@ fn last_place(cx: &App) -> Option<Place> {
         return known;
     }
     // Not closed yet this run: as the last run left it.
-    let place = place_file(cx)
+    place_file(cx)
         .and_then(|f| std::fs::read_to_string(f).ok())
         .and_then(|text| serde_json::from_str::<Place>(&text).ok())
-        .filter(|p| p.w >= 100.0 && p.h >= 100.0 && p.x.is_finite() && p.y.is_finite());
-    if let Some(p) = place {
-        crate::morph::learn_deltas(p.frame, p.maximized_frame);
-        crate::morph::learn_captions(p.caption, p.maximized_caption);
-    }
-    place
+        .filter(|p| p.w >= 100.0 && p.h >= 100.0 && p.x.is_finite() && p.y.is_finite())
 }
 
 /// Notes where the big window is, as it closes, so it opens there again.
-/// Its frame too, as it is now: settled, so the next flip lands on it.
 pub(crate) fn remember_place(window: &Window, cx: &mut App) {
     let (b, maximized) = match window.window_bounds() {
         WindowBounds::Maximized(b) => (b, true),
         WindowBounds::Windowed(b) | WindowBounds::Fullscreen(b) => (b, false),
     };
-    if let Some(h) = win::hwnd(window)
-        && maximized == win::is_zoomed(h)
-        && let Some(client) = win::client_rect(h)
-    {
-        let scale = sane_scale(window.scale_factor());
-        let requested = if maximized {
-            maximized_area(b, scale)
-        } else {
-            let at = |v: gpui::Pixels| (f32::from(v) * scale).round() as i32;
-            crate::layout::Rect::new(
-                at(b.origin.x),
-                at(b.origin.y),
-                at(b.origin.x + b.size.width),
-                at(b.origin.y + b.size.height),
-            )
-        };
-        crate::morph::seen_client(requested, client, maximized, win::frame_insets(h));
-    }
-    let (frame, maximized_frame) = crate::morph::deltas();
-    let (caption, maximized_caption) = crate::morph::captions();
     let place = Place {
         x: f32::from(b.origin.x),
         y: f32::from(b.origin.y),
         w: f32::from(b.size.width),
         h: f32::from(b.size.height),
         maximized,
-        frame,
-        maximized_frame,
-        caption,
-        maximized_caption,
     };
     cx.default_global::<LastPlace>().0 = Some(Some(place));
     if let (Some(file), Ok(text)) = (place_file(cx), serde_json::to_string(&place)) {
@@ -507,12 +388,12 @@ pub(crate) fn remember_place(window: &Window, cx: &mut App) {
     }
 }
 
-/// A maximised window's area: the work area of the monitor its restored
-/// `bounds` (logical px at `scale`) centre on, physical px.
-pub(crate) fn maximized_area(bounds: Bounds<gpui::Pixels>, scale: f32) -> crate::layout::Rect {
-    let c = bounds.center();
-    let at = |v: gpui::Pixels| (f32::from(v) * scale).round() as i32;
-    win::monitor_at(at(c.x), at(c.y)).work
+/// Whether the big window opens maximised: as it was left.
+pub(crate) fn opens_maximized(cx: &App) -> bool {
+    let table = cx
+        .try_global::<Ui>()
+        .map_or(0.0, |ui| table_width(ui.state.read(cx)));
+    matches!(window_place(table, cx).0, WindowBounds::Maximized(_))
 }
 
 /// Where the big window opens: where it was left (maximised again if it
@@ -684,7 +565,7 @@ impl StatusView {
         .detach();
         if mode == Mode::Window {
             // Closing flips it back into the panel when it can.
-            window.on_window_should_close(cx, |window, cx| !crate::morph::flip_back(window, cx));
+            window.on_window_should_close(cx, |window, cx| !crate::flip::flip_back(window, cx));
         }
         if mode == Mode::Panel {
             cx.observe_window_activation(window, |this: &mut Self, window, cx| {
@@ -841,19 +722,6 @@ pub(crate) fn table_cells(state: &AppState) -> Vec<Cell<'_>> {
     cells
 }
 
-/// Each cell's left edge in the unscrolled table, logical px.
-pub(crate) fn cell_lefts(cells: &[Cell]) -> Vec<f32> {
-    let mut x = 0.0;
-    cells
-        .iter()
-        .map(|c| {
-            let at = x;
-            x += c.width();
-            at
-        })
-        .collect()
-}
-
 /// The cell holding `path`'s column.
 pub(crate) fn cell_of(cells: &[Cell], path: &std::path::Path) -> Option<usize> {
     cells
@@ -882,10 +750,6 @@ pub(crate) fn section_text(section: Section, n: usize) -> String {
     }
 }
 
-fn heading_label(text: String) -> gpui::Div {
-    div().flex_1().child(text)
-}
-
 /// The faint wash of its colour behind a section's heading in the panel
 /// and its spine in the big window, alike.
 pub(crate) fn section_tint(section: Section, p: &Palette) -> Hsla {
@@ -893,91 +757,48 @@ pub(crate) fn section_tint(section: Section, p: &Palette) -> Hsla {
 }
 
 /// A section's spine in big mode: its fold arrow, count and name down a
-/// narrow column; a click folds or opens it. The flip slides it in and out
-/// from the window's sides.
+/// narrow column; a click folds or opens it. Its wash and the line at its
+/// side are the scene's parts, drawn under this.
 pub(crate) fn spine(section: Section, count: usize, folded: bool, p: &Palette) -> AnyElement {
-    let color = match section {
-        Section::NeedsYou => p.red,
-        Section::Synced => p.green,
-        Section::GithubOnly | Section::PullRequests => p.muted,
-    };
+    let color = section_color(section, p);
     let id = match section {
         Section::NeedsYou => "spine-needs-you",
         Section::Synced => "spine-synced",
         Section::GithubOnly => "spine-github-only",
         Section::PullRequests => "spine-prs",
     };
+    let label = section_text(section, count);
+    let len = crate::turned_text::length(&label, SPINE_TEXT);
     div()
         .id(id)
-        .flex_none()
         .flex()
         .flex_col()
         .items_center()
         .gap_1()
-        .w(px(SPINE_WIDTH))
-        .h_full()
+        .size_full()
         .pt_2()
-        .border_r_1()
-        .border_color(p.border)
-        .bg(section_tint(section, p))
         .cursor_pointer()
         .hover(|s| s.bg(p.hover))
         .text_xs()
         .text_color(color)
-        // The panel's heading turned a quarter turn anticlockwise, as the
-        // flip turns it: its arrow at the top (open, its columns are to
-        // the right; folded, it points up), its words below reading
-        // upwards.
+        // The panel's heading turned a quarter turn anticlockwise: its
+        // arrow at the top (open, its columns are to the right; folded,
+        // it points up), its words below reading upwards.
         .child(
             div()
-                .relative()
                 .text_color(p.muted)
-                .child(if folded { "▴" } else { "▸" })
-                .child(crate::morph::tag(
-                    crate::morph::Side::Column,
-                    crate::morph::app(),
-                    crate::morph::Part::Arrow(section),
-                    None,
-                )),
+                .child(if folded { "▴" } else { "▸" }),
         )
-        .child({
-            let label = section_text(section, count);
-            let len = crate::turned_text::length(&label, SPINE_TEXT);
-            let words: SharedString = label.clone().into();
-            div()
-                .relative()
-                .w_full()
-                .h(px(len))
-                .child(
-                    canvas(
-                        |_, _, _| {},
-                        move |bounds, _, window, _| {
-                            crate::turned_text::paint(window, bounds, &label, SPINE_TEXT, color)
-                        },
-                    )
-                    .size_full(),
-                )
-                .child(crate::morph::tag(
-                    crate::morph::Side::Column,
-                    crate::morph::app(),
-                    crate::morph::Part::Label(section),
-                    Some((
-                        words,
-                        crate::morph::Look {
-                            color,
-                            size: SPINE_TEXT,
-                            bold: false,
-                        },
-                    )),
-                ))
-        })
-        .relative()
-        .child(crate::morph::tag(
-            crate::morph::Side::Column,
-            crate::morph::app(),
-            crate::morph::Part::Spine(section),
-            None,
-        ))
+        .child(
+            canvas(
+                |_, _, _| {},
+                move |bounds, _, window, _| {
+                    crate::turned_text::paint(window, bounds, &label, SPINE_TEXT, color)
+                },
+            )
+            .w_full()
+            .h(px(len)),
+        )
         .on_click(fold(section))
         .into_any_element()
 }
@@ -1323,24 +1144,13 @@ pub(crate) fn prs_block(
     if rows.is_empty() {
         return None;
     }
-    let side = match mode {
-        Mode::Panel => crate::morph::Side::Panel,
-        Mode::Window => crate::morph::Side::Column,
-    };
     let block = div()
         .id("prs")
-        .relative()
         .flex()
         .flex_col()
         .flex_none()
         .bg(p.surface)
-        .children(rows)
-        .child(crate::morph::tag(
-            side,
-            crate::morph::app(),
-            crate::morph::Part::Prs,
-            None,
-        ));
+        .children(rows);
     Some(match mode {
         Mode::Panel => block.into_any_element(),
         Mode::Window => block
@@ -1349,117 +1159,6 @@ pub(crate) fn prs_block(
             .track_scroll(&PRS_SCROLL.with(Clone::clone))
             .into_any_element(),
     })
-}
-
-/// A panel section's heading: its tint, its words (icons only: the folded
-/// section's icons) and fold arrow; a click folds or opens it. Tagged for
-/// the flip, which slides it out of and into the list. None when the
-/// section is empty.
-pub(crate) fn panel_heading(
-    section: Section,
-    state: &AppState,
-    icons_only: bool,
-    p: &Palette,
-    cx: &App,
-) -> Option<AnyElement> {
-    let sorted = state.sorted_for_panel();
-    let (bad, good): (Vec<&RepoStatus>, Vec<&RepoStatus>) =
-        sorted.into_iter().partition(|s| !s.is_synced());
-    let remote = state.sorted(&state.remote_statuses);
-    let (repos, id, color) = match section {
-        Section::NeedsYou => (bad, "needs-you", p.red),
-        Section::Synced => (good, "synced", p.green),
-        Section::GithubOnly => (remote, "remote", p.muted),
-        Section::PullRequests => return None,
-    };
-    if repos.is_empty() {
-        return None;
-    }
-    let n = repos.len();
-    let text = section_text(section, n);
-    let open = !state.folded(section);
-    let label = if icons_only {
-        div()
-            .flex()
-            .flex_1()
-            .min_w_0()
-            .gap_1()
-            .overflow_hidden()
-            .when(!open, |d| {
-                d.children(repos.iter().map(|s| {
-                    let mark = match section {
-                        Section::NeedsYou => status_color(s, p),
-                        _ => color,
-                    };
-                    crate::repo_marks::global_mark(s, 16.0, mark, cx)
-                }))
-            })
-    } else {
-        heading_label(text.clone())
-            .relative()
-            .child(crate::morph::tag(
-                crate::morph::Side::Panel,
-                crate::morph::app(),
-                crate::morph::Part::Label(section),
-                Some((
-                    text.into(),
-                    crate::morph::Look {
-                        color,
-                        size: 14.0,
-                        bold: false,
-                    },
-                )),
-            ))
-    };
-    let tooltip = match section {
-        Section::GithubOnly => Some(vec![
-            (format!("{n} GitHub repos not cloned here"), p.text),
-            ("Their trees come from GitHub".to_string(), p.muted),
-        ]),
-        Section::NeedsYou if icons_only => Some(vec![(format!("{n} need you"), p.red)]),
-        Section::Synced if icons_only => Some(vec![(format!("{n} synced"), p.green)]),
-        _ => None,
-    };
-    let arrow = div()
-        .flex_none()
-        .relative()
-        .child(if open { "▾" } else { "▸" })
-        .child(crate::morph::tag(
-            crate::morph::Side::Panel,
-            crate::morph::app(),
-            crate::morph::Part::Arrow(section),
-            None,
-        ));
-    let arrow = match section {
-        Section::GithubOnly => arrow,
-        _ => arrow.text_color(p.muted),
-    };
-    Some(
-        div()
-            .id(id)
-            .relative()
-            .bg(section_tint(section, p))
-            .flex()
-            .items_center()
-            .gap(px(10.))
-            .px_4()
-            .py(px(6.))
-            .cursor_pointer()
-            .hover(|style| style.bg(p.hover))
-            .text_sm()
-            .text_color(color)
-            .when_some(tooltip, |d, lines| d.tooltip(tip(lines, p)))
-            .child(label)
-            .child(arrow)
-            .child(crate::morph::tag(
-                crate::morph::Side::Panel,
-                crate::morph::app(),
-                crate::morph::Part::Heading(section),
-                None,
-            ))
-            .on_click(fold(section))
-            .into_any_element(),
-    )
 }
 
 /// Big mode's pull request list at its tallest: the heading and about

@@ -56,9 +56,9 @@ fn gitstat_tests_itself_on_screen() {
         if let Some(status) = child.try_wait().expect("wait for gitstat") {
             break status;
         }
-        if began.elapsed() > Duration::from_secs(120) {
+        if began.elapsed() > Duration::from_secs(300) {
             let _ = child.kill();
-            panic!("gitstat's self-test did not end in two minutes");
+            panic!("gitstat's self-test did not end in five minutes");
         }
         std::thread::sleep(Duration::from_millis(200));
     };

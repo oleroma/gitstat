@@ -158,7 +158,7 @@ impl Render for ProbeView {
                     window.paint_shadows(
                         card,
                         gpui::Corners::all(px(win::PANEL_RADIUS)),
-                        &crate::morph::window_shadow(),
+                        &crate::scene::parts::window_shadow(),
                     );
                     window.paint_quad(quad(
                         card,

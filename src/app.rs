@@ -298,7 +298,7 @@ fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
                     }
                     Some(ClickAction::Window) => {
                         let anchor = overlay::anchor(cx).unwrap_or(Anchor::Tray(None));
-                        crate::morph::show_window(anchor, cx);
+                        crate::flip::show_window(anchor, cx);
                     }
                     Some(ClickAction::Menu) | None => {}
                 }
@@ -479,14 +479,14 @@ fn on_action(action: TrayAction, cx: &mut App) -> bool {
     match action {
         TrayAction::LeftClick(rect) => match cfg.left_click() {
             ClickAction::Panel => panel::toggle(Anchor::Tray(rect), cx),
-            ClickAction::Window => crate::morph::show_window(Anchor::Tray(rect), cx),
+            ClickAction::Window => crate::flip::show_window(Anchor::Tray(rect), cx),
             // tray-icon shows the menu itself (`set_show_menu_on_left_click`).
             ClickAction::Menu => {}
         },
         TrayAction::DoubleClick => {
             if cfg.window {
                 let rect = cx.global::<Shared>().tray.icon_rect();
-                crate::morph::show_window(Anchor::Tray(rect), cx);
+                crate::flip::show_window(Anchor::Tray(rect), cx);
             }
         }
         TrayAction::OpenPanel => {
@@ -497,7 +497,7 @@ fn on_action(action: TrayAction, cx: &mut App) -> bool {
         }
         TrayAction::ShowWindow => {
             let rect = cx.global::<Shared>().tray.icon_rect();
-            crate::morph::show_window(Anchor::Tray(rect), cx);
+            crate::flip::show_window(Anchor::Tray(rect), cx);
         }
         TrayAction::Refresh => {
             // The same as the panel's ↻: GitHub is asked again too.

@@ -4,21 +4,26 @@
 //! window's corner; this paints them there. gitstat draws the title bar
 //! itself: its colour, icon, name and three buttons, which Windows still
 //! works (dragging, snapping, minimising, closing) through the places
-//! this marks for it. The top bar's words, bar and buttons are painted
-//! here directly. The table's cells (a section's spine, a repo's column),
-//! the pull requests and the bottom bar are ordinary GPUI elements, the
-//! slots, laid out at the device px the layout gives them.
+//! this marks for it. What it paints itself (the title bar, the top
+//! bar's words and bar, the columns' headers and lines) it first lists as
+//! a picture (`scene::parts`) and then paints from that list: the list
+//! the flip carries to the panel's. A column's tree and rows, a spine's
+//! words, the pull requests and the bottom bar are ordinary GPUI
+//! elements, the slots, laid out at the device px the layout gives them
+//! and painted between the picture's fills and its words.
 
-use super::panel_scene::{hit, measure, put, width};
+use super::panel_scene::{centred, count_words, hit, measure, put, width};
 use super::{
-    Cell, Mode, NEXT_TABLE_SCROLL, Palette, StatusView, cell_of, filter_key, prs_block, refresh,
-    repo_row, spine, status_color, table_cells, title_bar, titles, tone_counts,
+    Cell, Mode, Palette, StatusView, cell_of, filter_key, prs_block, refresh, repo_row, rim,
+    rim_width, section_tint, spine, status_color, table_cells, title_bar, titles, tone_counts,
 };
+use crate::config::Section;
 use crate::git::RepoStatus;
 use crate::layout::Rect;
 use crate::scene::paint;
-use crate::scene::panel::{HEADLINE as GLYPH, SMALL, TINY, line_height};
-use crate::scene::text::{self, Align, Look, text};
+use crate::scene::panel::{HEADLINE as GLYPH, SMALL, TINY};
+use crate::scene::parts::{Key, Part, Picture, Sheet, What};
+use crate::scene::text::{Look, text};
 use crate::scene::window::{
     self as place, CellSpec, HEAD_ICON, HEAD_LINE, HEAD_NAME, HEADLINE, HeadSpec,
 };
@@ -31,6 +36,8 @@ use gpui::{
     SharedString, Style, Styled, Window, WindowAppearance, WindowControlArea, div, point,
     prelude::*, px, relative,
 };
+use std::path::PathBuf;
+use std::sync::Arc;
 
 /// The title bar's glyphs' size, logical px, as Windows 11 draws them.
 const CAPTION_GLYPH: f32 = 10.0;
@@ -39,6 +46,8 @@ const CAPTION_GLYPH: f32 = 10.0;
 const TOP_GRIP: f32 = 4.0;
 /// The close button under the mouse.
 const CLOSE_HOVER: u32 = 0xc42b1c;
+/// The radius Windows 11 rounds a window's corners with, logical px.
+const RADIUS: f32 = 8.0;
 
 /// The font the title bar's glyphs come from: Windows 11's, else Windows
 /// 10's.
@@ -62,22 +71,25 @@ fn caption_font(cx: &App) -> &'static str {
 /// A cell of the table: a section's spine or a repo's column, with what
 /// it shows when it is in sight.
 enum CellPart {
-    Spine(Option<AnyElement>),
+    Spine(Section, Option<AnyElement>),
     Column(Option<Box<ColumnPart>>),
 }
 
 /// A repo's column: what its header says, and its slots.
 struct ColumnPart {
-    repo: RepoStatus,
+    repo: Arc<RepoStatus>,
     color: Hsla,
     checkout: SharedString,
     status: SharedString,
+    /// Where its rows' lines go, when it draws them.
+    lines: Option<f32>,
     title: Option<AnyElement>,
     glance: Option<AnyElement>,
     body: Option<AnyElement>,
 }
 
-/// The big window as one element, as big as its window.
+/// The big window as one element, as big as its window; or, in a flip,
+/// drawn in the flip's window where its own window is on the screen.
 pub(super) struct WindowScene {
     p: Palette,
     dark: bool,
@@ -98,20 +110,465 @@ pub(super) struct WindowScene {
     prs: Option<AnyElement>,
     footer: Option<AnyElement>,
     scroll: ScrollHandle,
+    /// In a flip: its window's inside in the window that draws the flip,
+    /// device px.
+    stage: Option<Rect>,
 }
 
 /// The window laid out for this frame.
 pub(super) struct Laid {
     layout: place::Layout,
+    /// Its corner in the window that draws it, device px.
+    at: (i32, i32),
     counts: Vec<(SharedString, Hsla)>,
+    /// What each shown column says at a glance, the pull requests and
+    /// the bottom bar, measured, yet to be put where they go.
+    glances: Vec<Option<AnyElement>>,
+    prs: Option<AnyElement>,
+    footer: Option<AnyElement>,
+}
+
+/// The window's slots, laid out where they go.
+pub(super) struct Slots {
     top: Vec<AnyElement>,
     cells: Vec<AnyElement>,
     prs: Option<AnyElement>,
     footer: Option<AnyElement>,
-    /// The whole window, for the wheel, and the title bar's buttons.
+    table: Bounds<Pixels>,
+}
+
+/// What of the window takes the mouse: all of it, for the wheel, and the
+/// title bar with its buttons.
+pub(super) struct Hits {
     whole: Hitbox,
     drag: Hitbox,
     buttons: [Hitbox; 3],
+}
+
+impl WindowScene {
+    /// Lays the window out: where each of its parts goes. Its slots are
+    /// to be painted at `alpha`.
+    pub(super) fn lay(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        alpha: f32,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Laid {
+        let s = window.scale_factor();
+        let dev = |v: Pixels| (f32::from(v) * s).round() as i32;
+        let (at, (w, h)) = match self.stage {
+            Some(r) => ((r.left, r.top), (r.width(), r.height())),
+            None => ((0, 0), (dev(bounds.size.width), dev(bounds.size.height))),
+        };
+        let counts = match self.health {
+            Some((n, _)) => count_words(n, &self.p),
+            None => Vec::new(),
+        };
+        let health = (counts.len() == 3).then(|| {
+            let cw = |i: usize| width(&counts[i].0, TINY, window);
+            [cw(0), cw(1), cw(2)]
+        });
+        let prs = self
+            .prs
+            .take()
+            .map(|slot| measure(slot, w, s, alpha, window, cx));
+        let footer = self
+            .footer
+            .take()
+            .map(|slot| measure(slot, w, s, alpha, window, cx));
+        // Each column's header, as tall as what it says at a glance.
+        let inner = place::column(
+            Rect::new(0, 0, place::px(place::COLUMN, s), i32::MAX / 2),
+            &HeadSpec::default(),
+            s,
+        )
+        .title
+        .width();
+        let mut glances = Vec::new();
+        let specs: Vec<CellSpec> = self
+            .cells
+            .iter_mut()
+            .map(|cell| match cell {
+                CellPart::Spine(..) => CellSpec::Spine,
+                CellPart::Column(None) => CellSpec::Column(HeadSpec::default()),
+                CellPart::Column(Some(part)) => {
+                    let glance = part
+                        .glance
+                        .take()
+                        .map(|slot| measure(slot, inner, s, alpha, window, cx));
+                    let tall = glance.as_ref().map(|(_, tall)| *tall);
+                    glances.push(glance.map(|(el, _)| el));
+                    crate::repo_marks::want(&part.repo, HEAD_ICON, window, cx);
+                    CellSpec::Column(HeadSpec {
+                        checkout: width(&part.checkout, HEAD_LINE, window),
+                        status: width(&part.status, HEAD_LINE, window),
+                        glance: tall,
+                    })
+                }
+            })
+            .collect();
+        let wanted = dev(-self.scroll.offset().x);
+        let layout = place::layout(&place::Spec {
+            scale: s,
+            size: (w, h),
+            health,
+            refresh: width(&self.refresh_words, SMALL, window),
+            cells: specs,
+            scroll: wanted,
+            prs: prs.as_ref().map(|(_, tall)| *tall),
+            footer: footer.as_ref().map_or(0, |(_, tall)| *tall),
+        });
+        // Scrolled past its end (the window grew, a section folded): back
+        // to it. The window's own doing: a flip only draws it.
+        if layout.scroll != wanted && self.stage.is_none() {
+            self.scroll
+                .set_offset(point(px(-(layout.scroll as f32) / s), px(0.0)));
+        }
+        Laid {
+            layout,
+            at,
+            counts,
+            glances,
+            prs: prs.map(|(el, _)| el),
+            footer: footer.map(|(el, _)| el),
+        }
+    }
+
+    /// Everything the window paints itself, device px from the corner of
+    /// the window that draws it, in the order it is painted. In a flip,
+    /// with the sheet, rim and shadow Windows gives its own window.
+    /// `hovered` is the title bar button under the mouse.
+    pub(super) fn picture(&self, laid: &Laid, s: f32, hovered: Option<usize>) -> Picture {
+        let p = self.p;
+        let l = &laid.layout;
+        let at = laid.at;
+        let sh = |r: Rect| Rect::new(r.left + at.0, r.top + at.1, r.right + at.0, r.bottom + at.1);
+        let own = Key::Own;
+        let mut parts = Vec::new();
+        let whole = Rect::new(0, 0, l.size.0, l.size.1);
+
+        // Its ground: its own in its window, the sheet's in a flip.
+        let staged = self.stage.is_some();
+        let shaped = staged && !self.maximized;
+        let rim_px = if shaped {
+            rim_width(s).round() as i32
+        } else {
+            0
+        };
+        let radius = if shaped { RADIUS } else { 0.0 };
+        let inner = (radius - rim_px as f32 / s).max(0.0);
+        if !staged {
+            parts.push(Part::fill(own.clone(), whole, p.bg));
+        }
+
+        // The title bar.
+        let cap = &l.caption;
+        parts.push(
+            Part::fill(Key::Caption, sh(cap.rect), title_bar(self.dark))
+                .radii([inner, inner, 0.0, 0.0]),
+        );
+        let glyphs = [
+            "\u{e921}",
+            if self.maximized {
+                "\u{e923}"
+            } else {
+                "\u{e922}"
+            },
+            "\u{e8bb}",
+        ];
+        let mut glyph_parts = Vec::new();
+        for (i, (glyph, r)) in glyphs.into_iter().zip(cap.buttons).enumerate() {
+            let mut color = p.text;
+            if hovered == Some(i) {
+                let wash: Hsla = match (i, self.dark) {
+                    (2, _) => {
+                        color = gpui::white();
+                        gpui::rgb(CLOSE_HOVER).into()
+                    }
+                    (_, true) => gpui::white().opacity(0.06),
+                    (_, false) => gpui::black().opacity(0.04),
+                };
+                parts.push(Part::fill(own.clone(), sh(r), wash));
+            }
+            glyph_parts.push(
+                Part::words(
+                    own.clone(),
+                    sh(centred(r, CAPTION_GLYPH, s)),
+                    glyph,
+                    Look::new(CAPTION_GLYPH, color).family(self.font),
+                )
+                .centred(),
+            );
+        }
+        parts.push(Part::new(own.clone(), sh(cap.icon), What::AppIcon));
+        parts.push(Part::words(
+            own.clone(),
+            sh(cap.title),
+            "gitstat",
+            Look::new(TINY, p.text),
+        ));
+        parts.extend(glyph_parts);
+
+        // The top bar.
+        let h = &l.header;
+        parts.push(Part::words(
+            Key::Headline,
+            sh(h.headline),
+            self.headline.clone(),
+            Look::new(HEADLINE, self.headline_color).bold(),
+        ));
+        parts.push(Part::words(
+            Key::Subline,
+            sh(h.subline),
+            self.subline.clone(),
+            Look::new(TINY, p.muted),
+        ));
+        if let (Some(bar), Some((counts, checking))) = (h.bar, self.health) {
+            parts.push(Part::new(
+                Key::Health,
+                sh(bar),
+                What::Health {
+                    counts,
+                    colors: [p.green, p.amber, p.red],
+                    track: p.hover,
+                    checking,
+                },
+            ));
+            for (i, ((t, color), r)) in laid.counts.iter().zip(h.counts).enumerate() {
+                parts.push(Part::words(
+                    Key::Count(i as u8),
+                    sh(r),
+                    t.clone(),
+                    Look::new(TINY, *color),
+                ));
+            }
+        }
+        let dim = |c: Hsla| if self.checking { c.opacity(0.6) } else { c };
+        parts.push(Part::fill(own.clone(), sh(h.refresh), dim(p.button)).radii([6.0; 4]));
+        parts.push(
+            Part::words(
+                Key::Settings,
+                sh(centred(h.settings, GLYPH, s)),
+                "⚙",
+                Look::new(GLYPH, p.text),
+            )
+            .centred(),
+        );
+        parts.push(Part::words(
+            own.clone(),
+            sh(h.refresh_words),
+            self.refresh_words.clone(),
+            Look::new(SMALL, dim(p.button_text)),
+        ));
+        parts.push(Part::fill(Key::HeaderLine, sh(h.line), p.border));
+
+        // The table.
+        parts.push(Part::fill(Key::Body, sh(l.table), p.surface));
+        let line = place::px(1.0, s).max(1);
+        for ((cell, r), c) in self.cells.iter().zip(&l.cells).zip(&l.columns) {
+            match (cell, c) {
+                (CellPart::Spine(section, _), _) => {
+                    parts.push(
+                        Part::fill(Key::Tint(*section), sh(*r), section_tint(*section, &p))
+                            .clipped(),
+                    );
+                    let edge = Rect::new(r.right - line, r.top, r.right, r.bottom);
+                    parts.push(Part::fill(own.clone(), sh(edge), p.border).clipped());
+                }
+                (CellPart::Column(Some(part)), Some(c)) => {
+                    let path = &part.repo.path;
+                    if let Some(top) = part.lines {
+                        let tall = c.body.height() as f32 / s;
+                        for y in crate::timeline::row_lines(top, tall, s) {
+                            let r = Rect::new(
+                                c.body.left,
+                                c.body.top + y,
+                                c.body.right,
+                                c.body.top + y + line,
+                            );
+                            parts.push(Part::fill(own.clone(), sh(r), p.border).clipped());
+                        }
+                    }
+                    parts.push(Part::fill(own.clone(), sh(c.line), p.border).clipped());
+                    parts.push(Part::fill(own.clone(), sh(c.edge), p.border).clipped());
+                    parts.push(
+                        Part::new(
+                            Key::Icon(path.clone()),
+                            sh(c.icon),
+                            What::Icon {
+                                status: part.repo.clone(),
+                                side: HEAD_ICON,
+                                dot: part.color,
+                                ends: None,
+                            },
+                        )
+                        .clipped(),
+                    );
+                    parts.push(
+                        Part::words(
+                            Key::Name(path.clone()),
+                            sh(c.name),
+                            part.repo.name.clone(),
+                            Look::new(HEAD_NAME, p.text).bold(),
+                        )
+                        .clipped(),
+                    );
+                    parts.push(
+                        Part::words(
+                            Key::Checkout(path.clone()),
+                            sh(c.checkout),
+                            part.checkout.clone(),
+                            Look::new(HEAD_LINE, p.text),
+                        )
+                        .clipped(),
+                    );
+                    parts.push(
+                        Part::words(
+                            Key::Status(path.clone()),
+                            sh(c.status),
+                            part.status.clone(),
+                            Look::new(HEAD_LINE, part.color),
+                        )
+                        .clipped(),
+                    );
+                }
+                _ => {}
+            }
+        }
+        Picture {
+            sheet: staged.then(|| Sheet {
+                frame: sh(whole.outset(rim_px)),
+                radius,
+                rim: rim_px,
+                rim_color: rim(self.dark),
+                bg: p.bg,
+                shadow: if shaped { 1.0 } else { 0.0 },
+            }),
+            body: sh(l.table),
+            parts,
+        }
+    }
+
+    /// Where each shown repo's tree is drawn: its column's body, device
+    /// px from the corner of the window that draws it.
+    pub(super) fn bodies(&self, laid: &Laid) -> Vec<(PathBuf, Rect)> {
+        let at = laid.at;
+        self.cells
+            .iter()
+            .zip(&laid.layout.columns)
+            .filter_map(|(cell, c)| match (cell, c) {
+                (CellPart::Column(Some(part)), Some(c)) => {
+                    let r = c.body;
+                    Some((
+                        part.repo.path.clone(),
+                        Rect::new(r.left + at.0, r.top + at.1, r.right + at.0, r.bottom + at.1),
+                    ))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Lays the slots out where they go, to be painted at `alpha` of
+    /// their strength.
+    pub(super) fn slots(
+        &mut self,
+        laid: &mut Laid,
+        alpha: f32,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Slots {
+        let s = window.scale_factor();
+        let (layout, at) = (&laid.layout, laid.at);
+        // The top bar's.
+        let mut top = Vec::new();
+        if let Some(slot) = self.settings.take() {
+            top.push(put(slot, layout.header.settings, at, s, alpha, window, cx));
+        }
+        if let Some(slot) = self.refresh.take() {
+            top.push(put(slot, layout.header.refresh, at, s, alpha, window, cx));
+        }
+
+        // The table's, cut to the table; or what shows in its place.
+        let table = paint::bounds(layout.table, at, s);
+        let mut cells = Vec::new();
+        let mut glances = std::mem::take(&mut laid.glances).into_iter();
+        let (left, right) = (0, layout.size.0);
+        window.with_content_mask(Some(ContentMask { bounds: table }), |window| {
+            if let Some(slot) = self.body.take() {
+                cells.push(put(slot, layout.table, at, s, alpha, window, cx));
+                return;
+            }
+            for ((cell, r), column) in self
+                .cells
+                .iter_mut()
+                .zip(&layout.cells)
+                .zip(&layout.columns)
+            {
+                match (cell, column) {
+                    (CellPart::Spine(_, slot), _) => {
+                        if let Some(slot) = slot.take()
+                            && r.right > left
+                            && r.left < right
+                        {
+                            cells.push(put(slot, *r, at, s, alpha, window, cx));
+                        }
+                    }
+                    (CellPart::Column(Some(part)), Some(c)) => {
+                        if let Some(slot) = part.body.take() {
+                            cells.push(put(slot, c.body, at, s, alpha, window, cx));
+                        }
+                        if let Some(slot) = part.title.take() {
+                            cells.push(put(slot, c.title, at, s, alpha, window, cx));
+                        }
+                        if let (Some(mut el), Some(g)) = (glances.next().flatten(), c.glance) {
+                            el.prepaint_at(paint::bounds(g, at, s).origin, window, cx);
+                            cells.push(el);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let prs = laid.prs.take().zip(layout.prs).map(|(mut el, r)| {
+            el.prepaint_at(paint::bounds(r, at, s).origin, window, cx);
+            el
+        });
+        let footer = laid.footer.take().map(|mut el| {
+            el.prepaint_at(paint::bounds(layout.footer, at, s).origin, window, cx);
+            el
+        });
+        Slots {
+            top,
+            cells,
+            prs,
+            footer,
+            table,
+        }
+    }
+
+    pub(super) fn paint_slots(slots: &mut Slots, window: &mut Window, cx: &mut App) {
+        window.with_content_mask(
+            Some(ContentMask {
+                bounds: slots.table,
+            }),
+            |window| {
+                for slot in &mut slots.cells {
+                    slot.paint(window, cx);
+                }
+            },
+        );
+        for slot in &mut slots.top {
+            slot.paint(window, cx);
+        }
+        if let Some(prs) = &mut slots.prs {
+            prs.paint(window, cx);
+        }
+        if let Some(footer) = &mut slots.footer {
+            footer.paint(window, cx);
+        }
+    }
 }
 
 impl IntoElement for WindowScene {
@@ -124,7 +581,7 @@ impl IntoElement for WindowScene {
 
 impl Element for WindowScene {
     type RequestLayoutState = ();
-    type PrepaintState = Option<Laid>;
+    type PrepaintState = Option<(Laid, Slots, Hits)>;
 
     fn id(&self) -> Option<ElementId> {
         None
@@ -155,87 +612,9 @@ impl Element for WindowScene {
         _: &mut (),
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<Laid> {
+    ) -> Self::PrepaintState {
         let s = window.scale_factor();
-        let dev = |v: Pixels| (f32::from(v) * s).round() as i32;
-        let at = (0, 0);
-        let (w, h) = (dev(bounds.size.width), dev(bounds.size.height));
-
-        let counts: Vec<(SharedString, Hsla)> = match self.health {
-            Some((n, _)) => {
-                let p = &self.p;
-                [
-                    (n[0], "✓ ", p.green),
-                    (n[1], "● ", p.amber),
-                    (n[2], "! ", p.red),
-                ]
-                .into_iter()
-                .map(|(n, mark, color)| {
-                    let color = if n > 0 { color } else { p.muted.opacity(0.6) };
-                    (format!("{mark}{n}").into(), color)
-                })
-                .collect()
-            }
-            None => Vec::new(),
-        };
-        let health = (counts.len() == 3).then(|| {
-            let cw = |i: usize| width(&counts[i].0, TINY, window);
-            [cw(0), cw(1), cw(2)]
-        });
-        let prs = self.prs.take().map(|slot| measure(slot, w, s, window, cx));
-        let footer = self
-            .footer
-            .take()
-            .map(|slot| measure(slot, w, s, window, cx));
-        // Each column's header, as tall as what it says at a glance.
-        let inner = place::column(
-            Rect::new(0, 0, place::px(place::COLUMN, s), i32::MAX / 2),
-            &HeadSpec::default(),
-            s,
-        )
-        .title
-        .width();
-        let mut glances = Vec::new();
-        let specs: Vec<CellSpec> = self
-            .cells
-            .iter_mut()
-            .map(|cell| match cell {
-                CellPart::Spine(_) => CellSpec::Spine,
-                CellPart::Column(None) => CellSpec::Column(HeadSpec::default()),
-                CellPart::Column(Some(part)) => {
-                    let glance = part
-                        .glance
-                        .take()
-                        .map(|slot| measure(slot, inner, s, window, cx));
-                    let tall = glance.as_ref().map(|(_, tall)| *tall);
-                    glances.push(glance.map(|(el, _)| el));
-                    CellSpec::Column(HeadSpec {
-                        checkout: width(&part.checkout, HEAD_LINE, window),
-                        status: width(&part.status, HEAD_LINE, window),
-                        glance: tall,
-                    })
-                }
-            })
-            .collect();
-        let mut glances = glances.into_iter();
-        let wanted = dev(-self.scroll.offset().x);
-        let layout = place::layout(&place::Spec {
-            scale: s,
-            size: (w, h),
-            health,
-            refresh: width(&self.refresh_words, SMALL, window),
-            cells: specs,
-            scroll: wanted,
-            prs: prs.as_ref().map(|(_, tall)| *tall),
-            footer: footer.as_ref().map_or(0, |(_, tall)| *tall),
-        });
-        // Scrolled past its end (the window grew, a section folded): back
-        // to it.
-        if layout.scroll != wanted {
-            self.scroll
-                .set_offset(point(px(-(layout.scroll as f32) / s), px(0.0)));
-        }
-
+        let mut laid = self.lay(bounds, 1.0, window, cx);
         // The whole window takes the wheel; over it, the title bar: the
         // bar drags the window, its buttons are Windows' own three.
         let whole = window.insert_hitbox(bounds, HitboxBehavior::Normal);
@@ -246,120 +625,49 @@ impl Element for WindowScene {
         };
         let under_grip =
             |r: Rect| Rect::new(r.left, r.top + grip, r.right, r.bottom.max(r.top + grip));
-        let cap = &layout.caption;
+        let cap = &laid.layout.caption;
         let drag = window.insert_hitbox(
-            paint::bounds(under_grip(cap.rect), at, s),
+            paint::bounds(under_grip(cap.rect), laid.at, s),
             HitboxBehavior::Normal,
         );
         let buttons = cap.buttons.map(|r| {
-            window.insert_hitbox(paint::bounds(under_grip(r), at, s), HitboxBehavior::Normal)
+            window.insert_hitbox(
+                paint::bounds(under_grip(r), laid.at, s),
+                HitboxBehavior::Normal,
+            )
         });
-        // The top bar's slots.
-        let mut top = Vec::new();
-        if let Some(slot) = self.settings.take() {
-            top.push(put(slot, layout.header.settings, at, s, window, cx));
-        }
-        if let Some(slot) = self.refresh.take() {
-            top.push(put(slot, layout.header.refresh, at, s, window, cx));
-        }
-
-        // The table's, cut to the table; or what shows in its place.
-        let table_bounds = paint::bounds(layout.table, at, s);
-        let mut cells = Vec::new();
-        window.with_content_mask(
-            Some(ContentMask {
-                bounds: table_bounds,
-            }),
-            |window| {
-                if let Some(slot) = self.body.take() {
-                    cells.push(put(slot, layout.table, at, s, window, cx));
-                    return;
-                }
-                for ((cell, r), column) in self
-                    .cells
-                    .iter_mut()
-                    .zip(&layout.cells)
-                    .zip(&layout.columns)
-                {
-                    match (cell, column) {
-                        (CellPart::Spine(slot), _) => {
-                            if let Some(slot) = slot.take() {
-                                cells.push(put(slot, *r, at, s, window, cx));
-                            }
-                        }
-                        (CellPart::Column(Some(part)), Some(c)) => {
-                            if let Some(slot) = part.body.take() {
-                                cells.push(put(slot, c.body, at, s, window, cx));
-                            }
-                            if let Some(slot) = part.title.take() {
-                                cells.push(put(slot, c.title, at, s, window, cx));
-                            }
-                            if let (Some(mut el), Some(g)) = (glances.next().flatten(), c.glance) {
-                                el.prepaint_at(paint::bounds(g, at, s).origin, window, cx);
-                                cells.push(el);
-                            }
-                            crate::repo_marks::want(&part.repo, HEAD_ICON, window, cx);
-                        }
-                        _ => {}
-                    }
-                }
+        let slots = self.slots(&mut laid, 1.0, window, cx);
+        Some((
+            laid,
+            slots,
+            Hits {
+                whole,
+                drag,
+                buttons,
             },
-        );
-        let prs = prs.zip(layout.prs).map(|((mut el, _), r)| {
-            el.prepaint_at(paint::bounds(r, at, s).origin, window, cx);
-            el
-        });
-        let footer = footer.map(|(mut el, _)| {
-            el.prepaint_at(paint::bounds(layout.footer, at, s).origin, window, cx);
-            el
-        });
-        Some(Laid {
-            layout,
-            counts,
-            top,
-            cells,
-            prs,
-            footer,
-            whole,
-            drag,
-            buttons,
-        })
+        ))
     }
 
     fn paint(
         &mut self,
         _: Option<&GlobalElementId>,
         _: Option<&InspectorElementId>,
-        bounds: Bounds<Pixels>,
+        _: Bounds<Pixels>,
         _: &mut (),
-        laid: &mut Option<Laid>,
+        state: &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
-        let Some(laid) = laid else { return };
+        let Some((laid, slots, hits)) = state else {
+            return;
+        };
         let s = window.scale_factor();
-        let p = self.p;
-        let at = (0, 0);
         let l = &laid.layout;
-        let b = |r: Rect| paint::bounds(r, at, s);
-        let words = |window: &mut Window, t: &SharedString, look: Look, r: Rect, align: Align| {
-            text::paint(
-                window,
-                t,
-                &look,
-                (at.0 + r.left, at.1 + r.top),
-                line_height(look.size),
-                Some(r.width()),
-                align,
-            );
-        };
-        // A glyph's line, centred on its button.
-        let centred = |r: Rect, size: f32| {
-            let lh = place::px(line_height(size), s);
-            let top = r.top + (r.height() - lh) / 2;
-            Rect::new(r.left, top, r.right, top + lh)
-        };
-        paint::fill(window, bounds, p.bg);
+        let hovered = hits.buttons.iter().position(|h| h.is_hovered(window));
+        let picture = self.picture(laid, s, hovered);
+        // The ground and the fills; over them the slots; over those the
+        // words and pictures.
+        picture.paint_under(window, cx);
 
         // The title bar. Windows asks which of its parts the mouse is on:
         // the three buttons first, then the bar that drags the window.
@@ -369,60 +677,17 @@ impl Element for WindowScene {
             WindowControlArea::Close,
         ]
         .into_iter()
-        .zip(&laid.buttons)
+        .zip(&hits.buttons)
         {
             window.insert_window_control_hitbox(area, hitbox.clone());
         }
-        window.insert_window_control_hitbox(WindowControlArea::Drag, laid.drag.clone());
-        let cap = &l.caption;
-        paint::fill(window, b(cap.rect), title_bar(self.dark));
-        paint::app_icon(window, cap.icon, at);
-        words(
-            window,
-            &"gitstat".into(),
-            Look::new(TINY, p.text),
-            cap.title,
-            Align::Left,
-        );
-        let glyphs = [
-            "\u{e921}",
-            if self.maximized {
-                "\u{e923}"
-            } else {
-                "\u{e922}"
-            },
-            "\u{e8bb}",
-        ];
-        for (i, ((glyph, r), hitbox)) in glyphs
-            .into_iter()
-            .zip(cap.buttons)
-            .zip(&laid.buttons)
-            .enumerate()
-        {
-            let hovered = hitbox.is_hovered(window);
-            let mut color = p.text;
-            if hovered {
-                let wash: Hsla = match (i, self.dark) {
-                    (2, _) => {
-                        color = gpui::white();
-                        gpui::rgb(CLOSE_HOVER).into()
-                    }
-                    (_, true) => gpui::white().opacity(0.06),
-                    (_, false) => gpui::black().opacity(0.04),
-                };
-                paint::fill(window, b(r), wash);
-            }
-            words(
-                window,
-                &glyph.into(),
-                Look::new(CAPTION_GLYPH, color).family(self.font),
-                centred(r, CAPTION_GLYPH),
-                Align::Centre,
-            );
+        window.insert_window_control_hitbox(WindowControlArea::Drag, hits.drag.clone());
+        for (i, hitbox) in hits.buttons.iter().enumerate() {
+            let was = hovered == Some(i);
             // Drawn again when the mouse comes onto it or leaves it.
             let over = hitbox.clone();
             window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, _| {
-                if phase == DispatchPhase::Capture && over.is_hovered(window) != hovered {
+                if phase == DispatchPhase::Capture && over.is_hovered(window) != was {
                     window.refresh();
                 }
             });
@@ -446,73 +711,15 @@ impl Element for WindowScene {
             });
         }
 
-        // The top bar.
-        let h = &l.header;
-        words(
-            window,
-            &self.headline,
-            Look::new(HEADLINE, self.headline_color).bold(),
-            h.headline,
-            Align::Left,
-        );
-        words(
-            window,
-            &self.subline,
-            Look::new(TINY, p.muted),
-            h.subline,
-            Align::Left,
-        );
-        if let (Some(bar), Some((counts, checking))) = (h.bar, self.health) {
-            paint::health(
-                window,
-                bar,
-                at,
-                counts,
-                [p.green, p.amber, p.red],
-                p.hover,
-                checking,
-            );
-            for ((t, color), r) in laid.counts.iter().zip(h.counts) {
-                words(window, t, Look::new(TINY, *color), r, Align::Left);
-            }
-        }
-        let dim = |c: Hsla| if self.checking { c.opacity(0.6) } else { c };
-        paint::round(
-            window,
-            b(h.refresh),
-            gpui::Corners::all(px(6.0)),
-            dim(p.button),
-        );
-        for slot in &mut laid.top {
-            slot.paint(window, cx);
-        }
-        words(
-            window,
-            &"⚙".into(),
-            Look::new(GLYPH, p.text),
-            centred(h.settings, GLYPH),
-            Align::Centre,
-        );
-        words(
-            window,
-            &self.refresh_words,
-            Look::new(SMALL, dim(p.button_text)),
-            h.refresh_words,
-            Align::Left,
-        );
-        paint::fill(window, b(h.line), p.border);
-
-        // The table. The wheel anywhere scrolls it sideways, unless what
-        // is under the mouse takes it first (a column's commits, the pull
+        // The wheel anywhere scrolls the table sideways, unless what is
+        // under the mouse takes it first (a column's commits, the pull
         // requests): registered before the slots paint, it comes last.
-        let table_bounds = b(l.table);
-        paint::fill(window, table_bounds, p.surface);
         let (scroll, whole, max) = (
             self.scroll.clone(),
-            laid.whole.clone(),
+            hits.whole.clone(),
             px(l.max_scroll as f32 / s),
         );
-        let prs_bounds = l.prs.map(b);
+        let prs_bounds = l.prs.map(|r| paint::bounds(r, laid.at, s));
         window.on_mouse_event(move |e: &ScrollWheelEvent, phase, window, cx| {
             if phase != DispatchPhase::Bubble
                 || !whole.should_handle_scroll(window)
@@ -530,59 +737,10 @@ impl Element for WindowScene {
                 cx.stop_propagation();
             }
         });
-        window.with_content_mask(
-            Some(ContentMask {
-                bounds: table_bounds,
-            }),
-            |window| {
-                for (cell, c) in self.cells.iter().zip(&l.columns) {
-                    let (CellPart::Column(Some(part)), Some(c)) = (cell, c) else {
-                        continue;
-                    };
-                    paint::fill(window, b(c.line), p.border);
-                    paint::fill(window, b(c.edge), p.border);
-                    crate::repo_marks::paint(
-                        &part.repo,
-                        b(c.icon),
-                        HEAD_ICON,
-                        part.color,
-                        window,
-                        cx,
-                    );
-                    let name: SharedString = part.repo.name.clone().into();
-                    words(
-                        window,
-                        &name,
-                        Look::new(HEAD_NAME, p.text).bold(),
-                        c.name,
-                        Align::Left,
-                    );
-                    words(
-                        window,
-                        &part.checkout,
-                        Look::new(HEAD_LINE, p.text),
-                        c.checkout,
-                        Align::Left,
-                    );
-                    words(
-                        window,
-                        &part.status,
-                        Look::new(HEAD_LINE, part.color),
-                        c.status,
-                        Align::Left,
-                    );
-                }
-                for slot in &mut laid.cells {
-                    slot.paint(window, cx);
-                }
-            },
-        );
-        if let Some(prs) = &mut laid.prs {
-            prs.paint(window, cx);
-        }
-        if let Some(footer) = &mut laid.footer {
-            footer.paint(window, cx);
-        }
+        Self::paint_slots(slots, window, cx);
+        picture.paint_over(window, cx);
+        crate::flip::painted();
+        crate::flip::window_drew();
     }
 }
 
@@ -640,29 +798,36 @@ fn footer(state: &AppState, p: &Palette) -> AnyElement {
 }
 
 impl StatusView {
-    /// The big window: one element that draws it, under the root that
-    /// takes its keys.
-    pub(super) fn render_window(
+    /// The big window as the scene draws it: in its own window, or, for
+    /// a flip, `staged` in the panel's, where its window is (device px in
+    /// that window) and whether it is maximised.
+    pub(super) fn window_scene(
         &mut self,
+        staged: Option<(Rect, bool)>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> WindowScene {
         let p = Palette::for_appearance(window.appearance());
         let dark = matches!(
             window.appearance(),
             WindowAppearance::Dark | WindowAppearance::VibrantDark
         );
         let s = window.scale_factor();
-        let filter_state = self.state.clone();
         let timelines = self.timelines.clone();
-        // A strip's label asked for its repo's column.
+        // A strip's label asked for its repo's column: the window's own
+        // to bring into sight, as it first draws.
         let focus = self
             .timelines
             .as_ref()
+            .filter(|_| staged.is_none())
             .and_then(|t| t.update(cx, |t, _| t.take_focus()));
-        // Set by the flip, which has brought any asked-for column into
-        // sight already.
-        let table_to = NEXT_TABLE_SCROLL.take();
+        // A flip draws the table where the window itself has it.
+        let table = match staged {
+            Some(_) => super::SCROLLS
+                .with(|s| s.borrow().get(false))
+                .unwrap_or_default(),
+            None => self.table.clone(),
+        };
         let state = self.state.clone();
         let state = state.read(cx);
         let sweeping = state.sweeping;
@@ -670,24 +835,29 @@ impl StatusView {
         let health = (state.has_result && !state.statuses.is_empty())
             .then(|| (tone_counts(&state.statuses), sweeping));
 
-        let settings = hit("settings", true, &p)
-            .rounded_md()
-            .on_click(|_, _, cx| crate::settings::show(cx))
-            .into_any_element();
+        let live = staged.is_none();
+        let settings = live.then(|| {
+            hit("settings", true, &p)
+                .rounded_md()
+                .on_click(|_, _, cx| crate::settings::show(cx))
+                .into_any_element()
+        });
         let lighter = gpui::white().opacity(0.1);
-        let refresh_slot = div()
-            .id("refresh")
-            .size_full()
-            .rounded_md()
-            .when(!sweeping, |d| {
-                d.cursor_pointer().hover(move |st| st.bg(lighter))
-            })
-            .on_click(move |_, _, cx| {
-                if !sweeping {
-                    refresh(cx);
-                }
-            })
-            .into_any_element();
+        let refresh_slot = live.then(|| {
+            div()
+                .id("refresh")
+                .size_full()
+                .rounded_md()
+                .when(!sweeping, |d| {
+                    d.cursor_pointer().hover(move |st| st.bg(lighter))
+                })
+                .on_click(move |_, _, cx| {
+                    if !sweeping {
+                        refresh(cx);
+                    }
+                })
+                .into_any_element()
+        });
 
         // Each section's spine, then its repos' columns unless folded;
         // the GitHub repos with no clone come last. Only the cells in
@@ -707,37 +877,36 @@ impl StatusView {
                     })
                     .collect();
                 let edges = place::cell_edges(&kinds, s);
-                let view = (f32::from(window.viewport_size().width) * s).round() as i32;
-                let max = (edges.last().copied().unwrap_or(0) - view).max(0);
-                let mut scroll = match table_to {
-                    Some(x) => (x * s).round() as i32,
-                    None => (-f32::from(self.table.offset().x) * s).round() as i32,
+                let view = match staged {
+                    Some((r, _)) => r.width(),
+                    None => (f32::from(window.viewport_size().width) * s).round() as i32,
                 };
+                let max = (edges.last().copied().unwrap_or(0) - view).max(0);
+                let mut scroll = (-f32::from(table.offset().x) * s).round() as i32;
                 // The asked-for column, wholly in sight.
-                if let Some(i) = focus
-                    .as_deref()
-                    .and_then(|f| cell_of(&all, f))
-                    .filter(|_| table_to.is_none())
-                {
+                if let Some(i) = focus.as_deref().and_then(|f| cell_of(&all, f)) {
                     scroll = scroll.max(edges[i + 1] - view).min(edges[i]);
                 }
                 let scroll = scroll.clamp(0, max);
-                self.table
-                    .set_offset(point(px(-(scroll as f32) / s), px(0.0)));
+                if live {
+                    table.set_offset(point(px(-(scroll as f32) / s), px(0.0)));
+                }
                 for (i, cell) in all.iter().enumerate() {
                     let seen = edges[i + 1] > scroll && edges[i] < scroll + view;
                     cells.push(match *cell {
                         Cell::Spine(section, n) => CellPart::Spine(
+                            section,
                             seen.then(|| spine(section, n, state.folded(section), &p)),
                         ),
                         Cell::Repo(repo) => CellPart::Column(seen.then(|| {
-                            let c = Timelines::column(t, i, repo, &p, dark, true, window, cx);
+                            let c = Timelines::column(t, i, repo, &p, dark, live, window, cx);
                             Box::new(ColumnPart {
-                                repo: repo.clone(),
+                                repo: Arc::new(repo.clone()),
                                 color: status_color(repo, &p),
                                 checkout: c.checkout,
                                 status: c.status,
-                                title: Some(c.title),
+                                lines: c.lines,
+                                title: live.then_some(c.title),
                                 glance: c.glance,
                                 body: Some(c.body),
                             })
@@ -784,17 +953,20 @@ impl StatusView {
             }
         }
 
-        let scene = WindowScene {
+        WindowScene {
             p,
             dark,
-            maximized: window.is_maximized(),
+            maximized: match staged {
+                Some((_, maximized)) => maximized,
+                None => window.is_maximized(),
+            },
             font: caption_font(cx),
             headline,
             headline_color,
             subline: subline.into(),
             health,
-            settings: Some(settings),
-            refresh: Some(refresh_slot),
+            settings,
+            refresh: refresh_slot,
             refresh_words: if sweeping {
                 "Checking…"
             } else {
@@ -806,8 +978,25 @@ impl StatusView {
             body,
             prs: prs_block(state, Mode::Window, false, &p, cx),
             footer: Some(footer(state, &p)),
-            scroll: self.table.clone(),
-        };
+            scroll: table,
+            stage: staged.map(|(r, _)| r),
+        }
+    }
+
+    /// The big window: one element that draws it, under the root that
+    /// takes its keys.
+    pub(super) fn render_window(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let p = Palette::for_appearance(window.appearance());
+        let dark = matches!(
+            window.appearance(),
+            WindowAppearance::Dark | WindowAppearance::VibrantDark
+        );
+        let filter_state = self.state.clone();
+        let scene = self.window_scene(None, window, cx);
         div()
             .id("root")
             // Digits of one width, so counts and ⬆⬇ numbers line up.
@@ -827,7 +1016,7 @@ impl StatusView {
                     cx.stop_propagation();
                     return;
                 }
-                if event.keystroke.key == "escape" && !crate::morph::flip_back(window, cx) {
+                if event.keystroke.key == "escape" && !crate::flip::flip_back(window, cx) {
                     window.remove_window();
                 }
             })

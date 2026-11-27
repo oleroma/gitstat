@@ -3,16 +3,18 @@
 //! `scene::panel` says where each part goes, in whole device px from the
 //! panel's corner; this paints them there, wherever in its window the
 //! panel is now (`panel::sheet`): at rest, or part way through its slide.
-//! The parts that travel in the flip (the words, icons, bars and washes)
-//! are painted here directly. What only the mouse or the list needs (a
-//! row's tree and where its label is clicked, the buttons, the pull
-//! requests, the bottom bar) are ordinary GPUI elements, the slots, laid
-//! out at the device px the layout gives them and painted under the parts.
+//! What it paints itself (its sheet, the words, icons, bars and washes)
+//! it first lists as a picture (`scene::parts`) and then paints from that
+//! list: the list the flip carries to the big window's. What only the
+//! mouse or the list needs (a row's tree and where its label is clicked,
+//! the buttons, the pull requests, the bottom bar) are ordinary GPUI
+//! elements, the slots, laid out at the device px the layout gives them
+//! and painted between the picture's fills and its words.
 
 use super::{
-    NEXT_LIST_SCROLL, Palette, StatusView, filter_key, fold, mode_text, prs_block, refresh,
-    remote_problem_row, rim, rim_width, section_color, section_text, section_tint, status_color,
-    tip, titles, tone_counts,
+    Palette, StatusView, filter_key, fold, mode_text, prs_block, refresh, remote_problem_row, rim,
+    rim_width, section_color, section_text, section_tint, status_color, tip, title_bar, titles,
+    tone_counts,
 };
 use crate::config::Section;
 use crate::git::RepoStatus;
@@ -20,7 +22,8 @@ use crate::layout::Rect;
 use crate::panel;
 use crate::scene::paint;
 use crate::scene::panel::{self as place, HEADLINE, ICON_MARK, MARK, SMALL, TINY, line_height};
-use crate::scene::text::{self, Align, Look, text};
+use crate::scene::parts::{Key, Part, Picture, Sheet, What};
+use crate::scene::text::{self, Look, text};
 use crate::state::AppState;
 use crate::timeline::Timelines;
 use crate::win;
@@ -30,9 +33,12 @@ use gpui::{
     LayoutId, ParentElement, Pixels, ScrollHandle, ScrollWheelEvent, SharedString, Style, Styled,
     Window, WindowAppearance, div, point, prelude::*, px, relative, size,
 };
+use std::path::PathBuf;
+use std::sync::Arc;
 
 /// A button on the top bar.
 struct Button {
+    key: Key,
     glyph: SharedString,
     enabled: bool,
     slot: Option<AnyElement>,
@@ -47,17 +53,19 @@ struct SectionPart {
     words: SharedString,
     slot: Option<AnyElement>,
     /// Icons only, folded: its repos, for their icons in its heading.
-    marks: Vec<(RepoStatus, Hsla)>,
+    marks: Vec<(Arc<RepoStatus>, Hsla)>,
     rows: Vec<RowPart>,
 }
 
 /// A repo's row.
 struct RowPart {
-    repo: RepoStatus,
+    repo: Arc<RepoStatus>,
     color: Hsla,
     checkout: SharedString,
     status: SharedString,
-    slot: Option<AnyElement>,
+    /// Its tree, and where the mouse finds its label.
+    graph: Option<AnyElement>,
+    label: Option<AnyElement>,
 }
 
 /// The panel as one element, as big as its window: it draws itself where
@@ -88,23 +96,30 @@ pub(super) struct Laid {
     /// The next frame differs: it is sliding.
     moving: bool,
     counts: Vec<(SharedString, Hsla)>,
-    /// The slots, laid out where they go: the top bar's, the list's top
-    /// to bottom, and the bottom bar.
+    /// What follows the rows and the bottom bar, measured, yet to be put
+    /// where they go.
+    tail: Vec<AnyElement>,
+    footer: Option<AnyElement>,
+}
+
+/// The panel's slots, laid out where they go: the top bar's, the list's
+/// top to bottom, and the bottom bar.
+pub(super) struct Slots {
     top: Vec<AnyElement>,
     listed: Vec<AnyElement>,
     footer: Option<AnyElement>,
-    /// Which rows are in sight.
-    shown: Vec<bool>,
     list: Hitbox,
+    list_bounds: Bounds<Pixels>,
 }
 
 /// `slot` in a box of its own, `r` device px from the corner at `at`,
-/// laid out and ready to paint.
+/// laid out and ready to paint, at `alpha` of its strength.
 pub(super) fn put(
     slot: AnyElement,
     r: Rect,
     at: (i32, i32),
     s: f32,
+    alpha: f32,
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
@@ -114,6 +129,7 @@ pub(super) fn put(
         .flex_col()
         .w(b.size.width)
         .h(b.size.height)
+        .when(alpha < 1.0, |d| d.opacity(alpha))
         .child(slot)
         .into_any_element();
     el.prepaint_as_root(
@@ -128,16 +144,24 @@ pub(super) fn put(
     el
 }
 
-/// `slot` laid out `width` device px wide, and how tall it comes out.
+/// `slot` laid out `width` device px wide, and how tall it comes out; to
+/// be painted at `alpha` of its strength.
 pub(super) fn measure(
     slot: AnyElement,
     width: i32,
     s: f32,
+    alpha: f32,
     window: &mut Window,
     cx: &mut App,
 ) -> (AnyElement, i32) {
     let w = px(width as f32 / s);
-    let mut el = div().flex().flex_col().w(w).child(slot).into_any_element();
+    let mut el = div()
+        .flex()
+        .flex_col()
+        .w(w)
+        .when(alpha < 1.0, |d| d.opacity(alpha))
+        .child(slot)
+        .into_any_element();
     let laid = el.layout_as_root(
         size(AvailableSpace::Definite(w), AvailableSpace::MinContent),
         window,
@@ -156,6 +180,466 @@ fn arrow(open: bool) -> &'static str {
     if open { "▾" } else { "▸" }
 }
 
+/// A glyph's line, centred on its button.
+pub(super) fn centred(r: Rect, size: f32, s: f32) -> Rect {
+    let lh = place::px(line_height(size), s);
+    let top = r.top + (r.height() - lh) / 2;
+    Rect::new(r.left, top, r.right, top + lh)
+}
+
+/// The health bar's counts in words, each in its colour.
+pub(super) fn count_words(n: [usize; 3], p: &Palette) -> Vec<(SharedString, Hsla)> {
+    [
+        (n[0], "✓ ", p.green),
+        (n[1], "● ", p.amber),
+        (n[2], "! ", p.red),
+    ]
+    .into_iter()
+    .map(|(n, mark, color)| {
+        let color = if n > 0 { color } else { p.muted.opacity(0.6) };
+        (format!("{mark}{n}").into(), color)
+    })
+    .collect()
+}
+
+impl PanelScene {
+    /// Lays the panel out: where it is in its window now, and where each
+    /// of its parts goes. Its slots are to be painted at `alpha`.
+    pub(super) fn lay(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        alpha: f32,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Laid {
+        let s = window.scale_factor();
+        let dev = |v: Pixels| (f32::from(v) * s).round() as i32;
+        // As wide and at most as tall as the panel may be; in any other
+        // window (there is none), as big as this element.
+        let (room_w, room_h) =
+            panel::room(cx).unwrap_or((dev(bounds.size.width), dev(bounds.size.height)));
+
+        let counts = match self.health {
+            Some((n, _)) if !self.icons_only => count_words(n, &self.p),
+            _ => Vec::new(),
+        };
+        let health = (counts.len() == 3).then(|| {
+            let w = |i: usize| width(&counts[i].0, TINY, window);
+            [w(0), w(1), w(2)]
+        });
+        let sections = self
+            .sections
+            .iter()
+            .map(|sec| place::SectionSpec {
+                section: sec.section,
+                count: sec.count,
+                arrow: width(arrow(sec.open), SMALL, window),
+                rows: sec.open.then(|| {
+                    sec.rows
+                        .iter()
+                        .map(|row| place::RowSpec {
+                            checkout: width(&row.checkout, TINY, window),
+                            status: width(&row.status, TINY, window),
+                            edge: !row.repo.is_synced() && !row.repo.remote_only,
+                        })
+                        .collect()
+                }),
+            })
+            .collect();
+        let mut tail = Vec::new();
+        let mut tail_heights = Vec::new();
+        for slot in self.tail.drain(..) {
+            let (el, h) = measure(slot, room_w, s, alpha, window, cx);
+            tail.push(el);
+            tail_heights.push(h);
+        }
+        let footer = self
+            .footer
+            .take()
+            .map(|slot| measure(slot, room_w, s, alpha, window, cx));
+        let wanted = dev(-self.scroll.offset().y);
+        let layout = place::layout(&place::Spec {
+            scale: s,
+            width: room_w,
+            max_height: room_h,
+            icons_only: self.icons_only,
+            health,
+            buttons: self.buttons.len(),
+            sections,
+            tail: tail_heights,
+            footer: footer.as_ref().map(|(_, h)| *h),
+            scroll: wanted,
+        });
+        // Scrolled past its end (rows went, a section folded): back to it.
+        if layout.scroll != wanted {
+            self.scroll
+                .set_offset(point(px(0.0), px(-(layout.scroll as f32) / s)));
+        }
+        let (at, moving) = match panel::sheet(layout.size.1, window, cx) {
+            Some(sheet) => (sheet.at, sheet.moving),
+            None => ((dev(bounds.origin.x), dev(bounds.origin.y)), false),
+        };
+        // The icons its parts show, drawn by the time they are painted.
+        for sec in &self.sections {
+            for (repo, _) in &sec.marks {
+                crate::repo_marks::want(repo, MARK, window, cx);
+            }
+            let side = if self.icons_only { ICON_MARK } else { MARK };
+            for row in sec.rows.iter().filter(|_| sec.open) {
+                crate::repo_marks::want(&row.repo, side, window, cx);
+            }
+        }
+        Laid {
+            layout,
+            at,
+            moving,
+            counts,
+            tail,
+            footer: footer.map(|(el, _)| el),
+        }
+    }
+
+    /// Everything the panel paints itself, device px from its window's
+    /// corner: its sheet, and its parts in the order they are painted.
+    pub(super) fn picture(&self, laid: &Laid, s: f32) -> Picture {
+        let p = self.p;
+        let l = &laid.layout;
+        let at = laid.at;
+        let sh = |r: Rect| Rect::new(r.left + at.0, r.top + at.1, r.right + at.0, r.bottom + at.1);
+        let own = Key::Own;
+        let mut parts = Vec::new();
+
+        // The rim, Windows' own to the px, goes just outside the sheet.
+        let sheet = Rect::new(0, 0, l.size.0, l.size.1);
+        let rim_px = rim_width(s).round() as i32;
+        let inner = (win::PANEL_RADIUS - rim_px as f32 / s).max(0.0);
+        // The big window's title bar, of which the panel has none.
+        parts.push(
+            Part::fill(
+                Key::Caption,
+                sh(Rect::new(0, 0, l.size.0, 0)),
+                title_bar(self.dark),
+            )
+            .radii([inner, inner, 0.0, 0.0]),
+        );
+
+        // The top bar.
+        let h = &l.header;
+        if !self.icons_only {
+            parts.push(Part::words(
+                Key::Headline,
+                sh(h.headline),
+                self.headline.clone(),
+                Look::new(HEADLINE, self.headline_color).bold(),
+            ));
+            parts.push(Part::words(
+                Key::Subline,
+                sh(h.subline),
+                self.subline.clone(),
+                Look::new(TINY, p.muted),
+            ));
+        }
+        if let (Some(bar), Some((counts, checking))) = (h.bar, self.health) {
+            parts.push(Part::new(
+                Key::Health,
+                sh(bar),
+                What::Health {
+                    counts,
+                    colors: [p.green, p.amber, p.red],
+                    track: p.hover,
+                    checking,
+                },
+            ));
+            for (i, ((t, color), r)) in laid.counts.iter().zip(h.counts).enumerate() {
+                parts.push(Part::words(
+                    Key::Count(i as u8),
+                    sh(r),
+                    t.clone(),
+                    Look::new(TINY, *color),
+                ));
+            }
+        }
+        for (button, r) in self.buttons.iter().zip(&h.buttons) {
+            let color = if button.enabled {
+                p.text
+            } else {
+                p.text.opacity(0.4)
+            };
+            parts.push(
+                Part::words(
+                    button.key.clone(),
+                    sh(centred(*r, HEADLINE, s)),
+                    button.glyph.clone(),
+                    Look::new(HEADLINE, color),
+                )
+                .centred(),
+            );
+        }
+        parts.push(Part::fill(Key::HeaderLine, sh(h.line), p.border));
+
+        // The list. With no bottom bar it reaches the sheet's bottom
+        // corners, rounded as they are inside the rim.
+        let corners = if l.footer.is_some() { 0.0 } else { inner };
+        parts
+            .push(Part::fill(Key::Body, sh(l.list), p.surface).radii([0.0, 0.0, corners, corners]));
+        let mut rows = l.rows.iter();
+        for (sec, heading) in self.sections.iter().zip(&l.headings) {
+            parts.push(
+                Part::fill(
+                    Key::Tint(sec.section),
+                    sh(heading.rect),
+                    section_tint(sec.section, &p),
+                )
+                .clipped(),
+            );
+            if !self.icons_only {
+                parts.push(
+                    Part::words(
+                        own.clone(),
+                        sh(heading.label),
+                        sec.words.clone(),
+                        Look::new(SMALL, sec.color),
+                    )
+                    .clipped(),
+                );
+            }
+            for ((repo, color), r) in sec.marks.iter().zip(&heading.marks) {
+                parts.push(
+                    Part::new(
+                        own.clone(),
+                        sh(*r),
+                        What::Icon {
+                            status: repo.clone(),
+                            side: MARK,
+                            dot: *color,
+                            ends: None,
+                        },
+                    )
+                    .clipped(),
+                );
+            }
+            parts.push(
+                Part::words(
+                    own.clone(),
+                    sh(heading.arrow),
+                    arrow(sec.open),
+                    Look::new(SMALL, p.muted),
+                )
+                .clipped(),
+            );
+            if !sec.open {
+                continue;
+            }
+            for (part, row) in sec.rows.iter().zip(&mut rows) {
+                let path = &part.repo.path;
+                parts.push(
+                    Part::new(
+                        Key::Icon(path.clone()),
+                        sh(row.icon),
+                        What::Icon {
+                            status: part.repo.clone(),
+                            side: if self.icons_only { ICON_MARK } else { MARK },
+                            dot: part.color,
+                            ends: None,
+                        },
+                    )
+                    .clipped(),
+                );
+                if !self.icons_only {
+                    parts.push(
+                        Part::words(
+                            Key::Name(path.clone()),
+                            sh(row.name),
+                            part.repo.name.clone(),
+                            Look::new(SMALL, p.text),
+                        )
+                        .clipped(),
+                    );
+                    parts.push(
+                        Part::words(
+                            Key::Checkout(path.clone()),
+                            sh(row.checkout),
+                            part.checkout.clone(),
+                            Look::new(TINY, p.muted),
+                        )
+                        .clipped(),
+                    );
+                    parts.push(
+                        Part::words(
+                            Key::Status(path.clone()),
+                            sh(row.status),
+                            part.status.clone(),
+                            Look::new(TINY, part.color),
+                        )
+                        .clipped(),
+                    );
+                }
+                if let Some(edge) = row.edge {
+                    parts.push(
+                        Part::fill(own.clone(), sh(edge), part.color)
+                            .radii([0.0, 2.0, 2.0, 0.0])
+                            .over()
+                            .clipped(),
+                    );
+                }
+            }
+        }
+        Picture {
+            sheet: Some(Sheet {
+                frame: sh(sheet.outset(rim_px)),
+                radius: win::PANEL_RADIUS,
+                rim: rim_px,
+                rim_color: rim(self.dark),
+                bg: p.bg,
+                shadow: 1.0,
+            }),
+            body: sh(l.list),
+            parts,
+        }
+    }
+
+    /// Where each shown repo's tree is drawn: its row's graph box, device
+    /// px from the window's corner.
+    pub(super) fn strips(&self, laid: &Laid) -> Vec<(PathBuf, bool, Rect)> {
+        let at = laid.at;
+        let mut rows = laid.layout.rows.iter();
+        let mut out = Vec::new();
+        for sec in self.sections.iter().filter(|sec| sec.open) {
+            for (part, row) in sec.rows.iter().zip(&mut rows) {
+                let r = row.strip;
+                out.push((
+                    part.repo.path.clone(),
+                    part.repo.dirty,
+                    Rect::new(r.left + at.0, r.top + at.1, r.right + at.0, r.bottom + at.1),
+                ));
+            }
+        }
+        out
+    }
+
+    /// Lays the slots out where they go, to be painted at `alpha` of
+    /// their strength.
+    pub(super) fn slots(
+        &mut self,
+        laid: &mut Laid,
+        alpha: f32,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Slots {
+        let s = window.scale_factor();
+        let (layout, at) = (&laid.layout, laid.at);
+        // The top bar's.
+        let mut top = Vec::new();
+        if let (Some(slot), Some(bar)) = (self.summary.take(), layout.header.bar) {
+            let half = place::px(place::BUTTON, s) / 2;
+            let mid = (bar.top + bar.bottom) / 2;
+            let r = Rect::new(bar.left, mid - half, bar.right, mid + half);
+            top.push(put(slot, r, at, s, alpha, window, cx));
+        }
+        for (button, r) in self.buttons.iter_mut().zip(&layout.header.buttons) {
+            if let Some(slot) = button.slot.take() {
+                top.push(put(slot, *r, at, s, alpha, window, cx));
+            }
+        }
+
+        // The list's, cut to the list: its own hitbox first, so theirs
+        // lie over it.
+        let list_bounds = paint::bounds(layout.list, at, s);
+        let list = window.insert_hitbox(list_bounds, HitboxBehavior::Normal);
+        let bleed = place::px(crate::timeline::BLEED, s) + 1;
+        let in_sight =
+            |r: Rect| r.bottom + bleed > layout.list.top && r.top - bleed < layout.list.bottom;
+        let mut listed = Vec::new();
+        let tail = std::mem::take(&mut laid.tail);
+        window.with_content_mask(
+            Some(ContentMask {
+                bounds: list_bounds,
+            }),
+            |window| {
+                let mut rows = layout.rows.iter();
+                for (sec, heading) in self.sections.iter_mut().zip(&layout.headings) {
+                    if let Some(slot) = sec.slot.take().filter(|_| in_sight(heading.rect)) {
+                        listed.push(put(slot, heading.rect, at, s, alpha, window, cx));
+                    }
+                    if !sec.open {
+                        continue;
+                    }
+                    for (part, row) in sec.rows.iter_mut().zip(&mut rows) {
+                        if !in_sight(row.rect) {
+                            continue;
+                        }
+                        if let Some(slot) = part.graph.take() {
+                            listed.push(put(slot, row.strip, at, s, alpha, window, cx));
+                        }
+                        if let Some(slot) = part.label.take() {
+                            listed.push(put(slot, row.label, at, s, alpha, window, cx));
+                        }
+                    }
+                }
+                for (mut el, r) in tail.into_iter().zip(&layout.tail) {
+                    el.prepaint_at(paint::bounds(*r, at, s).origin, window, cx);
+                    listed.push(el);
+                }
+            },
+        );
+        let footer = laid.footer.take().zip(layout.footer).map(|(mut el, r)| {
+            el.prepaint_at(paint::bounds(r, at, s).origin, window, cx);
+            el
+        });
+        Slots {
+            top,
+            listed,
+            footer,
+            list,
+            list_bounds,
+        }
+    }
+
+    /// Paints the slots; with `scroll`, the list's scroll and how far it
+    /// goes, the wheel over the list scrolls it.
+    pub(super) fn paint_slots(
+        slots: &mut Slots,
+        scroll: Option<(ScrollHandle, Pixels)>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        // Before the slots paint: their own wheel handlers (a strip's
+        // sideways scroll) then come first.
+        if let Some((scroll, max)) = scroll {
+            let hitbox = slots.list.clone();
+            window.on_mouse_event(move |e: &ScrollWheelEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble || !hitbox.should_handle_scroll(window) {
+                    return;
+                }
+                let d = e.delta.pixel_delta(window.line_height());
+                let was = scroll.offset();
+                let y = (was.y + d.y).clamp(-max, px(0.0));
+                if y != was.y {
+                    scroll.set_offset(point(px(0.0), y));
+                    window.refresh();
+                    cx.stop_propagation();
+                }
+            });
+        }
+        window.with_content_mask(
+            Some(ContentMask {
+                bounds: slots.list_bounds,
+            }),
+            |window| {
+                for slot in &mut slots.listed {
+                    slot.paint(window, cx);
+                }
+            },
+        );
+        for slot in &mut slots.top {
+            slot.paint(window, cx);
+        }
+        if let Some(footer) = &mut slots.footer {
+            footer.paint(window, cx);
+        }
+    }
+}
+
 impl IntoElement for PanelScene {
     type Element = Self;
 
@@ -166,7 +650,7 @@ impl IntoElement for PanelScene {
 
 impl Element for PanelScene {
     type RequestLayoutState = ();
-    type PrepaintState = Option<Laid>;
+    type PrepaintState = Option<(Laid, Picture, Slots)>;
 
     fn id(&self) -> Option<ElementId> {
         None
@@ -197,163 +681,11 @@ impl Element for PanelScene {
         _: &mut (),
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<Laid> {
-        let s = window.scale_factor();
-        let dev = |v: Pixels| (f32::from(v) * s).round() as i32;
-        // As wide and at most as tall as the panel may be; in any other
-        // window (there is none), as big as this element.
-        let (room_w, room_h) =
-            panel::room(cx).unwrap_or((dev(bounds.size.width), dev(bounds.size.height)));
-
-        let counts: Vec<(SharedString, Hsla)> = match self.health {
-            Some((n, _)) if !self.icons_only => {
-                let p = &self.p;
-                [
-                    (n[0], "✓ ", p.green),
-                    (n[1], "● ", p.amber),
-                    (n[2], "! ", p.red),
-                ]
-                .into_iter()
-                .map(|(n, mark, color)| {
-                    let color = if n > 0 { color } else { p.muted.opacity(0.6) };
-                    (format!("{mark}{n}").into(), color)
-                })
-                .collect()
-            }
-            _ => Vec::new(),
-        };
-        let health = (counts.len() == 3).then(|| {
-            let w = |i: usize| width(&counts[i].0, TINY, window);
-            [w(0), w(1), w(2)]
-        });
-        let sections = self
-            .sections
-            .iter()
-            .map(|sec| place::SectionSpec {
-                section: sec.section,
-                count: sec.count,
-                arrow: width(arrow(sec.open), SMALL, window),
-                rows: sec.open.then(|| {
-                    sec.rows
-                        .iter()
-                        .map(|row| place::RowSpec {
-                            checkout: width(&row.checkout, TINY, window),
-                            status: width(&row.status, TINY, window),
-                            edge: !row.repo.is_synced() && !row.repo.remote_only,
-                        })
-                        .collect()
-                }),
-            })
-            .collect();
-        let mut tail = Vec::new();
-        let mut tail_heights = Vec::new();
-        for slot in self.tail.drain(..) {
-            let (el, h) = measure(slot, room_w, s, window, cx);
-            tail.push(el);
-            tail_heights.push(h);
-        }
-        let footer = self
-            .footer
-            .take()
-            .map(|slot| measure(slot, room_w, s, window, cx));
-        let wanted = dev(-self.scroll.offset().y);
-        let layout = place::layout(&place::Spec {
-            scale: s,
-            width: room_w,
-            max_height: room_h,
-            icons_only: self.icons_only,
-            health,
-            buttons: self.buttons.len(),
-            sections,
-            tail: tail_heights,
-            footer: footer.as_ref().map(|(_, h)| *h),
-            scroll: wanted,
-        });
-        // Scrolled past its end (rows went, a section folded): back to it.
-        if layout.scroll != wanted {
-            self.scroll
-                .set_offset(point(px(0.0), px(-(layout.scroll as f32) / s)));
-        }
-        crate::morph::seen_list_scroll(layout.scroll as f32 / s, layout.max_scroll as f32 / s);
-
-        let (at, moving) = match panel::sheet(layout.size.1, window, cx) {
-            Some(sheet) => (sheet.at, sheet.moving),
-            None => ((dev(bounds.origin.x), dev(bounds.origin.y)), false),
-        };
-
-        // The top bar's slots.
-        let mut top = Vec::new();
-        if let (Some(slot), Some(bar)) = (self.summary.take(), layout.header.bar) {
-            let half = place::px(place::BUTTON, s) / 2;
-            let mid = (bar.top + bar.bottom) / 2;
-            let r = Rect::new(bar.left, mid - half, bar.right, mid + half);
-            top.push(put(slot, r, at, s, window, cx));
-        }
-        for (button, r) in self.buttons.iter_mut().zip(&layout.header.buttons) {
-            if let Some(slot) = button.slot.take() {
-                top.push(put(slot, *r, at, s, window, cx));
-            }
-        }
-
-        // The list's, cut to the list: its own hitbox first, so theirs
-        // lie over it.
-        let list_bounds = paint::bounds(layout.list, at, s);
-        let list = window.insert_hitbox(list_bounds, HitboxBehavior::Normal);
-        let bleed = place::px(crate::timeline::BLEED, s) + 1;
-        let in_sight =
-            |r: Rect| r.bottom + bleed > layout.list.top && r.top - bleed < layout.list.bottom;
-        let mut listed = Vec::new();
-        let mut shown = Vec::new();
-        window.with_content_mask(
-            Some(ContentMask {
-                bounds: list_bounds,
-            }),
-            |window| {
-                let mut rows = layout.rows.iter();
-                for (sec, heading) in self.sections.iter_mut().zip(&layout.headings) {
-                    if let Some(slot) = sec.slot.take().filter(|_| in_sight(heading.rect)) {
-                        listed.push(put(slot, heading.rect, at, s, window, cx));
-                    }
-                    for ((repo, _), _) in sec.marks.iter().zip(&heading.marks) {
-                        crate::repo_marks::want(repo, MARK, window, cx);
-                    }
-                    if !sec.open {
-                        continue;
-                    }
-                    for (part, row) in sec.rows.iter_mut().zip(&mut rows) {
-                        let sight = in_sight(row.rect);
-                        shown.push(sight);
-                        if !sight {
-                            continue;
-                        }
-                        if let Some(slot) = part.slot.take() {
-                            listed.push(put(slot, row.rect, at, s, window, cx));
-                        }
-                        let side = if self.icons_only { ICON_MARK } else { MARK };
-                        crate::repo_marks::want(&part.repo, side, window, cx);
-                    }
-                }
-                for (mut el, r) in tail.into_iter().zip(&layout.tail) {
-                    el.prepaint_at(paint::bounds(*r, at, s).origin, window, cx);
-                    listed.push(el);
-                }
-            },
-        );
-        let footer = footer.zip(layout.footer).map(|((mut el, _), r)| {
-            el.prepaint_at(paint::bounds(r, at, s).origin, window, cx);
-            el
-        });
-        Some(Laid {
-            layout,
-            at,
-            moving,
-            counts,
-            top,
-            listed,
-            footer,
-            shown,
-            list,
-        })
+    ) -> Self::PrepaintState {
+        let mut laid = self.lay(bounds, 1.0, window, cx);
+        let picture = self.picture(&laid, window.scale_factor());
+        let slots = self.slots(&mut laid, 1.0, window, cx);
+        Some((laid, picture, slots))
     }
 
     fn paint(
@@ -362,231 +694,24 @@ impl Element for PanelScene {
         _: Option<&InspectorElementId>,
         _: Bounds<Pixels>,
         _: &mut (),
-        laid: &mut Option<Laid>,
+        state: &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
-        let Some(laid) = laid else { return };
-        let s = window.scale_factor();
-        let p = self.p;
-        let at = laid.at;
-        let l = &laid.layout;
-        let b = |r: Rect| paint::bounds(r, at, s);
-        let words = |window: &mut Window, t: &SharedString, look: Look, r: Rect, align: Align| {
-            text::paint(
-                window,
-                t,
-                &look,
-                (at.0 + r.left, at.1 + r.top),
-                line_height(look.size),
-                Some(r.width()),
-                align,
-            );
+        let Some((laid, picture, slots)) = state else {
+            return;
         };
-
-        // The sheet with its shadow; the rim, Windows' own to the px, goes
-        // on last, just outside the sheet.
-        let sheet = Rect::new(0, 0, l.size.0, l.size.1);
-        let rim_px = rim_width(s).round() as i32;
-        let frame = b(sheet.outset(rim_px));
-        let radius = px(win::PANEL_RADIUS);
-        window.paint_shadows(
-            frame,
-            gpui::Corners::all(radius),
-            &crate::morph::window_shadow(),
-        );
-        paint::round(window, frame, gpui::Corners::all(radius), p.bg);
-
-        // The top bar.
-        let h = &l.header;
-        if !self.icons_only {
-            words(
-                window,
-                &self.headline,
-                Look::new(HEADLINE, self.headline_color).bold(),
-                h.headline,
-                Align::Left,
-            );
-            words(
-                window,
-                &self.subline,
-                Look::new(TINY, p.muted),
-                h.subline,
-                Align::Left,
-            );
-        }
-        if let (Some(bar), Some((counts, checking))) = (h.bar, self.health) {
-            paint::health(
-                window,
-                bar,
-                at,
-                counts,
-                [p.green, p.amber, p.red],
-                p.hover,
-                checking,
-            );
-            for ((t, color), r) in laid.counts.iter().zip(h.counts) {
-                words(window, t, Look::new(TINY, *color), r, Align::Left);
-            }
-        }
-        for slot in &mut laid.top {
-            slot.paint(window, cx);
-        }
-        for (button, r) in self.buttons.iter().zip(&h.buttons) {
-            let color = if button.enabled {
-                p.text
-            } else {
-                p.text.opacity(0.4)
-            };
-            // Its glyph's line, centred on the button.
-            let lh = place::px(line_height(HEADLINE), s);
-            let top = r.top + (r.height() - lh) / 2;
-            let line = Rect::new(r.left, top, r.right, top + lh);
-            words(
-                window,
-                &button.glyph,
-                Look::new(HEADLINE, color),
-                line,
-                Align::Centre,
-            );
-        }
-        paint::fill(window, b(h.line), p.border);
-
-        // The list. With no bottom bar it reaches the sheet's bottom
-        // corners, rounded as they are inside the rim.
-        let list_bounds = b(l.list);
-        if l.footer.is_some() {
-            paint::fill(window, list_bounds, p.surface);
-        } else {
-            let inner = radius - px(rim_px as f32 / s);
-            let radii = gpui::Corners {
-                top_left: px(0.0),
-                top_right: px(0.0),
-                bottom_left: inner,
-                bottom_right: inner,
-            };
-            paint::round(window, list_bounds, radii, p.surface);
-        }
-        // Before the slots paint: their own wheel handlers (a strip's
-        // sideways scroll) then come first.
-        let (scroll, hitbox, max) = (
-            self.scroll.clone(),
-            laid.list.clone(),
-            px(l.max_scroll as f32 / s),
-        );
-        window.on_mouse_event(move |e: &ScrollWheelEvent, phase, window, cx| {
-            if phase != DispatchPhase::Bubble || !hitbox.should_handle_scroll(window) {
-                return;
-            }
-            let d = e.delta.pixel_delta(window.line_height());
-            let was = scroll.offset();
-            let y = (was.y + d.y).clamp(-max, px(0.0));
-            if y != was.y {
-                scroll.set_offset(point(px(0.0), y));
-                window.refresh();
-                cx.stop_propagation();
-            }
-        });
-        window.with_content_mask(
-            Some(ContentMask {
-                bounds: list_bounds,
-            }),
-            |window| {
-                for (sec, heading) in self.sections.iter().zip(&l.headings) {
-                    paint::fill(window, b(heading.rect), section_tint(sec.section, &p));
-                }
-                for slot in &mut laid.listed {
-                    slot.paint(window, cx);
-                }
-                let mut rows = l.rows.iter().zip(&laid.shown);
-                for (sec, heading) in self.sections.iter().zip(&l.headings) {
-                    if !self.icons_only {
-                        words(
-                            window,
-                            &sec.words,
-                            Look::new(SMALL, sec.color),
-                            heading.label,
-                            Align::Left,
-                        );
-                    }
-                    for ((repo, color), r) in sec.marks.iter().zip(&heading.marks) {
-                        crate::repo_marks::paint(repo, b(*r), MARK, *color, window, cx);
-                    }
-                    words(
-                        window,
-                        &arrow(sec.open).into(),
-                        Look::new(SMALL, p.muted),
-                        heading.arrow,
-                        Align::Left,
-                    );
-                    if !sec.open {
-                        continue;
-                    }
-                    for (part, (row, shown)) in sec.rows.iter().zip(&mut rows) {
-                        if !shown {
-                            continue;
-                        }
-                        let side = if self.icons_only { ICON_MARK } else { MARK };
-                        crate::repo_marks::paint(
-                            &part.repo,
-                            b(row.icon),
-                            side,
-                            part.color,
-                            window,
-                            cx,
-                        );
-                        if !self.icons_only {
-                            let name: SharedString = part.repo.name.clone().into();
-                            words(
-                                window,
-                                &name,
-                                Look::new(SMALL, p.text),
-                                row.name,
-                                Align::Left,
-                            );
-                            words(
-                                window,
-                                &part.checkout,
-                                Look::new(TINY, p.muted),
-                                row.checkout,
-                                Align::Left,
-                            );
-                            words(
-                                window,
-                                &part.status,
-                                Look::new(TINY, part.color),
-                                row.status,
-                                Align::Left,
-                            );
-                        }
-                        if let Some(edge) = row.edge {
-                            let r = px(2.0);
-                            let radii = gpui::Corners {
-                                top_left: px(0.0),
-                                top_right: r,
-                                bottom_right: r,
-                                bottom_left: px(0.0),
-                            };
-                            paint::round(window, b(edge), radii, part.color);
-                        }
-                    }
-                }
-            },
-        );
-        if let Some(footer) = &mut laid.footer {
-            footer.paint(window, cx);
-        }
-        window.paint_quad(gpui::quad(
-            frame,
-            radius,
-            gpui::transparent_black(),
-            px(rim_px as f32 / s),
-            rim(self.dark),
-            gpui::BorderStyle::Solid,
-        ));
+        let s = window.scale_factor();
+        // The sheet with its shadow and the fills; over them the slots;
+        // over those the words and pictures, and last the rim.
+        picture.paint_under(window, cx);
+        let max = px(laid.layout.max_scroll as f32 / s);
+        Self::paint_slots(slots, Some((self.scroll.clone(), max)), window, cx);
+        picture.paint_over(window, cx);
         if laid.moving {
             window.request_animation_frame();
         }
+        crate::flip::painted();
         panel::drew(window, cx);
     }
 }
@@ -667,10 +792,6 @@ impl StatusView {
             window.appearance(),
             WindowAppearance::Dark | WindowAppearance::VibrantDark
         );
-        // The flip lines the list up with the window's columns.
-        if let Some(y) = NEXT_LIST_SCROLL.take() {
-            self.list.set_offset(point(px(0.), px(-y)));
-        }
         let filter_state = self.state.clone();
         let timelines = self.timelines.clone();
         let state = self.state.clone();
@@ -679,7 +800,12 @@ impl StatusView {
         let sweeping = state.sweeping;
         let (headline, headline_color, subline) = titles(state, &p);
 
+        // In a flip, the panel's own slots fade with it, and the flip
+        // draws the trees.
+        let pose = crate::flip::pose(cx);
+        let staged = pose.is_some();
         let mut buttons = vec![Button {
+            key: Key::Own,
             glyph: "↻".into(),
             enabled: !sweeping,
             slot: Some(
@@ -695,19 +821,21 @@ impl StatusView {
         }];
         if state.config.window {
             buttons.push(Button {
+                key: Key::Own,
                 glyph: "⧉".into(),
                 enabled: true,
                 slot: Some(
                     hit("pop-out", true, &p)
                         .rounded_md()
                         .on_click(|_, window, cx| {
-                            crate::morph::open_window(window, None, cx);
+                            crate::flip::open_window(window, None, cx);
                         })
                         .into_any_element(),
                 ),
             });
         }
         buttons.push(Button {
+            key: Key::Settings,
             glyph: "⚙".into(),
             enabled: true,
             slot: Some(
@@ -784,7 +912,7 @@ impl StatusView {
                             Section::NeedsYou => status_color(s, &p),
                             _ => color,
                         };
-                        ((*s).clone(), mark)
+                        (Arc::new((*s).clone()), mark)
                     })
                     .collect()
             } else {
@@ -805,24 +933,26 @@ impl StatusView {
                                     &p,
                                     dark,
                                     icons_only,
-                                    true,
+                                    !staged,
                                     cx,
                                 );
                                 RowPart {
-                                    repo: (*s).clone(),
+                                    repo: Arc::new((*s).clone()),
                                     color,
                                     checkout: strip.checkout.into(),
                                     status: strip.status.into(),
-                                    slot: Some(strip.slot),
+                                    graph: Some(strip.graph),
+                                    label: Some(strip.label),
                                 }
                             }
                             // Before the app is up: the words alone.
                             None => RowPart {
-                                repo: (*s).clone(),
+                                repo: Arc::new((*s).clone()),
                                 color,
                                 checkout: SharedString::default(),
                                 status: s.label().into(),
-                                slot: None,
+                                graph: None,
+                                label: None,
                             },
                         }
                     })
@@ -917,12 +1047,24 @@ impl StatusView {
             })
             .size_full()
             .text_color(p.text)
-            .child(scene)
-            .children(
-                self.timelines
-                    .as_ref()
-                    .and_then(|t| t.read(cx).hover_card(&p, dark, cx)),
-            )
+            .map(|root| match pose {
+                // A flip: this window draws all of it.
+                Some(pose) => root.child(super::stage::Stage {
+                    panel: scene,
+                    window: pose
+                        .target
+                        .map(|target| self.window_scene(Some(target), window, cx)),
+                    pose,
+                    p,
+                    dark,
+                    timelines: self.timelines.clone(),
+                }),
+                None => root.child(scene).children(
+                    self.timelines
+                        .as_ref()
+                        .and_then(|t| t.read(cx).hover_card(&p, dark, cx)),
+                ),
+            })
             .into_any_element()
     }
 }

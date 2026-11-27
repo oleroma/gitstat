@@ -12,8 +12,12 @@ use crate::panel::{self, Anchor};
 use crate::view::{self, Ui};
 use crate::win;
 use gpui::{App, AppContext, AsyncApp};
+use image::ImageEncoder;
+use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 use std::fmt::Write as _;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Runs the test, then quits the app.
@@ -428,5 +432,262 @@ async fn run(out: &std::path::Path, report: &mut String, cx: &mut AsyncApp) -> R
     }
     cx.update(view::close_window).map_err(gone)?;
     pause(500, cx).await;
+
+    // The flip: panel to big window and back, every frame that can be
+    // caught, against the views at rest.
+    let window_rest = whole;
+    cx.update(|cx| panel::toggle(anchor, cx)).map_err(gone)?;
+    pause(1500, cx).await;
+    let panel_rest = shot(out, "flip-panel-rest", mon.rect, cx).await;
+    let (Some(panel_rest), Some(window_rest)) = (panel_rest, window_rest) else {
+        return Err("no picture of the screen".into());
+    };
+    let (panel_rest, window_rest) = (Arc::new(panel_rest), Arc::new(window_rest));
+    let watch = Watch::start(mon.rect, out.join("flip-open"));
+    let asked = cx
+        .update(|cx| {
+            let handle = cx
+                .try_global::<panel::PanelSlot>()
+                .and_then(|s| s.handle())?;
+            handle
+                .update(cx, |_, window, cx| {
+                    crate::flip::open_window(window, None, cx)
+                })
+                .ok()
+        })
+        .map_err(gone)?;
+    if asked.is_none() {
+        return Err("no panel to flip from".into());
+    }
+    flip_ends(cx).await?;
+    pause(400, cx).await;
+    let frames = watch.stop(cx).await;
+    let open = cx.update(|cx| view::window_open(cx)).map_err(gone)?;
+    let now = cx
+        .update(|cx| view::window_hwnd(cx).and_then(win::client_rect))
+        .map_err(gone)?;
+    let _ = writeln!(
+        report,
+        "flip open: window open {open}, client {now:?} (was {client:?}), panel open {}",
+        cx.update(|cx| panel::is_open(cx)).map_err(gone)?
+    );
+    tell(
+        report,
+        "flip open",
+        &frames,
+        &panel_rest,
+        rect,
+        &window_rest,
+        client,
+    );
+    if !open {
+        return Err("the flip did not open the big window".into());
+    }
+    pause(600, cx).await;
+    let Some(window_now) = shot(out, "flip-window-rest", mon.rect, cx).await else {
+        return Err("no picture of the screen".into());
+    };
+    let _ = writeln!(
+        report,
+        "flip open: the window it ended in against the window opened plainly, px that differ \
+         inside it: {}",
+        changed(&window_now, &window_rest, client)
+    );
+    let window_now = Arc::new(window_now);
+    let watch = Watch::start(mon.rect, out.join("flip-close"));
+    let asked = cx
+        .update(|cx| {
+            let handle = view::window_handle(cx)?;
+            handle
+                .update(cx, |_, window, cx| crate::flip::flip_back(window, cx))
+                .ok()
+        })
+        .map_err(gone)?;
+    let _ = writeln!(report, "flip close: taken by the flip: {asked:?}");
+    if asked != Some(true) {
+        return Err("the flip back did not start".into());
+    }
+    flip_ends(cx).await?;
+    pause(1500, cx).await;
+    let frames = watch.stop(cx).await;
+    tell(
+        report,
+        "flip close",
+        &frames,
+        &window_now,
+        client,
+        &panel_rest,
+        rect,
+    );
+    let _ = writeln!(
+        report,
+        "flip close: window open {}, panel open {}",
+        cx.update(|cx| view::window_open(cx)).map_err(gone)?,
+        cx.update(|cx| panel::is_open(cx)).map_err(gone)?
+    );
     Ok(())
+}
+
+/// Waits for the flip under way to end.
+async fn flip_ends(cx: &mut AsyncApp) -> Result<(), String> {
+    let began = Instant::now();
+    pause(50, cx).await;
+    loop {
+        let running = cx
+            .update(|cx| crate::flip::running(cx))
+            .map_err(|_| "the app went away".to_string())?;
+        if !running {
+            return Ok(());
+        }
+        if began.elapsed() > Duration::from_secs(8) {
+            return Err("the flip did not end in 8 s".into());
+        }
+        pause(10, cx).await;
+    }
+}
+
+/// How many px differ between `a` and `b` by more than a little, over `r`
+/// (screen px, cut to what both show).
+fn changed(a: &Shot, b: &Shot, r: Rect) -> u32 {
+    let r = Rect::new(
+        r.left.max(a.rect.left).max(b.rect.left),
+        r.top.max(a.rect.top).max(b.rect.top),
+        r.right.min(a.rect.right).min(b.rect.right),
+        r.bottom.min(a.rect.bottom).min(b.rect.bottom),
+    );
+    if r.width() <= 0 || r.height() <= 0 {
+        return 0;
+    }
+    fn row(s: &Shot, r: Rect, y: i32) -> Option<&[u8]> {
+        let from = ((y - s.rect.top) as usize * s.w as usize + (r.left - s.rect.left) as usize) * 4;
+        s.pixels.get(from..from + r.width() as usize * 4)
+    }
+    let mut n = 0;
+    for y in r.top..r.bottom {
+        let (Some(ra), Some(rb)) = (row(a, r, y), row(b, r, y)) else {
+            continue;
+        };
+        // Mostly the same: whole rows at once.
+        if ra == rb {
+            continue;
+        }
+        for (p, q) in ra.as_chunks::<4>().0.iter().zip(rb.as_chunks::<4>().0) {
+            if p[0].abs_diff(q[0]) > 2 || p[1].abs_diff(q[1]) > 2 || p[2].abs_diff(q[2]) > 2 {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// The screen, taken over and over on a thread of its own while a flip
+/// runs, each picture with the flip's frame drawn last.
+struct Watch {
+    stop: Arc<AtomicBool>,
+    thread: std::thread::JoinHandle<Vec<Caught>>,
+}
+
+struct Caught {
+    ms: u128,
+    drawn: Option<(u16, u16, u16)>,
+    shot: Shot,
+}
+
+/// No more pictures than this are kept of one flip.
+const MOST: usize = 90;
+
+impl Watch {
+    /// Starts taking `rect`; the pictures also go in `folder`.
+    fn start(rect: Rect, folder: PathBuf) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let _ = std::fs::create_dir_all(&folder);
+            let began = Instant::now();
+            let mut caught = Vec::new();
+            while !stopped.load(Ordering::Relaxed) && caught.len() < MOST {
+                let before = crate::flip::drawn();
+                let Some((w, _, pixels)) = win::capture(rect) else {
+                    break;
+                };
+                // Only pictures the flip did not draw a new frame under.
+                let drawn = crate::flip::drawn();
+                caught.push(Caught {
+                    ms: began.elapsed().as_millis(),
+                    drawn: if before == drawn { drawn } else { before },
+                    shot: Shot { rect, w, pixels },
+                });
+            }
+            // Every third, and the ends: saving them all takes too long.
+            for (i, c) in caught.iter().enumerate() {
+                if i % 3 != 0 && i + 1 != caught.len() {
+                    continue;
+                }
+                let h = c.shot.pixels.len() as u32 / 4 / c.shot.w.max(1);
+                let name = match c.drawn {
+                    Some((p, t, w)) => format!("{i:03}-{:05}ms-p{p}-t{t}-w{w}.png", c.ms),
+                    None => format!("{i:03}-{:05}ms-rest.png", c.ms),
+                };
+                let Ok(file) = std::fs::File::create(folder.join(name)) else {
+                    continue;
+                };
+                let png = PngEncoder::new_with_quality(
+                    std::io::BufWriter::new(file),
+                    CompressionType::Fast,
+                    FilterType::NoFilter,
+                );
+                let _ =
+                    png.write_image(&c.shot.pixels, c.shot.w, h, image::ExtendedColorType::Rgba8);
+            }
+            caught
+        });
+        Self { stop, thread }
+    }
+
+    /// Stops, and hands over what it caught once its pictures are saved.
+    async fn stop(self, cx: &mut AsyncApp) -> Vec<Caught> {
+        self.stop.store(true, Ordering::Relaxed);
+        while !self.thread.is_finished() {
+            pause(50, cx).await;
+        }
+        self.thread.join().unwrap_or_default()
+    }
+}
+
+/// Writes what the pictures of a flip show: for each, how many px differ
+/// from the picture before it (over the whole screen), from the view it
+/// started from (inside `from_in`) and from the view it ends in (inside
+/// `to_in`).
+fn tell(
+    report: &mut String,
+    what: &str,
+    frames: &[Caught],
+    from: &Shot,
+    from_in: Rect,
+    to: &Shot,
+    to_in: Rect,
+) {
+    let _ = writeln!(
+        report,
+        "{what}: {} pictures; each: ms, frame drawn (panel/turn/window, thousandths), px changed \
+         since the one before, px unlike the start inside {from_in:?}, px unlike the end inside \
+         {to_in:?}",
+        frames.len()
+    );
+    let mut before: Option<&Shot> = None;
+    for c in frames {
+        let drawn = match c.drawn {
+            Some((p, t, w)) => format!("{p}/{t}/{w}"),
+            None => "rest".into(),
+        };
+        let _ = writeln!(
+            report,
+            "{what}: {:5} {drawn:>14} {:8} {:8} {:8}",
+            c.ms,
+            before.map_or(0, |b| changed(&c.shot, b, c.shot.rect)),
+            changed(&c.shot, from, from_in),
+            changed(&c.shot, to, to_in),
+        );
+        before = Some(&c.shot);
+    }
 }

@@ -54,6 +54,10 @@ pub struct Column {
     pub glance: Option<AnyElement>,
     /// The tree with its rows' words.
     pub body: AnyElement,
+    /// With lines between its rows (the columns scroll together, so they
+    /// run across the table): the row at its body's top, for
+    /// [`row_lines`].
+    pub lines: Option<f32>,
 }
 
 impl Timelines {
@@ -270,9 +274,6 @@ impl Timelines {
         let (shown, shown_path) = (this.clone(), path.clone());
         let paint_path = path.clone();
         let web = graph.as_ref().and_then(|g| g.info.web.clone());
-        // Rows scrolled together line up across the table, so they get
-        // lines like the columns'.
-        let row_lines = together.then_some(p.border);
         let painter = canvas(
             move |bounds, window, cx| {
                 if window.content_mask().bounds.intersects(&bounds) {
@@ -285,9 +286,6 @@ impl Timelines {
                 window.insert_hitbox(bounds, HitboxBehavior::Normal)
             },
             move |bounds, hitbox, window, _cx| {
-                if let Some(color) = row_lines {
-                    paint_row_lines(bounds, top, color, window);
-                }
                 let Some(g) = graph else { return };
                 if moving {
                     window.request_animation_frame();
@@ -394,6 +392,9 @@ impl Timelines {
             title: header.title,
             glance: header.glance,
             body: body.into_any_element(),
+            // Rows scrolled together line up across the table, so they
+            // get lines like the columns'.
+            lines: together.then_some(top),
         }
     }
 
@@ -942,7 +943,6 @@ impl Geometry {
 
 /// Where a column body at its newest commits puts its tree, for the flip
 /// to turn the tree to.
-#[allow(dead_code)] // Until the flip draws from it.
 #[derive(Clone, Copy)]
 pub(super) struct ColumnGeo {
     geo: Geometry,
@@ -952,7 +952,6 @@ pub(super) struct ColumnGeo {
     rows: usize,
 }
 
-#[allow(dead_code)] // Until the flip draws from it.
 impl ColumnGeo {
     pub(super) fn new(bounds: Bounds<Pixels>, g: &RepoGraph, dirty: bool, s: f32) -> Self {
         Self {
@@ -995,57 +994,34 @@ impl ColumnGeo {
     }
 }
 
-/// A column body at rest, for the flip: its tree exactly as the big
-/// window draws it at its newest commits with nothing hovered. `bounds`
-/// are the body's, logical px.
-pub fn paint_still_column(
+/// A column's tree at rest, for the flip: exactly as the big window
+/// draws it at its newest commits with nothing hovered. `bounds` are the
+/// column's body, logical px.
+pub(super) fn paint_column_tree(
     bounds: Bounds<Pixels>,
     g: &RepoGraph,
     dirty: bool,
-    dark: bool,
-    p: &Palette,
+    colors: &Colors,
     window: &mut Window,
 ) {
-    let colors = Colors::new(dark, p);
     let geo = Geometry::new(g, dirty, 0.0);
     window.with_content_mask(Some(ContentMask { bounds }), |window| {
-        paint_column(bounds, g, &geo, Grow::default(), None, &colors, window);
+        paint_column(bounds, g, &geo, Grow::default(), None, colors, window);
     });
 }
 
-/// How wide a column's tree is, from the body's left edge to where its
-/// rows' words start, logical px.
-pub fn tree_width(g: &RepoGraph, dirty: bool) -> f32 {
-    Geometry::new(g, dirty, 0.0).text_left()
-}
-
-/// Where the rows' lines cross a column body `height` logical px tall at
-/// its newest commits, from its top, logical px (as `paint_row_lines`
-/// puts them, before snapping to device px).
-pub fn row_line_tops(height: f32) -> Vec<f32> {
+/// Where the rows' thin lines cross a column's body `height` logical px
+/// tall whose top row is `top`, one between each two rows: device px down
+/// from the body's top, each a crisp px there.
+pub fn row_lines(top: f32, height: f32, s: f32) -> Vec<i32> {
     let mut out = Vec::new();
-    let mut y = ROW;
+    // The line under row k sits where row k + 1 starts.
+    let mut y = (1.0 - top.fract()) * ROW;
     while y < height {
-        out.push(y);
+        out.push((y * s).floor() as i32);
         y += ROW;
     }
     out
-}
-
-/// The rows' thin lines across a column, one between each two rows, the
-/// same colour and width as the lines between the columns.
-fn paint_row_lines(bounds: Bounds<Pixels>, top: f32, color: Hsla, window: &mut Window) {
-    let s = window.scale_factor();
-    let (ox, oy) = (f32::from(bounds.left()), f32::from(bounds.top()));
-    let (x1, h) = (f32::from(bounds.right()), f32::from(bounds.size.height));
-    // The line under row k sits where row k + 1 starts.
-    let mut y = (1.0 - top.fract()) * ROW;
-    while y < h {
-        // On the device pixel grid, so a line stays one crisp pixel.
-        let at = ink::pos(s, oy + y, 1.0);
-        ink::line(window, (ox, at), (x1, at), 1.0, color, None);
-        y += ROW;
-    }
 }
 
 /// A column's highest top: its last row.

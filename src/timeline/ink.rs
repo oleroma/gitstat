@@ -362,13 +362,11 @@ mod tests {
 /// pictures kept at rest, so a shape that has come to rest looks as it
 /// does there. Straight runs, which GPUI draws well wherever they are,
 /// are painted in their turn among them.
-#[allow(dead_code)] // Until the flip draws from it.
 pub struct Batch {
     s: f32,
     ops: Vec<Op>,
 }
 
-#[allow(dead_code)] // Until the flip draws from it.
 enum Op {
     Line {
         a: P,
@@ -399,14 +397,11 @@ thread_local! {
 
 /// A shape's tile: where it goes in the window, its size, and where it is
 /// in the picture; device px.
-#[allow(dead_code)] // Until the flip draws from it.
 type Tile = (P, (u32, u32), (u32, u32));
 
 /// The packed picture's width, device px.
-#[allow(dead_code)] // Until the flip draws from it.
 const SHEET: u32 = 2048;
 
-#[allow(dead_code)] // Until the flip draws from it.
 impl Batch {
     pub fn new(window: &Window) -> Self {
         Self {
@@ -565,7 +560,6 @@ impl Batch {
 }
 
 /// Strokes the cubics through `pts` into `pixmap`, as [`draw`] does.
-#[allow(dead_code)] // Until the flip draws from it.
 fn stroke_into(
     pixmap: &mut tiny_skia::Pixmap,
     pts: &[P],
@@ -598,7 +592,6 @@ fn stroke_into(
 }
 
 /// Draws a dot into `pixmap`, as [`circle`] does.
-#[allow(dead_code)] // Until the flip draws from it.
 fn circle_into(
     pixmap: &mut tiny_skia::Pixmap,
     (cx, cy): P,

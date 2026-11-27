@@ -10,13 +10,12 @@ use crate::layout::Rect;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::{
     DWMNCRP_DISABLED, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_COLOR_NONE,
-    DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_NCRENDERING_POLICY, DWMWA_VISIBLE_FRAME_BORDER_THICKNESS,
-    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DwmFlush, DwmGetWindowAttribute,
-    DwmSetWindowAttribute,
+    DWMWA_NCRENDERING_POLICY, DWMWA_VISIBLE_FRAME_BORDER_THICKNESS, DWMWA_WINDOW_CORNER_PREFERENCE,
+    DWMWCP_DONOTROUND, DwmFlush, DwmGetWindowAttribute, DwmSetWindowAttribute,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    ClientToScreen, CreateEllipticRgn, DeleteObject, EnumDisplayMonitors, GetMonitorInfoW, HDC,
-    HMONITOR, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
+    ClientToScreen, CreateEllipticRgn, DeleteObject, GetMonitorInfoW, HMONITOR,
+    MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
     ScreenToClient, SetWindowRgn,
 };
 use windows_sys::Win32::UI::Controls::{
@@ -345,33 +344,6 @@ pub unsafe fn click_through(h: isize, through: bool) {
     }
 }
 
-/// Every monitor's work area, physical px.
-pub fn work_areas() -> Vec<Rect> {
-    unsafe extern "system" fn each(
-        mon: HMONITOR,
-        _: HDC,
-        _: *mut RECT,
-        data: LPARAM,
-    ) -> windows_sys::core::BOOL {
-        let out = unsafe { &mut *(data as *mut Vec<Rect>) };
-        out.push(monitor_info(mon).work);
-        1
-    }
-    let mut out: Vec<Rect> = Vec::new();
-    unsafe {
-        EnumDisplayMonitors(
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            Some(each),
-            (&raw mut out) as LPARAM,
-        )
-    };
-    if out.is_empty() {
-        out.push(primary_monitor().work);
-    }
-    out
-}
-
 /// The scale `h` draws at, from its monitor's DPI.
 pub fn window_scale(h: isize) -> Option<f32> {
     let hwnd = live(h)?;
@@ -402,27 +374,6 @@ pub fn dwm_flush() {
 pub fn uncloak(h: isize) {
     let Some(hwnd) = live(h) else { return };
     unsafe { dwm_set(hwnd, 13, 0) };
-}
-
-/// Puts the hidden flip window's client area at `r`, still hidden, so it
-/// draws its first frame at its size before it shows.
-///
-/// # Safety
-/// Call only from a spawned task outside `update`.
-pub unsafe fn size_morph(h: isize, r: Rect) {
-    let Some(hwnd) = live(h) else { return };
-    unsafe {
-        let (dx, dy, bw, bh) = frame(hwnd);
-        SetWindowPos(
-            hwnd,
-            HWND_TOPMOST,
-            r.left - dx,
-            r.top - dy,
-            r.width() + bw,
-            r.height() + bh,
-            SWP_NOACTIVATE,
-        );
-    }
 }
 
 /// Puts the flip's client area at `r`, topmost and shown without activation.
@@ -597,30 +548,6 @@ pub fn rim_thickness(h: isize) -> Option<u32> {
         )
     } == 0;
     (ok && (1..=8).contains(&v)).then_some(v)
-}
-
-/// How far the window's visible frame (where Windows draws its rim)
-/// reaches past its client area on each side, physical px (left, top:
-/// the title bar, right, bottom).
-pub fn frame_insets(h: isize) -> Option<(i32, i32, i32, i32)> {
-    let hwnd = live(h)?;
-    let client = client_rect(h)?;
-    let mut r = RECT::default();
-    let ok = unsafe {
-        DwmGetWindowAttribute(
-            hwnd,
-            DWMWA_EXTENDED_FRAME_BOUNDS as u32,
-            (&raw mut r).cast(),
-            size_of::<RECT>() as u32,
-        )
-    } == 0;
-    let d = (
-        client.left - r.left,
-        client.top - r.top,
-        r.right - client.right,
-        r.bottom - client.bottom,
-    );
-    (ok && [d.0, d.1, d.2, d.3].iter().all(|v| (0..200).contains(v))).then_some(d)
 }
 
 /// `s` as a NUL-ended UTF-16 string.

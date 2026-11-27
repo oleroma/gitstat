@@ -339,8 +339,11 @@ impl Element for Text {
             std::slice::from_ref(&run),
             None,
         );
-        // As it was measured: words that fit as shaped stay on one line.
-        let fits = !self.text.contains('\n') && f32::from(whole.width) <= box_w + 0.5;
+        // As it was measured: words that fit as shaped stay on one line,
+        // and so do words whose box is one line tall, whatever a rounding
+        // of its width made of it.
+        let one_row = f32::from(bounds.size.height) < line_height * 1.5;
+        let fits = !self.text.contains('\n') && (one_row || f32::from(whole.width) <= box_w + 0.5);
         if !wraps(&style) || fits {
             let mut line = whole;
             if style.text_overflow.is_some() && f32::from(line.width) > box_w + 0.5 {

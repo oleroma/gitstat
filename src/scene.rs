@@ -10,12 +10,16 @@
 //! - [`window`]: where the big window's parts go.
 //! - [`text`]: words on whole device px, the same in every window.
 //! - [`paint`]: the other parts' painters.
+//! - [`parts`]: a view as a list of parts, and the list part way between
+//!   two views.
 
 pub mod panel;
 pub mod window;
 
 #[cfg(windows)]
 pub mod paint;
+#[cfg(windows)]
+pub mod parts;
 #[cfg(windows)]
 pub mod text;
 

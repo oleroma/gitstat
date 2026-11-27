@@ -79,9 +79,64 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
+thread_local! {
+    /// Pictures at part strength, by the picture and the strength in
+    /// 32nds: made as a part fades, let go when the fading is over.
+    static FADED: std::cell::RefCell<
+        std::collections::HashMap<(usize, u8), std::sync::Arc<gpui::RenderImage>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Paints `image` in `b` at `alpha` of its strength. GPUI paints a picture
+/// whole or not at all, so one part way is a copy made at that strength.
+pub fn image(
+    window: &mut Window,
+    b: Bounds<Pixels>,
+    image: std::sync::Arc<gpui::RenderImage>,
+    alpha: f32,
+) {
+    let step = (alpha.clamp(0.0, 1.0) * 32.0).round() as u8;
+    if step == 0 {
+        return;
+    }
+    let shown = if step >= 32 {
+        Some(image)
+    } else {
+        let key = (std::sync::Arc::as_ptr(&image) as usize, step);
+        FADED.with(|faded| {
+            if let Some(kept) = faded.borrow().get(&key) {
+                return Some(kept.clone());
+            }
+            let size = image.size(0);
+            let (w, h) = (size.width.0 as u32, size.height.0 as u32);
+            let mut data = image.as_bytes(0)?.to_vec();
+            for px in data.as_chunks_mut::<4>().0 {
+                px[3] = (u16::from(px[3]) * u16::from(step) / 32) as u8;
+            }
+            let buffer = image::RgbaImage::from_raw(w, h, data)?;
+            let made = std::sync::Arc::new(gpui::RenderImage::new([image::Frame::new(buffer)]));
+            faded.borrow_mut().insert(key, made.clone());
+            Some(made)
+        })
+    };
+    if let Some(shown) = shown {
+        window
+            .paint_image(b, Default::default(), shown, 0, false)
+            .ok();
+    }
+}
+
+/// The fading is over: lets go of the pictures made for it.
+pub fn forget_faded(window: &mut Window) {
+    let faded = FADED.with(|faded| std::mem::take(&mut *faded.borrow_mut()));
+    for (_, picture) in faded {
+        window.drop_image(picture).ok();
+    }
+}
+
 /// Paints the app's icon in the square `r` (device px from the corner at
-/// `at`), drawn at exactly that many px.
-pub fn app_icon(window: &mut Window, r: Rect, at: (i32, i32)) {
+/// `at`), drawn at exactly that many px, at `alpha` of its strength.
+pub fn app_icon(window: &mut Window, r: Rect, at: (i32, i32), alpha: f32) {
     let n = r.width().min(r.height());
     if n <= 0 {
         return;
@@ -113,10 +168,8 @@ pub fn app_icon(window: &mut Window, r: Rect, at: (i32, i32)) {
             })
             .clone()
     });
-    if let Some(image) = image {
+    if let Some(picture) = image {
         let s = window.scale_factor();
-        window
-            .paint_image(bounds(r, at, s), Default::default(), image, 0, false)
-            .ok();
+        self::image(window, bounds(r, at, s), picture, alpha);
     }
 }

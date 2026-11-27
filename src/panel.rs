@@ -107,9 +107,28 @@ pub fn is_leaving(cx: &App) -> bool {
     slide_state(cx) == SlideState::Leaving
 }
 
-/// When the open panel was opened or last refitted.
-pub fn fitted_at(cx: &App) -> Option<Instant> {
-    cx.try_global::<PanelSlot>()?.fitted
+/// The open panel's window on the screen, physical px: its monitor's
+/// work area.
+pub fn area(cx: &App) -> Option<Rect> {
+    if !is_open(cx) {
+        return None;
+    }
+    cx.try_global::<PanelSlot>()?.area
+}
+
+/// Where the open panel's window's inside starts on the screen, physical
+/// px: what it draws is placed from there.
+pub fn origin(cx: &App) -> Option<(i32, i32)> {
+    let slot = cx.try_global::<PanelSlot>()?;
+    let client = slot.hwnd.and_then(win::client_rect).or(slot.area)?;
+    Some((client.left, client.top))
+}
+
+/// Whether the open panel's window is where it belongs yet.
+pub fn placed(cx: &App) -> bool {
+    cx.try_global::<PanelSlot>().is_some_and(|slot| {
+        slot.area.is_some() && slot.hwnd.and_then(win::client_rect) == slot.area
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -142,7 +161,7 @@ impl PanelSlot {
 /// click is the tail of the one that just closed it.
 pub fn toggle(anchor: Anchor, cx: &mut App) {
     // A flip under way owns the panel: toggled once it has ended.
-    if crate::morph::hold_toggle(anchor, cx) {
+    if crate::flip::hold_toggle(anchor, cx) {
         return;
     }
     if is_open(cx) {
@@ -342,8 +361,7 @@ fn open(anchor: Anchor, slide: bool, cloaked: bool, cx: &mut App) {
         Anchor::Tray(None) => Anchor::Tray(Some(anchor_rect(anchor))),
         a => a,
     };
-    crate::morph::clear_strips();
-    if !crate::morph::running(cx) {
+    if !crate::flip::running(cx) {
         crate::frames::watch(win::primary_monitor().rect, "panel", cx);
     }
     if let Some(t) = cx.try_global::<Ui>().map(|ui| ui.timelines.clone()) {
@@ -397,11 +415,9 @@ fn open(anchor: Anchor, slide: bool, cloaked: bool, cx: &mut App) {
                     window.activate_window();
                 }
                 if let Some(h) = hwnd {
-                    // Native window calls must run outside this update. A
-                    // flip drawing over it stays above it.
-                    let under = crate::morph::flip_hwnd(cx);
+                    // Native window calls must run outside this update.
                     cx.spawn(async move |_| unsafe {
-                        win::place_panel(h, area, under);
+                        win::place_panel(h, area, None);
                         win::click_through(h, true);
                         if cloaked {
                             // Shown without taking the foreground: the big
@@ -450,6 +466,9 @@ fn track_mouse(handle: WindowHandle<StatusView>, cx: &mut App) {
         loop {
             cx.background_executor().timer(MOUSE_EVERY).await;
             let open = cx.update(|cx| {
+                // A flip is drawn all over its window, and takes what
+                // clicks land on it.
+                let flipping = crate::flip::running(cx);
                 let slot = cx.default_global::<PanelSlot>();
                 if slot.handle != Some(handle) {
                     return false;
@@ -458,10 +477,11 @@ fn track_mouse(handle: WindowHandle<StatusView>, cx: &mut App) {
                     return true;
                 };
                 let (x, y) = win::cursor_pos();
-                let on_panel = slot.shown
-                    && !slot.leaving
-                    && (rect.left..rect.right).contains(&x)
-                    && (rect.top..rect.bottom).contains(&y);
+                let on_panel = flipping
+                    || slot.shown
+                        && !slot.leaving
+                        && (rect.left..rect.right).contains(&x)
+                        && (rect.top..rect.bottom).contains(&y);
                 if slot.through == on_panel {
                     slot.through = !on_panel;
                     cx.spawn(async move |_| unsafe { win::click_through(h, !on_panel) })
@@ -609,7 +629,7 @@ pub fn then_window(anchor: Anchor, cx: &mut App) {
     cx.spawn(async move |cx| {
         cx.background_executor().timer(wait).await;
         cx.update(|cx| {
-            if crate::morph::running(cx) {
+            if crate::flip::running(cx) {
                 return;
             }
             let slot = cx.default_global::<PanelSlot>();
@@ -619,7 +639,7 @@ pub fn then_window(anchor: Anchor, cx: &mut App) {
             if let Some(handle) = slot.handle {
                 handle
                     .update(cx, |_, window, cx| {
-                        crate::morph::open_window(window, None, cx)
+                        crate::flip::open_window(window, None, cx)
                     })
                     .ok();
             }
@@ -633,7 +653,7 @@ pub fn then_window(anchor: Anchor, cx: &mut App) {
 /// it at once when sliding is off. A flip under way that owns the panel
 /// lets it go once that ends.
 pub fn slide_away(cx: &mut App) {
-    if crate::morph::hold_leave(cx) {
+    if crate::flip::hold_leave(cx) {
         return;
     }
     slide_away_now(cx);
