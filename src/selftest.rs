@@ -199,7 +199,9 @@ async fn run(out: &std::path::Path, report: &mut String, cx: &mut AsyncApp) -> R
     let Some(place) = place else {
         return Err("no place for the panel".into());
     };
-    let before = shot(out, "panel-before", around(place), cx).await;
+    // The whole screen: with the badge showing, the guess is beside the
+    // badge, not by the tray where this opens it.
+    let before = shot(out, "panel-before", mon.rect, cx).await;
     let opened = Instant::now();
     cx.update(|cx| {
         crate::frames::crop(Some(around(place)));
@@ -757,6 +759,28 @@ fn unlike_cells(out: &std::path::Path, name: &str, a: &Shot, b: &Shot, r: Rect) 
         if i < 10 {
             let square = Rect::new(left - 8, top - 8, left + CELL + 8, top + CELL + 8);
             save_zoomed(out, &format!("{name}-square-{i}"), a, b, square);
+        }
+        // A few px around the first, as numbers (each px's red, in hex):
+        // the flip's rows, then the view's.
+        if n < 200 && lines.len() < 150 {
+            for (who, shot) in [("flip", a), ("rest", b)] {
+                for y in at.1 - 2..at.1 + 8 {
+                    let row: Vec<String> = (at.0 - 4..at.0 + 12)
+                        .map(|x| {
+                            let inside = x >= shot.rect.left
+                                && x < shot.rect.right
+                                && y >= shot.rect.top
+                                && y < shot.rect.bottom;
+                            if inside {
+                                format!("{:02x}", shot.at(x, y)[0])
+                            } else {
+                                "--".into()
+                            }
+                        })
+                        .collect();
+                    lines.push(format!("  {who} y{y}: {}", row.join(" ")));
+                }
+            }
         }
     }
     lines

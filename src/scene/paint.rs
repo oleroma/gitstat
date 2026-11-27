@@ -19,6 +19,23 @@ pub fn bounds(r: Rect, at: (i32, i32), s: f32) -> Bounds<Pixels> {
     )
 }
 
+/// How far past its whole device px a slot is put: a slot lays its own
+/// insides out in whole logical px, which at a scale like 1.25 land
+/// exactly on quarter px, where GPUI picks one of four pictures of each
+/// glyph. A hair past, the pick no longer hangs on the last bit of a
+/// sum, which differs with where the view's corner is: the big window
+/// drawn in the panel's window would pick otherwise than in its own. Too
+/// small to tint an edge.
+const SLOT_HAIR: f32 = 1.0 / 128.0;
+
+/// Where a slot at `r` goes: its corner, as [`bounds`] has it, a hair on.
+pub fn slot_origin(r: Rect, at: (i32, i32), s: f32) -> gpui::Point<Pixels> {
+    point(
+        px(((r.left + at.0) as f32 + SLOT_HAIR) / s),
+        px(((r.top + at.1) as f32 + SLOT_HAIR) / s),
+    )
+}
+
 /// Fills `b` with `color`.
 pub fn fill(window: &mut Window, b: Bounds<Pixels>, color: Hsla) {
     if color.a > 0.0 && b.size.width > px(0.0) && b.size.height > px(0.0) {

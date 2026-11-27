@@ -523,7 +523,7 @@ impl WindowScene {
                             cells.push(put(slot, c.title, at, s, alpha, window, cx));
                         }
                         if let (Some(mut el), Some(g)) = (glances.next().flatten(), c.glance) {
-                            el.prepaint_at(paint::bounds(g, at, s).origin, window, cx);
+                            el.prepaint_at(paint::slot_origin(g, at, s), window, cx);
                             cells.push(el);
                         }
                     }
@@ -532,11 +532,11 @@ impl WindowScene {
             }
         });
         let prs = laid.prs.take().zip(layout.prs).map(|(mut el, r)| {
-            el.prepaint_at(paint::bounds(r, at, s).origin, window, cx);
+            el.prepaint_at(paint::slot_origin(r, at, s), window, cx);
             el
         });
         let footer = laid.footer.take().map(|mut el| {
-            el.prepaint_at(paint::bounds(layout.footer, at, s).origin, window, cx);
+            el.prepaint_at(paint::slot_origin(layout.footer, at, s), window, cx);
             el
         });
         Slots {

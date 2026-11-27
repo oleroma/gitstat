@@ -133,7 +133,7 @@ pub(super) fn put(
         .child(slot)
         .into_any_element();
     el.prepaint_as_root(
-        b.origin,
+        paint::slot_origin(r, at, s),
         size(
             AvailableSpace::Definite(b.size.width),
             AvailableSpace::Definite(b.size.height),
@@ -577,13 +577,13 @@ impl PanelScene {
                     }
                 }
                 for (mut el, r) in tail.into_iter().zip(&layout.tail) {
-                    el.prepaint_at(paint::bounds(*r, at, s).origin, window, cx);
+                    el.prepaint_at(paint::slot_origin(*r, at, s), window, cx);
                     listed.push(el);
                 }
             },
         );
         let footer = laid.footer.take().zip(layout.footer).map(|(mut el, r)| {
-            el.prepaint_at(paint::bounds(r, at, s).origin, window, cx);
+            el.prepaint_at(paint::slot_origin(r, at, s), window, cx);
             el
         });
         Slots {

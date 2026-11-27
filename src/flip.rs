@@ -946,6 +946,9 @@ fn start_close(direction: Direction, cx: &mut App) -> bool {
                     // The big window is off the screen: the panel takes
                     // the keyboard.
                     panel::activate(cx);
+                    // Activating put it over the badge: the badge back
+                    // over it at once.
+                    crate::overlay::over_flip(cx);
                     view::close_window(cx);
                     redraw_stage(cx);
                 }
