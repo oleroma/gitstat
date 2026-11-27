@@ -5,9 +5,10 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.isSystemInDarkTheme
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -45,20 +46,20 @@ import gitstat.core.Tree
 import gitstat.core.tree
 
 /** Rows and lanes of the columns' trees. */
-private val ROW = 26.dp
-private val LANE = 11.dp
-private val DOT = 4.dp
-private val COLUMN = 168.dp
-private val HEADER = 54.dp
+private val ROW = 32.dp
+private val LANE = 16.dp
+private val DOT = 5.dp
+private val HEADER = 60.dp
 
 /** A commit picked on a tree, for the card at the bottom of the screen. */
 data class Picked(val repo: Repo, val commit: Commit, val branch: String?)
 
 /**
- * The repos as columns side by side, as gitstat's big window shows them: a header with the
- * repo's dot and name, and under it the repo's tree running down, newest at the top. The
- * columns scroll down together, and sideways when they don't all fit.
+ * One repo per screen, its tree filling the width: swipe sideways for the next repo (red ones
+ * first), scroll down through the repo's history. Each page has the repo's dot, name and
+ * state on top; tapping it opens the repo's branches and pull requests.
  */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun Board(
     snap: Snapshot,
@@ -68,67 +69,69 @@ fun Board(
 ) {
     val repos = remember(snap) { snap.sorted() }
     val trees = remember(snap) { repos.associate { it.slug to it.tree() } }
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+    val pager = rememberPagerState { repos.size }
+    Column(Modifier.fillMaxSize()) {
         header()
-        Row(
-            Modifier.horizontalScroll(rememberScrollState()).padding(start = 8.dp, end = 8.dp, bottom = 32.dp),
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            for (repo in repos) {
-                RepoColumn(repo, trees.getValue(repo.slug), snap.login, onRepo, onCommit)
-            }
+        HorizontalPager(state = pager, modifier = Modifier.fillMaxSize(), key = { repos[it].slug }) { page ->
+            val repo = repos[page]
+            RepoPage(repo, trees.getValue(repo.slug), snap.login, "${page + 1} / ${repos.size}", onRepo, onCommit)
         }
     }
 }
 
 @Composable
-private fun RepoColumn(
+private fun RepoPage(
     repo: Repo,
     tree: Tree,
     login: String,
+    position: String,
     onRepo: (Repo) -> Unit,
     onCommit: (Picked) -> Unit,
 ) {
     val c = LocalColors.current
     Column(
-        Modifier.width(COLUMN)
+        Modifier.fillMaxSize().padding(horizontal = 8.dp)
             .background(c.surface, RoundedCornerShape(12.dp))
-            .border(1.dp, c.border, RoundedCornerShape(12.dp)),
+            .border(1.dp, c.border, RoundedCornerShape(12.dp))
+            .verticalScroll(rememberScrollState()),
     ) {
         Column(
-            Modifier.fillMaxWidth().height(HEADER).clickable { onRepo(repo) }.padding(horizontal = 10.dp, vertical = 8.dp),
+            Modifier.fillMaxWidth().height(HEADER).clickable { onRepo(repo) }.padding(horizontal = 14.dp, vertical = 8.dp),
         ) {
             Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                Box(Modifier.size(10.dp).background(c.of(repo.health), CircleShape))
-                Spacer(Modifier.width(8.dp))
+                Box(Modifier.size(12.dp).background(c.of(repo.health), CircleShape))
+                Spacer(Modifier.width(10.dp))
                 Text(
                     repo.name,
                     color = c.text,
                     fontWeight = FontWeight.SemiBold,
-                    fontSize = 14.sp,
+                    fontSize = 17.sp,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
                 )
+                Text(position, color = c.muted, fontSize = 12.sp)
             }
             val n = repo.hanging.size
             Text(
                 when {
                     repo.problem != null -> "couldn't read"
-                    n > 0 -> "${branchCount(n)} not merged"
+                    n > 0 -> "${branchCount(n)} not merged: " + repo.hanging.joinToString(", ") { it.name }
                     else -> "all merged"
                 } + if (repo.owner != login) " · ${repo.owner}" else "",
                 color = if (n > 0) c.red else c.muted,
-                fontSize = 12.sp,
+                fontSize = 13.sp,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
         }
         Box(Modifier.fillMaxWidth().height(1.dp).background(c.border))
         if (repo.commits.isEmpty()) {
-            Text("No commits read", color = c.muted, fontSize = 12.sp, modifier = Modifier.padding(10.dp))
+            Text("No commits read yet. Pull down to refresh.", color = c.muted, fontSize = 13.sp, modifier = Modifier.padding(14.dp))
         } else {
             TreeCanvas(repo, tree, onCommit)
         }
+        Spacer(Modifier.height(24.dp))
     }
 }
 
@@ -140,7 +143,7 @@ private fun TreeCanvas(repo: Repo, tree: Tree, onCommit: (Picked) -> Unit) {
     val density = LocalDensity.current
     val rowPx = with(density) { ROW.toPx() }
     val lanes = tree.width.coerceAtMost(MAX_LANES)
-    val treeW: Dp = LANE * lanes + 10.dp
+    val treeW: Dp = LANE * lanes + 14.dp
     val branchAt = remember(repo) {
         repo.branches.associate { it.tip to it.name } + (repo.defaultTip to repo.defaultBranch)
     }
@@ -157,7 +160,7 @@ private fun TreeCanvas(repo: Repo, tree: Tree, onCommit: (Picked) -> Unit) {
     ) {
         Canvas(Modifier.width(treeW).height(ROW * tree.rows + 6.dp)) {
             val lanePx = LANE.toPx()
-            val x0 = 5.dp.toPx() + lanePx / 2
+            val x0 = 7.dp.toPx() + lanePx / 2
             fun x(l: Float) = x0 + l.coerceAtMost((lanes - 1).toFloat()) * lanePx
             fun y(r: Float) = r * rowPx + rowPx / 2
             val stroke = Stroke(width = 1.6.dp.toPx(), cap = StrokeCap.Round)
@@ -192,8 +195,8 @@ private fun TreeCanvas(repo: Repo, tree: Tree, onCommit: (Picked) -> Unit) {
                 Box(Modifier.height(ROW).padding(end = 8.dp), contentAlignment = androidx.compose.ui.Alignment.CenterStart) {
                     Text(
                         commit.subject,
-                        color = c.muted,
-                        fontSize = 11.sp,
+                        color = c.text,
+                        fontSize = 13.sp,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
