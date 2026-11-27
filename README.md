@@ -151,13 +151,15 @@ is running; it can also hide while everything is synced.
 **Right-click it** and it grows into a small floating view that stays on top
 like the badge: a row per repo, its tree and its icon, with the words in
 tooltips. It lists the repos you pin (**Pin to the floating view** in a repo's
-right-click menu) and the ones you worked on in the last few days. A click on
-a repo's icon opens it in the big window; a right click on the view turns it
-back into the badge. Drag the view by its top bar, and drag its free side edge
-to make it wider or narrower. The pencil in its top bar puts the rows in
-order: drag a row by its handle, take one out with its ✕, and undo either with
-the arrow beside **done**. **Settings ▸ Icon and badge ▸ Floating view** has
-its corners, how see-through it is, how many days count as lately, and its
+right-click menu in the panel) and the ones you worked on in the last few
+days. Click a repo's icon for its GitHub page, right-click it for its folder,
+drag it to put the row somewhere else, and middle-click it to take the repo
+out of the view (it asks first). After a change an undo button shows on its
+own small plate under the view for a few seconds. The wheel over a tree
+scrolls that tree through time. Drag the view by any empty spot, and drag its
+free side edge to make it wider or narrower; a right click anywhere else on it
+turns it back into the badge. **Settings ▸ Icon and badge ▸ Floating view**
+has its corners, how see-through it is, how many days count as lately, and its
 health bar and pull request marks.
 
 ### Folder icons in Explorer
@@ -436,7 +438,7 @@ from an older version keeps working:
 | `float.hidden` | `[]` | Repos taken out of the floating view though worked on lately. Pinning one brings it back. |
 | `float.order` | `[]` | The order the view's rows were dragged into; repos not named here follow. |
 | `float.recent_days` | 3 | Repos worked on in this many days are listed after the pinned ones. 0 lists the pinned ones alone. |
-| `float.width` | 220 | The view's width in px at 100% scale, 120 to 480. Drag its free side edge to change it. |
+| `float.width` | 220 | The view's width in px at 100% scale, 120 to 1600. Drag its free side edge to change it. |
 | `float.opacity` | 1.0 | How solid the view's background is, 0.2 to 1. |
 | `float.health` | true | The bar of green, amber and red repos along the view's top. |
 | `float.prs` | true | A mark per open pull request along the view's bottom. |

@@ -154,21 +154,18 @@ enum Spot {
     Off,
     /// The sheet itself: where the mouse takes hold of it.
     Sheet,
-    Row(usize),
-    /// The top bar's buttons: put the rows in order, undo, done.
-    Edit,
+    /// A row's tree, which the view is dragged by too, and its icon.
+    Strip(usize),
+    Icon(usize),
+    /// The undo button on its plate beside the view.
     Undo,
-    Done,
-    /// A row's handle and its way out, while the rows are put in order.
-    Grip(usize),
-    Remove(usize),
     /// The side edge that is dragged to make the view wider.
     Edge,
     /// The pull requests' marks.
     Tail,
 }
 
-/// A row taken hold of by its handle, on its way to another place.
+/// A row taken hold of by its icon, on its way to another place.
 struct Reorder {
     path: PathBuf,
     from: usize,
@@ -188,15 +185,18 @@ struct Spots {
     live: bool,
     sheet: Rect,
     edge: Option<Rect>,
-    buttons: Vec<(Rect, Spot)>,
+    undo: Option<Rect>,
     list: Option<Rect>,
-    /// Each row, cut to the list, with its handle and its way out.
-    rows: Vec<(Rect, Option<Rect>, Option<Rect>)>,
+    /// Each row and its icon's column, cut to the list.
+    rows: Vec<(Rect, Rect)>,
     tail: Option<Rect>,
 }
 
 impl Spots {
     fn at(&self, at: (i32, i32)) -> Spot {
+        if self.undo.is_some_and(|r| contains(r, at)) {
+            return Spot::Undo;
+        }
         if !self.live {
             return if contains(self.sheet, at) {
                 Spot::Sheet
@@ -210,38 +210,31 @@ impl Spots {
         if !contains(self.sheet, at) {
             return Spot::Off;
         }
-        if let Some((_, spot)) = self.buttons.iter().find(|(r, _)| contains(*r, at)) {
-            return *spot;
-        }
         if self.tail.is_some_and(|r| contains(r, at)) {
             return Spot::Tail;
         }
         if self.list.is_some_and(|l| contains(l, at)) {
-            for (i, (rect, grip, remove)) in self.rows.iter().enumerate() {
-                if !contains(*rect, at) {
-                    continue;
+            for (i, (rect, label)) in self.rows.iter().enumerate() {
+                if contains(*label, at) {
+                    return Spot::Icon(i);
                 }
-                return if grip.is_some_and(|r| contains(r, at)) {
-                    Spot::Grip(i)
-                } else if remove.is_some_and(|r| contains(r, at)) {
-                    Spot::Remove(i)
-                } else {
-                    Spot::Row(i)
-                };
+                if contains(*rect, at) {
+                    return Spot::Strip(i);
+                }
             }
         }
         Spot::Sheet
     }
 }
 
-/// The glyphs of the view's buttons, in the title bar's font.
-const GLYPH_EDIT: &str = "\u{e70f}";
+/// The undo button's glyph, in the title bar's font, and its size,
+/// logical px.
 const GLYPH_UNDO: &str = "\u{e7a7}";
-const GLYPH_DONE: &str = "\u{e8fb}";
-const GLYPH_REMOVE: &str = "\u{e711}";
-const GLYPH_GRIP: &str = "\u{e700}";
-/// Their size, logical px.
-const GLYPH: f32 = 10.0;
+const GLYPH: f32 = 12.0;
+/// How long the undo plate stays after the last change, and how long it
+/// takes to come and go.
+const PLATE_STAYS: Duration = Duration::from_secs(8);
+const PLATE_FADE: f32 = 0.15;
 
 /// A repo's row in the view.
 struct RowPart {
@@ -273,9 +266,8 @@ struct Scene {
     health: Option<([usize; 3], bool)>,
     rows: Vec<RowPart>,
     scroll: i32,
-    /// The rows are being put in order; whether there is a step to undo.
-    edit: bool,
-    can_undo: bool,
+    /// The undo plate, in this window, and how far it has come.
+    plate: Option<(Rect, f32)>,
     /// The row taken hold of.
     dragged: Option<usize>,
     spot: Spot,
@@ -294,6 +286,8 @@ struct Laid {
     spots: Spots,
     /// Where the mouse shows that the view can be made wider.
     edge: Option<gpui::Hitbox>,
+    /// The undo plate, drawn with its own shadow.
+    plate: Option<(Rect, f32)>,
     max_scroll: i32,
     strip: i32,
 }
@@ -379,10 +373,9 @@ impl Scene {
                 radius: self.radius,
                 rows: self.rows.len(),
                 health: self.health.is_some(),
-                buttons: if self.edit { 2 } else { 1 },
+                buttons: 0,
                 tail: usize::from(!self.prs.is_empty()),
                 scroll: self.scroll,
-                edit: self.edit,
             });
             // Scrolled past its end (rows went): back to it.
             if l.scroll != self.scroll {
@@ -396,7 +389,7 @@ impl Scene {
                 part.alpha = alpha;
                 part
             };
-            let (spot, font, hover) = (self.spot, self.font, p.hover);
+            let hover = p.hover;
             // What the mouse is on shows it.
             let lit = |r: Rect| faded(Part::fill(Key::Own, r, hover).radii([4.0; 4]));
             if let (Some(bar), Some((counts, checking))) = (l.bar, self.health) {
@@ -411,24 +404,6 @@ impl Scene {
                     },
                 )));
             }
-            // The buttons, right to left.
-            let buttons = if self.edit {
-                vec![
-                    (Spot::Done, GLYPH_DONE, true),
-                    (Spot::Undo, GLYPH_UNDO, self.can_undo),
-                ]
-            } else {
-                vec![(Spot::Edit, GLYPH_EDIT, true)]
-            };
-            for (&(which, code, live), r) in buttons.iter().zip(&l.buttons) {
-                let r = sh(*r);
-                if live && spot == which {
-                    parts.push(lit(r));
-                }
-                let color = if live { p.muted } else { p.muted.opacity(0.4) };
-                parts.push(faded(glyph(r, code, color, font, s)));
-                spots.buttons.push((r, which));
-            }
             if let Some(empty) = l.empty {
                 let lh = place::px(line_height(TINY), s);
                 let top = empty.top + (empty.height() - lh) / 2;
@@ -436,7 +411,7 @@ impl Scene {
                     Part::words(
                         Key::Own,
                         sh(Rect::new(empty.left, top, empty.right, top + lh)),
-                        "Pin repos from their menu",
+                        "Pin repos from the panel's menu",
                         Look::new(TINY, p.muted),
                     )
                     .centred(),
@@ -457,20 +432,6 @@ impl Scene {
                 }
                 if self.dragged == Some(i) {
                     parts.push(lit(sh(down(row.rect, d))).clipped());
-                }
-                if let Some(grip) = row.grip {
-                    let r = sh(down(grip, d));
-                    if spot == Spot::Grip(i) && self.dragged.is_none() {
-                        parts.push(lit(r).clipped());
-                    }
-                    parts.push(faded(glyph(r, GLYPH_GRIP, p.muted, font, s)).clipped());
-                }
-                if let Some(remove) = row.remove {
-                    let r = sh(down(remove, d));
-                    if spot == Spot::Remove(i) && self.dragged.is_none() {
-                        parts.push(lit(r).clipped());
-                    }
-                    parts.push(faded(glyph(r, GLYPH_REMOVE, p.muted, font, s)).clipped());
                 }
                 parts.push(faded(
                     Part::new(
@@ -536,7 +497,7 @@ impl Scene {
             spots.rows = l
                 .rows
                 .iter()
-                .map(|row| (cut(sh(row.rect)), row.grip.map(sh), row.remove.map(sh)))
+                .map(|row| (cut(sh(row.rect)), cut(sh(row.label))))
                 .collect();
             spots.list = Some(shown);
             spots.live = self.pose.rows >= 1.0;
@@ -559,6 +520,37 @@ impl Scene {
                     ));
             }
         }
+        // The undo plate: a small sheet of its own beside the view.
+        let plate = self.plate.filter(|(_, a)| *a > 0.0);
+        if let Some((r, a)) = plate {
+            let rim = (s.round() as i32).max(1);
+            let pr = place::PLATE_RADIUS;
+            let fade = |mut part: Part| {
+                part.alpha = a;
+                part
+            };
+            parts.push(fade(
+                Part::fill(Key::Own, r, p.border).radii([pr; 4]).over(),
+            ));
+            let inner = Rect::new(r.left + rim, r.top + rim, r.right - rim, r.bottom - rim);
+            let ground = p.bg.opacity(self.opacity.max(0.85));
+            parts.push(fade(
+                Part::fill(Key::Own, inner, ground)
+                    .radii([pr - rim as f32 / s; 4])
+                    .over(),
+            ));
+            if self.spot == Spot::Undo {
+                parts.push(fade(
+                    Part::fill(Key::Own, inner, p.hover)
+                        .radii([pr - rim as f32 / s; 4])
+                        .over(),
+                ));
+            }
+            parts.push(fade(glyph(r, GLYPH_UNDO, p.text, self.font, s)));
+            if a >= 1.0 {
+                spots.undo = Some(r);
+            }
+        }
         let picture = Picture {
             sheet: Some(Sheet {
                 frame: sheet,
@@ -579,6 +571,7 @@ impl Scene {
             list,
             spots,
             edge,
+            plate,
             max_scroll,
             strip: place::px(place::STRIP, s),
         }
@@ -668,9 +661,13 @@ impl Element for Scene {
                 return;
             }
             let spot = at_down.at(dev(e.position));
-            match e.button {
-                MouseButton::Left => down(spot, cx),
-                MouseButton::Right if !matches!(spot, Spot::Off | Spot::Edge) => toggle(cx),
+            match (e.button, spot) {
+                (MouseButton::Left, _) => down(spot, cx),
+                // An icon: its folder; anywhere else on it, the badge.
+                (MouseButton::Right, Spot::Icon(row)) => open_row(row, false, cx),
+                (MouseButton::Right, Spot::Off | Spot::Edge | Spot::Undo) => {}
+                (MouseButton::Right, _) => toggle(cx),
+                (MouseButton::Middle, Spot::Icon(row)) => ask_take_out(row, cx),
                 _ => {}
             }
         });
@@ -723,6 +720,18 @@ impl Element for Scene {
                 spread_radius: px(0.),
             }],
         );
+        if let Some((r, a)) = laid.plate {
+            window.paint_shadows(
+                paint::bounds(r, (0, 0), s),
+                gpui::Corners::all(px(place::PLATE_RADIUS)),
+                &[BoxShadow {
+                    color: gpui::hsla(0., 0., 0., 0.35 * a),
+                    offset: point(px(0.), px(0.5)),
+                    blur_radius: px(0.75),
+                    spread_radius: px(0.),
+                }],
+            );
+        }
         laid.picture.paint_under(window, cx);
         if let Some(list) = laid.list {
             window.with_content_mask(
@@ -757,16 +766,17 @@ impl Render for OverlayView {
         let (g, moving) = slot.growth();
         let pose = pose(g);
         let scroll = slot.scroll;
-        let (edit, can_undo, spot) = (slot.editing, !slot.undo.is_empty(), slot.spot);
+        let spot = slot.spot;
+        let plate_alpha = slot.plate_alpha();
         let held_lists = slot.lists.clone();
         let held_corner = slot.held.map(|(_, corner)| corner);
         // Where this window is, and so where in it the badge and the view
         // are: nowhere before it is placed.
         let placed = slot
             .pane(hwnd)
-            .and_then(|pane| Some((pane.area?, pane.frame)))
+            .and_then(|pane| Some((pane.area?, pane.frame, pane.plate)))
             .zip(slot.placed);
-        let Some(((area, frame), badge)) = placed else {
+        let Some(((area, frame, plate), badge)) = placed else {
             return gpui::div().into_any_element();
         };
         let local = |r: Rect| {
@@ -859,6 +869,7 @@ impl Render for OverlayView {
         let slot = cx.default_global::<OverlaySlot>();
         let paths: Vec<&Path> = names.iter().map(|(path, _)| path.as_path()).collect();
         let rows_moving = slot.settle(&paths, strip);
+        let plate_moving = slot.plate_fading();
         for (row, (path, _)) in rows.iter_mut().zip(&names) {
             row.offset = slot.offset(path);
         }
@@ -876,7 +887,7 @@ impl Render for OverlayView {
             fill,
             text: text.into(),
             pose,
-            moving: moving || rows_moving,
+            moving: moving || rows_moving || plate_moving,
             badge: local(badge),
             frame: local(frame),
             radius,
@@ -884,8 +895,7 @@ impl Render for OverlayView {
             health,
             rows,
             scroll,
-            edit,
-            can_undo,
+            plate: plate.map(|r| (local(r), plate_alpha)),
             dragged,
             spot,
             font,
@@ -914,10 +924,12 @@ struct Pane {
     hwnd: isize,
     /// Its inside on the screen, physical px, once it is placed.
     area: Option<Rect>,
-    /// The view's sheet on the screen, as this window holds it.
+    /// The view's sheet on the screen, as this window holds it, and the
+    /// undo plate beside it.
     frame: Rect,
+    plate: Option<Rect>,
     /// How it is cut, as last asked: see `win::shape_overlay`.
-    shape: Option<Option<i32>>,
+    shape: Option<Option<Vec<(Rect, i32)>>>,
     /// Frames it has drawn where it is placed.
     drawn: u32,
 }
@@ -971,10 +983,16 @@ pub struct OverlaySlot {
     /// listed by; and a row's height, device px.
     names: Vec<(PathBuf, String)>,
     strip: i32,
-    /// The rows are being put in order.
-    editing: bool,
     /// The lists before each change made here, the latest last.
     undo: Vec<FloatLists>,
+    /// The plate that holds the undo button, while there is one.
+    plate: Option<Plate>,
+    /// A left press on a row's icon, and where the cursor was: a click
+    /// opens the repo, a drag takes the row to another place.
+    icon_press: Option<(usize, (i32, i32))>,
+    /// The press on the view under way is a click that opens the panel
+    /// (on the sheet), or none (on a tree).
+    press_opens: bool,
     /// The lists as changed here, until the config holds them.
     lists: Option<FloatLists>,
     /// A row on its way to another place.
@@ -995,7 +1013,51 @@ pub struct OverlaySlot {
 
 impl Global for OverlaySlot {}
 
+/// The undo plate's coming and going.
+#[derive(Clone, Copy, Debug)]
+struct Plate {
+    /// When it began to show: none while the window that holds it is
+    /// still coming up.
+    shown: Option<Instant>,
+    /// When it goes.
+    until: Instant,
+}
+
 impl OverlaySlot {
+    /// How far the undo plate has come, 0 to 1.
+    fn plate_alpha(&self) -> f32 {
+        let Some(plate) = self.plate else { return 0.0 };
+        let Some(shown) = plate.shown else { return 0.0 };
+        let now = Instant::now();
+        let came = (now.duration_since(shown).as_secs_f32() / PLATE_FADE).min(1.0);
+        let left = if now >= plate.until {
+            1.0 - (now.duration_since(plate.until).as_secs_f32() / PLATE_FADE).min(1.0)
+        } else {
+            1.0
+        };
+        came.min(left)
+    }
+
+    /// The plate is coming or going: drawn every frame.
+    fn plate_fading(&self) -> bool {
+        let Some(Plate {
+            shown: Some(shown),
+            until,
+        }) = self.plate
+        else {
+            return false;
+        };
+        let now = Instant::now();
+        now.duration_since(shown).as_secs_f32() < PLATE_FADE || now >= until
+    }
+
+    /// The plate has faded away.
+    fn plate_gone(&self) -> bool {
+        self.plate
+            .is_some_and(|p| p.shown.is_some() && Instant::now() >= p.until)
+            && self.plate_alpha() <= 0.0
+    }
+
     /// How far grown it is now, 0 the badge and 1 the view, and whether
     /// it is on its way.
     fn growth(&self) -> (f32, bool) {
@@ -1123,6 +1185,7 @@ fn drew(hwnd: Option<isize>, window: &mut Window, cx: &mut App) {
         std::sync::atomic::Ordering::Relaxed,
     );
     let arrived = matches!(slot.anim, Some((_, Some(_)))) && !moving;
+    let faded = slot.plate_gone();
     let mut swap = false;
     if let Some(next) = slot.next.as_mut().filter(|n| Some(n.hwnd) == hwnd) {
         // Only frames drawn where it belongs, at the size it is to have.
@@ -1139,6 +1202,9 @@ fn drew(hwnd: Option<isize>, window: &mut Window, cx: &mut App) {
     }
     if swap {
         cx.defer(finish_swap);
+    }
+    if faded {
+        cx.defer(sync);
     }
     if arrived {
         cx.defer(|cx| {
@@ -1204,9 +1270,9 @@ fn toggle(cx: &mut App) {
     let grown = slot.grown == Some(true);
     if grown {
         // Shrinking ends whatever was being done to the rows.
-        slot.editing = false;
         slot.reorder = None;
         slot.armed = None;
+        slot.icon_press = None;
     }
     if let Some(ui) = cx.try_global::<Ui>() {
         ui.input.unbounded_send(Input::OverlayGrown(!grown)).ok();
@@ -1232,12 +1298,15 @@ fn tip_for(slot: &OverlaySlot) -> String {
         return String::new();
     }
     match slot.spot {
-        Spot::Row(row) => slot.tips.get(row).cloned().unwrap_or_default(),
-        Spot::Edit => "Put the rows in order, or take some out".into(),
+        Spot::Icon(row) => match slot.tips.get(row) {
+            Some(tip) => format!(
+                "{tip}\n\nClick: its GitHub page. Right-click: its folder.\n\
+                 Drag: another place. Middle-click: take it out."
+            ),
+            None => String::new(),
+        },
+        Spot::Strip(row) => slot.tips.get(row).cloned().unwrap_or_default(),
         Spot::Undo => "Undo".into(),
-        Spot::Done => "Done".into(),
-        Spot::Grip(_) => "Drag to another place".into(),
-        Spot::Remove(_) => "Take out of this view".into(),
         Spot::Edge => "Drag to make it wider or narrower".into(),
         Spot::Tail => slot.pr_tip.clone(),
         Spot::Sheet | Spot::Off => slot.summary.clone(),
@@ -1252,15 +1321,22 @@ fn steady(slot: &OverlaySlot) -> bool {
 
 /// The left button went down on `spot`.
 fn down(spot: Spot, cx: &mut App) {
+    let slot = cx.default_global::<OverlaySlot>();
     match spot {
         Spot::Edge => start_resize(cx),
-        Spot::Grip(row) => start_reorder(row, cx),
-        Spot::Edit | Spot::Undo | Spot::Done | Spot::Remove(_) => {
-            cx.default_global::<OverlaySlot>().armed = Some(spot);
+        Spot::Icon(row) => slot.icon_press = Some((row, win::cursor_pos())),
+        Spot::Undo => slot.armed = Some(spot),
+        // The sheet, and an empty spot of it: the view's or the badge's
+        // to drag, and a click on the sheet opens the panel.
+        Spot::Sheet | Spot::Tail => {
+            slot.press_opens = true;
+            press(cx);
         }
-        Spot::Sheet | Spot::Tail => press(cx),
-        // A row's tree and icon have their own clicks.
-        Spot::Row(_) | Spot::Off => {}
+        Spot::Strip(_) => {
+            slot.press_opens = false;
+            press(cx);
+        }
+        Spot::Off => {}
     }
 }
 
@@ -1271,6 +1347,17 @@ fn moved(pressed: bool, cx: &mut App) {
     let slot = cx.default_global::<OverlaySlot>();
     if !pressed {
         slot.armed = None;
+        slot.icon_press = None;
+    }
+    if let Some((row, from)) = slot.icon_press {
+        // A press on an icon that goes far enough takes its row.
+        let at = win::cursor_pos();
+        let far = (at.0 - from.0).abs().max((at.1 - from.1).abs()) >= layout::DRAG_THRESHOLD;
+        if far {
+            slot.icon_press = None;
+            start_reorder(row, from.1, cx);
+        }
+        return;
     }
     if slot.resize.is_some() {
         if pressed {
@@ -1296,59 +1383,144 @@ fn up(spot: Spot, click_count: Option<usize>, cx: &mut App) {
         end_resize(cx);
     } else if slot.reorder.is_some() {
         end_reorder(cx);
+    } else if let Some((row, _)) = slot.icon_press.take() {
+        // A click: the repo on GitHub.
+        if spot == Spot::Icon(row) {
+            open_row(row, true, cx);
+        }
     } else if let Some(armed) = slot.armed.take() {
         // A click is a press and a release on the same button.
-        if armed == spot {
-            act(armed, cx);
+        if armed == spot && armed == Spot::Undo {
+            undo(cx);
         }
     } else {
         release(click_count, cx);
     }
 }
 
-/// A click on one of the view's buttons.
-fn act(spot: Spot, cx: &mut App) {
-    let slot = cx.default_global::<OverlaySlot>();
-    match spot {
-        Spot::Edit => set_editing(true, cx),
-        Spot::Done => set_editing(false, cx),
-        Spot::Undo => {
-            if let Some(lists) = slot.undo.pop() {
-                apply_lists(lists, cx);
-            }
-        }
-        Spot::Remove(row) => {
-            let Some((_, name)) = slot.names.get(row).cloned() else {
-                return;
-            };
-            let Some(mut lists) = lists_now(cx) else {
-                return;
-            };
-            remember(lists.clone(), cx);
-            let same = |n: &String| crate::config::same_name(n, &name);
-            lists.pinned.retain(|n| !same(n));
-            lists.order.retain(|n| !same(n));
-            if !lists.hidden.iter().any(same) {
-                lists.hidden.push(name.clone());
-            }
-            apply_lists(lists, cx);
-        }
-        _ => {}
+/// Opens a row's repo: on GitHub, or its folder. A repo only on GitHub
+/// has no folder.
+fn open_row(row: usize, web: bool, cx: &mut App) {
+    let Some((path, _)) = cx.default_global::<OverlaySlot>().names.get(row).cloned() else {
+        return;
+    };
+    let remote_only = cx.try_global::<Ui>().is_some_and(|ui| {
+        let s = ui.state.read(cx);
+        s.remote_statuses.iter().any(|r| r.path == path)
+    });
+    if web || remote_only {
+        crate::repo_menu::open_github(&path, cx);
+    } else {
+        cx.open_with_system(&path);
     }
 }
 
-/// Starts or ends putting the view's rows in order.
-pub fn set_editing(on: bool, cx: &mut App) {
-    let slot = cx.default_global::<OverlaySlot>();
-    if slot.editing == on {
+/// A middle click on a row's icon: asks, then takes the repo out of the
+/// view.
+fn ask_take_out(row: usize, cx: &mut App) {
+    let Some((_, name)) = cx.default_global::<OverlaySlot>().names.get(row).cloned() else {
         return;
+    };
+    let asked = win::confirm_box(format!(
+        "Take {name} out of the floating view?\n\nUndo brings it back, and so does pinning it \
+         from its menu in the panel."
+    ));
+    cx.spawn(async move |cx| {
+        let yes = cx
+            .background_executor()
+            .spawn(async move { asked.join().unwrap_or(false) })
+            .await;
+        if yes {
+            cx.update(|cx| take_out(&name, cx)).ok();
+        }
+    })
+    .detach();
+}
+
+/// Takes the repo listed as `name` out of the view.
+fn take_out(name: &str, cx: &mut App) {
+    let Some(mut lists) = lists_now(cx) else {
+        return;
+    };
+    let before = lists.clone();
+    let same = |n: &String| crate::config::same_name(n, name);
+    lists.pinned.retain(|n| !same(n));
+    lists.order.retain(|n| !same(n));
+    if !lists.hidden.iter().any(same) {
+        lists.hidden.push(name.to_string());
     }
-    slot.editing = on;
-    if !on {
-        slot.reorder = None;
-        slot.armed = None;
+    changed(before, lists, cx);
+}
+
+/// The self-test's way to take the first row out, as a middle click and
+/// a yes would; whether there was one.
+pub fn take_out_first(cx: &mut App) -> bool {
+    let name = cx
+        .default_global::<OverlaySlot>()
+        .names
+        .first()
+        .map(|(_, name)| name.clone());
+    if let Some(name) = &name {
+        take_out(name, cx);
     }
-    redraw(cx);
+    name.is_some()
+}
+
+/// Goes back one change, as the undo button does.
+pub fn undo(cx: &mut App) {
+    let slot = cx.default_global::<OverlaySlot>();
+    let Some(lists) = slot.undo.pop() else {
+        return;
+    };
+    let now = Instant::now();
+    if let Some(plate) = slot.plate.as_mut() {
+        // Gone with the last change; kept while there are more.
+        plate.until = if slot.undo.is_empty() {
+            now.max(
+                plate
+                    .shown
+                    .map_or(now, |t| t + Duration::from_secs_f32(PLATE_FADE)),
+            )
+        } else {
+            now + PLATE_STAYS
+        };
+    }
+    apply_lists(lists, cx);
+    wake_plate(cx);
+}
+
+/// Whether the undo plate shows, or is on its way.
+pub fn plate_showing(cx: &App) -> bool {
+    cx.try_global::<OverlaySlot>()
+        .is_some_and(|slot| slot.plate.is_some())
+}
+
+/// The view's lists changed here from `before` to `after`: kept as a
+/// step to undo, and the undo plate shows for a while.
+fn changed(before: FloatLists, after: FloatLists, cx: &mut App) {
+    remember(before, cx);
+    let slot = cx.default_global::<OverlaySlot>();
+    let until = Instant::now() + PLATE_STAYS;
+    match slot.plate.as_mut() {
+        // Still going: it comes back from however far it went.
+        Some(plate) => plate.until = until,
+        None => slot.plate = Some(Plate { shown: None, until }),
+    }
+    apply_lists(after, cx);
+    wake_plate(cx);
+}
+
+/// Wakes the view when the undo plate is to go, to fade it.
+fn wake_plate(cx: &mut App) {
+    let Some(plate) = cx.default_global::<OverlaySlot>().plate else {
+        return;
+    };
+    let wait = plate.until.saturating_duration_since(Instant::now());
+    cx.spawn(async move |cx| {
+        cx.background_executor().timer(wait).await;
+        cx.update(redraw).ok();
+    })
+    .detach();
 }
 
 /// The lists the view shows now: the ones changed here that the config
@@ -1382,10 +1554,10 @@ fn apply_lists(lists: FloatLists, cx: &mut App) {
     redraw(cx);
 }
 
-/// A row is taken hold of by its handle.
-fn start_reorder(row: usize, cx: &mut App) {
+/// A row is taken hold of by its icon, the press at `start` (screen y).
+fn start_reorder(row: usize, start: i32, cx: &mut App) {
     let slot = cx.default_global::<OverlaySlot>();
-    if !steady(slot) || !slot.editing {
+    if !steady(slot) {
         return;
     }
     let Some((path, _)) = slot.names.get(row).cloned() else {
@@ -1395,10 +1567,11 @@ fn start_reorder(row: usize, cx: &mut App) {
         path,
         from: row,
         to: row,
-        start: win::cursor_pos().1,
+        start,
         dy: 0,
     });
     sync_tooltip(String::new(), cx);
+    reorder_to(cx);
     redraw(cx);
 }
 
@@ -1463,9 +1636,9 @@ fn end_reorder(cx: &mut App) {
     let Some(mut lists) = lists_now(cx) else {
         return;
     };
-    remember(lists.clone(), cx);
+    let before = lists.clone();
     lists.order = new.into_iter().map(|(_, name)| name).collect();
-    apply_lists(lists, cx);
+    changed(before, lists, cx);
 }
 
 /// The view's free side edge is taken hold of, to make it wider or
@@ -1592,6 +1765,7 @@ fn move_to(rect: Rect, cx: &mut App) {
     slot.held = slot.held.map(|(badge, corner)| (shift(badge), corner));
     let Some(cur) = slot.cur.as_mut() else { return };
     cur.frame = shift(cur.frame);
+    cur.plate = cur.plate.map(shift);
     cur.area = cur.area.map(shift);
     let (Some(area), h) = (cur.area, cur.hwnd) else {
         return;
@@ -1649,7 +1823,9 @@ fn release(click_count: Option<usize>, cx: &mut App) {
         // A double-click's second click would close the panel the first
         // one just opened. app.rs resolves overlay_click() and anchors the
         // panel.
-        click_count.filter(|&n| n <= 1).map(|_| Input::Overlay)
+        click_count
+            .filter(|&n| n <= 1 && slot.press_opens)
+            .map(|_| Input::Overlay)
     };
     if let (Some(input), Some(ui)) = (input, cx.try_global::<Ui>()) {
         ui.input.unbounded_send(input).ok();
@@ -1668,22 +1844,6 @@ pub fn drop_position(rect: Rect) -> (Corner, f32, f32) {
 pub fn drop_saved(cx: &mut App) {
     cx.default_global::<OverlaySlot>().held = None;
     sync(cx);
-}
-
-/// Opens the big window at a repo of the view's, through the panel when
-/// the flip is on; the repo itself when the big window is turned off.
-pub fn open_repo(path: &std::path::Path, cx: &mut App) {
-    let Some(ui) = cx.try_global::<Ui>() else {
-        return;
-    };
-    if !ui.state.read(cx).config.window {
-        view::open_repo(path, cx);
-        return;
-    }
-    let timelines = ui.timelines.clone();
-    timelines.update(cx, |t, _| t.focus(path));
-    let anchor = anchor(cx).unwrap_or(Anchor::Tray(None));
-    crate::flip::show_window(anchor, cx);
 }
 
 /// Whether the badge stays over the panel's window for now: while a flip
@@ -1780,7 +1940,6 @@ fn grown_frame(badge: Rect, corner: Corner, work: Rect, scale: f32, view: Held) 
         buttons: 1,
         tail: view.tail,
         scroll: 0,
-        edit: false,
     });
     place::frame(badge, l.size, corner)
 }
@@ -1870,18 +2029,56 @@ pub fn sync(cx: &mut App) {
     // after it has shrunk.
     let big = want_grown || g > 0.0 || slot.anim.is_some();
     let sizing = big && slot.width.is_some_and(|w| w.1);
-    let area = if sizing {
+    let held = if sizing {
         grown_frame(badge, corner, mon.work, scale, widest)
     } else if big {
         frame
     } else {
         badge
+    };
+    // The undo plate, beside the view at rest, until it has faded.
+    if slot.plate_gone() {
+        slot.plate = None;
     }
-    .outset(pad);
-    // At rest it is cut to the sheet's own shape; while that changes, to
-    // nothing.
-    let shape = (slot.anim.is_none() && !sizing)
-        .then(|| physical(view.radius).min(badge.width() / 2) + pad);
+    let grown_still = big && g >= 1.0 && slot.anim.is_none() && !sizing;
+    if !grown_still && slot.anim.is_some() {
+        slot.plate = None;
+    }
+    let plate = slot
+        .plate
+        .filter(|_| grown_still)
+        .map(|_| place::plate(frame, mon.work, scale));
+    let around = match plate {
+        Some(p) => Rect::new(
+            held.left.min(p.left),
+            held.top.min(p.top),
+            held.right.max(p.right),
+            held.bottom.max(p.bottom),
+        ),
+        None => held,
+    };
+    let area = around.outset(pad);
+    // At rest it is cut to the sheet's own shape (and the plate's); while
+    // that changes, to nothing.
+    let local = |r: Rect| {
+        let r = r.outset(pad);
+        Rect::new(
+            r.left - area.left,
+            r.top - area.top,
+            r.right - area.left,
+            r.bottom - area.top,
+        )
+    };
+    let shape = (slot.anim.is_none() && !sizing).then(|| {
+        let mut cut = vec![(
+            local(held),
+            physical(view.radius).min(badge.width() / 2) + pad,
+        )];
+        if let Some(p) = plate {
+            cut.push((local(p), physical(place::PLATE_RADIUS) + pad));
+        }
+        cut
+    });
     slot.placed = Some(badge);
     slot.pad = pad;
     let Some(cur) = slot.cur.as_mut() else { return };
@@ -1902,10 +2099,11 @@ pub fn sync(cx: &mut App) {
         slot.visible = true;
         cur.area = Some(area);
         cur.frame = frame;
-        cur.shape = Some(shape);
+        cur.plate = plate;
+        cur.shape = Some(shape.clone());
         refresh = true;
         cx.spawn(async move |_| unsafe {
-            win::place_overlay(h, area, shape);
+            win::place_overlay(h, area, shape.as_deref());
             if let Some(p) = panel {
                 win::panel_restack(p);
             }
@@ -1916,9 +2114,10 @@ pub fn sync(cx: &mut App) {
         // window comes up there, cloaked, and takes over once it has
         // drawn the same picture.
         if let Some(next) = slot.next.as_mut().filter(|n| n.area == Some(area))
-            && next.frame != frame
+            && (next.frame, next.plate) != (frame, plate)
         {
             next.frame = frame;
+            next.plate = plate;
             refresh = true;
         }
         if slot.next.is_none()
@@ -1929,12 +2128,13 @@ pub fn sync(cx: &mut App) {
                 hwnd,
                 area: Some(area),
                 frame,
-                shape: Some(shape),
+                plate,
+                shape: Some(shape.clone()),
                 drawn: 0,
             });
             cx.spawn(async move |_| unsafe {
                 win::style_overlay(hwnd);
-                win::place_overlay(hwnd, area, shape);
+                win::place_overlay(hwnd, area, shape.as_deref());
                 if let Some(p) = panel {
                     win::panel_restack(p);
                 }
@@ -1942,11 +2142,19 @@ pub fn sync(cx: &mut App) {
             .detach();
         }
     } else {
-        let reshape = cur.shape != Some(shape);
-        cur.shape = Some(shape);
+        let reshape = cur.shape.as_ref() != Some(&shape);
+        cur.shape = Some(shape.clone());
         // The same window, the view in it wider or narrower.
-        if cur.frame != frame {
+        if (cur.frame, cur.plate) != (frame, plate) {
             cur.frame = frame;
+            cur.plate = plate;
+            refresh = true;
+        }
+        // The window holds the plate: it comes now.
+        if let Some(p) = slot.plate.as_mut().filter(|p| p.shown.is_none())
+            && plate.is_some()
+        {
+            p.shown = Some(Instant::now());
             refresh = true;
         }
         // The window holds it: a growth waiting for that sets off.
@@ -1955,7 +2163,7 @@ pub fn sync(cx: &mut App) {
             refresh = true;
         }
         if reshape {
-            cx.spawn(async move |_| unsafe { win::shape_overlay(h, shape) })
+            cx.spawn(async move |_| unsafe { win::shape_overlay(h, shape.as_deref()) })
                 .detach();
         }
     }
@@ -2045,7 +2253,7 @@ pub fn close(cx: &mut App) {
     let panes = [slot.cur.take(), slot.next.take(), slot.captor.take()];
     slot.resize = None;
     slot.reorder = None;
-    slot.editing = false;
+    slot.plate = None;
     slot.placed = None;
     slot.visible = false;
     slot.drag = None;
@@ -2137,6 +2345,7 @@ fn ensure_open(state: Entity<AppState>, cx: &mut App) {
             hwnd,
             area: None,
             frame: Rect::new(0, 0, 0, 0),
+            plate: None,
             shape: None,
             drawn: 0,
         }),

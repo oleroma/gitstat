@@ -1027,6 +1027,10 @@ impl Timelines {
                 (if x != 0.0 { x } else { y }, true)
             } else if x.abs() > y.abs() {
                 (x, false)
+            } else if float {
+                // The floating view's trees each go their own way, with
+                // the plain wheel too.
+                (y, false)
             } else {
                 // The strips move under the mouse, and no mouse move
                 // follows to say so: the hover and its card go.
@@ -1064,38 +1068,32 @@ impl Timelines {
         }
         lines.push((status_text.clone(), status_color));
         lines.extend(crate::view::status_details(status, p));
+        // In the floating view the view itself handles an icon's clicks
+        // (it is dragged by it too) and the wheel over it, which scrolls
+        // its rows.
         let label = div()
             .id(("label", index))
             .size_full()
             .cursor_pointer()
             .hover(|s| s.bg(p.hover))
-            .on_scroll_wheel(move |e: &ScrollWheelEvent, _, cx| wheel(e, cx))
-            .on_mouse_down(gpui::MouseButton::Right, {
+            .when(!float, |d| {
                 let status = status.clone();
-                move |_, window, cx| {
-                    cx.stop_propagation();
-                    if float {
-                        // The badge's window never takes the keyboard.
-                        crate::repo_menu::show_from(&status, None, cx);
-                    } else {
+                d.on_scroll_wheel(move |e: &ScrollWheelEvent, _, cx| wheel(e, cx))
+                    .on_mouse_down(gpui::MouseButton::Right, move |_, window, cx| {
+                        cx.stop_propagation();
                         crate::repo_menu::show(&status, window, cx);
-                    }
-                }
-            })
-            // Big mode, scrolled to this repo's column; the folder when the
-            // window is turned off.
-            .on_click(move |_, window, cx| {
-                if float {
-                    crate::overlay::open_repo(&open_path, cx);
-                    return;
-                }
-                let big = this_for_label.read(cx).state.read(cx).config.window;
-                if big {
-                    crate::flip::open_window(window, Some(open_path.clone()), cx);
-                } else {
-                    crate::panel::dismiss(window, cx);
-                    crate::view::open_repo(&open_path, cx);
-                }
+                    })
+                    // Big mode, scrolled to this repo's column; the folder
+                    // when the window is turned off.
+                    .on_click(move |_, window, cx| {
+                        let big = this_for_label.read(cx).state.read(cx).config.window;
+                        if big {
+                            crate::flip::open_window(window, Some(open_path.clone()), cx);
+                        } else {
+                            crate::panel::dismiss(window, cx);
+                            crate::view::open_repo(&open_path, cx);
+                        }
+                    })
             })
             .when(!float, |d| d.tooltip(crate::view::tip(lines, p)))
             .into_any_element();

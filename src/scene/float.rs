@@ -49,9 +49,6 @@ pub struct Spec {
     pub tail: usize,
     /// How far the rows are scrolled.
     pub scroll: i32,
-    /// Its rows are being put in order: each shows what it is taken hold
-    /// of by, and what takes it out.
-    pub edit: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -61,10 +58,6 @@ pub struct Row {
     pub strip: Rect,
     pub label: Rect,
     pub icon: Rect,
-    /// While the rows are put in order: what the row is moved by, at its
-    /// left, and what takes it out, before its icon.
-    pub grip: Option<Rect>,
-    pub remove: Option<Rect>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -149,19 +142,11 @@ pub fn layout(spec: &Spec) -> Layout {
             let side = e(MARK);
             let icon_left = label.left + (label.width() - side) / 2;
             let icon_top = y + (e(STRIP) - side) / 2;
-            let b = if spec.edit { e(BUTTON) } else { 0 };
-            let b_top = y + (e(STRIP) - b) / 2;
             Row {
                 rect,
-                strip: Rect::new(left + b, y, (label.left - b).max(left + b), y + e(STRIP)),
+                strip: Rect::new(left, y, label.left, y + e(STRIP)),
                 label,
                 icon: Rect::new(icon_left, icon_top, icon_left + side, icon_top + side),
-                grip: spec
-                    .edit
-                    .then(|| Rect::new(left, b_top, left + b, b_top + b)),
-                remove: spec
-                    .edit
-                    .then(|| Rect::new(label.left - b, b_top, label.left, b_top + b)),
             }
         })
         .collect();
@@ -186,6 +171,24 @@ pub fn layout(spec: &Spec) -> Layout {
         scroll,
         max_scroll,
     }
+}
+
+/// The plate beside the view that holds its undo button, logical px.
+pub const PLATE: (f32, f32) = (36.0, 28.0);
+pub const PLATE_GAP: f32 = 6.0;
+pub const PLATE_RADIUS: f32 = 8.0;
+
+/// Where the undo plate goes for the view at `frame`, kept on `work`:
+/// under it, in its middle, or over it when the screen ends below it.
+pub fn plate(frame: Rect, work: Rect, scale: f32) -> Rect {
+    let (w, h, gap) = (px(PLATE.0, scale), px(PLATE.1, scale), px(PLATE_GAP, scale));
+    let left = frame.left + (frame.width() - w) / 2;
+    let top = if frame.bottom + gap + h <= work.bottom {
+        frame.bottom + gap
+    } else {
+        frame.top - gap - h
+    };
+    Rect::new(left, top, left + w, top + h)
 }
 
 /// Where on the screen the view grown from the badge at `badge` lies: it
@@ -227,7 +230,6 @@ mod tests {
             buttons: 1,
             tail: 0,
             scroll: 0,
-            edit: false,
         }
     }
 
@@ -242,7 +244,6 @@ mod tests {
             }
             for row in &l.rows {
                 assert_eq!(row.strip.right, row.label.left);
-                assert!(row.grip.is_none() && row.remove.is_none());
                 assert!(row.rect.left >= m && row.rect.right <= l.size.0 - m);
                 assert!(row.icon.left >= row.label.left && row.icon.right <= row.label.right);
             }
@@ -280,22 +281,15 @@ mod tests {
     }
 
     #[test]
-    fn put_in_order_rows_keep_their_icons_where_they_were() {
-        for scale in [1.0, 1.25, 1.5] {
-            let plain = layout(&spec(scale, 3));
-            let mut s = spec(scale, 3);
-            s.edit = true;
-            let edit = layout(&s);
-            assert_eq!(plain.size, edit.size);
-            for (a, b) in plain.rows.iter().zip(&edit.rows) {
-                assert_eq!((a.rect, a.icon, a.label), (b.rect, b.icon, b.label));
-                let (grip, remove) = (b.grip.unwrap(), b.remove.unwrap());
-                assert_eq!(grip.right, b.strip.left);
-                assert_eq!(b.strip.right, remove.left);
-                assert_eq!(remove.right, b.label.left);
-                assert!(grip.left == a.rect.left && grip.width() == grip.height());
-            }
-        }
+    fn the_plate_goes_under_unless_the_screen_ends() {
+        let work = Rect::new(0, 0, 1000, 800);
+        let view = Rect::new(100, 100, 400, 500);
+        let under = plate(view, work, 1.25);
+        assert_eq!(under.top, view.bottom + px(PLATE_GAP, 1.25));
+        assert!(((under.left - view.left) - (view.right - under.right)).abs() <= 1);
+        let low = Rect::new(100, 400, 400, 790);
+        let over = plate(low, work, 1.25);
+        assert_eq!(over.bottom, low.top - px(PLATE_GAP, 1.25));
     }
 
     #[test]

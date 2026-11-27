@@ -9,7 +9,7 @@ pub const FILE_NAME: &str = "config.json";
 
 /// The floating view's width, logical px, at its least and at its most.
 pub const FLOAT_MIN_WIDTH: f32 = 120.0;
-pub const FLOAT_MAX_WIDTH: f32 = 480.0;
+pub const FLOAT_MAX_WIDTH: f32 = 1600.0;
 
 /// Work-area corner of the primary monitor that holds the overlay badge.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

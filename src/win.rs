@@ -14,8 +14,8 @@ use windows_sys::Win32::Graphics::Dwm::{
     DWMWCP_DONOTROUND, DwmFlush, DwmGetWindowAttribute, DwmSetWindowAttribute,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    ClientToScreen, CreateRoundRectRgn, DeleteObject, GetMonitorInfoW, HMONITOR,
-    MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
+    ClientToScreen, CombineRgn, CreateRoundRectRgn, DeleteObject, GetMonitorInfoW, HMONITOR,
+    MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, RGN_OR,
     ScreenToClient, SetWindowRgn,
 };
 use windows_sys::Win32::UI::Controls::{
@@ -34,15 +34,16 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CreateWindowExW, FindWindowExW, FindWindowW, HTMINBUTTON, IsIconic, IsZoomed,
     PostMessageW, SC_MINIMIZE, SIZE_MINIMIZED, SendMessageW, WM_CLOSE, WM_MOUSEMOVE, WM_NCHITTEST,
-    WM_NCLBUTTONUP, WM_SIZE, WM_SYSCOMMAND, WS_EX_TOPMOST, WS_POPUP,
+    WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSEMOVE, WM_SIZE, WM_SYSCOMMAND, WS_EX_TOPMOST,
+    WS_POPUP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GWL_EXSTYLE, GetClientRect, GetCursorPos, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
     HWND_TOPMOST, IDYES, IsWindow, IsWindowVisible, LWA_ALPHA, MB_ICONQUESTION, MB_SETFOREGROUND,
-    MB_YESNO, MessageBoxW, SM_CXSCREEN, SM_CXSMICON, SM_CYSCREEN, SM_SWAPBUTTON, SW_HIDE,
-    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
-    SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow, WINDOW_EX_STYLE,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TRANSPARENT, WindowFromPoint,
+    MB_TOPMOST, MB_YESNO, MessageBoxW, SM_CXSCREEN, SM_CXSMICON, SM_CYSCREEN, SM_SWAPBUTTON,
+    SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    WINDOW_EX_STYLE, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TRANSPARENT, WindowFromPoint,
 };
 
 /// The HWND of a GPUI window.
@@ -215,7 +216,7 @@ unsafe fn frame(hwnd: HWND) -> (i32, i32, i32, i32) {
 ///
 /// # Safety
 /// Call only from a spawned task outside `update`.
-pub unsafe fn place_overlay(h: isize, r: Rect, shape: Option<i32>) {
+pub unsafe fn place_overlay(h: isize, r: Rect, shape: Option<&[(Rect, i32)]>) {
     let Some(hwnd) = live(h) else { return };
     unsafe {
         // Size the window so the client area is exactly `r`.
@@ -233,16 +234,16 @@ pub unsafe fn place_overlay(h: isize, r: Rect, shape: Option<i32>) {
     }
 }
 
-/// Cuts the overlay (drawing and clicks) to its client area with its
-/// corners rounded by `shape` px, a disc when that is half its side; with
-/// none, to nothing: all of it shows, as while what it draws grows inside
-/// it. The cut is 1-bit, so its edge is jagged: the client area includes
+/// Cuts the overlay (drawing and clicks) to the rects of `shape`, in its
+/// client area, each with its corners rounded by its px (a disc when that
+/// is half its side); with none, to nothing: all of it shows, as while
+/// what it draws grows inside it. The cut is 1-bit, so its edge is jagged: the client area includes
 /// transparent padding around what is drawn, which keeps that one's own
 /// anti-aliased edge away from it.
 ///
 /// # Safety
 /// Call only from a spawned task outside `update`.
-pub unsafe fn shape_overlay(h: isize, shape: Option<i32>) {
+pub unsafe fn shape_overlay(h: isize, shape: Option<&[(Rect, i32)]>) {
     let Some(hwnd) = live(h) else { return };
     unsafe {
         let (dx, dy, _, _) = frame(hwnd);
@@ -253,24 +254,40 @@ pub unsafe fn shape_overlay(h: isize, shape: Option<i32>) {
     }
 }
 
-/// The region for a client area `size` at `at` in its window.
-unsafe fn set_shape(hwnd: HWND, at: (i32, i32), size: (i32, i32), shape: Option<i32>) {
+/// The region for a client area `size` at `at` in its window: `shape`'s
+/// rounded rects, cut to it.
+unsafe fn set_shape(hwnd: HWND, at: (i32, i32), size: (i32, i32), shape: Option<&[(Rect, i32)]>) {
     unsafe {
-        let Some(radius) = shape else {
+        let Some(shape) = shape.filter(|s| !s.is_empty()) else {
             SetWindowRgn(hwnd, std::ptr::null_mut(), 1);
             return;
         };
         // Region coordinates are relative to the window, not the client area.
-        let rgn = CreateRoundRectRgn(
-            at.0,
-            at.1,
-            at.0 + size.0 + 1,
-            at.1 + size.1 + 1,
-            2 * radius,
-            2 * radius,
-        );
+        let round = |(r, radius): (Rect, i32)| {
+            let (l, t) = (r.left.max(0), r.top.max(0));
+            let (rt, b) = (r.right.min(size.0), r.bottom.min(size.1));
+            CreateRoundRectRgn(
+                at.0 + l,
+                at.1 + t,
+                at.0 + rt + 1,
+                at.1 + b + 1,
+                2 * radius,
+                2 * radius,
+            )
+        };
+        let rgn = round(shape[0]);
+        if rgn.is_null() {
+            return;
+        }
+        for &part in &shape[1..] {
+            let more = round(part);
+            if !more.is_null() {
+                CombineRgn(rgn, rgn, more, RGN_OR);
+                DeleteObject(more);
+            }
+        }
         // On success the system owns the region; on failure it is ours to free.
-        if !rgn.is_null() && SetWindowRgn(hwnd, rgn, 1) == 0 {
+        if SetWindowRgn(hwnd, rgn, 1) == 0 {
             DeleteObject(rgn);
         }
     }
@@ -508,6 +525,22 @@ pub unsafe fn hit_test(h: isize, x: i32, y: i32) -> Option<isize> {
         SendMessageW(hwnd, WM_MOUSEMOVE, 0, client);
         let screen = ((y as u16 as isize) << 16) | (x as u16 as isize);
         Some(SendMessageW(hwnd, WM_NCHITTEST, 0, screen))
+    }
+}
+
+/// A click on `h`'s title bar part `hit` (Windows' hit-test code) at
+/// (`x`, `y`) on screen, told as Windows tells one: for the self-test,
+/// which can't press a button.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn click_caption(h: isize, x: i32, y: i32, hit: usize) {
+    let Some(hwnd) = live(h) else { return };
+    let screen = ((y as u16 as isize) << 16) | (x as u16 as isize);
+    unsafe {
+        SendMessageW(hwnd, WM_NCMOUSEMOVE, hit, screen);
+        SendMessageW(hwnd, WM_NCLBUTTONDOWN, hit, screen);
+        SendMessageW(hwnd, WM_NCLBUTTONUP, hit, screen);
     }
 }
 
@@ -839,7 +872,7 @@ pub fn confirm_box(text: String) -> std::thread::JoinHandle<bool> {
                 std::ptr::null_mut(),
                 text.as_ptr(),
                 title.as_ptr(),
-                MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND,
+                MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST,
             )
         };
         answer == IDYES

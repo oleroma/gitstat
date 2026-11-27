@@ -634,14 +634,18 @@ impl Element for WindowScene {
         let under_grip =
             |r: Rect| Rect::new(r.left, r.top + grip, r.right, r.bottom.max(r.top + grip));
         let cap = &laid.layout.caption;
+        // Over the rest: a press on the bar must reach Windows. The view's
+        // root takes focus on a press anywhere under it and marks the
+        // press handled, and GPUI then leaves a press on a button or the
+        // bar to nobody: maximise and close did nothing.
         let drag = window.insert_hitbox(
             paint::bounds(under_grip(cap.rect), laid.at, s),
-            HitboxBehavior::Normal,
+            HitboxBehavior::BlockMouse,
         );
         let buttons = cap.buttons.map(|r| {
             window.insert_hitbox(
                 paint::bounds(under_grip(r), laid.at, s),
-                HitboxBehavior::Normal,
+                HitboxBehavior::BlockMouse,
             )
         });
         let slots = self.slots(&mut laid, 1.0, window, cx);

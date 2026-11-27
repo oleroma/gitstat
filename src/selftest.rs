@@ -438,6 +438,24 @@ async fn run(out: &std::path::Path, report: &mut String, cx: &mut AsyncApp) -> R
     if hits[..4] != [Some(2), Some(8), Some(9), Some(20)] {
         return Err("Windows does not find the title bar's parts where they are drawn".into());
     }
+    // Its maximise button, clicked as Windows tells a click: it maximises,
+    // and again puts it back.
+    let mut zoomed = Vec::new();
+    for _ in 0..2 {
+        unsafe { win::click_caption(h, button(1), mid, 9) };
+        pause(700, cx).await;
+        zoomed.push(win::is_zoomed(h));
+    }
+    let back = win::client_rect(h);
+    let _ = writeln!(
+        report,
+        "window: maximise clicked twice, maximised after each (want true, false): {zoomed:?}; \
+         back as it was {}",
+        back == Some(client)
+    );
+    if zoomed != [true, false] {
+        return Err("the maximise button does not maximise and restore".into());
+    }
     cx.update(view::close_window).map_err(gone)?;
     pause(500, cx).await;
 
@@ -527,17 +545,34 @@ async fn run(out: &std::path::Path, report: &mut String, cx: &mut AsyncApp) -> R
         gear_log(report, "between flips");
         let watch = Watch::start(mon.rect, out.join(what.replace(' ', "-")));
         pause(120, cx).await;
-        let asked = cx
-            .update(|cx| {
+        let asked = if minimise {
+            cx.update(|cx| {
                 let handle = view::window_handle(cx)?;
-                if minimise {
-                    win::mark_minimized();
-                }
+                win::mark_minimized();
                 handle
                     .update(cx, |_, window, cx| crate::flip::flip_back(window, cx))
                     .ok()
             })
-            .map_err(gone)?;
+            .map_err(gone)?
+        } else {
+            // Closed by its close button, clicked as Windows tells a click.
+            let h = cx.update(view::window_hwnd).map_err(gone)?;
+            let at = h.and_then(win::client_rect);
+            if let (Some(h), Some(c)) = (h, at) {
+                let x = c.right - e(23.0);
+                unsafe { win::click_caption(h, x, c.top + e(16.0), 20) };
+            }
+            let began = Instant::now();
+            loop {
+                pause(10, cx).await;
+                if cx.update(|cx| crate::flip::running(cx)).map_err(gone)? {
+                    break Some(true);
+                }
+                if began.elapsed() > Duration::from_secs(2) {
+                    break Some(false);
+                }
+            }
+        };
         let _ = writeln!(report, "{what}: taken by the flip: {asked:?}");
         if asked != Some(true) {
             return Err("the flip back did not start".into());
@@ -701,8 +736,9 @@ async fn float(
         }
     }
 
-    // Putting its rows in order: the view shows what that is done with,
-    // and is itself again afterwards.
+    // Taking a row out, as a middle click and a yes would: the undo
+    // plate comes beside the view, and undoing brings the view back as it
+    // was, the plate gone.
     let send = |grown: bool, cx: &mut AsyncApp| {
         cx.update(|cx| {
             cx.global::<Ui>()
@@ -712,53 +748,77 @@ async fn float(
         })
         .map_err(gone)
     };
-    let rest = async |grown: bool, cx: &mut AsyncApp| -> Result<(), String> {
+    let rest = async |grown: bool, plate: bool, cx: &mut AsyncApp| -> Result<u128, String> {
         let began = Instant::now();
         loop {
             pause(20, cx).await;
-            if cx.update(|cx| crate::overlay::resting(cx)).map_err(gone)? == Some(grown) {
-                pause(300, cx).await;
-                return Ok(());
+            let (r, p) = cx
+                .update(|cx| {
+                    (
+                        crate::overlay::resting(cx),
+                        crate::overlay::plate_showing(cx),
+                    )
+                })
+                .map_err(gone)?;
+            if r == Some(grown) && p == plate {
+                let took = began.elapsed().as_millis();
+                pause(400, cx).await;
+                return Ok(took);
             }
             if began.elapsed() > Duration::from_secs(6) {
-                return Err(format!("float edit: never at rest, grown {grown}"));
+                return Err(format!(
+                    "float undo: never at rest, grown {grown}, plate {plate} ({r:?}, {p})"
+                ));
             }
         }
     };
     send(true, cx)?;
-    rest(true, cx).await?;
+    rest(true, false, cx).await?;
     let sheet = cx.update(|cx| crate::overlay::placed(cx)).map_err(gone)?;
-    let mut shots = Vec::new();
-    for (name, edit) in [
-        ("plain", None),
-        ("edit", Some(true)),
-        ("after", Some(false)),
-    ] {
-        if let Some(on) = edit {
-            cx.update(|cx| crate::overlay::set_editing(on, cx))
-                .map_err(gone)?;
-            pause(400, cx).await;
-        }
-        let Some(now) = shot(out, &format!("float-edit-{name}"), area, cx).await else {
-            return Err("no picture of the screen".into());
-        };
-        shots.push(now);
-    }
-    send(false, cx)?;
-    rest(false, cx).await?;
-    if let (Some(sheet), [plain, edit, after]) = (sheet, &shots[..]) {
-        let shown = changed(edit, plain, inner(sheet));
-        let left = changed(after, plain, inner(sheet));
+    let Some(plain) = shot(out, "float-undo-before", area, cx).await else {
+        return Err("no picture of the screen".into());
+    };
+    let took = cx.update(crate::overlay::take_out_first).map_err(gone)?;
+    if !took {
         let _ = writeln!(
             report,
-            "float edit: putting the rows in order changes {shown} px of the view, and leaves \
-             {left} px changed afterwards (must be 0)"
+            "float undo: the view lists no repo to take out; skipped"
         );
-        if shown == 0 {
-            return Err("float edit: the view shows nothing to put its rows in order with".into());
+        send(false, cx)?;
+        rest(false, false, cx).await?;
+        return Ok(());
+    }
+    // The plate is put in while the window changes; then it fades in.
+    pause(600, cx).await;
+    let Some(with) = shot(out, "float-undo-plate", area, cx).await else {
+        return Err("no picture of the screen".into());
+    };
+    let watch = Watch::start_on(area, out.join("float-undo"), crate::overlay::drawn);
+    pause(150, cx).await;
+    cx.update(crate::overlay::undo).map_err(gone)?;
+    let gone_after = rest(true, false, cx).await?;
+    let frames = watch.stop(cx).await;
+    let Some(after) = shot(out, "float-undo-after", area, cx).await else {
+        return Err("no picture of the screen".into());
+    };
+    send(false, cx)?;
+    rest(false, false, cx).await?;
+    if let Some(sheet) = sheet {
+        // Under the view, or over it near the screen's bottom: anywhere
+        // in the picture but the view itself.
+        let outside = changed(&with, &plain, area) - changed(&with, &plain, sheet);
+        let left = changed(&after, &plain, area);
+        let _ = writeln!(
+            report,
+            "float undo: the plate changes {outside} px beside the view; undone, it went in \
+             {gone_after} ms over {} pictures and leaves {left} px changed (must be 0)",
+            frames.len()
+        );
+        if outside == 0 {
+            return Err("float undo: no plate beside the view".into());
         }
         if left > 0 {
-            return Err(format!("float edit: {left} px stay changed afterwards"));
+            return Err(format!("float undo: {left} px stay changed after the undo"));
         }
     }
     Ok(())
