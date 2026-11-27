@@ -1334,9 +1334,20 @@ pub fn left(cx: &mut App) {
     if !cx.default_global::<OverlaySlot>().mouse_in {
         return;
     }
-    // Onto its tooltip or card: they stay while the mouse is on them.
-    if crate::float_tip::holds_mouse(cx) {
+    // A tooltip or card shows: the mouse may be on its way onto it, past
+    // the view's edge. It stays a moment for the mouse to get there, and
+    // as long as the mouse is on it.
+    if crate::float_tip::shown_hwnd(cx).is_some() {
         crate::float_tip::watch_mouse(cx);
+        return;
+    }
+    let_go(cx);
+}
+
+/// The mouse is gone from the view and from what it shows: its tooltip
+/// and card go.
+pub fn let_go(cx: &mut App) {
+    if !cx.default_global::<OverlaySlot>().mouse_in {
         return;
     }
     let slot = cx.default_global::<OverlaySlot>();

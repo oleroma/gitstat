@@ -370,8 +370,13 @@ pub fn holds_at(x: i32, y: i32, cx: &App) -> bool {
             .is_some_and(|r| x >= r.left && x < r.right && y >= r.top && y < r.bottom)
 }
 
-/// The mouse went from the view onto what this shows: once it is off
-/// that too, and not back on the view, it all goes.
+/// How long what this shows waits for the mouse, after it left the view
+/// or what this shows, before it goes.
+const GRACE: Duration = Duration::from_millis(350);
+
+/// The mouse left the view while this shows: it stays a moment for the
+/// mouse to get onto it, and as long as the mouse is on it. Once the mouse
+/// has been off it, and off the view, a moment, it all goes.
 pub fn watch_mouse(cx: &mut App) {
     let slot = cx.default_global::<TipSlot>();
     if slot.watching {
@@ -379,22 +384,30 @@ pub fn watch_mouse(cx: &mut App) {
     }
     slot.watching = true;
     cx.spawn(async move |cx| {
+        let tick = Duration::from_millis(40);
+        let mut off = Duration::ZERO;
         loop {
-            cx.background_executor()
-                .timer(Duration::from_millis(40))
-                .await;
+            cx.background_executor().timer(tick).await;
             let done = cx
                 .update(|cx| {
-                    if holds_mouse(cx) {
-                        return false;
-                    }
-                    cx.default_global::<TipSlot>().watching = false;
                     let (x, y) = win::cursor_pos();
                     let on_view = crate::overlay::placed(cx)
                         .is_some_and(|r| x >= r.left && x < r.right && y >= r.top && y < r.bottom);
-                    if !on_view {
-                        crate::overlay::left(cx);
+                    // Back on the view: the view's own hover takes over.
+                    if on_view || shown_hwnd(cx).is_none() {
+                        cx.default_global::<TipSlot>().watching = false;
+                        return true;
                     }
+                    if holds_at(x, y, cx) {
+                        off = Duration::ZERO;
+                        return false;
+                    }
+                    off += tick;
+                    if off < GRACE {
+                        return false;
+                    }
+                    cx.default_global::<TipSlot>().watching = false;
+                    crate::overlay::let_go(cx);
                     true
                 })
                 .unwrap_or(true);
