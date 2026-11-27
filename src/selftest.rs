@@ -11,7 +11,7 @@ use crate::layout::Rect;
 use crate::panel::{self, Anchor};
 use crate::view::{self, Ui};
 use crate::win;
-use gpui::{App, AsyncApp};
+use gpui::{App, AppContext, AsyncApp};
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -32,7 +32,7 @@ pub fn start(out: PathBuf, cx: &mut App) {
         let _ = std::fs::write(out.join("report.txt"), report);
         // The recorder's last pictures are still being written.
         cx.background_executor()
-            .timer(Duration::from_millis(1500))
+            .timer(Duration::from_millis(4000))
             .await;
         std::process::exit(i32::from(verdict.is_err()));
     })
@@ -45,14 +45,56 @@ async fn pause(ms: u64, cx: &mut AsyncApp) {
         .await;
 }
 
-/// Saves the screen inside `rect` as `name`.png in `out`, off this thread.
-fn still(out: &std::path::Path, name: &str, rect: Rect) {
-    let file = out.join(format!("{name}.png"));
-    std::thread::spawn(move || {
-        if let Some((w, h, pixels)) = win::capture(rect) {
-            let _ = image::save_buffer(file, &pixels, w, h, image::ExtendedColorType::Rgba8);
+/// A picture of part of the screen: its place, and its pixels as RGBA.
+struct Shot {
+    rect: Rect,
+    w: u32,
+    pixels: Vec<u8>,
+}
+
+impl Shot {
+    /// The colour at screen px (`x`, `y`), which must be inside it.
+    fn at(&self, x: i32, y: i32) -> [u8; 3] {
+        let i =
+            ((y - self.rect.top) as usize * self.w as usize + (x - self.rect.left) as usize) * 4;
+        match self.pixels.get(i..i + 3) {
+            Some(p) => [p[0], p[1], p[2]],
+            None => [0; 3],
         }
-    });
+    }
+
+    /// How far apart `self` and `other` are at most, in any channel, over
+    /// `r` (screen px, cut to what both show).
+    fn differs(&self, other: &Shot, r: Rect) -> u8 {
+        let r = Rect::new(
+            r.left.max(self.rect.left).max(other.rect.left),
+            r.top.max(self.rect.top).max(other.rect.top),
+            r.right.min(self.rect.right).min(other.rect.right),
+            r.bottom.min(self.rect.bottom).min(other.rect.bottom),
+        );
+        let mut most = 0;
+        for y in r.top..r.bottom {
+            for x in r.left..r.right {
+                let (a, b) = (self.at(x, y), other.at(x, y));
+                for c in 0..3 {
+                    most = most.max(a[c].abs_diff(b[c]));
+                }
+            }
+        }
+        most
+    }
+}
+
+/// The screen inside `rect` now, also saved as `name`.png in `out`: taken
+/// and written off this thread, and done when this returns.
+async fn shot(out: &std::path::Path, name: &str, rect: Rect, cx: &mut AsyncApp) -> Option<Shot> {
+    let file = out.join(format!("{name}.png"));
+    cx.background_spawn(async move {
+        let (w, h, pixels) = win::capture(rect)?;
+        let _ = image::save_buffer(file, &pixels, w, h, image::ExtendedColorType::Rgba8);
+        Some(Shot { rect, w, pixels })
+    })
+    .await
 }
 
 async fn run(out: &std::path::Path, report: &mut String, cx: &mut AsyncApp) -> Result<(), String> {
@@ -102,11 +144,14 @@ async fn run(out: &std::path::Path, report: &mut String, cx: &mut AsyncApp) -> R
             r.bottom.min(mon.rect.bottom),
         )
     };
+    let place = cx.update(panel::guess_place).map_err(gone)?;
+    let Some(place) = place else {
+        return Err("no place for the panel".into());
+    };
+    let before = shot(out, "panel-before", around(place), cx).await;
     let opened = Instant::now();
     cx.update(|cx| {
-        if let Some(r) = panel::guess_place(cx) {
-            crate::frames::crop(Some(around(r)));
-        }
+        crate::frames::crop(Some(around(place)));
         panel::toggle(anchor, cx);
     })
     .map_err(gone)?;
@@ -119,7 +164,7 @@ async fn run(out: &std::path::Path, report: &mut String, cx: &mut AsyncApp) -> R
         }
     }
     let facts = cx.update(|cx| panel::facts(cx)).map_err(gone)?;
-    let _ = writeln!(report, "panel: shown after {shown_after:?}\n{facts}");
+    let _ = writeln!(report, "panel: seen shown after {shown_after:?}\n{facts}");
     let rect = cx.update(|cx| panel::last_rect(cx)).map_err(gone)?;
     let Some(rect) = rect else {
         return Err("the panel has no place".into());
@@ -127,11 +172,69 @@ async fn run(out: &std::path::Path, report: &mut String, cx: &mut AsyncApp) -> R
     if shown_after.is_none() {
         return Err("the panel never showed".into());
     }
-    still(out, "panel-rest", around(rect));
-    pause(300, cx).await;
-    // Twice the size, for reading its pixels.
-    still(out, "panel-only", rect.outset((12.0 * mon.scale) as i32));
-    pause(300, cx).await;
+    // Clicks beside the panel must reach what is under its window.
+    if let Some((h, x, y)) = cx.update(|cx| panel::click_test(cx)).map_err(gone)? {
+        let passes = unsafe { win::passes_clicks(h, x, y) };
+        let _ = writeln!(
+            report,
+            "panel: a click beside it at ({x}, {y}) passes through: {passes:?}"
+        );
+        if passes != Some(true) {
+            return Err("clicks beside the panel do not pass through its window".into());
+        }
+    }
+    let rest = shot(out, "panel-rest", around(rect), cx).await;
+    shot(
+        out,
+        "panel-only",
+        rect.outset((12.0 * mon.scale) as i32),
+        cx,
+    )
+    .await;
+    if let (Some(before), Some(rest)) = (&before, &rest) {
+        // What the panel changed on the screen around itself: its rim just
+        // outside it, its shadow fading out from there, and nothing far
+        // from it.
+        let (mx, my) = rect.centre();
+        let _ = writeln!(
+            report,
+            "panel: sheet {:?} at its middle; rim left {:?} top {:?} right {:?} bottom {:?}",
+            rest.at(mx, my),
+            rest.at(rect.left - 1, my),
+            rest.at(mx, rect.top - 1),
+            rest.at(rect.right, my),
+            rest.at(mx, rect.bottom),
+        );
+        let mut shadow = String::new();
+        for d in [2, 4, 8, 12, 16, 24, 32, 48, 64, 96] {
+            let below = Rect::new(mx - 40, rect.bottom + d, mx + 40, rect.bottom + d + 1);
+            let right = Rect::new(rect.right + d, my - 40, rect.right + d + 1, my + 40);
+            let above = Rect::new(mx - 40, rect.top - d - 1, mx + 40, rect.top - d);
+            let _ = write!(
+                shadow,
+                " {d}px: {}/{}/{}",
+                before.differs(rest, below),
+                before.differs(rest, right),
+                before.differs(rest, above),
+            );
+        }
+        let _ = writeln!(
+            report,
+            "panel: change from the screen before, below/right/above its edge:{shadow}"
+        );
+        let far = (140.0 * mon.scale) as i32;
+        let strip = Rect::new(
+            rect.right + far,
+            rect.top,
+            rect.right + far + 60,
+            rect.bottom,
+        );
+        let _ = writeln!(
+            report,
+            "panel: change far to its right (must be 0): {}",
+            before.differs(rest, strip)
+        );
+    }
     cx.update(|cx| {
         crate::frames::crop(Some(around(rect)));
         panel::slide_away(cx);
@@ -140,8 +243,14 @@ async fn run(out: &std::path::Path, report: &mut String, cx: &mut AsyncApp) -> R
     pause(1200, cx).await;
     let open = cx.update(|cx| panel::is_open(cx)).map_err(gone)?;
     let _ = writeln!(report, "panel: open after sliding away: {open}");
-    still(out, "panel-gone", around(rect));
-    pause(300, cx).await;
+    let after = shot(out, "panel-gone", around(rect), cx).await;
+    if let (Some(before), Some(after)) = (&before, &after) {
+        let _ = writeln!(
+            report,
+            "panel: left behind on the screen (must be 0): {}",
+            before.differs(after, around(rect))
+        );
+    }
     if open {
         return Err("the panel did not close".into());
     }
@@ -157,8 +266,7 @@ async fn run(out: &std::path::Path, report: &mut String, cx: &mut AsyncApp) -> R
         .update(|cx| view::window_hwnd(cx).and_then(win::client_rect))
         .map_err(gone)?;
     let _ = writeln!(report, "window: client {client:?}");
-    still(out, "window-rest", mon.rect);
-    pause(500, cx).await;
+    shot(out, "window-rest", mon.rect, cx).await;
     cx.update(view::close_window).map_err(gone)?;
     pause(500, cx).await;
     Ok(())

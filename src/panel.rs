@@ -63,6 +63,8 @@ pub struct PanelSlot {
     /// The slide in under way: when it began, how long it lasts, and the
     /// work area edge it comes from.
     slide: Option<Slide>,
+    /// How long after it was opened it first drew in place, and showed.
+    timing: [Option<Duration>; 2],
     /// It is sliding away to close, and has slid all the way.
     leaving: bool,
     closing: bool,
@@ -162,6 +164,21 @@ pub fn shows(cx: &App) -> bool {
     is_open(cx) && cx.try_global::<PanelSlot>().is_some_and(|s| s.shown)
 }
 
+/// The open panel's window, and whether clicks pass it where it should
+/// let them (`win::passes_clicks`), tried beside the panel: for the
+/// self-test's report.
+pub fn click_test(cx: &App) -> Option<(isize, i32, i32)> {
+    let slot = cx.try_global::<PanelSlot>()?;
+    let (h, rect, area) = (slot.hwnd?, slot.rect?, slot.area?);
+    // A point of its window well away from the panel itself.
+    let x = if rect.left - area.left > area.right - rect.right {
+        (area.left + rect.left) / 2
+    } else {
+        (rect.right + area.right) / 2
+    };
+    Some((h, x, (area.top + area.bottom) / 2))
+}
+
 /// The open panel's state in words, for the self-test's report.
 pub fn facts(cx: &App) -> String {
     let Some(slot) = cx.try_global::<PanelSlot>() else {
@@ -169,7 +186,8 @@ pub fn facts(cx: &App) -> String {
     };
     format!(
         "  rect {:?}\n  window area {:?}\n  client now {:?}\n  ex-style {:#x}\n  frames in place {} \
-         shown {} click-through {} leaving {} height {}",
+         shown {} click-through {} leaving {} height {}\n  first drawn in place after {:?}, \
+         shown after {:?}",
         slot.rect,
         slot.area,
         slot.hwnd.and_then(win::client_rect),
@@ -179,6 +197,8 @@ pub fn facts(cx: &App) -> String {
         slot.through,
         slot.leaving,
         slot.height,
+        slot.timing[0],
+        slot.timing[1],
     )
 }
 
@@ -407,6 +427,7 @@ fn open(anchor: Anchor, slide: bool, cloaked: bool, cx: &mut App) {
     slot.rect = Some(rect);
     slot.area = Some(area);
     slot.drawn = 0;
+    slot.timing = [None; 2];
     slot.shown = false;
     slot.held = cloaked;
     slot.through = true;
@@ -540,10 +561,15 @@ pub fn drew(window: &mut Window, cx: &mut App) {
         return;
     }
     slot.drawn += 1;
+    let since = slot.toggled_at.map(|t| t.elapsed());
+    if slot.drawn == 1 && slot.timing[0].is_none() {
+        slot.timing[0] = since;
+    }
     // The second frame: the first may have been laid out before the
     // window was where it belongs.
     if slot.drawn == 2 && !slot.shown && !slot.held {
         slot.shown = true;
+        slot.timing[1] = since;
         if let Some(slide) = &mut slot.slide {
             slide.start = Instant::now();
         }
@@ -657,6 +683,11 @@ pub fn slide_away_now(cx: &mut App) {
     });
     slot.leaving = true;
     crate::frames::watch(win::primary_monitor().rect, "panel-out", cx);
+    // A commit's card stays where the mouse is: gone before the panel
+    // moves from under it.
+    if let Some(t) = cx.try_global::<Ui>().map(|ui| ui.timelines.clone()) {
+        t.update(cx, |t, cx| t.drop_hover(cx));
+    }
     // It draws itself sliding out, a frame at a time, and closes as it
     // gets there (`sheet`); outside any update of its window this may be
     // called from.

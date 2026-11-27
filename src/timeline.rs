@@ -608,6 +608,15 @@ impl Timelines {
         cx.notify();
     }
 
+    /// No dot is hovered any more, and its card goes: the view under the
+    /// mouse is moving away.
+    pub fn drop_hover(&mut self, cx: &mut Context<Self>) {
+        if self.hover.is_some() {
+            self.unhover();
+            cx.notify();
+        }
+    }
+
     fn unhover(&mut self) {
         self.leave(Instant::now());
         self.hover = None;
@@ -961,8 +970,8 @@ impl Timelines {
                     if phase != DispatchPhase::Bubble {
                         return;
                     }
-                    let found = hitbox
-                        .is_hovered(window)
+                    // Not while the panel slides away under the mouse.
+                    let found = (hitbox.is_hovered(window) && !crate::panel::is_leaving(cx))
                         .then(|| nearest(&dots, e.position))
                         .flatten()
                         .map(|(dot, at)| {

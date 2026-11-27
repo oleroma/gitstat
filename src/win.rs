@@ -43,7 +43,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     MB_YESNO, MessageBoxW, SM_CXSCREEN, SM_CXSMICON, SM_CYSCREEN, SM_SWAPBUTTON, SW_HIDE,
     SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
     SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow, WINDOW_EX_STYLE,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TRANSPARENT,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TRANSPARENT, WindowFromPoint,
 };
 
 /// The HWND of a GPUI window.
@@ -442,6 +442,27 @@ pub unsafe fn place_morph(h: isize, r: Rect) {
             r.height() + bh,
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
+    }
+}
+
+/// Whether a click at (`x`, `y`) on screen, inside `h`, would pass through
+/// `h` to what is under it once [`click_through`] is on: tried and put
+/// back at once, for the self-test.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn passes_clicks(h: isize, x: i32, y: i32) -> Option<bool> {
+    let hwnd = live(h)?;
+    unsafe {
+        let was = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let at = POINT { x, y };
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, was & !(WS_EX_TRANSPARENT as isize));
+        let solid = WindowFromPoint(at) == hwnd;
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, was | WS_EX_TRANSPARENT as isize);
+        let through = WindowFromPoint(at) != hwnd;
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, was);
+        // Only if it takes the click when it should, too.
+        solid.then_some(through)
     }
 }
 
