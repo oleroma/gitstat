@@ -291,7 +291,10 @@ async fn run(out: &std::path::Path, report: &mut String, cx: &mut AsyncApp) -> R
             ];
             let _ = write!(left_of, " {d}px:");
             for band in bands {
-                match (rest.light(band) * 100).checked_div(before.light(band)) {
+                // Over a dark screen a shadow takes nothing to measure.
+                let was = before.light(band);
+                let was = if was < 120 * 3 * 40 { 0 } else { was };
+                match (rest.light(band) * 100).checked_div(was) {
                     Some(left) => {
                         let _ = write!(left_of, " {left}");
                     }

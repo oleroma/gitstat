@@ -258,7 +258,18 @@ impl Element for Text {
                     _ => None,
                 });
                 let run = style.to_run(text.len());
-                if wraps(&style) {
+                // The wrapper adds up letters one by one, which can come
+                // out wider than the line as shaped: words that fit as
+                // shaped stay on one line.
+                let whole = window.text_system().shape_line(
+                    text.clone(),
+                    font_size,
+                    std::slice::from_ref(&run),
+                    None,
+                );
+                let fits = !text.contains('\n')
+                    && limit.is_none_or(|limit| whole.width <= limit + px(0.5));
+                if wraps(&style) && !fits {
                     let lines = window
                         .text_system()
                         .shape_text(text.clone(), font_size, &[run], limit, None)
@@ -271,10 +282,7 @@ impl Element for Text {
                     }
                     size(width.ceil(), line_height * rows.max(1))
                 } else {
-                    let line =
-                        window
-                            .text_system()
-                            .shape_line(text.clone(), font_size, &[run], None);
+                    let line = whole;
                     let width = match limit {
                         Some(limit) if style.text_overflow.is_some() => line.width.min(limit),
                         _ => line.width,
@@ -325,13 +333,16 @@ impl Element for Text {
             TextAlign::Center => (box_w - line_w) / 2.0,
             TextAlign::Right => box_w - line_w,
         };
-        if !wraps(&style) {
-            let mut line = window.text_system().shape_line(
-                self.text.clone(),
-                font_size,
-                std::slice::from_ref(&run),
-                None,
-            );
+        let whole = window.text_system().shape_line(
+            self.text.clone(),
+            font_size,
+            std::slice::from_ref(&run),
+            None,
+        );
+        // As it was measured: words that fit as shaped stay on one line.
+        let fits = !self.text.contains('\n') && f32::from(whole.width) <= box_w + 0.5;
+        if !wraps(&style) || fits {
+            let mut line = whole;
             if style.text_overflow.is_some() && f32::from(line.width) > box_w + 0.5 {
                 let text = cut(&self.text, box_w, &run, font_size, window);
                 let run = TextRun {
