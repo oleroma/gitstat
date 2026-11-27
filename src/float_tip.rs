@@ -14,9 +14,9 @@ use crate::view::{self, Palette, Ui};
 use crate::win;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, Bounds, Context, Corner, Entity, Global, Hsla, IntoElement, ParentElement,
-    Pixels, Point, Render, SharedString, Styled, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowHandle, WindowKind, WindowOptions, anchored, canvas, div, point, px, size,
+    AnyElement, App, AppContext, Bounds, Context, Corner, Entity, Global, Hsla, IntoElement,
+    ParentElement, Pixels, Point, Render, SharedString, Styled, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowHandle, WindowKind, WindowOptions, anchored, canvas, div, point, px, size,
 };
 use std::time::Duration;
 
@@ -78,6 +78,27 @@ impl Render for TipView {
             point(px((x - a.left) as f32 / s), px((y - a.top) as f32 / s))
         };
         let half = px(area.map_or(0, |a| a.height()) as f32 / s / 2.0);
+        let origin = area.map_or((0, 0), |a| (a.left, a.top));
+        // What it shows, with where that lands on the screen noted: the
+        // mouse on it is on it, not on what it covers.
+        let measured = move |el: AnyElement| {
+            div().relative().child(el).child(
+                canvas(
+                    move |b, _, cx| {
+                        let e = |v: Pixels| (f32::from(v) * s).round() as i32;
+                        cx.default_global::<TipSlot>().content = Some(Rect::new(
+                            origin.0 + e(b.left()),
+                            origin.1 + e(b.top()),
+                            origin.0 + e(b.right()),
+                            origin.1 + e(b.bottom()),
+                        ));
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+        };
         let body = match &shows {
             // Where GPUI puts a tooltip: a px right of and below the
             // mouse, the other way where the screen ends.
@@ -85,7 +106,9 @@ impl Render for TipView {
                 anchored()
                     .anchor(Corner::TopLeft)
                     .position(local(*at) + point(px(1.), px(1.)))
-                    .child(view::tip_body(lines, p.bg, p.border))
+                    .child(measured(
+                        view::tip_body(lines, p.bg, p.border).into_any_element(),
+                    ))
                     .into_any_element(),
             ),
             // Where the panel puts a card: from a little left of its dot,
@@ -107,7 +130,7 @@ impl Render for TipView {
                             .anchor(corner)
                             .position(point(x, y))
                             .snap_to_window_with_margin(px(8.))
-                            .child(card)
+                            .child(measured(card))
                             .into_any_element(),
                     )
                 })
@@ -115,26 +138,6 @@ impl Render for TipView {
             None => None,
         };
         let hwnd = win::hwnd(window);
-        let origin = area.map_or((0, 0), |a| (a.left, a.top));
-        // What it shows, and where that lands on the screen.
-        let body = body.map(|body| {
-            div().relative().child(body).child(
-                canvas(
-                    move |b, _, cx| {
-                        let e = |v: Pixels| (f32::from(v) * s).round() as i32;
-                        cx.default_global::<TipSlot>().content = Some(Rect::new(
-                            origin.0 + e(b.left()),
-                            origin.1 + e(b.top()),
-                            origin.0 + e(b.right()),
-                            origin.1 + e(b.bottom()),
-                        ));
-                    },
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .size_full(),
-            )
-        });
         div()
             .size_full()
             .when_some(body, |d, body| d.child(body))
