@@ -32,6 +32,8 @@ mod repo_icon;
 #[cfg(any(windows, test))]
 mod repo_info;
 #[cfg(any(windows, test))]
+mod scene;
+#[cfg(any(windows, test))]
 mod self_update;
 #[cfg(any(windows, test))]
 mod state;
@@ -43,19 +45,25 @@ mod app;
 #[cfg(windows)]
 mod autostart;
 #[cfg(windows)]
+mod flip;
+#[cfg(windows)]
+mod float_tip;
+#[cfg(windows)]
 mod frames;
 #[cfg(windows)]
 mod glyph_path;
-#[cfg(windows)]
-mod morph;
 #[cfg(windows)]
 mod overlay;
 #[cfg(windows)]
 mod panel;
 #[cfg(windows)]
+mod probe;
+#[cfg(windows)]
 mod repo_marks;
 #[cfg(windows)]
 mod repo_menu;
+#[cfg(windows)]
+mod selftest;
 #[cfg(windows)]
 mod settings;
 #[cfg(windows)]
@@ -95,6 +103,9 @@ struct Args {
     config_file: PathBuf,
     /// Started by a gitstat that just swapped in a new build (self_update.rs).
     after_update: bool,
+    /// Test itself on the screen, leaving what it saw in this folder
+    /// (selftest.rs).
+    self_test: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -104,6 +115,7 @@ fn parse_args() -> Result<Args, String> {
         fetch: true,
         config_file: config::default_file(),
         after_update: false,
+        self_test: None,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -112,6 +124,9 @@ fn parse_args() -> Result<Args, String> {
             "--no-fetch" => args.fetch = false,
             "--remove-folder-icons" => args.remove_folder_icons = true,
             "--after-update" => args.after_update = true,
+            "--self-test" => {
+                args.self_test = Some(iter.next().ok_or("--self-test needs a folder")?.into());
+            }
             "--config" => args.config_file = iter.next().ok_or("--config needs a file")?.into(),
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument: {other}")),
@@ -153,6 +168,15 @@ fn main() {
         std::process::exit(run_once(&args));
     }
 
+    // Testing itself, it runs beside the gitstat that is running, and is
+    // no build to update or hand over to.
+    #[cfg(windows)]
+    if let Some(out) = args.self_test {
+        log_panics();
+        app::run(args.config_file, Some(out));
+        return;
+    }
+
     #[cfg(windows)]
     {
         let first = if args.after_update {
@@ -191,7 +215,7 @@ fn main() {
         }
         write_tray_pid();
         log_panics();
-        app::run(args.config_file);
+        app::run(args.config_file, None);
     }
 }
 

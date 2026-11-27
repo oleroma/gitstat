@@ -1,0 +1,1293 @@
+//! gitstat testing itself on a real screen: `gitstat --self-test DIR`
+//! opens its views by itself, records what shows, writes what it saw to
+//! `DIR/report.txt` and quits. Run by the quick tests (`tests/self_test.rs`)
+//! beside whatever gitstat is running, with a config and a data folder of
+//! its own, so nothing of the user's is touched.
+//!
+//! The pictures go where the config's frame recorder puts them: every
+//! frame of a view coming or going, and stills of it at rest.
+
+use crate::layout::Rect;
+use crate::panel::{self, Anchor};
+use crate::view::{self, Ui};
+use crate::win;
+use gpui::{App, AppContext, AsyncApp};
+use image::ImageEncoder;
+use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+use std::fmt::Write as _;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+/// Runs the test, then quits the app.
+pub fn start(out: PathBuf, cx: &mut App) {
+    cx.spawn(async move |cx| {
+        let mut report = String::new();
+        // The mouse, off the views while they are compared px for px (a
+        // row under it lights up), and back after.
+        let mouse = win::cursor_pos();
+        let work = win::primary_monitor().work;
+        win::set_cursor_pos(work.left + 150, work.top + 60);
+        let verdict = run(&out, &mut report, cx).await;
+        win::set_cursor_pos(mouse.0, mouse.1);
+        let _ = writeln!(
+            report,
+            "{}",
+            match &verdict {
+                Ok(()) => "result: done".to_string(),
+                Err(why) => format!("result: failed: {why}"),
+            }
+        );
+        let _ = std::fs::write(out.join("report.txt"), report);
+        // The recorder's last pictures are still being written.
+        cx.background_executor()
+            .timer(Duration::from_millis(4000))
+            .await;
+        std::process::exit(i32::from(verdict.is_err()));
+    })
+    .detach();
+}
+
+async fn pause(ms: u64, cx: &mut AsyncApp) {
+    cx.background_executor()
+        .timer(Duration::from_millis(ms))
+        .await;
+}
+
+/// A picture of part of the screen: its place, and its pixels as RGBA.
+struct Shot {
+    rect: Rect,
+    w: u32,
+    pixels: Vec<u8>,
+}
+
+impl Shot {
+    /// The colour at screen px (`x`, `y`), which must be inside it.
+    fn at(&self, x: i32, y: i32) -> [u8; 3] {
+        let (dx, dy) = (x - self.rect.left, y - self.rect.top);
+        if dx < 0 || dy < 0 || dx >= self.w as i32 {
+            // Off the picture: the window is not where it was asked to be.
+            return [0; 3];
+        }
+        let i = (dy as usize * self.w as usize + dx as usize) * 4;
+        match self.pixels.get(i..i + 3) {
+            Some(p) => [p[0], p[1], p[2]],
+            None => [0; 3],
+        }
+    }
+
+    /// How bright it is over `r` (screen px, cut to what it shows), all
+    /// channels summed.
+    fn light(&self, r: Rect) -> u64 {
+        let h = (self.pixels.len() / 4 / self.w.max(1) as usize) as i32;
+        let r = Rect::new(
+            r.left.max(self.rect.left),
+            r.top.max(self.rect.top),
+            r.right.min(self.rect.right),
+            r.bottom.min(self.rect.top + h),
+        );
+        let mut sum = 0u64;
+        for y in r.top..r.bottom {
+            for x in r.left..r.right {
+                sum += self.at(x, y).iter().map(|&c| u64::from(c)).sum::<u64>();
+            }
+        }
+        sum
+    }
+
+    /// How far apart `self` and `other` are at most, in any channel, over
+    /// `r` (screen px, cut to what both show).
+    fn differs(&self, other: &Shot, r: Rect) -> u8 {
+        let r = Rect::new(
+            r.left.max(self.rect.left).max(other.rect.left),
+            r.top.max(self.rect.top).max(other.rect.top),
+            r.right.min(self.rect.right).min(other.rect.right),
+            r.bottom.min(self.rect.bottom).min(other.rect.bottom),
+        );
+        let mut most = 0;
+        for y in r.top..r.bottom {
+            for x in r.left..r.right {
+                let (a, b) = (self.at(x, y), other.at(x, y));
+                for c in 0..3 {
+                    most = most.max(a[c].abs_diff(b[c]));
+                }
+            }
+        }
+        most
+    }
+}
+
+/// The screen inside `rect` now, also saved as `name`.png in `out`: taken
+/// and written off this thread, and done when this returns.
+async fn shot(out: &std::path::Path, name: &str, rect: Rect, cx: &mut AsyncApp) -> Option<Shot> {
+    let file = out.join(format!("{name}.png"));
+    cx.background_spawn(async move {
+        let (w, h, pixels) = win::capture(rect)?;
+        let _ = image::save_buffer(file, &pixels, w, h, image::ExtendedColorType::Rgba8);
+        Some(Shot { rect, w, pixels })
+    })
+    .await
+}
+
+async fn run(out: &std::path::Path, report: &mut String, cx: &mut AsyncApp) -> Result<(), String> {
+    let gone = |_| "the app went away".to_string();
+    // The repos, and a moment for their trees.
+    let began = Instant::now();
+    loop {
+        let ready = cx
+            .update(|cx| {
+                cx.try_global::<Ui>()
+                    .is_some_and(|ui| ui.state.read(cx).has_result)
+            })
+            .map_err(gone)?;
+        if ready {
+            break;
+        }
+        if began.elapsed() > Duration::from_secs(40) {
+            return Err("no repos found in 40 s".into());
+        }
+        pause(100, cx).await;
+    }
+    pause(2500, cx).await;
+    // GitHub's pull requests come later: the panel is tested with them.
+    let waited = Instant::now();
+    let prs = loop {
+        let (prs, problem) = cx
+            .update(|cx| {
+                let s = cx.global::<Ui>().state.read(cx);
+                (s.open_prs().len(), s.github_problem.clone())
+            })
+            .map_err(gone)?;
+        if prs > 0 || problem.is_some() || waited.elapsed() > Duration::from_secs(12) {
+            break (prs, problem);
+        }
+        pause(200, cx).await;
+    };
+    let _ = writeln!(
+        report,
+        "pull requests: {} open, problem {:?}, after {} ms more",
+        prs.0,
+        prs.1,
+        waited.elapsed().as_millis()
+    );
+    pause(500, cx).await;
+    let mon = win::primary_monitor();
+    let _ = writeln!(
+        report,
+        "monitor: {:?} work {:?} scale {}",
+        mon.rect, mon.work, mon.scale
+    );
+    let repos = cx
+        .update(|cx| cx.global::<Ui>().state.read(cx).statuses.len())
+        .map_err(gone)?;
+    let _ = writeln!(
+        report,
+        "repos: {repos}, found in {} ms",
+        began.elapsed().as_millis()
+    );
+
+    // The panel: slides in by the tray, rests, slides away.
+    let anchor = Anchor::Tray(win::tray_area());
+    let around = |r: Rect| {
+        let room = (220.0 * mon.scale) as i32;
+        let r = r.outset(room);
+        Rect::new(
+            r.left.max(mon.rect.left),
+            r.top.max(mon.rect.top),
+            r.right.min(mon.rect.right),
+            r.bottom.min(mon.rect.bottom),
+        )
+    };
+    let place = cx.update(panel::guess_place).map_err(gone)?;
+    let Some(place) = place else {
+        return Err("no place for the panel".into());
+    };
+    // The whole screen: with the badge showing, the guess is beside the
+    // badge, not by the tray where this opens it.
+    let before = shot(out, "panel-before", mon.rect, cx).await;
+    let opened = Instant::now();
+    cx.update(|cx| {
+        crate::frames::crop(Some(around(place)));
+        panel::toggle(anchor, cx);
+    })
+    .map_err(gone)?;
+    let mut shown_after = None;
+    while opened.elapsed() < Duration::from_millis(1500) {
+        pause(10, cx).await;
+        let shown = cx.update(|cx| panel::shows(cx)).map_err(gone)?;
+        if shown && shown_after.is_none() {
+            shown_after = Some(opened.elapsed());
+        }
+    }
+    let facts = cx.update(|cx| panel::facts(cx)).map_err(gone)?;
+    let _ = writeln!(report, "panel: seen shown after {shown_after:?}\n{facts}");
+    let rect = cx.update(|cx| panel::last_rect(cx)).map_err(gone)?;
+    let Some(rect) = rect else {
+        return Err("the panel has no place".into());
+    };
+    if shown_after.is_none() {
+        return Err("the panel never showed".into());
+    }
+    // Clicks beside the panel must reach what is under its window.
+    if let Some((h, x, y)) = cx.update(|cx| panel::click_test(cx)).map_err(gone)? {
+        let passes = unsafe { win::passes_clicks(h, x, y) };
+        let _ = writeln!(
+            report,
+            "panel: a click beside it at ({x}, {y}) passes through: {passes:?}"
+        );
+        if passes != Some(true) {
+            return Err("clicks beside the panel do not pass through its window".into());
+        }
+    }
+    let rest = shot(out, "panel-rest", around(rect), cx).await;
+    shot(
+        out,
+        "panel-only",
+        rect.outset((12.0 * mon.scale) as i32),
+        cx,
+    )
+    .await;
+    if let (Some(before), Some(rest)) = (&before, &rest) {
+        // What the panel changed on the screen around itself: its rim just
+        // outside it, its shadow fading out from there, and nothing far
+        // from it.
+        let (mx, my) = rect.centre();
+        let _ = writeln!(
+            report,
+            "panel: sheet {:?} at its middle; rim left {:?} top {:?} right {:?} bottom {:?}",
+            rest.at(mx, my),
+            rest.at(rect.left - 1, my),
+            rest.at(mx, rect.top - 1),
+            rest.at(rect.right, my),
+            rest.at(mx, rect.bottom),
+        );
+        let mut shadow = String::new();
+        for d in [2, 4, 8, 12, 16, 24, 32, 48, 64, 96] {
+            let below = Rect::new(mx - 40, rect.bottom + d, mx + 40, rect.bottom + d + 1);
+            let right = Rect::new(rect.right + d, my - 40, rect.right + d + 1, my + 40);
+            let above = Rect::new(mx - 40, rect.top - d - 1, mx + 40, rect.top - d);
+            let _ = write!(
+                shadow,
+                " {d}px: {}/{}/{}",
+                before.differs(rest, below),
+                before.differs(rest, right),
+                before.differs(rest, above),
+            );
+        }
+        let _ = writeln!(
+            report,
+            "panel: change from the screen before, below/right/above its edge:{shadow}"
+        );
+        // The shadow alone: how much light is left of what was there, in
+        // a line along each side at each distance (100 = untouched).
+        let mut left_of = String::new();
+        for d in [1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96] {
+            let rim = 2;
+            let bands = [
+                Rect::new(
+                    mx - 60,
+                    rect.bottom + rim + d,
+                    mx + 60,
+                    rect.bottom + rim + d + 1,
+                ),
+                Rect::new(
+                    rect.right + rim + d,
+                    my - 60,
+                    rect.right + rim + d + 1,
+                    my + 60,
+                ),
+                Rect::new(mx - 60, rect.top - rim - d - 1, mx + 60, rect.top - rim - d),
+                Rect::new(
+                    rect.left - rim - d - 1,
+                    my - 60,
+                    rect.left - rim - d,
+                    my + 60,
+                ),
+            ];
+            let _ = write!(left_of, " {d}px:");
+            for band in bands {
+                // Over a dark screen a shadow takes nothing to measure.
+                let was = before.light(band);
+                let was = if was < 120 * 3 * 40 { 0 } else { was };
+                match (rest.light(band) * 100).checked_div(was) {
+                    Some(left) => {
+                        let _ = write!(left_of, " {left}");
+                    }
+                    None => {
+                        let _ = write!(left_of, " -");
+                    }
+                }
+            }
+        }
+        let _ = writeln!(
+            report,
+            "panel: light left under its shadow, % below/right/above/left:{left_of}"
+        );
+        let far = (140.0 * mon.scale) as i32;
+        let strip = Rect::new(
+            rect.right + far,
+            rect.top,
+            rect.right + far + 60,
+            rect.bottom,
+        );
+        let _ = writeln!(
+            report,
+            "panel: change far to its right (must be 0): {}",
+            before.differs(rest, strip)
+        );
+    }
+    cx.update(|cx| {
+        crate::frames::crop(Some(around(rect)));
+        panel::slide_away(cx);
+    })
+    .map_err(gone)?;
+    pause(1200, cx).await;
+    let open = cx.update(|cx| panel::is_open(cx)).map_err(gone)?;
+    let _ = writeln!(report, "panel: open after sliding away: {open}");
+    let after = shot(out, "panel-gone", around(rect), cx).await;
+    if let (Some(before), Some(after)) = (&before, &after) {
+        let _ = writeln!(
+            report,
+            "panel: left behind on the screen (must be 0): {}",
+            before.differs(after, around(rect))
+        );
+    }
+    if open {
+        return Err("the panel did not close".into());
+    }
+
+    // The big window: opens, rests, closes.
+    cx.update(|cx| {
+        crate::frames::crop(None);
+        view::show_window(cx);
+    })
+    .map_err(gone)?;
+    pause(2500, cx).await;
+    let client = cx
+        .update(|cx| view::window_hwnd(cx).and_then(win::client_rect))
+        .map_err(gone)?;
+    let hwnd = cx.update(view::window_hwnd).map_err(gone)?;
+    let frame = hwnd.and_then(win::window_rect);
+    let _ = writeln!(report, "window: frame {frame:?} client {client:?}");
+    let whole = shot(out, "window-rest", mon.rect, cx).await;
+    let (Some(h), Some(client)) = (hwnd, client) else {
+        return Err("the big window did not open".into());
+    };
+    let inside = client.left >= mon.work.left
+        && client.top >= mon.work.top
+        && client.right <= mon.work.right
+        && client.bottom <= mon.work.bottom;
+    let _ = writeln!(report, "window: inside the work area: {inside}");
+    // Its own title bar: its colour, and Windows finding its parts where
+    // they are drawn.
+    let e = |v: f32| (v * mon.scale).round() as i32;
+    let mid = client.top + e(16.0);
+    let button = |i: i32| client.right - e(46.0) * (2 - i) - e(23.0);
+    if let Some(whole) = &whole {
+        let _ = writeln!(
+            report,
+            "window: title bar {:?} beside its name, {:?} between name and buttons; top bar {:?}; \
+             rim left {:?} top {:?}",
+            whole.at(client.left + e(4.0), mid),
+            whole.at((client.left + button(0)) / 2, mid),
+            whole.at(client.left + e(4.0), client.top + e(36.0)),
+            whole.at(client.left - 1, mid),
+            whole.at(client.left + e(100.0), client.top - 1),
+        );
+    }
+    let hits = unsafe {
+        [
+            win::hit_test(h, (client.left + button(0)) / 2, mid),
+            win::hit_test(h, button(0), mid),
+            win::hit_test(h, button(1), mid),
+            win::hit_test(h, button(2), mid),
+            win::hit_test(h, (client.left + button(0)) / 2, client.top + 1),
+            win::hit_test(h, client.left + e(100.0), client.top + e(60.0)),
+        ]
+    };
+    let _ = writeln!(
+        report,
+        "window: Windows finds title bar, minimise, maximise, close, top edge, inside \
+         (want 2, 8, 9, 20, 12, 1): {hits:?}"
+    );
+    pause(300, cx).await;
+    shot(
+        out,
+        "window-title-bar",
+        Rect::new(
+            client.left - e(12.0),
+            client.top - e(12.0),
+            client.right + e(12.0),
+            client.top + e(110.0),
+        ),
+        cx,
+    )
+    .await;
+    shot(
+        out,
+        "window-bottom",
+        Rect::new(
+            client.left - e(12.0),
+            client.bottom - e(300.0),
+            client.left + e(700.0),
+            client.bottom + e(12.0),
+        ),
+        cx,
+    )
+    .await;
+    if !inside {
+        return Err("the big window reaches off the work area".into());
+    }
+    if hits[..4] != [Some(2), Some(8), Some(9), Some(20)] {
+        return Err("Windows does not find the title bar's parts where they are drawn".into());
+    }
+    // Its maximise button, clicked as Windows tells a click: it maximises,
+    // and again puts it back.
+    let mut zoomed = Vec::new();
+    for _ in 0..2 {
+        // Where its button is now: maximised, the window has moved.
+        let Some(c) = win::client_rect(h) else {
+            return Err("the big window went away".into());
+        };
+        let x = c.right - e(46.0) - e(23.0);
+        unsafe { win::click_caption(h, x, c.top + e(16.0), 9) };
+        pause(700, cx).await;
+        zoomed.push(win::is_zoomed(h));
+    }
+    let back = win::client_rect(h);
+    let _ = writeln!(
+        report,
+        "window: maximise clicked twice, maximised after each (want true, false): {zoomed:?}; \
+         back as it was {}",
+        back == Some(client)
+    );
+    if zoomed != [true, false] {
+        return Err("the maximise button does not maximise and restore".into());
+    }
+    cx.update(view::close_window).map_err(gone)?;
+    pause(500, cx).await;
+
+    // The flip: panel to big window and back (closed, then minimised),
+    // every frame that can be caught, against the views at rest.
+    let window_rest = whole;
+    crate::frames::mute(true);
+    cx.update(|cx| panel::toggle(anchor, cx)).map_err(gone)?;
+    pause(1500, cx).await;
+    let panel_rest = shot(out, "flip-panel-rest", mon.rect, cx).await;
+    let (Some(panel_rest), Some(window_rest)) = (panel_rest, window_rest) else {
+        return Err("no picture of the screen".into());
+    };
+    let badge = cx.update(|cx| crate::overlay::placed(cx)).map_err(gone)?;
+    let _ = writeln!(
+        report,
+        "flip: the mouse is at {:?}, the badge at {badge:?}",
+        win::cursor_pos()
+    );
+    let (panel_rest, window_rest) = (Arc::new(panel_rest), Arc::new(window_rest));
+    let mut window_now = window_rest.clone();
+    for (round, minimise) in [(1, false), (2, true)] {
+        let what = format!("flip open {round}");
+        if !cx.update(|cx| panel::is_open(cx)).map_err(gone)? {
+            cx.update(|cx| panel::toggle(anchor, cx)).map_err(gone)?;
+            pause(1500, cx).await;
+        }
+        gear_log(report, "between flips");
+        let watch = Watch::start(mon.rect, out.join(what.replace(' ', "-")));
+        pause(120, cx).await;
+        let asked = cx
+            .update(|cx| {
+                let handle = cx
+                    .try_global::<panel::PanelSlot>()
+                    .and_then(|s| s.handle())?;
+                handle
+                    .update(cx, |_, window, cx| {
+                        crate::flip::open_window(window, None, cx);
+                    })
+                    .ok()
+            })
+            .map_err(gone)?;
+        if asked.is_none() {
+            return Err("no panel to flip from".into());
+        }
+        flip_ends(cx).await?;
+        pause(300, cx).await;
+        let frames = watch.stop(cx).await;
+        let open = cx.update(|cx| view::window_open(cx)).map_err(gone)?;
+        let now = cx
+            .update(|cx| view::window_hwnd(cx).and_then(win::client_rect))
+            .map_err(gone)?;
+        let _ = writeln!(
+            report,
+            "{what}: window open {open}, client {now:?} (was {client:?}), panel open {}",
+            cx.update(|cx| panel::is_open(cx)).map_err(gone)?
+        );
+        tell(
+            report,
+            out,
+            &what,
+            &frames,
+            (&panel_rest, rect, (1000, 0, 0)),
+            (&window_rest, client, (0, 1000, 1000)),
+            badge,
+        );
+        drop(frames);
+        if !open {
+            return Err("the flip did not open the big window".into());
+        }
+        pause(600, cx).await;
+        let Some(now) = shot(out, &format!("flip-window-rest-{round}"), mon.rect, cx).await else {
+            return Err("no picture of the screen".into());
+        };
+        let _ = writeln!(
+            report,
+            "{what}: the window it ended in against the window opened plainly, px that differ \
+             inside it: {}",
+            changed(&now, &window_rest, client)
+        );
+        window_now = Arc::new(now);
+
+        let what = format!(
+            "flip {} {round}",
+            if minimise { "minimise" } else { "close" }
+        );
+        gear_log(report, "between flips");
+        let watch = Watch::start(mon.rect, out.join(what.replace(' ', "-")));
+        pause(120, cx).await;
+        let asked = if minimise {
+            cx.update(|cx| {
+                let handle = view::window_handle(cx)?;
+                win::mark_minimized();
+                handle
+                    .update(cx, |_, window, cx| crate::flip::flip_back(window, cx))
+                    .ok()
+            })
+            .map_err(gone)?
+        } else {
+            // Closed by its close button, clicked as Windows tells a click.
+            let h = cx.update(view::window_hwnd).map_err(gone)?;
+            let at = h.and_then(win::client_rect);
+            if let (Some(h), Some(c)) = (h, at) {
+                let x = c.right - e(23.0);
+                unsafe { win::click_caption(h, x, c.top + e(16.0), 20) };
+            }
+            let began = Instant::now();
+            loop {
+                pause(10, cx).await;
+                if cx.update(|cx| crate::flip::running(cx)).map_err(gone)? {
+                    break Some(true);
+                }
+                if began.elapsed() > Duration::from_secs(2) {
+                    break Some(false);
+                }
+            }
+        };
+        let _ = writeln!(report, "{what}: taken by the flip: {asked:?}");
+        if asked != Some(true) {
+            return Err("the flip back did not start".into());
+        }
+        flip_ends(cx).await?;
+        pause(if minimise { 300 } else { 900 }, cx).await;
+        let frames = watch.stop(cx).await;
+        tell(
+            report,
+            out,
+            &what,
+            &frames,
+            (&window_now, client, (0, 1000, 1000)),
+            (&panel_rest, rect, (1000, 0, 0)),
+            badge,
+        );
+        drop(frames);
+        let _ = writeln!(
+            report,
+            "{what}: window open {}, panel open {}",
+            cx.update(|cx| view::window_open(cx)).map_err(gone)?,
+            cx.update(|cx| panel::is_open(cx)).map_err(gone)?
+        );
+    }
+    let _ = window_now;
+    cx.update(panel::slide_away).map_err(gone)?;
+    pause(800, cx).await;
+    let grown = float(out, report, cx).await;
+    crate::frames::mute(false);
+    grown
+}
+
+/// The badge grows into the floating view and shrinks back, twice: every
+/// picture that can be caught, against the badge and the view at rest.
+/// While it is the badge, in whichever window, the screen must show the
+/// badge as it rests, to the px; the same of the view the second time,
+/// once its trees are read.
+async fn float(
+    out: &std::path::Path,
+    report: &mut String,
+    cx: &mut AsyncApp,
+) -> Result<(), String> {
+    let gone = |_| "the app went away".to_string();
+    let mon = win::primary_monitor();
+    let Some(badge) = cx.update(|cx| crate::overlay::placed(cx)).map_err(gone)? else {
+        return Err("no badge to grow".into());
+    };
+    let room = (520.0 * mon.scale) as i32;
+    let o = badge.outset(room);
+    let area = Rect::new(
+        o.left.max(mon.rect.left),
+        o.top.max(mon.rect.top),
+        o.right.min(mon.rect.right),
+        o.bottom.min(mon.rect.bottom),
+    );
+    // What is surely the sheet's own, whatever lies under its corners.
+    let inner = |r: Rect| {
+        let d = (r.width().min(r.height()) as f32 * 0.16) as i32;
+        Rect::new(r.left + d, r.top + d, r.right - d, r.bottom - d)
+    };
+    let Some(small) = shot(out, "float-badge-rest", area, cx).await else {
+        return Err("no picture of the screen".into());
+    };
+    let mut big: Option<(Shot, Rect)> = None;
+    for round in 1..=2 {
+        for grow in [true, false] {
+            let what = format!("float {} {round}", if grow { "grow" } else { "shrink" });
+            let watch = Watch::start_on(
+                area,
+                out.join(what.replace(' ', "-")),
+                crate::overlay::drawn,
+            );
+            pause(150, cx).await;
+            cx.update(|cx| {
+                cx.global::<Ui>()
+                    .input
+                    .unbounded_send(crate::state::Input::OverlayGrown(grow))
+                    .ok();
+            })
+            .map_err(gone)?;
+            let began = Instant::now();
+            pause(60, cx).await;
+            loop {
+                let resting = cx.update(|cx| crate::overlay::resting(cx)).map_err(gone)?;
+                if resting == Some(grow) {
+                    break;
+                }
+                if began.elapsed() > Duration::from_secs(6) {
+                    return Err(format!("{what}: it never came to rest ({resting:?})"));
+                }
+                pause(10, cx).await;
+            }
+            let took = began.elapsed().as_millis();
+            pause(if grow && round == 1 { 1500 } else { 350 }, cx).await;
+            let frames = watch.stop(cx).await;
+            let sheet = cx.update(|cx| crate::overlay::placed(cx)).map_err(gone)?;
+            let _ = writeln!(
+                report,
+                "{what}: at rest after {took} ms, as {sheet:?} (the badge {badge:?}); {} pictures; \
+                 each: ms, thousandths grown, px changed since the one before, px unlike the \
+                 badge at rest, px unlike the view at rest",
+                frames.len()
+            );
+            if grow {
+                let Some(sheet) = sheet else {
+                    return Err(format!("{what}: no view"));
+                };
+                let Some(now) = shot(out, &format!("float-view-rest-{round}"), area, cx).await
+                else {
+                    return Err("no picture of the screen".into());
+                };
+                big = Some((now, sheet));
+            }
+            let Some((view, sheet)) = &big else {
+                return Err(format!("{what}: no view to compare with"));
+            };
+            let mut wrong = Vec::new();
+            for (i, c) in frames.iter().enumerate() {
+                let moved = match i.checked_sub(1).and_then(|j| frames.get(j)) {
+                    Some(last) => changed(&c.shot, &last.shot, area),
+                    None => 0,
+                };
+                let unlike_badge = changed(&c.shot, &small, inner(badge));
+                let unlike_view = changed(&c.shot, view, inner(*sheet));
+                let g = c.drawn.map(|d| d.0);
+                let _ = writeln!(
+                    report,
+                    "{what}: {:5} {:>5} {}{moved:8} {unlike_badge:8} {unlike_view:8}",
+                    c.ms,
+                    g.map_or("-".to_string(), |g| g.to_string()),
+                    if c.steady { " " } else { "~" },
+                );
+                // While it is the badge it shows as the badge at rest,
+                // whichever window draws it; and the view as the view,
+                // once its trees are read.
+                if c.steady && g == Some(0) && unlike_badge > 0 {
+                    wrong.push(format!("{} ms: the badge, {unlike_badge} px off", c.ms));
+                }
+                if c.steady && g == Some(1000) && unlike_view > 0 && (round == 2 || !grow) {
+                    wrong.push(format!("{} ms: the view, {unlike_view} px off", c.ms));
+                }
+            }
+            if let Some(first) = wrong.first() {
+                let _ = writeln!(report, "{what}: {} pictures off: {wrong:?}", wrong.len());
+                return Err(format!("{what}: {first}"));
+            }
+            if !grow {
+                let Some(now) = shot(out, &format!("float-badge-after-{round}"), area, cx).await
+                else {
+                    return Err("no picture of the screen".into());
+                };
+                let off = changed(&now, &small, inner(badge));
+                let _ = writeln!(
+                    report,
+                    "{what}: the badge it ended as against the badge before, px that differ: {off}"
+                );
+                if off > 0 {
+                    return Err(format!("{what}: the badge came back {off} px off"));
+                }
+            }
+        }
+    }
+
+    // Taking a row out, as a middle click and a yes would: the undo
+    // plate comes beside the view, and undoing brings the view back as it
+    // was, the plate gone.
+    let send = |grown: bool, cx: &mut AsyncApp| {
+        cx.update(|cx| {
+            cx.global::<Ui>()
+                .input
+                .unbounded_send(crate::state::Input::OverlayGrown(grown))
+                .ok();
+        })
+        .map_err(gone)
+    };
+    let rest = async |grown: bool, plate: bool, cx: &mut AsyncApp| -> Result<u128, String> {
+        let began = Instant::now();
+        loop {
+            pause(20, cx).await;
+            let (r, p) = cx
+                .update(|cx| {
+                    (
+                        crate::overlay::resting(cx),
+                        crate::overlay::plate_showing(cx),
+                    )
+                })
+                .map_err(gone)?;
+            if r == Some(grown) && p == plate {
+                let took = began.elapsed().as_millis();
+                pause(400, cx).await;
+                return Ok(took);
+            }
+            if began.elapsed() > Duration::from_secs(6) {
+                return Err(format!(
+                    "float undo: never at rest, grown {grown}, plate {plate} ({r:?}, {p})"
+                ));
+            }
+        }
+    };
+    send(true, cx)?;
+    rest(true, false, cx).await?;
+    float_wheel(out, report, cx).await?;
+    let sheet = cx.update(|cx| crate::overlay::placed(cx)).map_err(gone)?;
+    let Some(plain) = shot(out, "float-undo-before", area, cx).await else {
+        return Err("no picture of the screen".into());
+    };
+    let took = cx.update(crate::overlay::take_out_first).map_err(gone)?;
+    if !took {
+        let _ = writeln!(
+            report,
+            "float undo: the view lists no repo to take out; skipped"
+        );
+        send(false, cx)?;
+        rest(false, false, cx).await?;
+        return Ok(());
+    }
+    // The plate is put in while the window changes; then it fades in.
+    pause(600, cx).await;
+    let Some(with) = shot(out, "float-undo-plate", area, cx).await else {
+        return Err("no picture of the screen".into());
+    };
+    let watch = Watch::start_on(area, out.join("float-undo"), crate::overlay::drawn);
+    pause(150, cx).await;
+    cx.update(crate::overlay::undo).map_err(gone)?;
+    let gone_after = rest(true, false, cx).await?;
+    let frames = watch.stop(cx).await;
+    let Some(after) = shot(out, "float-undo-after", area, cx).await else {
+        return Err("no picture of the screen".into());
+    };
+    send(false, cx)?;
+    rest(false, false, cx).await?;
+    if let Some(sheet) = sheet {
+        // Under the view, or over it near the screen's bottom: anywhere
+        // in the picture but the view itself.
+        let outside = changed(&with, &plain, area) - changed(&with, &plain, sheet);
+        // The view itself: what lies around it is whatever other app is
+        // there, and may change on its own (a ticking clock did).
+        // Inside its corners, as every other check of it: what shows
+        // past their curve is the app behind.
+        let left = changed(&after, &plain, inner(sheet));
+        let _ = writeln!(
+            report,
+            "float undo: the plate changes {outside} px beside the view; undone, it went in \
+             {gone_after} ms over {} pictures and leaves {left} px changed (must be 0)",
+            frames.len()
+        );
+        if outside == 0 {
+            return Err("float undo: no plate beside the view".into());
+        }
+        if left > 0 {
+            return Err(format!("float undo: {left} px stay changed after the undo"));
+        }
+    }
+    Ok(())
+}
+
+/// The wheel over the floating view's first tree scrolls that tree back
+/// in time, and the tree shows it; a double click brings it home.
+async fn float_wheel(
+    out: &std::path::Path,
+    report: &mut String,
+    cx: &mut AsyncApp,
+) -> Result<(), String> {
+    let gone = |_| "the app went away".to_string();
+    let found = cx
+        .update(|cx| crate::overlay::hwnd(cx).zip(crate::overlay::first_strip(cx)))
+        .map_err(gone)?;
+    let Some((h, (strip, path))) = found else {
+        let _ = writeln!(report, "float wheel: no tree in the view; skipped");
+        return Ok(());
+    };
+    let scrolled = |cx: &mut AsyncApp| {
+        cx.update(|cx| {
+            cx.try_global::<Ui>()
+                .and_then(|ui| ui.timelines.read(cx).scrolled(&path))
+        })
+        .map_err(gone)
+    };
+    let before = scrolled(cx)?;
+    let Some(plain) = shot(out, "float-wheel-before", strip, cx).await else {
+        return Err("no picture of the screen".into());
+    };
+    let (x, y) = (
+        (strip.left + strip.right) / 2,
+        (strip.top + strip.bottom) / 2,
+    );
+    let under = unsafe { win::wheel(h, x, y, 2) };
+    pause(700, cx).await;
+    let after = scrolled(cx)?;
+    let Some(moved) = shot(out, "float-wheel-after", strip, cx).await else {
+        return Err("no picture of the screen".into());
+    };
+    let px = changed(&moved, &plain, strip);
+    // The mouse the wheel was told of is gone again.
+    cx.update(crate::overlay::left).map_err(gone)?;
+
+    // A tooltip beside the view shows, and lets the mouse through to it.
+    cx.update(|cx| {
+        crate::float_tip::set_lines(
+            Some((vec![("Self-test".to_string(), gpui::white())], (x, y))),
+            cx,
+        )
+    })
+    .map_err(gone)?;
+    pause(400, cx).await;
+    let tip = cx
+        .update(|cx| crate::float_tip::shown_hwnd(cx))
+        .map_err(gone)?;
+    let through = tip.and_then(|t| unsafe { win::passes_clicks_now(t, x, y) });
+    cx.update(|cx| crate::float_tip::set_lines(None, cx))
+        .map_err(gone)?;
+    pause(200, cx).await;
+    let _ = writeln!(
+        report,
+        "float tip: shown {}, the mouse passes through it {through:?}",
+        tip.is_some()
+    );
+    if tip.is_none() {
+        return Err("float tip: the tooltip never showed".into());
+    }
+    if through != Some(true) {
+        return Err("float tip: the tooltip takes the mouse from the view".into());
+    }
+    let _ = writeln!(
+        report,
+        "float wheel: 2 notches up over the first tree at ({x}, {y}) in {strip:?}, the view's \
+         window there {under:?}; scrolled {before:?} -> {after:?}, {px} px changed"
+    );
+    let home = cx
+        .update(|cx| {
+            if let Some(ui) = cx.try_global::<Ui>() {
+                let t = ui.timelines.clone();
+                t.update(cx, |t, cx| t.scroll_home(&path, cx));
+            }
+        })
+        .map_err(gone);
+    home?;
+    pause(500, cx).await;
+    if after.unwrap_or(0.0) <= before.unwrap_or(0.0) {
+        return Err("float wheel: the wheel did not scroll the tree".into());
+    }
+    if px == 0 {
+        return Err("float wheel: the tree scrolled but did not show it".into());
+    }
+    Ok(())
+}
+
+/// Writes what the log says of emoji glyphs since it was last taken (there
+/// should be none), and empties it.
+fn gear_log(report: &mut String, what: &str) {
+    for line in crate::flip::take_log() {
+        if line.contains("emoji") || line.contains("big window:") {
+            let _ = writeln!(report, "{what}: log {line}");
+        }
+    }
+}
+
+/// Waits for the flip under way to end.
+async fn flip_ends(cx: &mut AsyncApp) -> Result<(), String> {
+    let began = Instant::now();
+    pause(50, cx).await;
+    loop {
+        let running = cx
+            .update(|cx| crate::flip::running(cx))
+            .map_err(|_| "the app went away".to_string())?;
+        if !running {
+            return Ok(());
+        }
+        if began.elapsed() > Duration::from_secs(8) {
+            return Err("the flip did not end in 8 s".into());
+        }
+        pause(10, cx).await;
+    }
+}
+
+/// How many px differ between `a` and `b` by more than a little, over `r`
+/// (screen px, cut to what both show).
+fn changed(a: &Shot, b: &Shot, r: Rect) -> u32 {
+    let r = Rect::new(
+        r.left.max(a.rect.left).max(b.rect.left),
+        r.top.max(a.rect.top).max(b.rect.top),
+        r.right.min(a.rect.right).min(b.rect.right),
+        r.bottom.min(a.rect.bottom).min(b.rect.bottom),
+    );
+    if r.width() <= 0 || r.height() <= 0 {
+        return 0;
+    }
+    fn row(s: &Shot, r: Rect, y: i32) -> Option<&[u8]> {
+        let from = ((y - s.rect.top) as usize * s.w as usize + (r.left - s.rect.left) as usize) * 4;
+        s.pixels.get(from..from + r.width() as usize * 4)
+    }
+    let mut n = 0;
+    for y in r.top..r.bottom {
+        let (Some(ra), Some(rb)) = (row(a, r, y), row(b, r, y)) else {
+            continue;
+        };
+        // Mostly the same: whole rows at once.
+        if ra == rb {
+            continue;
+        }
+        for (p, q) in ra.as_chunks::<4>().0.iter().zip(rb.as_chunks::<4>().0) {
+            if p[0].abs_diff(q[0]) > 2 || p[1].abs_diff(q[1]) > 2 || p[2].abs_diff(q[2]) > 2 {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// The screen, taken over and over on a thread of its own while a flip
+/// runs, each picture with the flip's frame drawn last.
+struct Watch {
+    stop: Arc<AtomicBool>,
+    thread: std::thread::JoinHandle<Vec<Caught>>,
+}
+
+struct Caught {
+    ms: u128,
+    drawn: Option<(u16, u16, u16)>,
+    /// No new frame was drawn while it was taken: it shows `drawn`, or
+    /// the frame before it, never a later one.
+    steady: bool,
+    shot: Shot,
+}
+
+/// What says which frame was drawn last.
+type Drawn = fn() -> Option<(u16, u16, u16)>;
+
+/// No more pictures than this are kept of one flip.
+const MOST: usize = 110;
+
+impl Watch {
+    /// Starts taking `rect`; the pictures also go in `folder`.
+    fn start(rect: Rect, folder: PathBuf) -> Self {
+        Self::start_on(rect, folder, crate::flip::drawn)
+    }
+
+    /// The same, of whatever `read` says the frame drawn last was.
+    fn start_on(rect: Rect, folder: PathBuf, read: Drawn) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let _ = std::fs::create_dir_all(&folder);
+            let began = Instant::now();
+            let mut caught = Vec::new();
+            while !stopped.load(Ordering::Relaxed) && caught.len() < MOST {
+                let before = read();
+                let Some((w, _, pixels)) = win::capture(rect) else {
+                    break;
+                };
+                // Only pictures the flip did not draw a new frame under.
+                let drawn = read();
+                caught.push(Caught {
+                    ms: began.elapsed().as_millis(),
+                    drawn: if before == drawn { drawn } else { before },
+                    steady: before == drawn,
+                    shot: Shot { rect, w, pixels },
+                });
+            }
+            // Every third, and the ends: saving them all takes too long.
+            for (i, c) in caught.iter().enumerate() {
+                if i % 3 != 0 && i + 1 != caught.len() {
+                    continue;
+                }
+                let h = c.shot.pixels.len() as u32 / 4 / c.shot.w.max(1);
+                let name = match c.drawn {
+                    Some((p, t, w)) => format!("{i:03}-{:05}ms-p{p}-t{t}-w{w}.png", c.ms),
+                    None => format!("{i:03}-{:05}ms-rest.png", c.ms),
+                };
+                let Ok(file) = std::fs::File::create(folder.join(name)) else {
+                    continue;
+                };
+                let png = PngEncoder::new_with_quality(
+                    std::io::BufWriter::new(file),
+                    CompressionType::Fast,
+                    FilterType::NoFilter,
+                );
+                let _ =
+                    png.write_image(&c.shot.pixels, c.shot.w, h, image::ExtendedColorType::Rgba8);
+            }
+            caught
+        });
+        Self { stop, thread }
+    }
+
+    /// Stops, and hands over what it caught once its pictures are saved.
+    async fn stop(self, cx: &mut AsyncApp) -> Vec<Caught> {
+        self.stop.store(true, Ordering::Relaxed);
+        while !self.thread.is_finished() {
+            pause(50, cx).await;
+        }
+        self.thread.join().unwrap_or_default()
+    }
+}
+
+/// The box around the px that differ between `a` and `b` inside `r`.
+fn unlike_box(a: &Shot, b: &Shot, r: Rect) -> Option<Rect> {
+    let mut found: Option<Rect> = None;
+    for y in r.top..r.bottom {
+        let mut row: Option<(i32, i32)> = None;
+        for x in r.left..r.right {
+            let (p, q) = (a.at(x, y), b.at(x, y));
+            if (0..3).any(|c| p[c].abs_diff(q[c]) > 2) {
+                row = Some(row.map_or((x, x), |(l, _)| (l, x)));
+            }
+        }
+        if let Some((l, right)) = row {
+            found = Some(found.map_or(Rect::new(l, y, right + 1, y + 1), |f| {
+                Rect::new(f.left.min(l), f.top, f.right.max(right + 1), y + 1)
+            }));
+        }
+    }
+    found
+}
+
+/// Where `a` and `b` differ inside `r`, as lines for the report: the 48 px
+/// squares with the most px that differ, each with where its first such px
+/// is and both colours there. Also saved as `name`.png in `out`: `r` with
+/// the px that differ white on black.
+fn unlike_cells(out: &std::path::Path, name: &str, a: &Shot, b: &Shot, r: Rect) -> Vec<String> {
+    const CELL: i32 = 48;
+    let (w, h) = (r.width().max(0), r.height().max(0));
+    let cols = (w + CELL - 1) / CELL;
+    let mut cells = std::collections::BTreeMap::new();
+    let mut mask = vec![0u8; (w * h) as usize];
+    for y in r.top..r.bottom {
+        for x in r.left..r.right {
+            let (p, q) = (a.at(x, y), b.at(x, y));
+            if (0..3).any(|c| p[c].abs_diff(q[c]) > 2) {
+                mask[((y - r.top) * w + (x - r.left)) as usize] = 255;
+                let cell = ((y - r.top) / CELL, (x - r.left) / CELL);
+                cells.entry(cell).or_insert((0u32, (x, y), p, q)).0 += 1;
+            }
+        }
+    }
+    let _ = image::save_buffer(
+        out.join(format!("{name}.png")),
+        &mask,
+        w as u32,
+        h as u32,
+        image::ExtendedColorType::L8,
+    );
+    let mut most: Vec<_> = cells.into_iter().collect();
+    let squares = most.len();
+    most.sort_by_key(|(_, (n, ..))| std::cmp::Reverse(*n));
+    let mut lines = vec![format!(
+        "{squares} of {} squares of {CELL} px differ; the most:",
+        cols * ((h + CELL - 1) / CELL)
+    )];
+    for (i, ((row, col), (n, at, p, q))) in most.into_iter().take(30).enumerate() {
+        let (left, top) = (r.left + col * CELL, r.top + row * CELL);
+        lines.push(format!(
+            "square {i} at ({left}, {top}): {n} px, first at {at:?} flip {p:?} rest {q:?}"
+        ));
+        // The first few, eight times as large: the flip's beside the
+        // view's.
+        if i < 10 {
+            let square = Rect::new(left - 8, top - 8, left + CELL + 8, top + CELL + 8);
+            save_zoomed(out, &format!("{name}-square-{i}"), a, b, square);
+        }
+        // A few px around the first, as numbers (each px's red, in hex):
+        // the flip's rows, then the view's.
+        if n < 200 && lines.len() < 150 {
+            for (who, shot) in [("flip", a), ("rest", b)] {
+                for y in at.1 - 2..at.1 + 8 {
+                    let row: Vec<String> = (at.0 - 4..at.0 + 12)
+                        .map(|x| {
+                            let inside = x >= shot.rect.left
+                                && x < shot.rect.right
+                                && y >= shot.rect.top
+                                && y < shot.rect.bottom;
+                            if inside {
+                                format!("{:02x}", shot.at(x, y)[0])
+                            } else {
+                                "--".into()
+                            }
+                        })
+                        .collect();
+                    lines.push(format!("  {who} y{y}: {}", row.join(" ")));
+                }
+            }
+        }
+    }
+    lines
+}
+
+/// Saves `r` of `a` (left) and of `b` (right) side by side as `name`.png
+/// in `out`, each px eight px wide.
+fn save_zoomed(out: &std::path::Path, name: &str, a: &Shot, b: &Shot, r: Rect) {
+    const ZOOM: i32 = 8;
+    const GAP: i32 = 16;
+    let (w, h) = (r.width().max(0), r.height().max(0));
+    let (wide, high) = (w * ZOOM * 2 + GAP, h * ZOOM);
+    let inside = |s: &Shot, x: i32, y: i32| {
+        x >= s.rect.left && x < s.rect.right && y >= s.rect.top && y < s.rect.bottom
+    };
+    let mut pixels = Vec::with_capacity((wide * high * 3) as usize);
+    for y in 0..high {
+        for x in 0..wide {
+            let (shot, x) = if x < w * ZOOM {
+                (Some(a), x)
+            } else if x >= w * ZOOM + GAP {
+                (Some(b), x - w * ZOOM - GAP)
+            } else {
+                (None, 0)
+            };
+            let (sx, sy) = (r.left + x / ZOOM, r.top + y / ZOOM);
+            let p = match shot {
+                Some(s) if inside(s, sx, sy) => s.at(sx, sy),
+                _ => [255, 0, 255],
+            };
+            pixels.extend_from_slice(&p);
+        }
+    }
+    let _ = image::save_buffer(
+        out.join(format!("{name}.png")),
+        &pixels,
+        wide as u32,
+        high as u32,
+        image::ExtendedColorType::Rgb8,
+    );
+}
+
+/// A view at rest: its picture, where it is, and the flip's frame that
+/// must look the same.
+type Rest<'a> = (&'a Shot, Rect, (u16, u16, u16));
+
+/// Writes what the pictures of a flip show: for each, how many px differ
+/// from the picture before it (over the whole screen), from the view it
+/// started from and from the view it ends in (each inside that view).
+/// Where a picture is of the frame that must look like a view at rest and
+/// doesn't, also where they differ, and both saved there.
+fn tell(
+    report: &mut String,
+    out: &std::path::Path,
+    what: &str,
+    frames: &[Caught],
+    from: Rest,
+    to: Rest,
+    badge: Option<Rect>,
+) {
+    // The badge shows over both views and over the flip: its px never
+    // change.
+    if let (Some(badge), Some(first)) = (badge, frames.first()) {
+        let inner = badge.outset(-badge.width() / 5);
+        let changed: Vec<String> = frames
+            .iter()
+            .filter(|c| changed(&c.shot, &first.shot, inner) > 0)
+            .map(|c| format!("{} ms", c.ms))
+            .collect();
+        let _ = writeln!(
+            report,
+            "{what}: the badge changed in {} of {} pictures (must be 0): {}",
+            changed.len(),
+            frames.len(),
+            changed.join(", ")
+        );
+    }
+    for line in crate::flip::take_log() {
+        let _ = writeln!(report, "{what}: log {line}");
+    }
+    let _ = writeln!(
+        report,
+        "{what}: {} pictures; each: ms, frame drawn (panel/turn/window, thousandths), px changed \
+         since the one before, px unlike the start inside {:?}, px unlike the end inside {:?}",
+        frames.len(),
+        from.1,
+        to.1
+    );
+    let mut before: Option<&Shot> = None;
+    let mut saved = [false; 2];
+    for (i, c) in frames.iter().enumerate() {
+        let drawn = match c.drawn {
+            Some((p, t, w)) => format!("{p}/{t}/{w}"),
+            None => "rest".into(),
+        };
+        let unlike = [
+            changed(&c.shot, from.0, from.1),
+            changed(&c.shot, to.0, to.1),
+        ];
+        let _ = write!(
+            report,
+            "{what}: {:5} {drawn:>14} {:8} {:8} {:8}",
+            c.ms,
+            before.map_or(0, |b| changed(&c.shot, b, c.shot.rect)),
+            unlike[0],
+            unlike[1],
+        );
+        for (k, rest) in [from, to].into_iter().enumerate() {
+            if c.drawn == Some(rest.2)
+                && unlike[k] > 0
+                && let Some(b) = unlike_box(&c.shot, rest.0, rest.1)
+            {
+                let _ = write!(report, "  unlike its view at rest inside {b:?}");
+                if !saved[k] {
+                    saved[k] = true;
+                    let name = what.replace(' ', "-");
+                    let end = ["start", "end"][k];
+                    let mask = format!("{name}-unlike-{end}-{i:03}-where");
+                    for line in unlike_cells(out, &mask, &c.shot, rest.0, rest.1) {
+                        let _ = write!(report, "\n{what}:     {line}");
+                    }
+                }
+            }
+        }
+        let _ = writeln!(report);
+        before = Some(&c.shot);
+    }
+}

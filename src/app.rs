@@ -93,7 +93,7 @@ fn sync_monitors(cx: &mut App) {
     }
 }
 
-pub fn run(config_file: PathBuf) {
+pub fn run(config_file: PathBuf, self_test: Option<PathBuf>) {
     Application::new().run(move |cx: &mut App| {
         let (tx, rx) = unbounded::<Input>();
         // Before Tray::new: the handlers can be set only once.
@@ -197,11 +197,16 @@ pub fn run(config_file: PathBuf) {
         apply_config(&Config::default(), cfg, cx);
         update_outputs(false, cx);
 
-        if let Ok(exe) = std::env::current_exe() {
-            let update_tx = tx.clone();
-            crate::self_update::watch(exe, move || {
-                let _ = update_tx.unbounded_send(Input::NewBuild);
-            });
+        match self_test {
+            Some(out) => crate::selftest::start(out, cx),
+            None => {
+                if let Ok(exe) = std::env::current_exe() {
+                    let update_tx = tx.clone();
+                    crate::self_update::watch(exe, move || {
+                        let _ = update_tx.unbounded_send(Input::NewBuild);
+                    });
+                }
+            }
         }
 
         cx.spawn(async move |cx| input_loop(rx, cx).await).detach();
@@ -269,6 +274,27 @@ fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
                         cx.global::<Shared>()
                             .send_monitors(Command::Pushed(report.pushed.clone()));
                     }
+                    // Repos a pull request was opened in: into the
+                    // floating view.
+                    let opened: Vec<String> = {
+                        let s = state.read(cx);
+                        crate::state::new_pr_repos(&s.prs, &report.prs)
+                            .iter()
+                            .filter_map(|p| s.statuses.iter().find(|st| &st.path == p))
+                            .map(AppState::listed_name)
+                            .collect()
+                    };
+                    if !opened.is_empty() {
+                        let now = unix_now();
+                        change_setting(
+                            move |c| {
+                                for name in &opened {
+                                    c.float.note(name, crate::config::FloatEvent::Pr, now);
+                                }
+                            },
+                            cx,
+                        );
+                    }
                     state.update(cx, |s, _| {
                         let (prs, repos) = (s.config.github_prs, s.config.github_repos);
                         s.github_report(report);
@@ -293,10 +319,33 @@ fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
                     }
                     Some(ClickAction::Window) => {
                         let anchor = overlay::anchor(cx).unwrap_or(Anchor::Tray(None));
-                        crate::morph::show_window(anchor, cx);
+                        crate::flip::show_window(anchor, cx);
                     }
                     Some(ClickAction::Menu) | None => {}
                 }
+            }
+            Input::OverlayGrown(grown) => {
+                change_setting(|c| c.overlay.grown = grown, cx);
+                changed = true;
+            }
+            Input::FloatLists(lists) => {
+                change_setting(
+                    move |c| {
+                        c.float.pinned = lists.pinned;
+                        c.float.hidden = lists.hidden;
+                        c.float.taken_out = lists.taken_out;
+                        c.float.order = lists.order;
+                    },
+                    cx,
+                );
+                // Nothing to save: the view still lets go of its own.
+                overlay::sync(cx);
+                changed = true;
+            }
+            Input::FloatWidth(width) => {
+                change_setting(move |c| c.float.width = width, cx);
+                overlay::sync(cx);
+                changed = true;
             }
             Input::OverlayMoved(rect) => {
                 let (corner, x, y) = overlay::drop_position(rect);
@@ -389,9 +438,10 @@ fn on_update(slot: usize, update: Update, cx: &mut App) -> (bool, bool) {
             (false, false)
         }
         Update::Status(status, fetched) => {
-            let (line, changes) = {
+            let (line, changes, events) = {
                 let s = state.read(cx);
                 let old = s.statuses.iter().find(|o| o.path == status.path);
+                let events = crate::state::float_events(old, &status);
                 (
                     crate::notify::behind(&s.config.notify, old, &status),
                     // Remote branches your own pull or fetch moved are no news.
@@ -400,8 +450,21 @@ fn on_update(slot: usize, update: Update, cx: &mut App) -> (bool, bool) {
                     } else {
                         Vec::new()
                     },
+                    events,
                 )
             };
+            if !events.is_empty() {
+                let name = AppState::listed_name(&status);
+                let now = unix_now();
+                change_setting(
+                    move |c| {
+                        for e in events {
+                            c.float.note(&name, e, now);
+                        }
+                    },
+                    cx,
+                );
+            }
             // One fetch, one notification: the behind line goes with
             // what the fetch brought in.
             if !changes.is_empty() {
@@ -474,14 +537,14 @@ fn on_action(action: TrayAction, cx: &mut App) -> bool {
     match action {
         TrayAction::LeftClick(rect) => match cfg.left_click() {
             ClickAction::Panel => panel::toggle(Anchor::Tray(rect), cx),
-            ClickAction::Window => crate::morph::show_window(Anchor::Tray(rect), cx),
+            ClickAction::Window => crate::flip::show_window(Anchor::Tray(rect), cx),
             // tray-icon shows the menu itself (`set_show_menu_on_left_click`).
             ClickAction::Menu => {}
         },
         TrayAction::DoubleClick => {
             if cfg.window {
                 let rect = cx.global::<Shared>().tray.icon_rect();
-                crate::morph::show_window(Anchor::Tray(rect), cx);
+                crate::flip::show_window(Anchor::Tray(rect), cx);
             }
         }
         TrayAction::OpenPanel => {
@@ -492,7 +555,7 @@ fn on_action(action: TrayAction, cx: &mut App) -> bool {
         }
         TrayAction::ShowWindow => {
             let rect = cx.global::<Shared>().tray.icon_rect();
-            crate::morph::show_window(Anchor::Tray(rect), cx);
+            crate::flip::show_window(Anchor::Tray(rect), cx);
         }
         TrayAction::Refresh => {
             // The same as the panel's ↻: GitHub is asked again too.
@@ -511,14 +574,26 @@ fn on_action(action: TrayAction, cx: &mut App) -> bool {
                     cx.global::<Shared>()
                         .send_monitors(Command::Fetch(target.path.clone()));
                 }
+                RepoAction::Pin | RepoAction::Unpin => {
+                    use crate::config::same_name;
+                    let name = listed_name(&target);
+                    let pin = action == RepoAction::Pin;
+                    change_setting(
+                        move |c| {
+                            let float = &mut c.float;
+                            float.pinned.retain(|p| !same_name(p, &name));
+                            if pin {
+                                // Pinned, it is no longer one taken out.
+                                float.hidden.retain(|h| !same_name(h, &name));
+                                float.taken_out.retain(|h, _| !same_name(h, &name));
+                                float.pinned.push(name);
+                            }
+                        },
+                        cx,
+                    );
+                }
                 RepoAction::Hide => {
-                    let name = if target.remote_only {
-                        crate::github::remote_slug(&target.path)
-                            .unwrap_or(&target.name)
-                            .to_string()
-                    } else {
-                        target.name.clone()
-                    };
+                    let name = listed_name(&target);
                     change_setting(
                         move |c| {
                             if !c.is_ignored(&name) {
@@ -552,6 +627,16 @@ fn on_action(action: TrayAction, cx: &mut App) -> bool {
         TrayAction::SetSort(s) => change_setting(|c| c.sort = s, cx),
         TrayAction::SetPanelSlide(ms) => change_setting(|c| c.panel_slide_ms = ms, cx),
         TrayAction::SetFlipSpeed(ms) => change_setting(|c| c.flip_ms = ms, cx),
+        TrayAction::SetOverlayRadius(radius) => change_setting(
+            |c| {
+                // A disc stays one whatever size the badge is given.
+                let half = c.overlay_size() / 2.0;
+                c.overlay.radius = (radius < half).then_some(radius.max(0.0));
+            },
+            cx,
+        ),
+        TrayAction::SetFloatOpacity(opacity) => change_setting(|c| c.float.opacity = opacity, cx),
+        TrayAction::SetFloatRecent(days) => change_setting(|c| c.float.recent_days = days, cx),
         TrayAction::Fold(section) => change_setting(|c| c.folds.toggle(section), cx),
         TrayAction::SetInterval(minutes) => change_setting(|c| c.interval_minutes = minutes, cx),
         TrayAction::SetDepth(depth) => change_setting(|c| c.depth = depth, cx),
@@ -672,6 +757,24 @@ fn ask_folder_icons(cx: &mut App) {
 /// (config.json doesn't parse) keeps the change in memory, with one notice
 /// per session. The monitor gets the change directly either way: it only
 /// rereads a file that saved.
+/// The name a repo menu's repo is hidden or pinned by: as gitstat shows
+/// it, `owner/name` for one only on GitHub.
+fn listed_name(target: &crate::repo_menu::Target) -> String {
+    if target.remote_only {
+        crate::github::remote_slug(&target.path)
+            .unwrap_or(&target.name)
+            .to_string()
+    } else {
+        target.name.clone()
+    }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
 fn change_setting(f: impl FnOnce(&mut Config), cx: &mut App) {
     let state = cx.global::<Ui>().state.clone();
     let (old, file) = {
@@ -694,7 +797,7 @@ fn change_setting(f: impl FnOnce(&mut Config), cx: &mut App) {
         }
     }
     cx.global::<Shared>()
-        .send_monitors(Command::Apply(new.clone()));
+        .send_monitors(Command::Apply(Box::new(new.clone())));
     apply_config(&old, new, cx);
 }
 
@@ -717,7 +820,7 @@ fn apply_config(old: &Config, new: Config, cx: &mut App) {
     if !new.window {
         view::close_window(cx);
     }
-    if new.overlay != old.overlay {
+    if new.overlay != old.overlay || new.float != old.float {
         overlay::sync(cx);
     }
     let s = state.read(cx);

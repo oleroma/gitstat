@@ -190,43 +190,87 @@ fn to_image(n: u32, mut rgba: Vec<u8>) -> Option<Arc<RenderImage>> {
 /// `status`'s icon, `side` logical px square, in its status tone; a dot in
 /// `dot` colour while there is none.
 pub fn mark(marks: &Entity<RepoMarks>, status: &RepoStatus, side: f32, dot: Hsla) -> AnyElement {
-    let path = status.path.clone();
-    let tone = FolderState::of(status).tone();
-    let off_trunk = status.off_trunk();
     let (marks1, marks2) = (marks.clone(), marks.clone());
-    let path2 = path.clone();
+    let (status1, status2) = (status.clone(), status.clone());
     canvas(
-        move |_, window, cx| {
-            let key = (tone, device_px(side, window));
-            marks1.update(cx, |m, cx| m.want(&path, key, cx));
-        },
+        move |_, window, cx| want_in(&marks1, &status1, side, window, cx),
         move |bounds, _, window, cx| {
-            let key = (tone, device_px(side, window));
-            match marks2.read(cx).look(&path2, key) {
-                Look::Image(image) => {
-                    // On whole device px, at the picture's own size.
-                    let scale = window.scale_factor();
-                    let origin = point(
-                        px((f32::from(bounds.origin.x) * scale).round() / scale),
-                        px((f32::from(bounds.origin.y) * scale).round() / scale),
-                    );
-                    let n = key.1 as f32 / scale;
-                    let at = Bounds::new(origin, size(px(n), px(n)));
-                    window
-                        .paint_image(at, Default::default(), image, 0, false)
-                        .ok();
-                }
-                Look::Dot => paint_dot(bounds, side, dot, window),
-                Look::Drawing => {}
-            }
-            if off_trunk {
-                paint_branch_badge(bounds, side, window);
-            }
+            paint_in(&marks2, &status2, bounds, side, dot, 1.0, window, cx)
         },
     )
     .size(px(side))
     .flex_none()
     .into_any_element()
+}
+
+fn want_in(
+    marks: &Entity<RepoMarks>,
+    status: &RepoStatus,
+    side: f32,
+    window: &Window,
+    cx: &mut App,
+) {
+    let key = (FolderState::of(status).tone(), device_px(side, window));
+    marks.update(cx, |m, cx| m.want(&status.path, key, cx));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_in(
+    marks: &Entity<RepoMarks>,
+    status: &RepoStatus,
+    bounds: Bounds<gpui::Pixels>,
+    side: f32,
+    dot: Hsla,
+    alpha: f32,
+    window: &mut Window,
+    cx: &App,
+) {
+    let key = (FolderState::of(status).tone(), device_px(side, window));
+    match marks.read(cx).look(&status.path, key) {
+        Look::Image(image) => {
+            // On whole device px, at the picture's own size.
+            let scale = window.scale_factor();
+            let origin = point(
+                px((f32::from(bounds.origin.x) * scale).round() / scale),
+                px((f32::from(bounds.origin.y) * scale).round() / scale),
+            );
+            let n = key.1 as f32 / scale;
+            let at = Bounds::new(origin, size(px(n), px(n)));
+            crate::scene::paint::image(window, at, image, alpha);
+        }
+        Look::Dot => paint_dot(bounds, side, dot.opacity(dot.a * alpha), window),
+        Look::Drawing => {}
+    }
+    if status.off_trunk() {
+        paint_branch_badge(bounds, side, alpha, window);
+    }
+}
+
+/// Asks for `status`'s icon `side` logical px square, for [`paint`] to
+/// draw once it is there: as a view lays itself out.
+pub fn want(status: &RepoStatus, side: f32, window: &Window, cx: &mut App) {
+    if let Some(marks) = cx
+        .try_global::<crate::view::Ui>()
+        .map(|ui| ui.marks.clone())
+    {
+        want_in(&marks, status, side, window, cx);
+    }
+}
+
+/// Paints `status`'s icon, as [`mark`] does, in the box `bounds`, `side`
+/// logical px square, at `alpha` of its strength.
+pub fn paint(
+    status: &RepoStatus,
+    bounds: Bounds<gpui::Pixels>,
+    side: f32,
+    dot: Hsla,
+    alpha: f32,
+    window: &mut Window,
+    cx: &App,
+) {
+    if let Some(ui) = cx.try_global::<crate::view::Ui>() {
+        paint_in(&ui.marks, status, bounds, side, dot, alpha, window, cx);
+    }
 }
 
 /// The badge on a repo's icon while it is checked out off its default
@@ -272,7 +316,12 @@ fn branch_badge(n: u32) -> Option<Arc<RenderImage>> {
 
 /// The branch badge over the top-right corner of an icon `side` logical px
 /// square at `bounds`, on whole device px.
-pub(crate) fn paint_branch_badge(bounds: Bounds<gpui::Pixels>, side: f32, window: &mut Window) {
+pub(crate) fn paint_branch_badge(
+    bounds: Bounds<gpui::Pixels>,
+    side: f32,
+    alpha: f32,
+    window: &mut Window,
+) {
     let scale = window.scale_factor();
     let n = (side * 0.62 * scale).round().max(6.0) as u32;
     let Some(image) = branch_badge(n) else {
@@ -288,9 +337,7 @@ pub(crate) fn paint_branch_badge(bounds: Bounds<gpui::Pixels>, side: f32, window
         ),
         size(px(w), px(w)),
     );
-    window
-        .paint_image(at, Default::default(), image, 0, false)
-        .ok();
+    crate::scene::paint::image(window, at, image, alpha);
 }
 
 /// `status`'s icon picture at the first of `sides` (device px) that is

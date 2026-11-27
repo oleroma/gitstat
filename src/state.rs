@@ -371,6 +371,92 @@ impl AppState {
             .collect()
     }
 
+    /// The name a repo is pinned, hidden or ignored by: as gitstat shows
+    /// it, `owner/name` for one only on GitHub.
+    pub fn listed_name(s: &RepoStatus) -> String {
+        if s.remote_only {
+            crate::github::remote_slug(&s.path)
+                .unwrap_or(&s.name)
+                .to_string()
+        } else {
+            s.name.clone()
+        }
+    }
+
+    /// The floating view's repos at `now` (Unix seconds): the pinned ones
+    /// in their order, then those worked on lately, the latest first,
+    /// but for the ones taken out of it; the ones put in an order by hand
+    /// before the rest. `lists` are the config's, or the ones the view
+    /// holds until the config has them.
+    pub fn float_repos_of(&self, lists: &FloatLists, now: i64) -> Vec<&RepoStatus> {
+        use crate::config::same_name;
+        let all = || self.statuses.iter().chain(&self.remote_statuses);
+        let mut listed: Vec<&RepoStatus> = Vec::new();
+        for name in &lists.pinned {
+            if let Some(s) = all().find(|s| same_name(&Self::listed_name(s), name))
+                && !listed.iter().any(|l| l.path == s.path)
+            {
+                listed.push(s);
+            }
+        }
+        if let Some(within) = self.config.float_recent_secs() {
+            let float = &self.config.float;
+            let last = |s: &RepoStatus| {
+                float.last_event(&Self::listed_name(s), s.last_worked.max(s.last_commit))
+            };
+            // Taken out, it stays out until something new happens in it;
+            // one taken out before times were kept stays out.
+            let out_since = |name: &str| -> Option<i64> {
+                lists
+                    .taken_out
+                    .iter()
+                    .find(|(k, _)| same_name(k, name))
+                    .map(|(_, t)| *t)
+                    .or_else(|| {
+                        lists
+                            .hidden
+                            .iter()
+                            .any(|h| same_name(h, name))
+                            .then_some(i64::MAX)
+                    })
+            };
+            let mut recent: Vec<(&RepoStatus, i64)> = self
+                .statuses
+                .iter()
+                .map(|s| (s, last(s)))
+                .filter(|&(s, t)| {
+                    let name = Self::listed_name(s);
+                    t > 0
+                        && now - t <= within
+                        && out_since(&name).is_none_or(|out| t > out)
+                        && !listed.iter().any(|l| l.path == s.path)
+                })
+                .collect();
+            recent.sort_by_cached_key(|&(s, t)| (std::cmp::Reverse(t), s.name.to_lowercase()));
+            listed.extend(recent.into_iter().map(|(s, _)| s));
+        }
+        // Stable: the ones not put in an order keep theirs, after the rest.
+        listed.sort_by_cached_key(|s| {
+            let name = Self::listed_name(s);
+            lists
+                .order
+                .iter()
+                .position(|o| same_name(o, &name))
+                .unwrap_or(usize::MAX)
+        });
+        listed
+    }
+
+    /// Whether `s` is pinned to the floating view.
+    pub fn pinned(&self, s: &RepoStatus) -> bool {
+        let name = Self::listed_name(s);
+        self.config
+            .float
+            .pinned
+            .iter()
+            .any(|p| crate::config::same_name(p, &name))
+    }
+
     /// The cloned repos in the configured order; the panel splits them
     /// into unsynced and synced keeping it.
     pub fn sorted_for_panel(&self) -> Vec<&RepoStatus> {
@@ -487,6 +573,71 @@ fn severity(s: &RepoStatus) -> u8 {
     }
 }
 
+/// What the floating view lists, and how: see [`crate::config::FloatConfig`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FloatLists {
+    pub pinned: Vec<String>,
+    pub hidden: Vec<String>,
+    pub taken_out: std::collections::BTreeMap<String, i64>,
+    pub order: Vec<String>,
+}
+
+impl FloatLists {
+    pub fn of(config: &Config) -> Self {
+        let float = &config.float;
+        Self {
+            pinned: float.pinned.clone(),
+            hidden: float.hidden.clone(),
+            taken_out: float.taken_out.clone(),
+            order: float.order.clone(),
+        }
+    }
+}
+
+/// What happened in a repo, between its last status and `new`, that
+/// brings it into the floating view: a branch it didn't have, local or
+/// fetched, or files starting to change. None on its first status.
+pub fn float_events(old: Option<&RepoStatus>, new: &RepoStatus) -> Vec<crate::config::FloatEvent> {
+    use crate::config::FloatEvent;
+    let Some(old) = old.filter(|o| !o.tips.is_empty()) else {
+        return Vec::new();
+    };
+    let branch = |r: &str| {
+        (r.starts_with("refs/heads/") || r.starts_with("refs/remotes/")) && !r.ends_with("/HEAD")
+    };
+    let mut events = Vec::new();
+    if new
+        .tips
+        .iter()
+        .any(|(r, _)| branch(r) && !old.tips.iter().any(|(o, _)| o == r))
+    {
+        events.push(FloatEvent::Branch);
+    }
+    if new.dirty && !old.dirty {
+        events.push(FloatEvent::Changes);
+    }
+    events
+}
+
+/// The repos, by path, a pull request was opened in between two polls.
+/// A repo the last poll didn't cover counts nothing.
+pub fn new_pr_repos(
+    old: &HashMap<PathBuf, Vec<crate::github::Pr>>,
+    new: &HashMap<PathBuf, Vec<crate::github::Pr>>,
+) -> Vec<PathBuf> {
+    new.iter()
+        .filter(|(path, prs)| {
+            old.get(*path).is_some_and(|before| {
+                // Only the newest open ones are read: numbers only grow,
+                // so a new one is past every number seen before.
+                let newest = before.iter().map(|b| b.number).max().unwrap_or(0);
+                prs.iter().any(|p| p.is_open() && p.number > newest)
+            })
+        })
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
 /// Everything the UI loop reacts to, funnelled through one channel.
 #[cfg(windows)]
 pub enum Input {
@@ -496,8 +647,15 @@ pub enum Input {
     Monitor(usize, crate::monitor::Update),
     /// A click on the badge.
     Overlay,
+    /// The badge was asked to grow into the floating view, or back.
+    OverlayGrown(bool),
     /// The badge was dragged and dropped with its disc here (physical px).
     OverlayMoved(crate::layout::Rect),
+    /// The floating view's rows were put in an order, or one was taken
+    /// out, or that was undone.
+    FloatLists(FloatLists),
+    /// The floating view was made this wide, logical px.
+    FloatWidth(f32),
     /// The folder-icon worker's report: skipped folders and why.
     FolderSkips(Vec<(PathBuf, String)>),
     /// A GitHub pull request poll.
@@ -519,6 +677,100 @@ mod tests {
             has_upstream: true,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn float_lists_pinned_then_lately_worked() {
+        let day = 86_400;
+        let now = 100 * day;
+        let mut old = repo("old");
+        old.last_worked = now - 10 * day;
+        let mut today = repo("today");
+        today.last_commit = now - 60;
+        let mut yesterday = repo("Yesterday");
+        yesterday.last_worked = now - day;
+        let mut gone = repo("gone");
+        gone.last_worked = now - 30;
+        let mut s = state(vec![old, today, yesterday, gone, repo("never")]);
+        s.config.float.pinned = vec!["OLD".into(), "missing".into(), "yesterday".into()];
+        s.config.float.hidden = vec!["gone".into()];
+        let names = |s: &AppState| -> Vec<String> {
+            s.float_repos_of(&FloatLists::of(&s.config), now)
+                .iter()
+                .map(|r| r.name.clone())
+                .collect()
+        };
+        assert_eq!(names(&s), ["old", "Yesterday", "today"]);
+        // Lately worked on turned off: the pinned ones alone.
+        s.config.float.recent_days = 0.0;
+        assert_eq!(names(&s), ["old", "Yesterday"]);
+        assert!(s.pinned(&s.statuses[0]) && !s.pinned(&s.statuses[1]));
+        // Put in an order by hand: those first, the rest as they were.
+        s.config.float.recent_days = 3.0;
+        s.config.float.order = vec!["today".into(), "nowhere".into(), "yesterday".into()];
+        assert_eq!(names(&s), ["today", "Yesterday", "old"]);
+    }
+
+    #[test]
+    fn float_brings_repos_in_on_what_happens_and_keeps_taken_out_ones_out() {
+        use crate::config::FloatEvent;
+        let day = 86_400;
+        let now = 100 * day;
+        let mut patched = repo("patched");
+        patched.last_commit = now - 3600;
+        let mut quiet = repo("quiet");
+        quiet.last_commit = now - 30 * day;
+        let mut s = state(vec![patched, quiet]);
+        let names = |s: &AppState| -> Vec<String> {
+            s.float_repos_of(&FloatLists::of(&s.config), now)
+                .iter()
+                .map(|r| r.name.clone())
+                .collect()
+        };
+        assert_eq!(names(&s), ["patched"]);
+        // Taken out after its commit: out, until something new happens.
+        s.config.float.hidden = vec!["patched".into()];
+        s.config.float.taken_out.insert("patched".into(), now - 60);
+        assert_eq!(names(&s), Vec::<String>::new());
+        s.config.float.note("Patched", FloatEvent::Branch, now - 10);
+        assert_eq!(names(&s), ["patched"]);
+        // Branches don't count when switched off; commits alone don't
+        // either when those are off.
+        s.config.float.on_branch = false;
+        assert_eq!(names(&s), Vec::<String>::new());
+        // A new pull request in a quiet repo brings it in.
+        s.config.float.note("quiet", FloatEvent::Pr, now - 5);
+        assert_eq!(names(&s), ["quiet"]);
+        s.config.float.on_pr = false;
+        s.config.float.on_commit = false;
+        assert_eq!(names(&s), Vec::<String>::new());
+    }
+
+    #[test]
+    fn float_events_are_new_branches_and_changes_starting() {
+        use crate::config::FloatEvent;
+        let mut old = repo("r");
+        old.tips = vec![
+            ("refs/heads/main".into(), "a".into()),
+            ("refs/remotes/origin/main".into(), "a".into()),
+        ];
+        // The first status is no news.
+        assert!(float_events(None, &old).is_empty());
+        let mut new = old.clone();
+        new.tips[0].1 = "b".into();
+        new.tips
+            .push(("refs/remotes/origin/HEAD".into(), "a".into()));
+        assert!(float_events(Some(&old), &new).is_empty());
+        new.tips
+            .push(("refs/remotes/origin/feature".into(), "c".into()));
+        assert_eq!(float_events(Some(&old), &new), [FloatEvent::Branch]);
+        new.dirty = true;
+        assert_eq!(
+            float_events(Some(&old), &new),
+            [FloatEvent::Branch, FloatEvent::Changes]
+        );
+        // Still changing is no news.
+        assert!(float_events(Some(&new), &new).is_empty());
     }
 
     fn state(statuses: Vec<RepoStatus>) -> AppState {

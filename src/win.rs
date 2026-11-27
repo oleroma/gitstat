@@ -9,20 +9,14 @@
 use crate::layout::Rect;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::{
-    DWMNCRP_DISABLED, DWMNCRP_USEWINDOWSTYLE, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR,
-    DWMWA_COLOR_DEFAULT, DWMWA_COLOR_NONE, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_NCRENDERING_POLICY,
-    DWMWA_VISIBLE_FRAME_BORDER_THICKNESS, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
-    DWMWCP_ROUND, DwmGetWindowAttribute, DwmSetWindowAttribute,
+    DWMNCRP_DISABLED, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_COLOR_NONE,
+    DWMWA_NCRENDERING_POLICY, DWMWA_VISIBLE_FRAME_BORDER_THICKNESS, DWMWA_WINDOW_CORNER_PREFERENCE,
+    DWMWCP_DONOTROUND, DwmFlush, DwmGetWindowAttribute, DwmSetWindowAttribute,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    ClientToScreen, CreateEllipticRgn, CreateRectRgn, DeleteObject, EnumDisplayMonitors,
-    GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL,
-    MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, MonitorFromRect, SetWindowRgn,
-};
-use windows_sys::Win32::UI::Controls::{
-    ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, TOOLTIPS_CLASSW, TTDT_AUTOPOP,
-    TTF_IDISHWND, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_SETDELAYTIME, TTM_SETMAXTIPWIDTH,
-    TTM_UPDATETIPTEXTW, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW,
+    ClientToScreen, CombineRgn, CreateRoundRectRgn, DeleteObject, GetMonitorInfoW, HMONITOR,
+    MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, RGN_OR,
+    ScreenToClient, SetWindowRgn,
 };
 use windows_sys::Win32::UI::HiDpi::{
     GetDpiForMonitor, GetDpiForWindow, GetSystemMetricsForDpi, MDT_EFFECTIVE_DPI,
@@ -33,16 +27,17 @@ use windows_sys::Win32::UI::Shell::{
     SHQueryUserNotificationState, SetWindowSubclass,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CW_USEDEFAULT, CreateWindowExW, FindWindowExW, FindWindowW, HTMINBUTTON, IsIconic, IsZoomed,
-    PostMessageW, SC_MINIMIZE, SIZE_MINIMIZED, SendMessageW, WM_CLOSE, WM_NCLBUTTONUP, WM_SIZE,
-    WM_SYSCOMMAND, WS_EX_TOPMOST, WS_POPUP,
+    FindWindowExW, FindWindowW, HTMINBUTTON, IsIconic, IsZoomed, PostMessageW, SC_MINIMIZE,
+    SIZE_MINIMIZED, SendMessageW, WM_CLOSE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST,
+    WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSEMOVE, WM_SIZE, WM_SYSCOMMAND,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GWL_EXSTYLE, GetClientRect, GetCursorPos, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
-    HWND_TOPMOST, IDYES, IsWindow, IsWindowVisible, MB_ICONQUESTION, MB_SETFOREGROUND, MB_YESNO,
-    MessageBoxW, SM_CXSCREEN, SM_CXSMICON, SM_CYSCREEN, SM_SWAPBUTTON, SW_HIDE, SW_SHOWNOACTIVATE,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WS_EX_NOACTIVATE, WS_EX_TRANSPARENT,
+    HWND_TOPMOST, IDYES, IsWindow, IsWindowVisible, LWA_ALPHA, MB_ICONQUESTION, MB_SETFOREGROUND,
+    MB_TOPMOST, MB_YESNO, MessageBoxW, SM_CXSCREEN, SM_CXSMICON, SM_CYSCREEN, SM_SWAPBUTTON,
+    SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    WINDOW_EX_STYLE, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TRANSPARENT, WindowFromPoint,
 };
 
 /// The HWND of a GPUI window.
@@ -132,6 +127,12 @@ pub fn tray_icon_size() -> u32 {
     }
 }
 
+/// Puts the mouse at (`x`, `y`), physical px: the self-test's, which
+/// keeps it off the views it compares px for px and puts it back after.
+pub fn set_cursor_pos(x: i32, y: i32) {
+    unsafe { windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos(x, y) };
+}
+
 /// The cursor in physical px, or (0, 0) if it can't be read (secure desktop).
 pub fn cursor_pos() -> (i32, i32) {
     let mut p = POINT { x: 0, y: 0 };
@@ -204,14 +205,12 @@ unsafe fn frame(hwnd: HWND) -> (i32, i32, i32, i32) {
 }
 
 /// Puts the overlay's client area at `r`, topmost and shown without
-/// activation, and clips it (drawing and clicks) to the ellipse inscribed
-/// in `r`. The region is 1-bit, so its edge is jagged: `r` includes
-/// transparent padding around the drawn disc, which keeps the disc's own
-/// anti-aliased edge away from it.
+/// activation, and cuts it (drawing and clicks) to `shape`: see
+/// [`shape_overlay`].
 ///
 /// # Safety
 /// Call only from a spawned task outside `update`.
-pub unsafe fn place_overlay(h: isize, r: Rect) {
+pub unsafe fn place_overlay(h: isize, r: Rect, shape: Option<&[(Rect, i32)]>) {
     let Some(hwnd) = live(h) else { return };
     unsafe {
         // Size the window so the client area is exactly `r`.
@@ -225,10 +224,64 @@ pub unsafe fn place_overlay(h: isize, r: Rect) {
             r.height() + bh,
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
+        set_shape(hwnd, (dx, dy), (r.width(), r.height()), shape);
+    }
+}
+
+/// Cuts the overlay (drawing and clicks) to the rects of `shape`, in its
+/// client area, each with its corners rounded by its px (a disc when that
+/// is half its side); with none, to nothing: all of it shows, as while
+/// what it draws grows inside it. The cut is 1-bit, so its edge is jagged: the client area includes
+/// transparent padding around what is drawn, which keeps that one's own
+/// anti-aliased edge away from it.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn shape_overlay(h: isize, shape: Option<&[(Rect, i32)]>) {
+    let Some(hwnd) = live(h) else { return };
+    unsafe {
+        let (dx, dy, _, _) = frame(hwnd);
+        let mut cr = RECT::default();
+        if GetClientRect(hwnd, &mut cr) != 0 {
+            set_shape(hwnd, (dx, dy), (cr.right, cr.bottom), shape);
+        }
+    }
+}
+
+/// The region for a client area `size` at `at` in its window: `shape`'s
+/// rounded rects, cut to it.
+unsafe fn set_shape(hwnd: HWND, at: (i32, i32), size: (i32, i32), shape: Option<&[(Rect, i32)]>) {
+    unsafe {
+        let Some(shape) = shape.filter(|s| !s.is_empty()) else {
+            SetWindowRgn(hwnd, std::ptr::null_mut(), 1);
+            return;
+        };
         // Region coordinates are relative to the window, not the client area.
-        let rgn = CreateEllipticRgn(dx, dy, dx + r.width() + 1, dy + r.height() + 1);
+        let round = |(r, radius): (Rect, i32)| {
+            let (l, t) = (r.left.max(0), r.top.max(0));
+            let (rt, b) = (r.right.min(size.0), r.bottom.min(size.1));
+            CreateRoundRectRgn(
+                at.0 + l,
+                at.1 + t,
+                at.0 + rt + 1,
+                at.1 + b + 1,
+                2 * radius,
+                2 * radius,
+            )
+        };
+        let rgn = round(shape[0]);
+        if rgn.is_null() {
+            return;
+        }
+        for &part in &shape[1..] {
+            let more = round(part);
+            if !more.is_null() {
+                CombineRgn(rgn, rgn, more, RGN_OR);
+                DeleteObject(more);
+            }
+        }
         // On success the system owns the region; on failure it is ours to free.
-        if !rgn.is_null() && SetWindowRgn(hwnd, rgn, 1) == 0 {
+        if SetWindowRgn(hwnd, rgn, 1) == 0 {
             DeleteObject(rgn);
         }
     }
@@ -316,6 +369,20 @@ pub unsafe fn style_morph(h: isize) {
     }
 }
 
+/// Styles a window that only shows, as `style_morph`, and is layered:
+/// without that Windows still gives it the mouse, transparent or not.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn style_see_through(h: isize) {
+    unsafe { style_morph(h) };
+    let Some(hwnd) = live(h) else { return };
+    unsafe {
+        add_ex_style(hwnd, WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE);
+        SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
+    }
+}
+
 /// Hides `h` from the screen, shadow and all, at the next composition,
 /// without hiding it from Windows: it stays the active window, so the
 /// window that follows it can still come to the front.
@@ -344,44 +411,11 @@ pub unsafe fn click_through(h: isize, through: bool) {
     }
 }
 
-/// Every monitor's work area, physical px.
-pub fn work_areas() -> Vec<Rect> {
-    unsafe extern "system" fn each(
-        mon: HMONITOR,
-        _: HDC,
-        _: *mut RECT,
-        data: LPARAM,
-    ) -> windows_sys::core::BOOL {
-        let out = unsafe { &mut *(data as *mut Vec<Rect>) };
-        out.push(monitor_info(mon).work);
-        1
-    }
-    let mut out: Vec<Rect> = Vec::new();
-    unsafe {
-        EnumDisplayMonitors(
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            Some(each),
-            (&raw mut out) as LPARAM,
-        )
-    };
-    if out.is_empty() {
-        out.push(primary_monitor().work);
-    }
-    out
-}
-
 /// The scale `h` draws at, from its monitor's DPI.
 pub fn window_scale(h: isize) -> Option<f32> {
     let hwnd = live(h)?;
     let dpi = unsafe { GetDpiForWindow(hwnd) };
     (dpi > 0).then(|| dpi as f32 / 96.0)
-}
-
-/// Whether the panel `h` is sliding clipped now, with DWM's rim off, so
-/// it draws its own.
-pub fn is_bare(h: isize) -> bool {
-    BARE_PANEL.load(std::sync::atomic::Ordering::Relaxed) == h
 }
 
 /// Makes `h` the foreground window unless it is already. During a flip a
@@ -397,31 +431,22 @@ pub fn to_front(h: isize) {
     }
 }
 
+/// Whether `h` is the foreground window.
+pub fn is_front(h: isize) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    live(h).is_some_and(|hwnd| unsafe { GetForegroundWindow() } == hwnd)
+}
+
+/// Waits for Windows to put the next frame on the screen. Changes made to
+/// windows right after it returns have a whole refresh to land together.
+pub fn dwm_flush() {
+    unsafe { DwmFlush() };
+}
+
 /// Shows a window [`cloak`] hid, at the next composition.
 pub fn uncloak(h: isize) {
     let Some(hwnd) = live(h) else { return };
     unsafe { dwm_set(hwnd, 13, 0) };
-}
-
-/// Puts the hidden flip window's client area at `r`, still hidden, so it
-/// draws its first frame at its size before it shows.
-///
-/// # Safety
-/// Call only from a spawned task outside `update`.
-pub unsafe fn size_morph(h: isize, r: Rect) {
-    let Some(hwnd) = live(h) else { return };
-    unsafe {
-        let (dx, dy, bw, bh) = frame(hwnd);
-        SetWindowPos(
-            hwnd,
-            HWND_TOPMOST,
-            r.left - dx,
-            r.top - dy,
-            r.width() + bw,
-            r.height() + bh,
-            SWP_NOACTIVATE,
-        );
-    }
 }
 
 /// Puts the flip's client area at `r`, topmost and shown without activation.
@@ -440,6 +465,164 @@ pub unsafe fn place_morph(h: isize, r: Rect) {
             r.width() + bw,
             r.height() + bh,
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+    }
+}
+
+/// Whether a click at (`x`, `y`) on screen, inside `h`, would pass through
+/// `h` to what is under it once [`click_through`] is on: tried and put
+/// back at once, for the self-test.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn passes_clicks(h: isize, x: i32, y: i32) -> Option<bool> {
+    let hwnd = live(h)?;
+    unsafe {
+        let was = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let at = POINT { x, y };
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, was & !(WS_EX_TRANSPARENT as isize));
+        let solid = WindowFromPoint(at) == hwnd;
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, was | WS_EX_TRANSPARENT as isize);
+        let through = WindowFromPoint(at) != hwnd;
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, was);
+        // Only if it takes the click when it should, too.
+        solid.then_some(through)
+    }
+}
+
+/// The wheel turned `notches` up (down when below 0) with the mouse at
+/// (`x`, `y`) on screen, told to `h` as Windows tells it; and whether `h`
+/// is the window there, which Windows would tell: for the self-test.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn wheel(h: isize, x: i32, y: i32, notches: i32) -> Option<bool> {
+    let hwnd = live(h)?;
+    let mut at = POINT { x, y };
+    unsafe {
+        let under = WindowFromPoint(at) == hwnd;
+        if ScreenToClient(hwnd, &mut at) == 0 {
+            return None;
+        }
+        let client = ((at.y as u16 as isize) << 16) | (at.x as u16 as isize);
+        SendMessageW(hwnd, WM_MOUSEMOVE, 0, client);
+        let screen = ((y as u16 as isize) << 16) | (x as u16 as isize);
+        let delta = ((notches * 120) as i16 as u16 as usize) << 16;
+        SendMessageW(hwnd, WM_MOUSEWHEEL, delta, screen);
+        Some(under)
+    }
+}
+
+/// Whether the mouse at (`x`, `y`) on screen passes through `h` to what
+/// is under it, as `h` is styled now: for the self-test.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn passes_clicks_now(h: isize, x: i32, y: i32) -> Option<bool> {
+    let hwnd = live(h)?;
+    Some(unsafe { WindowFromPoint(POINT { x, y }) } != hwnd)
+}
+
+/// `h`'s extended window styles, for the self-test's report.
+pub fn ex_style(h: isize) -> u32 {
+    live(h).map_or(0, |hwnd| unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) }
+        as u32)
+}
+
+/// Tells `h` the mouse is at (`x`, `y`) on screen, as a mouse move would:
+/// for a window clicks pass through, which hears of no move itself.
+pub fn tell_mouse(h: isize, x: i32, y: i32) {
+    let Some(hwnd) = live(h) else { return };
+    let mut at = POINT { x, y };
+    unsafe {
+        if ScreenToClient(hwnd, &mut at) != 0 {
+            let at = ((at.y as u16 as isize) << 16) | (at.x as u16 as isize);
+            PostMessageW(hwnd, WM_MOUSEMOVE, 0, at);
+        }
+    }
+}
+
+/// `h`'s whole window, its frame too, screen px.
+pub fn window_rect(h: isize) -> Option<Rect> {
+    let hwnd = live(h)?;
+    let mut r = RECT::default();
+    (unsafe { GetWindowRect(hwnd, &mut r) } != 0).then(|| rect(r))
+}
+
+/// What `h` says is at (`x`, `y`) on screen, Windows' hit-test code (2 its
+/// title bar, 8, 9 and 20 its three buttons, 12 its top edge), with the
+/// mouse told to be there first: for the self-test.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn hit_test(h: isize, x: i32, y: i32) -> Option<isize> {
+    let hwnd = live(h)?;
+    let mut at = POINT { x, y };
+    unsafe {
+        if ScreenToClient(hwnd, &mut at) == 0 {
+            return None;
+        }
+        let client = ((at.y as u16 as isize) << 16) | (at.x as u16 as isize);
+        SendMessageW(hwnd, WM_MOUSEMOVE, 0, client);
+        let screen = ((y as u16 as isize) << 16) | (x as u16 as isize);
+        Some(SendMessageW(hwnd, WM_NCHITTEST, 0, screen))
+    }
+}
+
+/// A click on `h`'s title bar part `hit` (Windows' hit-test code) at
+/// (`x`, `y`) on screen, told as Windows tells one: for the self-test,
+/// which can't press a button.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn click_caption(h: isize, x: i32, y: i32, hit: usize) {
+    let Some(hwnd) = live(h) else { return };
+    let screen = ((y as u16 as isize) << 16) | (x as u16 as isize);
+    unsafe {
+        SendMessageW(hwnd, WM_NCMOUSEMOVE, hit, screen);
+        SendMessageW(hwnd, WM_NCLBUTTONDOWN, hit, screen);
+        SendMessageW(hwnd, WM_NCLBUTTONUP, hit, screen);
+    }
+}
+
+/// Takes Windows' own frame off the panel's window for good: no border,
+/// rounded corners or shadow. The panel draws its own, inside a window
+/// far bigger than itself.
+pub fn bare(h: isize) {
+    let Some(hwnd) = live(h) else { return };
+    unsafe {
+        dwm_set(hwnd, DWMWA_NCRENDERING_POLICY, DWMNCRP_DISABLED as u32);
+        dwm_set(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            DWMWCP_DONOTROUND as u32,
+        );
+        dwm_set(hwnd, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE);
+    }
+}
+
+/// Puts the panel's window, its client area, at `area` for as long as it
+/// is open, on top, or just under `under` (a flip drawing over it). Made
+/// a layered window, which is what lets [`click_through`] pass clicks on
+/// to other programs' windows.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn place_panel(h: isize, area: Rect, under: Option<isize>) {
+    let Some(hwnd) = live(h) else { return };
+    unsafe {
+        add_ex_style(hwnd, WS_EX_LAYERED);
+        SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
+        let (dx, dy, bw, bh) = frame(hwnd);
+        SetWindowPos(
+            hwnd,
+            // Placed after a topmost window, it becomes topmost too.
+            under.and_then(live).unwrap_or(HWND_TOPMOST),
+            area.left - dx,
+            area.top - dy,
+            area.width() + bw,
+            area.height() + bh,
+            SWP_NOACTIVATE,
         );
     }
 }
@@ -473,34 +656,6 @@ pub unsafe fn panel_restack(h: isize) {
     };
 }
 
-/// Whether any of `r` (screen px) is on a monitor; past every screen's
-/// edge, a sliding panel needs no clip.
-fn on_a_monitor(r: Rect) -> bool {
-    let rc = RECT {
-        left: r.left,
-        top: r.top,
-        right: r.right,
-        bottom: r.bottom,
-    };
-    r.width() > 0
-        && r.height() > 0
-        && !unsafe { MonitorFromRect(&rc, MONITOR_DEFAULTTONULL) }.is_null()
-}
-
-/// The part of `moved` outside `shown`: the strip past the edge it
-/// slides from.
-fn hidden_part(moved: Rect, shown: Rect) -> Rect {
-    if shown.top > moved.top {
-        Rect::new(moved.left, moved.top, moved.right, shown.top)
-    } else if shown.bottom < moved.bottom {
-        Rect::new(moved.left, shown.bottom, moved.right, moved.bottom)
-    } else if shown.left > moved.left {
-        Rect::new(moved.left, moved.top, shown.left, moved.bottom)
-    } else {
-        Rect::new(shown.right, moved.top, moved.right, moved.bottom)
-    }
-}
-
 /// The thickness Windows draws a window's rim at, physical px, as it
 /// draws it on `h` (Windows 11; it scales with the display).
 pub fn rim_thickness(h: isize) -> Option<u32> {
@@ -516,36 +671,6 @@ pub fn rim_thickness(h: isize) -> Option<u32> {
     } == 0;
     (ok && (1..=8).contains(&v)).then_some(v)
 }
-
-/// How far the window's visible frame (where Windows draws its rim)
-/// reaches past its client area on each side, physical px (left, top:
-/// the title bar, right, bottom).
-pub fn frame_insets(h: isize) -> Option<(i32, i32, i32, i32)> {
-    let hwnd = live(h)?;
-    let client = client_rect(h)?;
-    let mut r = RECT::default();
-    let ok = unsafe {
-        DwmGetWindowAttribute(
-            hwnd,
-            DWMWA_EXTENDED_FRAME_BOUNDS as u32,
-            (&raw mut r).cast(),
-            size_of::<RECT>() as u32,
-        )
-    } == 0;
-    let d = (
-        client.left - r.left,
-        client.top - r.top,
-        r.right - client.right,
-        r.bottom - client.bottom,
-    );
-    (ok && [d.0, d.1, d.2, d.3].iter().all(|v| (0..200).contains(v))).then_some(d)
-}
-
-/// The panel whose DWM border and shadow are off for its slide.
-static BARE_PANEL: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
-
-/// The bare panel's room around itself, physical px ([`bare_margin`]).
-static BARE_MARGIN: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 /// `s` as a NUL-ended UTF-16 string.
 fn w(s: &str) -> Vec<u16> {
@@ -612,188 +737,22 @@ fn taskbar_over(r: Rect) -> Option<HWND> {
     }
 }
 
-/// Room the panel keeps around itself while it slides clipped, logical
-/// px: for the shadow it draws itself meanwhile, as far as Windows' own
-/// reaches (the flip keeps as much around its sheet).
-pub const PANEL_SHADOW_ROOM: f32 = 72.0;
-
-/// Moves the panel's client area to `moved` without resizing it, showing
-/// only the part inside `shown` (screen px), for its slide in or out.
-/// `None` shows it whole again, on top.
-///
-/// Sliding from a taskbar, it slides from behind it: just below it in the
-/// z-order, keeping its own rim and shadow. Elsewhere (the badge, a hidden
-/// taskbar) it is clipped to `shown`, with DWM's border, rounded corners
-/// and shadow off meanwhile: they follow the whole window, not the part
-/// shown, so they'd draw a frame around the hidden part. The panel then
-/// draws them itself, exactly where Windows does: its window grows by
-/// [`bare_margin`] on every side, and it draws its sheet, rim and shadow
-/// in that room (`view`), anti-aliased, clipped only along the edge it
-/// slides out of. Call [`draw_now`] when [`is_bare`] changes, so the
-/// grown or shrunk window and what it draws show in the same frame.
-///
-/// # Safety
-/// Call only from a spawned task outside `update`.
-pub unsafe fn slide_panel(h: isize, moved: Rect, shown: Option<Rect>) {
-    use std::sync::atomic::Ordering::Relaxed;
-    let Some(hwnd) = live(h) else { return };
-    // Behind a taskbar that edges onto another monitor, the part past it
-    // would show on that monitor: clipped instead, like a slide from a
-    // screen's edge.
-    let behind = shown
-        .filter(|s| *s != moved)
-        .and_then(|_| taskbar_over(moved))
-        .filter(|_| {
-            let (x, y) = shown.map_or(moved.centre(), |s| s.centre());
-            let mon = monitor_at(x, y).rect;
-            let inside = Rect::new(
-                moved.left.max(mon.left),
-                moved.top.max(mon.top),
-                moved.right.min(mon.right),
-                moved.bottom.min(mon.bottom),
-            );
-            inside == moved || !on_a_monitor(hidden_part(moved, inside))
-        });
-    // Past a screen's edge with nothing beyond, it needs no clip either:
-    // Windows keeps its own rim and shadow on all the way.
-    let clip = shown
-        .filter(|_| behind.is_none())
-        .filter(|s| *s != moved && on_a_monitor(hidden_part(moved, *s)));
-    unsafe {
-        let bare = BARE_PANEL.load(Relaxed) == h;
-        if clip.is_some() && !bare {
-            let dpi = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
-            BARE_MARGIN.store((PANEL_SHADOW_ROOM * dpi).ceil() as i32, Relaxed);
-            BARE_PANEL.store(h, Relaxed);
-            dwm_set(hwnd, DWMWA_NCRENDERING_POLICY, DWMNCRP_DISABLED as u32);
-            dwm_set(
-                hwnd,
-                DWMWA_WINDOW_CORNER_PREFERENCE,
-                DWMWCP_DONOTROUND as u32,
-            );
-            dwm_set(hwnd, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE);
-        }
-        // Clipped, the client area takes in the room around the panel.
-        let room = if clip.is_some() {
-            BARE_MARGIN.load(Relaxed)
-        } else {
-            0
-        };
-        let client = moved.outset(room);
-        let (dx, dy, bw, bh) = frame(hwnd);
-        let (wl, wt) = (client.left - dx, client.top - dy);
-        // Behind a taskbar, or whole again beside one: placed after it,
-        // below it but still topmost, so its shadow never jumps over the
-        // taskbar. Clipped, or away from taskbars: on top.
-        let after = behind.or_else(|| taskbar_over(moved.outset(SHADOW_REACH)));
-        let after = after.unwrap_or(HWND_TOPMOST);
-        SetWindowPos(
-            hwnd,
-            after,
-            wl,
-            wt,
-            client.width() + bw,
-            client.height() + bh,
-            SWP_NOACTIVATE,
-        );
-        let rgn = match clip {
-            // Region coordinates are relative to the window. Cut only
-            // where `shown` cuts the panel: elsewhere the room around it,
-            // with the rim, corners and shadow it draws there, shows.
-            Some(s) => {
-                let side = |cut: i32, edge: i32, out: i32| if cut == edge { out } else { cut };
-                let r = Rect::new(
-                    side(s.left, moved.left, client.left),
-                    side(s.top, moved.top, client.top),
-                    side(s.right, moved.right, client.right),
-                    side(s.bottom, moved.bottom, client.bottom),
-                );
-                CreateRectRgn(r.left - wl, r.top - wt, r.right - wl, r.bottom - wt)
-            }
-            None => std::ptr::null_mut(),
-        };
-        // Cleared only when one is set: setting none again would still
-        // redraw the whole panel every frame.
-        if (clip.is_some() || bare) && SetWindowRgn(hwnd, rgn, 1) == 0 && !rgn.is_null() {
-            DeleteObject(rgn);
-        }
-        if clip.is_none() && bare {
-            BARE_PANEL.store(0, Relaxed);
-            BARE_MARGIN.store(0, Relaxed);
-            dwm_set(
-                hwnd,
-                DWMWA_NCRENDERING_POLICY,
-                DWMNCRP_USEWINDOWSTYLE as u32,
-            );
-            dwm_set(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND as u32);
-            dwm_set(
-                hwnd,
-                DWMWA_BORDER_COLOR,
-                PANEL_RIM.load(std::sync::atomic::Ordering::Relaxed),
-            );
-        }
-    }
-}
-
-/// The room, physical px, the bare panel `h` keeps around itself on every
-/// side while it slides clipped; `None` while Windows draws its frame.
-pub fn bare_margin(h: isize) -> Option<i32> {
-    use std::sync::atomic::Ordering::Relaxed;
-    is_bare(h).then(|| BARE_MARGIN.load(Relaxed))
-}
-
-/// Forgets that `h` slid clipped, as it closes: a later window given the
-/// same handle starts with Windows' own frame.
-pub fn forget_bare(h: isize) {
-    use std::sync::atomic::Ordering::Relaxed;
-    if BARE_PANEL.compare_exchange(h, 0, Relaxed, Relaxed).is_ok() {
-        BARE_MARGIN.store(0, Relaxed);
-    }
-}
-
-/// Draws and presents `h`'s next frame now, rather than at the next
-/// screen refresh: after its window grew or shrank, so the new size and
-/// what it draws at that size reach the screen together.
-///
-/// # Safety
-/// Call only from a spawned task outside `update`.
-pub unsafe fn draw_now(h: isize) {
-    use windows_sys::Win32::Graphics::Gdi::{RDW_INVALIDATE, RDW_UPDATENOW, RedrawWindow};
-    let Some(hwnd) = live(h) else { return };
-    unsafe {
-        RedrawWindow(
-            hwnd,
-            std::ptr::null(),
-            std::ptr::null_mut(),
-            RDW_INVALIDATE | RDW_UPDATENOW,
-        );
-    }
-}
-
-/// The panel's rim as set, a COLORREF, for after a clipped slide.
-static PANEL_RIM: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(DWMWA_COLOR_DEFAULT);
-
 /// 0xRRGGBB as a COLORREF (0x00BBGGRR).
 fn colorref(rgb: u32) -> u32 {
     ((rgb & 0xff) << 16) | (rgb & 0xff00) | ((rgb >> 16) & 0xff)
 }
 
-/// Sets the window's rim and, given, its title bar to exact colours
-/// (0xRRGGBB), which gitstat then draws itself in the flip and a clipped
-/// slide, so the drawn and the real ones hand over unseen. A panel's rim
-/// is also kept for after a clipped slide.
+/// Sets the big window's rim and title bar to exact colours (0xRRGGBB),
+/// which gitstat then draws itself in the flip, so the drawn and the real
+/// ones hand over unseen.
 ///
 /// # Safety
 /// Call only from a spawned task outside `update`.
-pub unsafe fn set_frame_colors(h: isize, rim: u32, caption: Option<u32>) {
+pub unsafe fn set_frame_colors(h: isize, rim: u32, caption: u32) {
     let Some(hwnd) = live(h) else { return };
     unsafe {
         dwm_set(hwnd, DWMWA_BORDER_COLOR, colorref(rim));
-        match caption {
-            Some(c) => dwm_set(hwnd, DWMWA_CAPTION_COLOR, colorref(c)),
-            None => PANEL_RIM.store(colorref(rim), std::sync::atomic::Ordering::Relaxed),
-        }
+        dwm_set(hwnd, DWMWA_CAPTION_COLOR, colorref(caption));
     }
 }
 
@@ -837,45 +796,6 @@ pub unsafe fn reassert_topmost(h: isize) {
     };
 }
 
-/// Makes the panel topmost so the badge never covers it, with the Win11
-/// rounded corners of a system flyout (ignored on Win10).
-///
-/// # Safety
-/// Call only from a spawned task outside `update`.
-///
-/// With `under` (a flip drawing over it), it goes just below that one
-/// instead, so it never shows above the flip for a frame.
-///
-/// `None` for `under` and `sliding` leaves the z-order to the slide
-/// (`slide_panel`), which may start it behind the taskbar.
-pub unsafe fn panel_topmost(h: isize, under: Option<isize>, sliding: bool) {
-    let Some(hwnd) = live(h) else { return };
-    unsafe {
-        dwm_set(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND as u32);
-        if sliding && under.is_none() {
-            return;
-        }
-        // Beside a taskbar it goes under the taskbar, which is under the
-        // flip, so its shadow stays where it will be after the flip.
-        let beside = client_rect(h).and_then(|r| taskbar_over(r.outset(SHADOW_REACH)));
-        match beside.or(under.and_then(live)) {
-            // Placed after a topmost window, it becomes topmost too.
-            Some(over) => {
-                SetWindowPos(
-                    hwnd,
-                    over,
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                );
-            }
-            None => panel_restack(h),
-        }
-    }
-}
-
 /// Off-screen, where a forced show of the keepalive draws nothing visible.
 const PARKED: i32 = -32000;
 
@@ -894,6 +814,12 @@ pub unsafe fn minimize_closes(h: isize) {
 
 /// The close under way came from minimising.
 static MINIMIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The next close counts as a minimise: the self-test's, which can't press
+/// the button.
+pub fn mark_minimized() {
+    MINIMIZED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Whether the close under way came from minimising; clears it.
 pub fn take_minimized() -> bool {
@@ -987,81 +913,55 @@ pub fn confirm_box(text: String) -> std::thread::JoinHandle<bool> {
                 std::ptr::null_mut(),
                 text.as_ptr(),
                 title.as_ptr(),
-                MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND,
+                MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST,
             )
         };
         answer == IDYES
     })
 }
 
-/// Creates a native tooltip over the whole of `owner`, empty until
-/// [`set_tooltip`]; returns the tooltip's HWND. It subclasses `owner` to
-/// see the mouse, so it works for a window that never takes focus.
-///
-/// # Safety
-/// Call only from a spawned task outside `update`.
-pub unsafe fn create_tooltip(owner: isize) -> Option<isize> {
-    let hwnd = live(owner)?;
-    unsafe {
-        let icc = INITCOMMONCONTROLSEX {
-            dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
-            dwICC: ICC_WIN95_CLASSES,
-        };
-        InitCommonControlsEx(&icc);
-        let tip = CreateWindowExW(
-            WS_EX_TOPMOST,
-            TOOLTIPS_CLASSW,
-            std::ptr::null(),
-            WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            hwnd,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-        );
-        if tip.is_null() {
-            return None;
-        }
-        let mut empty = [0u16];
-        let info = tool_info(hwnd, empty.as_mut_ptr());
-        SendMessageW(tip, TTM_ADDTOOLW, 0, (&raw const info) as isize);
-        // Lines break at `\n` rather than running off the screen.
-        SendMessageW(tip, TTM_SETMAXTIPWIDTH, 0, 480);
-        // Stays up while the mouse rests on the badge.
-        SendMessageW(tip, TTM_SETDELAYTIME, TTDT_AUTOPOP as usize, 30_000);
-        Some(tip as isize)
+/// The window the wheel goes to whenever the mouse is over it, focused or
+/// not; 0 for none.
+static WHEEL_TO: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static WHEEL_HOOK: std::sync::Once = std::sync::Once::new();
+
+/// Sends the wheel to `h` whenever the mouse is over it, though another
+/// window has the focus: with "Scroll inactive windows when I hover over
+/// them" off, Windows sends it to the focused window, and the floating
+/// view, which never takes the focus, would never hear of it. `None`
+/// stops it. Call on the thread that runs the windows: the hook is heard
+/// through its message loop.
+pub fn wheel_to(h: Option<isize>) {
+    use std::sync::atomic::Ordering;
+    WHEEL_TO.store(h.unwrap_or(0), Ordering::Relaxed);
+    if h.is_some() {
+        WHEEL_HOOK.call_once(|| unsafe {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowsHookExW, WH_MOUSE_LL};
+            SetWindowsHookExW(WH_MOUSE_LL, Some(wheel_hook), std::ptr::null_mut(), 0);
+        });
     }
 }
 
-/// Sets the text of `owner`'s tooltip; an empty text shows none.
-///
-/// # Safety
-/// Call only from a spawned task outside `update`.
-pub unsafe fn set_tooltip(tip: isize, owner: isize, text: &str) {
-    let (Some(tip), Some(owner)) = (live(tip), live(owner)) else {
-        return;
+unsafe extern "system" fn wheel_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, GA_ROOT, GetAncestor, HC_ACTION, MSLLHOOKSTRUCT, WM_MOUSEHWHEEL,
     };
-    let mut text: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
-    let info = tool_info(owner, text.as_mut_ptr());
-    unsafe {
-        SendMessageW(tip, TTM_UPDATETIPTEXTW, 0, (&raw const info) as isize);
+    let to = WHEEL_TO.load(std::sync::atomic::Ordering::Relaxed);
+    let msg = wparam as u32;
+    if code == HC_ACTION as i32 && to != 0 && (msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL) {
+        let info = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
+        let under = unsafe { WindowFromPoint(info.pt) };
+        let target = to as HWND;
+        if !under.is_null() && unsafe { GetAncestor(under, GA_ROOT) } == target {
+            // The delta in the high word, as the wheel message has it; the
+            // position on the screen.
+            let delta = (info.mouseData & 0xFFFF_0000) as usize;
+            let at = ((info.pt.y as u16 as isize) << 16) | (info.pt.x as u16 as isize);
+            unsafe { PostMessageW(target, msg, delta, at) };
+            return 1;
+        }
     }
-}
-
-/// The tool that is all of `owner`. Sized without `lpReserved`, so it is
-/// accepted by comctl32 5 as well as 6: the app has no manifest asking for 6.
-fn tool_info(owner: HWND, text: *mut u16) -> TTTOOLINFOW {
-    TTTOOLINFOW {
-        cbSize: std::mem::offset_of!(TTTOOLINFOW, lpReserved) as u32,
-        uFlags: TTF_IDISHWND | TTF_SUBCLASS,
-        hwnd: owner,
-        uId: owner as usize,
-        lpszText: text,
-        ..Default::default()
-    }
+    unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
 }
 
 /// The screen's pixels in `r` (physical px) as they are shown now, layered

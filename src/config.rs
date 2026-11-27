@@ -3,9 +3,14 @@
 
 use crate::git::{DEFAULT_DEPTH, MAX_DEPTH};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub const FILE_NAME: &str = "config.json";
+
+/// The floating view's width, logical px, at its least and at its most.
+pub const FLOAT_MIN_WIDTH: f32 = 120.0;
+pub const FLOAT_MAX_WIDTH: f32 = 1600.0;
 
 /// Work-area corner of the primary monitor that holds the overlay badge.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,6 +110,137 @@ pub struct OverlayConfig {
     pub offset_y: Option<f32>,
     pub hide_when_synced: bool,
     pub hide_in_fullscreen: bool,
+    /// Its corners' radius in logical px; unset, half its size: a disc.
+    /// Grown into the floating view it keeps this radius.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub radius: Option<f32>,
+    /// Grown into the floating view (a right click on it), which it comes
+    /// back as after a restart.
+    pub grown: bool,
+}
+
+/// The floating view the badge grows into: a row per repo, its icon and
+/// its tree, always on top.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FloatConfig {
+    /// The repos pinned to it, by name as gitstat shows them, in the
+    /// order they are listed.
+    pub pinned: Vec<String>,
+    /// Repos taken out of it, by name: each stays out until something
+    /// new happens in it after `taken_out` says it went.
+    pub hidden: Vec<String>,
+    /// When each repo was taken out, Unix seconds, by name. One in
+    /// `hidden` without a time (from before) stays out for good.
+    pub taken_out: BTreeMap<String, i64>,
+    /// The order its rows were put in by hand, by name: the repos named
+    /// here come first, in this order, then the rest.
+    pub order: Vec<String>,
+    /// A repo something new happened in (what the `on_` switches pick)
+    /// within this many days is listed after the pinned ones; 0 lists
+    /// the pinned ones alone.
+    pub recent_days: f64,
+    /// What brings a repo in: a commit on any branch or a checkout, a
+    /// new branch, a new pull request, files starting to change.
+    pub on_commit: bool,
+    pub on_branch: bool,
+    pub on_pr: bool,
+    pub on_changes: bool,
+    /// When each of those last happened in a repo, by name, for those
+    /// git doesn't keep a time of.
+    pub events: BTreeMap<String, FloatEvents>,
+    /// Its width in logical px.
+    pub width: f32,
+    /// How solid its background is, 0.2 to 1.
+    pub opacity: f32,
+    /// The health bar along its top.
+    pub health: bool,
+    /// The open pull requests along its bottom.
+    pub prs: bool,
+    /// A commit's card when the mouse rests on its dot.
+    pub cards: bool,
+}
+
+/// When something new last happened in a repo, of the kinds git keeps no
+/// time of, Unix seconds; 0 for never.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FloatEvents {
+    pub branch: i64,
+    pub pr: i64,
+    pub changes: i64,
+}
+
+/// A kind of thing that happens in a repo and brings it into the
+/// floating view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FloatEvent {
+    Branch,
+    Pr,
+    Changes,
+}
+
+impl FloatConfig {
+    /// Notes that `what` happened in the repo listed as `name` at `at`.
+    pub fn note(&mut self, name: &str, what: FloatEvent, at: i64) {
+        let key = self
+            .events
+            .keys()
+            .find(|k| same_name(k, name))
+            .cloned()
+            .unwrap_or_else(|| name.to_string());
+        let e = self.events.entry(key).or_default();
+        let slot = match what {
+            FloatEvent::Branch => &mut e.branch,
+            FloatEvent::Pr => &mut e.pr,
+            FloatEvent::Changes => &mut e.changes,
+        };
+        *slot = (*slot).max(at);
+    }
+
+    /// The last time something that brings it in happened in the repo
+    /// listed as `name`, with `worked` its newest commit or checkout.
+    pub fn last_event(&self, name: &str, worked: i64) -> i64 {
+        let e = self
+            .events
+            .iter()
+            .find(|(k, _)| same_name(k, name))
+            .map(|(_, e)| *e)
+            .unwrap_or_default();
+        [
+            (self.on_commit, worked),
+            (self.on_branch, e.branch),
+            (self.on_pr, e.pr),
+            (self.on_changes, e.changes),
+        ]
+        .into_iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, t)| t)
+        .max()
+        .unwrap_or(0)
+    }
+}
+
+impl Default for FloatConfig {
+    fn default() -> Self {
+        Self {
+            pinned: Vec::new(),
+            hidden: Vec::new(),
+            taken_out: BTreeMap::new(),
+            order: Vec::new(),
+            recent_days: 3.0,
+            on_commit: true,
+            on_branch: true,
+            on_pr: true,
+            on_changes: true,
+            events: BTreeMap::new(),
+            width: 220.0,
+            opacity: 1.0,
+            health: true,
+            prs: true,
+            cards: true,
+        }
+    }
 }
 
 impl Default for OverlayConfig {
@@ -118,6 +254,8 @@ impl Default for OverlayConfig {
             offset_y: None,
             hide_when_synced: false,
             hide_in_fullscreen: true,
+            radius: None,
+            grown: false,
         }
     }
 }
@@ -151,10 +289,9 @@ pub struct Config {
     pub panel: bool,
     /// The normal status window is available.
     pub window: bool,
-    /// The panel and the badge show pictures only: repo icons, the graph
-    /// and coloured marks, their words in tooltips.
-    pub icons_only: bool,
     pub overlay: OverlayConfig,
+    /// The floating view the badge grows into.
+    pub float: FloatConfig,
     /// desktop.ini status icons on the repo folders.
     pub folder_icons: bool,
     /// What those icons are drawn from; only matters with `folder_icons`.
@@ -295,8 +432,8 @@ impl Default for Config {
             watch: true,
             panel: true,
             window: true,
-            icons_only: false,
             overlay: OverlayConfig::default(),
+            float: FloatConfig::default(),
             folder_icons: false,
             folder_icon_mode: FolderIconMode::default(),
             github_prs: true,
@@ -561,6 +698,39 @@ impl Config {
         )
     }
 
+    /// The badge's corners' radius, logical px: at most half its size,
+    /// which makes it a disc.
+    pub fn overlay_radius(&self) -> f32 {
+        let half = self.overlay_size() / 2.0;
+        match self.overlay.radius {
+            Some(r) if r.is_finite() => r.clamp(0.0, half),
+            _ => half,
+        }
+    }
+
+    /// The floating view's width, logical px, never narrower than the
+    /// badge it grows from.
+    pub fn float_width(&self) -> f32 {
+        clamp_f32(
+            self.float.width,
+            FLOAT_MIN_WIDTH,
+            FLOAT_MAX_WIDTH,
+            FloatConfig::default().width,
+        )
+        .max(self.overlay_size())
+    }
+
+    pub fn float_opacity(&self) -> f32 {
+        clamp_f32(self.float.opacity, 0.2, 1.0, 1.0)
+    }
+
+    /// How long ago a repo may have been worked on to be listed in the
+    /// floating view unpinned, in seconds; none when that is off.
+    pub fn float_recent_secs(&self) -> Option<i64> {
+        let days = self.float.recent_days;
+        (days.is_finite() && days > 0.0).then(|| (days.min(3650.0) * 86_400.0) as i64)
+    }
+
     pub fn overlay_margin(&self) -> f32 {
         clamp_f32(
             self.overlay.margin,
@@ -578,6 +748,19 @@ impl Config {
         let offset = |v: Option<f32>| v.map_or(margin, |v| clamp_f32(v, 0.0, 100_000.0, margin));
         (offset(self.overlay.offset_x), offset(self.overlay.offset_y))
     }
+}
+
+/// Whether two repo names are the same repo's: case and the slash's
+/// direction don't matter.
+pub fn same_name(a: &str, b: &str) -> bool {
+    let fold = |c: char| {
+        if c == '\\' {
+            '/'
+        } else {
+            c.to_ascii_lowercase()
+        }
+    };
+    a.chars().map(fold).eq(b.chars().map(fold))
 }
 
 fn clamp_f32(value: f32, min: f32, max: f32, default: f32) -> f32 {
