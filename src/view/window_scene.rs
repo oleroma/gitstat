@@ -90,6 +90,7 @@ pub(super) struct Laid {
     footer: Option<AnyElement>,
     /// The whole window, for the wheel, and the title bar's buttons.
     whole: Hitbox,
+    drag: Hitbox,
     buttons: [Hitbox; 3],
 }
 
@@ -202,18 +203,6 @@ impl Element for WindowScene {
         let buttons = cap.buttons.map(|r| {
             window.insert_hitbox(paint::bounds(under_grip(r), at, s), HitboxBehavior::Normal)
         });
-        for (area, hitbox) in [
-            WindowControlArea::Min,
-            WindowControlArea::Max,
-            WindowControlArea::Close,
-        ]
-        .into_iter()
-        .zip(&buttons)
-        {
-            window.insert_window_control_hitbox(area, hitbox.clone());
-        }
-        window.insert_window_control_hitbox(WindowControlArea::Drag, drag);
-
         // The top bar's slots.
         let mut top = Vec::new();
         if let Some(slot) = self.settings.take() {
@@ -261,6 +250,7 @@ impl Element for WindowScene {
             prs,
             footer,
             whole,
+            drag,
             buttons,
         })
     }
@@ -300,7 +290,19 @@ impl Element for WindowScene {
         };
         paint::fill(window, bounds, p.bg);
 
-        // The title bar.
+        // The title bar. Windows asks which of its parts the mouse is on:
+        // the three buttons first, then the bar that drags the window.
+        for (area, hitbox) in [
+            WindowControlArea::Min,
+            WindowControlArea::Max,
+            WindowControlArea::Close,
+        ]
+        .into_iter()
+        .zip(&laid.buttons)
+        {
+            window.insert_window_control_hitbox(area, hitbox.clone());
+        }
+        window.insert_window_control_hitbox(WindowControlArea::Drag, laid.drag.clone());
         let cap = &l.caption;
         paint::fill(window, b(cap.rect), title_bar(self.dark));
         paint::app_icon(window, cap.icon, at);
