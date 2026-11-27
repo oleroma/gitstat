@@ -442,7 +442,12 @@ async fn run(out: &std::path::Path, report: &mut String, cx: &mut AsyncApp) -> R
     // and again puts it back.
     let mut zoomed = Vec::new();
     for _ in 0..2 {
-        unsafe { win::click_caption(h, button(1), mid, 9) };
+        // Where its button is now: maximised, the window has moved.
+        let Some(c) = win::client_rect(h) else {
+            return Err("the big window went away".into());
+        };
+        let x = c.right - e(46.0) - e(23.0);
+        unsafe { win::click_caption(h, x, c.top + e(16.0), 9) };
         pause(700, cx).await;
         zoomed.push(win::is_zoomed(h));
     }
