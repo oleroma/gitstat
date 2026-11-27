@@ -751,6 +751,10 @@ impl Timelines {
         window: Option<isize>,
         cx: &mut Context<Self>,
     ) {
+        // On the card that shows, the dots it covers are out of reach.
+        if self.card && self.hover.is_some() && card_holds_mouse(cx) {
+            return;
+        }
         let new = match hit {
             Some((dot, at, above, dirty)) => Some(Hover {
                 repo: path.to_path_buf(),
@@ -1068,7 +1072,7 @@ impl Timelines {
                         });
                     // On the floating view's card, over the tree: the
                     // card holds.
-                    if crate::float_tip::holds_mouse(cx) {
+                    if crate::float_tip::holds_event(e.position, window, cx) {
                         return;
                     }
                     let win = crate::win::hwnd(window);
@@ -1379,29 +1383,29 @@ impl Timelines {
             .or_else(|| (!c.message.is_empty()).then(|| c.message.clone()))
             .unwrap_or_else(|| c.subject.clone());
         let (subject, body) = message_parts(&message);
+        // The id, then the subject wrapping under itself: a column's width
+        // is known when its text is laid out, a flexible row's isn't, which
+        // let a wrapped subject run over the line under it.
+        let id_width = c.short().chars().count() as f32 * CARD_MONO_ADVANCE + 8.0;
         let mut lines = vec![
             div()
-                .flex()
-                .gap_2()
+                .relative()
+                .pl(px(id_width))
                 .child(
                     div()
-                        .flex_none()
+                        .absolute()
+                        .left_0()
+                        .top_0()
                         .font_family("Consolas")
                         .text_color(colors.node(g, row))
                         .child(c.short().to_string()),
                 )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .child(subject),
-                )
-                .when(copied, |d| {
-                    d.child(div().flex_none().text_color(p.muted).child("copied"))
-                })
+                .child(div().font_weight(gpui::FontWeight::SEMIBOLD).child(subject))
                 .into_any_element(),
         ];
+        if copied {
+            lines.push(div().text_color(p.muted).child("Copied").into_any_element());
+        }
         if !body.is_empty() {
             lines.push(
                 div()
@@ -1468,6 +1472,9 @@ impl Timelines {
 
 /// Lines of a message body a card shows at most; longer ones end in "…".
 const BODY_LINES: usize = 24;
+/// How far a card's Consolas glyph advances, logical px at its text size
+/// (0.55 em of 12 px).
+const CARD_MONO_ADVANCE: f32 = 6.6;
 /// Characters of one body line a card shows at most.
 const BODY_LINE_CHARS: usize = 400;
 

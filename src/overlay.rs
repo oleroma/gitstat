@@ -680,14 +680,14 @@ impl Element for Scene {
             cx.defer(left);
         }
         let at_move = spots.clone();
-        window.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
+        window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, cx| {
             if phase != DispatchPhase::Bubble {
                 return;
             }
             moved(e.pressed_button == Some(MouseButton::Left), cx);
             // Over its tooltip or card, the mouse is on them, not on what
             // they cover.
-            if e.pressed_button.is_none() && crate::float_tip::holds_mouse(cx) {
+            if e.pressed_button.is_none() && crate::float_tip::holds_event(e.position, window, cx) {
                 return;
             }
             hover(at_move.at(dev(e.position)), cx);

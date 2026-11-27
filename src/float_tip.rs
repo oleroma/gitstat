@@ -335,6 +335,17 @@ fn ensure_open(cx: &mut App) {
     slot.visible = false;
 }
 
+/// The mouse at `pos` in `window` is on what this shows.
+pub fn holds_event(pos: Point<Pixels>, window: &Window, cx: &App) -> bool {
+    let Some(c) = win::hwnd(window).and_then(win::client_rect) else {
+        return false;
+    };
+    let s = window.scale_factor();
+    let x = c.left + (f32::from(pos.x) * s).floor() as i32;
+    let y = c.top + (f32::from(pos.y) * s).floor() as i32;
+    holds_at(x, y, cx) || holds_mouse(cx)
+}
+
 /// Its window, while it shows: kept over the view.
 pub fn shown_hwnd(cx: &App) -> Option<isize> {
     let slot = cx.try_global::<TipSlot>()?;
@@ -343,10 +354,15 @@ pub fn shown_hwnd(cx: &App) -> Option<isize> {
 
 /// The mouse is on what it shows: that stays while it is.
 pub fn holds_mouse(cx: &App) -> bool {
+    let (x, y) = win::cursor_pos();
+    holds_at(x, y, cx)
+}
+
+/// What it shows is at (`x`, `y`) on the screen, physical px.
+pub fn holds_at(x: i32, y: i32, cx: &App) -> bool {
     let Some(slot) = cx.try_global::<TipSlot>() else {
         return false;
     };
-    let (x, y) = win::cursor_pos();
     slot.visible
         && slot.shows.is_some()
         && slot
