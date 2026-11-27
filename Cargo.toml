@@ -74,3 +74,12 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+# With debug assertions gpui compiles its shaders each time a window is
+# made, about 0.2 s the real build never spends: without them it builds
+# them once, in its build script, as a release build does.
+[profile.dev.package.gpui]
+debug-assertions = false
+
+[profile.dev.build-override]
+debug-assertions = false
