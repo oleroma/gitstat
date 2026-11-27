@@ -36,6 +36,11 @@ class Store(context: Context) {
         get() = prefs.getBoolean(KEY_NOTIFY, true)
         set(value) = prefs.edit { putBoolean(KEY_NOTIFY, value) }
 
+    /** The horizontal view (a row per repo) instead of one repo per screen. */
+    var rows: Boolean
+        get() = prefs.getBoolean(KEY_ROWS, false)
+        set(value) = prefs.edit { putBoolean(KEY_ROWS, value) }
+
     /** Why the last refresh failed, or null when it worked. */
     var problem: String?
         get() = prefs.getString(KEY_PROBLEM, null)
@@ -63,6 +68,7 @@ class Store(context: Context) {
         const val KEY_TOKEN = "token"
         const val KEY_NOTIFY = "notify"
         const val KEY_PROBLEM = "problem"
+        const val KEY_ROWS = "rows"
     }
 }
 

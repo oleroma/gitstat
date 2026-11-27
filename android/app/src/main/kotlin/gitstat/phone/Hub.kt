@@ -12,6 +12,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.glance.appwidget.updateAll
+import gitstat.core.CommitDetail
 import gitstat.core.GitHub
 import gitstat.core.GitHubException
 import gitstat.core.Repo
@@ -33,6 +34,7 @@ data class UiState(
     val refreshing: Boolean = false,
     val problem: String? = null,
     val notify: Boolean = true,
+    val rows: Boolean = false,
 )
 
 /**
@@ -56,6 +58,7 @@ object Hub {
                 snapshot = store.snapshot(),
                 problem = store.problem,
                 notify = store.notify,
+                rows = store.rows,
             )
             loaded = true
         }
@@ -115,6 +118,19 @@ object Hub {
     fun setNotify(context: Context, on: Boolean) {
         Store(context).notify = on
         _state.update { it.copy(notify = on) }
+    }
+
+    fun setRows(context: Context, on: Boolean) {
+        Store(context).rows = on
+        _state.update { it.copy(rows = on) }
+    }
+
+    /** A commit's whole message and size, for its card. */
+    suspend fun commit(context: Context, repo: Repo, id: String): Result<CommitDetail> {
+        val token = Store(context).token ?: return Result.failure(GitHubException("Not signed in"))
+        return withContext(Dispatchers.IO) {
+            runCatching { GitHub(GitHub.https(token)).commit(repo, id) }
+        }
     }
 
     const val CHANNEL = "red"

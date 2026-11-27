@@ -175,3 +175,19 @@ class QueryTest {
         assertTrue("history(first:${GitHub.MAIN_DEPTH})" in q)
     }
 }
+
+class CommitDetailTest {
+    @Test
+    fun readsACommitsMessageAndSize() {
+        var asked = ""
+        val gh = GitHub { q ->
+            asked = q
+            """{"data":{"repository":{"object":{"message":"Subject\n\nBody line\n","additions":3,"deletions":1,"changedFilesIfAvailable":2}}}}"""
+        }
+        val d = gh.commit(Repo("o/n", "u", false, false, "", "main"), "abc")
+        assertEquals("Subject\n\nBody line", d.message)
+        assertEquals(3, d.additions)
+        assertEquals(2, d.files)
+        assertTrue("object(oid:\"abc\")" in asked, asked)
+    }
+}

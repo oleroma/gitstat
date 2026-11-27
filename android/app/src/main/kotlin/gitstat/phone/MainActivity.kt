@@ -86,7 +86,7 @@ private fun Screen() {
 }
 
 /** How long ago [millis] was, such as "5 minutes ago". */
-private fun ago(millis: Long): String =
+fun ago(millis: Long): String =
     DateUtils.getRelativeTimeSpanString(millis, System.currentTimeMillis(), DateUtils.MINUTE_IN_MILLIS).toString()
 
 private fun ago(iso: String): String =
@@ -198,6 +198,16 @@ private fun RepoScreen(state: UiState) {
         }
     }
 
+    // Top right: the switch between one repo per screen and a row per repo, then the menu.
+    val actions: @Composable () -> Unit = {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onClick = { Hub.setRows(context, !state.rows) }) {
+                Text(if (state.rows) "↕" else "↔", fontSize = 20.sp, color = c.text)
+            }
+            menuButton()
+        }
+    }
+
     Scaffold(
         containerColor = c.bg,
     ) { pad ->
@@ -214,12 +224,27 @@ private fun RepoScreen(state: UiState) {
                 Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
                     Row(Modifier.fillMaxWidth().padding(start = 16.dp), verticalAlignment = Alignment.CenterVertically) {
                         Text("gitstat", fontWeight = FontWeight.Bold, fontSize = 20.sp, color = c.text, modifier = Modifier.weight(1f))
-                        menuButton()
+                        actions()
                     }
                     summary()
                 }
+            } else if (state.rows) {
+                RowsView(
+                    snap,
+                    top = {
+                        Column {
+                            Row(Modifier.fillMaxWidth().padding(start = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Text("gitstat", fontWeight = FontWeight.Bold, fontSize = 20.sp, color = c.text, modifier = Modifier.weight(1f))
+                                actions()
+                            }
+                            summary()
+                        }
+                    },
+                    onRepo = { sheet = it.slug },
+                    onCommit = { picked = it },
+                )
             } else {
-                Board(snap, menu = menuButton, summary = summary, onRepo = { sheet = it.slug }, onCommit = { picked = it })
+                Board(snap, menu = actions, summary = summary, onRepo = { sheet = it.slug }, onCommit = { picked = it })
             }
         }
     }
@@ -233,29 +258,7 @@ private fun RepoScreen(state: UiState) {
             }
         }
     }
-    picked?.let { p ->
-        ModalBottomSheet(onDismissRequest = { picked = null }, containerColor = c.surface) {
-            CommitCard(p)
-        }
-    }
-}
-
-@Composable
-private fun CommitCard(p: Picked) {
-    val c = LocalColors.current
-    val uri = LocalUriHandler.current
-    Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 28.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        Text(p.commit.subject, color = c.text, fontWeight = FontWeight.SemiBold)
-        val meta = listOfNotNull(
-            p.repo.name,
-            p.branch,
-            p.commit.author.ifEmpty { null },
-            ago(p.commit.time * 1000),
-            p.commit.id.take(7),
-        )
-        Text(meta.joinToString(" · "), color = c.muted, fontSize = 13.sp)
-        TextButton(onClick = { uri.openUri("${p.repo.url}/commit/${p.commit.id}") }) { Text("Open on GitHub") }
-    }
+    picked?.let { p -> CommitPopup(p) { picked = null } }
 }
 
 @Composable

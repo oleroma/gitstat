@@ -78,6 +78,19 @@ class GitHub(private val post: (query: String) -> String) {
         }
     }
 
+    /** A commit's whole message and size, read when it's tapped. Throws [GitHubException]. */
+    fun commit(repo: Repo, id: String): CommitDetail {
+        val data = ask(commitQuery(repo, id))
+        val c = data.obj("repository").obj("object")
+        val message = c.str("message") ?: throw GitHubException("GitHub has no commit $id")
+        return CommitDetail(
+            message = message.trimEnd(),
+            additions = c.int("additions"),
+            deletions = c.int("deletions"),
+            files = c.int("changedFilesIfAvailable"),
+        )
+    }
+
     /** Runs one query and returns its `data`; GraphQL errors with no data throw. */
     private fun ask(query: String): JsonObject {
         val text = post(query)
@@ -148,6 +161,10 @@ class GitHub(private val post: (query: String) -> String) {
         }
 
         private const val COMMIT = "oid committedDate messageHeadline author{name} parents(first:3){nodes{oid}}"
+
+        fun commitQuery(repo: Repo, id: String): String =
+            "query{repository(owner:${quote(repo.owner)},name:${quote(repo.name)})" +
+                "{object(oid:${quote(id)}){...on Commit{message additions deletions changedFilesIfAvailable}}}}"
 
         /** A GraphQL string literal: JSON's escaping is GraphQL's. */
         fun quote(s: String): String = JsonPrimitive(s).toString()
@@ -272,6 +289,9 @@ class GitHub(private val post: (query: String) -> String) {
  * A read that failed. [auth]: the token was refused. [fatal]: GitHub couldn't be reached or
  * refused the whole request, so the read stops instead of marking repos one by one.
  */
+/** What a commit card shows beyond the tree's own [Commit]; sizes are null when GitHub didn't say. */
+data class CommitDetail(val message: String, val additions: Int?, val deletions: Int?, val files: Int?)
+
 class GitHubException(
     message: String,
     val auth: Boolean = false,

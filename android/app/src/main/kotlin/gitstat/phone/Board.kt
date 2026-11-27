@@ -48,7 +48,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import gitstat.core.Commit
 import gitstat.core.Repo
 import gitstat.core.Snapshot
 import gitstat.core.Tree
@@ -59,8 +58,6 @@ private val ROW = 32.dp
 private val LANE = 16.dp
 private val DOT = 5.dp
 
-/** A commit picked on a tree, for the card at the bottom of the screen. */
-data class Picked(val repo: Repo, val commit: Commit, val branch: String?)
 
 /**
  * One repo per screen, its tree filling the width: swipe sideways for the next repo (red ones
@@ -202,16 +199,12 @@ private fun TreeCanvas(repo: Repo, tree: Tree, onCommit: (Picked) -> Unit) {
     val rowPx = with(density) { row.toPx() }
     val lanes = tree.width.coerceAtMost(MAX_LANES)
     val treeW: Dp = LANE * lanes + 14.dp
-    val branchAt = remember(repo) {
-        repo.branches.associate { it.tip to it.name } + (repo.defaultTip to repo.defaultBranch)
-    }
     Box(
         Modifier.fillMaxWidth().height(row * tree.rows + 6.dp).pointerInput(repo) {
             detectTapGestures { at ->
                 val row = (at.y / rowPx).toInt()
                 if (row in 0 until tree.rows) {
-                    val commit = repo.commits[row]
-                    onCommit(Picked(repo, commit, branchAt[commit.id]))
+                    onCommit(pick(repo, tree, row, inks))
                 }
             }
         },
