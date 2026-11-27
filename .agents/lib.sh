@@ -301,22 +301,31 @@ release_lock() {
 
 # run_from_copy <script> <args>...: a PC run of <script> (agent-build or agent-check) goes on from
 # a fresh copy of .agents/ in build/run/<PID>-<n>, so checking out another commit in the repo never
-# changes a script while bash is reading it (Windows can't replace a file bash has open). Returns at
-# once when this run already is such a copy; AGENTS_DIR="" run_from_copy makes a new one anyway
-# (after the checkout, for the branch's own scripts). Copies of runs that ended are removed.
+# changes a script while bash is reading it (Windows can't replace a file bash has open). A copy
+# holds a .run-copy file, so a run from it returns at once (comparing paths fails in Git Bash,
+# where pwd says /d/dev/... and git says D:/dev/...). AGENTS_DIR="" run_from_copy makes a new copy
+# anyway (after the checkout, for the branch's own scripts). Copies of ended runs, and this run's
+# earlier copies, are removed. More than two copies in one run is a bug: it stops.
 run_from_copy() {
-  local script="$1" run d
+  local script="$1" run d name mine=""
   shift
-  case "$AGENTS_DIR" in "$BUILD_DIR"/run/*) return 0 ;; esac
+  if [ -n "$AGENTS_DIR" ] && [ -f "$AGENTS_DIR/.run-copy" ]; then return 0; fi
+  AGENT_COPIES=$(( ${AGENT_COPIES:-0} + 1 ))
+  export AGENT_COPIES
+  [ "$AGENT_COPIES" -le 2 ] || die "run_from_copy made more than two copies of .agents in one run: a bug in the pipeline scripts."
+  if [ -n "${AGENT_COPY_DIR:-}" ]; then mine="${AGENT_COPY_DIR##*/}"; fi
   mkdir -p "$BUILD_DIR/run"
   for d in "$BUILD_DIR"/run/*/; do
     [ -d "$d" ] || continue
     d="${d%/}"
-    d="${d##*/}"
-    if ! kill -0 "${d%%-*}" 2>/dev/null; then rm -rf "$BUILD_DIR/run/$d" || true; fi
+    name="${d##*/}"
+    if [ "$name" = "$mine" ]; then continue; fi
+    if [ "${name%%-*}" = "$$" ] || ! kill -0 "${name%%-*}" 2>/dev/null; then rm -rf "$d" || true; fi
   done
   run="$(mktemp -d "$BUILD_DIR/run/$$-XXXXXX")" || die "Couldn't make a folder in $BUILD_DIR/run."
   cp -r "$WORKTREE/.agents" "$run/" || die "Couldn't copy .agents to $run."
+  : >"$run/.agents/.run-copy"
+  export AGENT_COPY_DIR="$run"
   exec bash "$run/.agents/$script" "$@" >&3 2>&3 3>&-
 }
 
