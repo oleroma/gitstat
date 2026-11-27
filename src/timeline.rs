@@ -72,6 +72,25 @@ const GLIDE: Duration = Duration::from_millis(140);
 const GROW: Duration = Duration::from_millis(110);
 /// A card fades in over this long.
 const CARD_FADE: Duration = Duration::from_millis(120);
+/// How long a card stays once the mouse is off its dot, for the mouse to
+/// get onto it.
+const CARD_GRACE: Duration = Duration::from_millis(350);
+
+/// Where the card that shows is on the screen, physical px, as last laid
+/// out; and in which window.
+#[derive(Default)]
+struct CardRect(Option<(i32, i32, i32, i32)>);
+
+impl gpui::Global for CardRect {}
+
+/// The mouse is on the card that shows.
+fn card_holds_mouse(cx: &App) -> bool {
+    let Some(CardRect(Some((l, t, r, b)))) = cx.try_global::<CardRect>() else {
+        return false;
+    };
+    let (x, y) = crate::win::cursor_pos();
+    x >= *l && x < *r && y >= *t && y < *b
+}
 /// How long a failed page of older history waits before it is asked again.
 const MORE_RETRY: Duration = Duration::from_secs(10);
 
@@ -246,6 +265,9 @@ pub struct Timelines {
     card_shown: u64,
     /// Bumped on every hover change, so an older card timer does nothing.
     hover_generation: u64,
+    /// The mouse went off the hovered dot while its card showed: the card
+    /// waits a moment for it.
+    letting_go: bool,
     /// The commit whose id was just copied, flashed until its timer ends.
     copied: Option<(PathBuf, usize)>,
     copied_generation: u64,
@@ -313,6 +335,7 @@ impl Timelines {
             card: false,
             card_shown: 0,
             hover_generation: 0,
+            letting_go: false,
             copied: None,
             copied_generation: 0,
             stats: HashMap::new(),
@@ -622,6 +645,7 @@ impl Timelines {
     }
 
     fn unhover(&mut self) {
+        self.letting_go = false;
         self.leave(Instant::now());
         self.hover = None;
         self.card = false;
@@ -748,6 +772,45 @@ impl Timelines {
             {
                 return;
             }
+            // Off a dot whose card shows: the mouse may be on its way to
+            // the card, which stays a moment for it to get there, and for
+            // as long as it is on it.
+            None if self.card && self.hover.is_some() => {
+                if !self.letting_go {
+                    self.letting_go = true;
+                    let held = self.hover.clone();
+                    let timer = cx.background_executor().timer(CARD_GRACE);
+                    cx.spawn(async move |this, cx| {
+                        timer.await;
+                        let mut wait = Duration::from_millis(40);
+                        loop {
+                            let on_card = cx.update(|cx| card_holds_mouse(cx)).unwrap_or(false);
+                            let again = this
+                                .update(cx, |this, cx| {
+                                    if this.hover != held {
+                                        this.letting_go = false;
+                                        return false;
+                                    }
+                                    if on_card {
+                                        return true;
+                                    }
+                                    this.letting_go = false;
+                                    this.unhover();
+                                    cx.notify();
+                                    false
+                                })
+                                .unwrap_or(false);
+                            if !again {
+                                break;
+                            }
+                            cx.background_executor().timer(wait).await;
+                            wait = Duration::from_millis(40);
+                        }
+                    })
+                    .detach();
+                }
+                return;
+            }
             None => None,
         };
         if new == self.hover {
@@ -762,6 +825,7 @@ impl Timelines {
             self.request_hovered_stat(new.as_ref(), cx);
         }
         let now = Instant::now();
+        self.letting_go = false;
         self.leave(now);
         self.hover_since = now;
         self.hover = new;
@@ -1220,7 +1284,27 @@ impl Timelines {
             // The strips under it don't see the mouse, so a click here
             // copies nothing.
             .occlude()
+            .relative()
             .children(card)
+            // Where it lands on the screen: the mouse may stay on it.
+            .child(
+                canvas(
+                    |b, window, cx| {
+                        let s = window.scale_factor();
+                        let o = window.bounds().origin;
+                        let e = |v: Pixels| (f32::from(v) * s).round() as i32;
+                        cx.set_global(CardRect(Some((
+                            e(o.x + b.left()),
+                            e(o.y + b.top()),
+                            e(o.x + b.right()),
+                            e(o.y + b.bottom()),
+                        ))));
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
+            )
             .with_animation(
                 ("card", self.card_shown),
                 Animation::new(CARD_FADE).with_easing(gpui::ease_out_quint()),
