@@ -40,6 +40,8 @@ use std::sync::Arc;
 struct Button {
     key: Key,
     glyph: SharedString,
+    /// The glyph's font, when not the window's own.
+    family: Option<&'static str>,
     enabled: bool,
     slot: Option<AnyElement>,
 }
@@ -370,7 +372,10 @@ impl PanelScene {
                     button.key.clone(),
                     sh(centred(*r, HEADLINE, s)),
                     button.glyph.clone(),
-                    Look::new(HEADLINE, color),
+                    Look {
+                        family: button.family,
+                        ..Look::new(HEADLINE, color)
+                    },
                 )
                 .centred(),
             );
@@ -807,6 +812,7 @@ impl StatusView {
         let mut buttons = vec![Button {
             key: Key::Own,
             glyph: "↻".into(),
+            family: None,
             enabled: !sweeping,
             slot: Some(
                 hit("refresh", !sweeping, &p)
@@ -823,6 +829,7 @@ impl StatusView {
             buttons.push(Button {
                 key: Key::Own,
                 glyph: "⧉".into(),
+                family: None,
                 enabled: true,
                 slot: Some(
                     hit("pop-out", true, &p)
@@ -836,7 +843,8 @@ impl StatusView {
         }
         buttons.push(Button {
             key: Key::Settings,
-            glyph: "⚙".into(),
+            glyph: super::window_scene::GEAR.into(),
+            family: Some(super::window_scene::caption_font(cx)),
             enabled: true,
             slot: Some(
                 hit("settings", true, &p)

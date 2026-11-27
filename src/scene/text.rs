@@ -144,34 +144,24 @@ pub fn paint(
         (Align::Centre, Some(max)) => (max as f32 / s - f32::from(line.width)) / 2.0,
         _ => 0.0,
     };
+    // A glyph out of the colour emoji font is a picture: it takes no
+    // colour, so it can't fade, and comes out a little differently each
+    // time a window draws it first. Said once, for the self-test to find.
     #[cfg(windows)]
-    if text.as_ref() == "⚙" {
-        // Looked into: the gear comes out a quarter px apart from one
-        // time to the next.
+    if line
+        .runs
+        .iter()
+        .any(|r| r.glyphs.iter().any(|g| g.is_emoji))
+    {
         thread_local! {
-            static LAST: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+            static SAID: std::cell::RefCell<Vec<SharedString>> =
+                const { std::cell::RefCell::new(Vec::new()) };
         }
-        let first = line.runs.first();
-        let now = format!(
-            "gear at {at:?} max {max:?} size {} width {} ascent {} descent {} line {line_height} \
-             shift {shift} base {} font {:?} glyph {:?} runs {}",
-            look.size,
-            f32::from(line.width),
-            f32::from(line.ascent),
-            f32::from(line.descent),
-            baseline(&line, line_height, s),
-            first.map(|r| r.font_id),
-            first.and_then(|r| r.glyphs.first().map(|g| (
-                g.id,
-                f32::from(g.position.x),
-                g.is_emoji
-            ))),
-            line.runs.len(),
-        );
-        LAST.with(|last| {
-            if *last.borrow() != now {
-                crate::flip::note(&now);
-                *last.borrow_mut() = now;
+        SAID.with(|said| {
+            let mut said = said.borrow_mut();
+            if !said.contains(text) && said.len() < 50 {
+                said.push(text.clone());
+                crate::flip::note(format!("emoji glyph in {text:?}"));
             }
         });
     }

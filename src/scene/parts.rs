@@ -569,16 +569,22 @@ fn paint_part(part: &Part, window: &mut Window, cx: &mut App) {
             };
             // Part way, the words' size and their box's width are each
             // rounded on their own: a px short is no reason to cut them.
+            // They stay placed across their box all the same (centred
+            // words don't jump aside as they set off).
             let slack = (2.0 * s).ceil() as i32;
-            let fits = part.moving
-                && (text::width(text, &look, window) * s).ceil() as i32 <= r.width() + slack;
+            let wide = (text::width(text, &look, window) * s).ceil() as i32;
+            let room = if part.moving && wide <= r.width() + slack {
+                r.width().max(wide)
+            } else {
+                r.width()
+            };
             text::paint(
                 window,
                 text,
                 &look,
                 (r.left, r.top),
                 line_height(look.size),
-                (!fits).then_some(r.width()),
+                Some(room),
                 *align,
             );
         }

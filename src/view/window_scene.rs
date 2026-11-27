@@ -49,9 +49,14 @@ const CLOSE_HOVER: u32 = 0xc42b1c;
 /// The radius Windows 11 rounds a window's corners with, logical px.
 const RADIUS: f32 = 8.0;
 
+/// The settings gear, in the title bar's font: the gear among the text
+/// fonts' symbols is the colour emoji font's, a picture that takes no
+/// colour and can't fade.
+pub(super) const GEAR: &str = "\u{e713}";
+
 /// The font the title bar's glyphs come from: Windows 11's, else Windows
 /// 10's.
-fn caption_font(cx: &App) -> &'static str {
+pub(super) fn caption_font(cx: &App) -> &'static str {
     static FONT: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
     FONT.get_or_init(|| {
         let fluent = "Segoe Fluent Icons";
@@ -350,8 +355,11 @@ impl WindowScene {
             Part::words(
                 Key::Settings,
                 sh(centred(h.settings, GLYPH, s)),
-                "⚙",
-                Look::new(GLYPH, p.text),
+                GEAR,
+                Look {
+                    family: Some(self.font),
+                    ..Look::new(GLYPH, p.text)
+                },
             )
             .centred(),
         );

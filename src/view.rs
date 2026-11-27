@@ -115,6 +115,7 @@ fn show_window_as(cloaked: bool, cx: &mut App) {
         (table_width(s), s.has_result)
     };
     let (place, _) = window_place(table, cx);
+    crate::flip::note("big window: asking for it");
     let handle = cx
         .open_window(
             WindowOptions {
@@ -133,12 +134,14 @@ fn show_window_as(cloaked: bool, cx: &mut App) {
                 ..Default::default()
             },
             |window, cx| {
+                crate::flip::note("big window: made, building its view");
                 if cloaked && let Some(h) = win::hwnd(window) {
                     win::cloak(h);
                 }
                 // Shown, there is no parked placement; cloaked, activating
                 // places and shows it, cloaked.
                 window.activate_window();
+                crate::flip::note("big window: activated");
                 if let Some(h) = win::hwnd(window) {
                     let dark = matches!(
                         window.appearance(),
@@ -162,11 +165,13 @@ fn show_window_as(cloaked: bool, cx: &mut App) {
                     if !known && !remembered {
                         view.fit = Some(window.bounds());
                     }
+                    crate::flip::note("big window: view built");
                     view
                 })
             },
         )
         .ok();
+    crate::flip::note("big window: open_window returned");
     cx.default_global::<WindowSlot>().handle = handle;
 }
 

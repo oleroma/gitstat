@@ -569,11 +569,11 @@ async fn run(out: &std::path::Path, report: &mut String, cx: &mut AsyncApp) -> R
     Ok(())
 }
 
-/// Writes what the log says of the gear since it was last taken, and
-/// empties it.
+/// Writes what the log says of emoji glyphs since it was last taken (there
+/// should be none), and empties it.
 fn gear_log(report: &mut String, what: &str) {
     for line in crate::flip::take_log() {
-        if line.contains("gear") {
+        if line.contains("emoji") || line.contains("big window:") {
             let _ = writeln!(report, "{what}: log {line}");
         }
     }
