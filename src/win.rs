@@ -369,6 +369,20 @@ pub unsafe fn style_morph(h: isize) {
     }
 }
 
+/// Styles a window that only shows, as `style_morph`, and is layered:
+/// without that Windows still gives it the mouse, transparent or not.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn style_see_through(h: isize) {
+    unsafe { style_morph(h) };
+    let Some(hwnd) = live(h) else { return };
+    unsafe {
+        add_ex_style(hwnd, WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE);
+        SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
+    }
+}
+
 /// Hides `h` from the screen, shadow and all, at the next composition,
 /// without hiding it from Windows: it stays the active window, so the
 /// window that follows it can still come to the front.
@@ -497,6 +511,16 @@ pub unsafe fn wheel(h: isize, x: i32, y: i32, notches: i32) -> Option<bool> {
         SendMessageW(hwnd, WM_MOUSEWHEEL, delta, screen);
         Some(under)
     }
+}
+
+/// Whether the mouse at (`x`, `y`) on screen passes through `h` to what
+/// is under it, as `h` is styled now: for the self-test.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn passes_clicks_now(h: isize, x: i32, y: i32) -> Option<bool> {
+    let hwnd = live(h)?;
+    Some(unsafe { WindowFromPoint(POINT { x, y }) } != hwnd)
 }
 
 /// `h`'s extended window styles, for the self-test's report.

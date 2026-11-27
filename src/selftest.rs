@@ -877,6 +877,34 @@ async fn float_wheel(
     let px = changed(&moved, &plain, strip);
     // The mouse the wheel was told of is gone again.
     cx.update(crate::overlay::left).map_err(gone)?;
+
+    // A tooltip beside the view shows, and lets the mouse through to it.
+    cx.update(|cx| {
+        crate::float_tip::set_lines(
+            Some((vec![("Self-test".to_string(), gpui::white())], (x, y))),
+            cx,
+        )
+    })
+    .map_err(gone)?;
+    pause(400, cx).await;
+    let tip = cx
+        .update(|cx| crate::float_tip::shown_hwnd(cx))
+        .map_err(gone)?;
+    let through = tip.and_then(|t| unsafe { win::passes_clicks_now(t, x, y) });
+    cx.update(|cx| crate::float_tip::set_lines(None, cx))
+        .map_err(gone)?;
+    pause(200, cx).await;
+    let _ = writeln!(
+        report,
+        "float tip: shown {}, the mouse passes through it {through:?}",
+        tip.is_some()
+    );
+    if tip.is_none() {
+        return Err("float tip: the tooltip never showed".into());
+    }
+    if through != Some(true) {
+        return Err("float tip: the tooltip takes the mouse from the view".into());
+    }
     let _ = writeln!(
         report,
         "float wheel: 2 notches up over the first tree at ({x}, {y}) in {strip:?}, the view's \

@@ -322,7 +322,7 @@ fn ensure_open(cx: &mut App) {
         )
         .ok();
     if let Some(h) = hwnd {
-        cx.spawn(async move |_| unsafe { win::style_morph(h) })
+        cx.spawn(async move |_| unsafe { win::style_see_through(h) })
             .detach();
     }
     let slot = cx.default_global::<TipSlot>();
