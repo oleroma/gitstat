@@ -33,9 +33,9 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CreateWindowExW, FindWindowExW, FindWindowW, HTMINBUTTON, IsIconic, IsZoomed,
-    PostMessageW, SC_MINIMIZE, SIZE_MINIMIZED, SendMessageW, WM_CLOSE, WM_MOUSEMOVE, WM_NCHITTEST,
-    WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSEMOVE, WM_SIZE, WM_SYSCOMMAND, WS_EX_TOPMOST,
-    WS_POPUP,
+    PostMessageW, SC_MINIMIZE, SIZE_MINIMIZED, SendMessageW, WM_CLOSE, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSEMOVE, WM_SIZE, WM_SYSCOMMAND,
+    WS_EX_TOPMOST, WS_POPUP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GWL_EXSTYLE, GetClientRect, GetCursorPos, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
@@ -479,6 +479,29 @@ pub unsafe fn passes_clicks(h: isize, x: i32, y: i32) -> Option<bool> {
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, was);
         // Only if it takes the click when it should, too.
         solid.then_some(through)
+    }
+}
+
+/// The wheel turned `notches` up (down when below 0) with the mouse at
+/// (`x`, `y`) on screen, told to `h` as Windows tells it; and whether `h`
+/// is the window there, which Windows would tell: for the self-test.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn wheel(h: isize, x: i32, y: i32, notches: i32) -> Option<bool> {
+    let hwnd = live(h)?;
+    let mut at = POINT { x, y };
+    unsafe {
+        let under = WindowFromPoint(at) == hwnd;
+        if ScreenToClient(hwnd, &mut at) == 0 {
+            return None;
+        }
+        let client = ((at.y as u16 as isize) << 16) | (at.x as u16 as isize);
+        SendMessageW(hwnd, WM_MOUSEMOVE, 0, client);
+        let screen = ((y as u16 as isize) << 16) | (x as u16 as isize);
+        let delta = ((notches * 120) as i16 as u16 as usize) << 16;
+        SendMessageW(hwnd, WM_MOUSEWHEEL, delta, screen);
+        Some(under)
     }
 }
 

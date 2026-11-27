@@ -995,11 +995,12 @@ impl StatusView {
                     timelines: self.timelines.clone(),
                     laid_in: std::time::Duration::ZERO,
                 }),
-                None => root.child(scene).children(
-                    self.timelines
-                        .as_ref()
-                        .and_then(|t| t.read(cx).hover_card(&p, dark, cx)),
-                ),
+                None => root
+                    .child(scene)
+                    .children(self.timelines.as_ref().and_then(|t| {
+                        t.read(cx)
+                            .hover_card(&p, dark, crate::win::hwnd(window), cx)
+                    })),
             })
             .into_any_element()
     }

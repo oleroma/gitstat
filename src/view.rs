@@ -1342,32 +1342,37 @@ struct Tip {
 
 impl Render for Tip {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        // A line that wraps needs a definite width: under only a max width
-        // its height is measured as one line and the next line overlaps it.
-        let wraps = self
-            .lines
-            .iter()
-            .any(|(text, _)| text.chars().count() > TIP_LINE_CHARS);
-        div()
-            .flex()
-            .flex_col()
-            .max_w(px(TIP_WIDTH))
-            .when(wraps, |d| d.w(px(TIP_WIDTH)))
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .border_1()
-            .border_color(self.border)
-            .bg(self.bg)
-            .shadow_md()
-            .text_xs()
-            .children(
-                self.lines
-                    .iter()
-                    .filter(|(text, _)| !text.is_empty())
-                    .map(|(text, color)| div().text_color(*color).child(text.clone())),
-            )
+        tip_body(&self.lines, self.bg, self.border)
     }
+}
+
+/// What a tooltip shows: its lines on the app's tooltip plate. The
+/// floating view draws the same in a window of its own.
+pub(crate) fn tip_body(lines: &[(SharedString, Hsla)], bg: Hsla, border: Hsla) -> gpui::Div {
+    // A line that wraps needs a definite width: under only a max width
+    // its height is measured as one line and the next line overlaps it.
+    let wraps = lines
+        .iter()
+        .any(|(text, _)| text.chars().count() > TIP_LINE_CHARS);
+    div()
+        .flex()
+        .flex_col()
+        .max_w(px(TIP_WIDTH))
+        .when(wraps, |d| d.w(px(TIP_WIDTH)))
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .border_1()
+        .border_color(border)
+        .bg(bg)
+        .shadow_md()
+        .text_xs()
+        .children(
+            lines
+                .iter()
+                .filter(|(text, _)| !text.is_empty())
+                .map(|(text, color)| div().text_color(*color).child(text.clone())),
+        )
 }
 
 /// What a repo's tooltip adds below its name and status: the rest of a

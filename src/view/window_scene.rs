@@ -1035,11 +1035,10 @@ impl StatusView {
             .size_full()
             .text_color(p.text)
             .child(scene)
-            .children(
-                self.timelines
-                    .as_ref()
-                    .and_then(|t| t.read(cx).hover_card(&p, dark, cx)),
-            )
+            .children(self.timelines.as_ref().and_then(|t| {
+                t.read(cx)
+                    .hover_card(&p, dark, crate::win::hwnd(window), cx)
+            }))
             .into_any_element()
     }
 }

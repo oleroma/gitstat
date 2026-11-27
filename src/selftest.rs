@@ -779,6 +779,7 @@ async fn float(
     };
     send(true, cx)?;
     rest(true, false, cx).await?;
+    float_wheel(out, report, cx).await?;
     let sheet = cx.update(|cx| crate::overlay::placed(cx)).map_err(gone)?;
     let Some(plain) = shot(out, "float-undo-before", area, cx).await else {
         return Err("no picture of the screen".into());
@@ -829,6 +830,67 @@ async fn float(
         if left > 0 {
             return Err(format!("float undo: {left} px stay changed after the undo"));
         }
+    }
+    Ok(())
+}
+
+/// The wheel over the floating view's first tree scrolls that tree back
+/// in time, and the tree shows it; a double click brings it home.
+async fn float_wheel(
+    out: &std::path::Path,
+    report: &mut String,
+    cx: &mut AsyncApp,
+) -> Result<(), String> {
+    let gone = |_| "the app went away".to_string();
+    let found = cx
+        .update(|cx| crate::overlay::hwnd(cx).zip(crate::overlay::first_strip(cx)))
+        .map_err(gone)?;
+    let Some((h, (strip, path))) = found else {
+        let _ = writeln!(report, "float wheel: no tree in the view; skipped");
+        return Ok(());
+    };
+    let scrolled = |cx: &mut AsyncApp| {
+        cx.update(|cx| {
+            cx.try_global::<Ui>()
+                .and_then(|ui| ui.timelines.read(cx).scrolled(&path))
+        })
+        .map_err(gone)
+    };
+    let before = scrolled(cx)?;
+    let Some(plain) = shot(out, "float-wheel-before", strip, cx).await else {
+        return Err("no picture of the screen".into());
+    };
+    let (x, y) = (
+        (strip.left + strip.right) / 2,
+        (strip.top + strip.bottom) / 2,
+    );
+    let under = unsafe { win::wheel(h, x, y, 2) };
+    pause(700, cx).await;
+    let after = scrolled(cx)?;
+    let Some(moved) = shot(out, "float-wheel-after", strip, cx).await else {
+        return Err("no picture of the screen".into());
+    };
+    let px = changed(&moved, &plain, strip);
+    let _ = writeln!(
+        report,
+        "float wheel: 2 notches up over the first tree at ({x}, {y}) in {strip:?}, the view's \
+         window there {under:?}; scrolled {before:?} -> {after:?}, {px} px changed"
+    );
+    let home = cx
+        .update(|cx| {
+            if let Some(ui) = cx.try_global::<Ui>() {
+                let t = ui.timelines.clone();
+                t.update(cx, |t, cx| t.scroll_home(&path, cx));
+            }
+        })
+        .map_err(gone);
+    home?;
+    pause(500, cx).await;
+    if after.unwrap_or(0.0) <= before.unwrap_or(0.0) {
+        return Err("float wheel: the wheel did not scroll the tree".into());
+    }
+    if px == 0 {
+        return Err("float wheel: the tree scrolled but did not show it".into());
     }
     Ok(())
 }

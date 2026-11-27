@@ -189,6 +189,8 @@ struct Spots {
     list: Option<Rect>,
     /// Each row and its icon's column, cut to the list.
     rows: Vec<(Rect, Rect)>,
+    /// The first row's tree, cut to the list: for the self-test.
+    first_strip: Option<Rect>,
     tail: Option<Rect>,
 }
 
@@ -499,6 +501,7 @@ impl Scene {
                 .iter()
                 .map(|row| (cut(sh(row.rect)), cut(sh(row.label))))
                 .collect();
+            spots.first_strip = l.rows.first().map(|row| cut(sh(row.strip)));
             spots.list = Some(shown);
             spots.live = self.pose.rows >= 1.0;
             list = Some(shown);
@@ -645,6 +648,7 @@ impl Element for Scene {
         };
         let sheet = laid.sheet;
         let spots = Rc::new(std::mem::take(&mut laid.spots));
+        cx.default_global::<OverlaySlot>().first_strip = spots.first_strip;
         let list = laid.list.filter(|_| spots.live);
         let (max_scroll, strip) = (laid.max_scroll, laid.strip);
         if let Some(edge) = &laid.edge {
@@ -1009,6 +1013,8 @@ pub struct OverlaySlot {
     /// The window the press of that drag landed in, kept (unseen) while
     /// the drag lasts: it has the mouse.
     captor: Option<Pane>,
+    /// The first row's tree in `cur`, client px: for the self-test.
+    first_strip: Option<Rect>,
 }
 
 impl Global for OverlaySlot {}
@@ -1454,6 +1460,35 @@ fn take_out(name: &str, cx: &mut App) {
 
 /// The self-test's way to take the first row out, as a middle click and
 /// a yes would; whether there was one.
+/// The window that shows the badge or the view now.
+pub fn hwnd(cx: &App) -> Option<isize> {
+    Some(cx.try_global::<OverlaySlot>()?.cur.as_ref()?.hwnd)
+}
+
+/// Where that window's inside starts on the screen, physical px.
+#[allow(dead_code)] // The floating view's tips, next.
+pub fn origin(cx: &App) -> Option<(i32, i32)> {
+    let area = cx.try_global::<OverlaySlot>()?.cur.as_ref()?.area?;
+    Some((area.left, area.top))
+}
+
+/// The first row's tree on the screen, and its repo: for the self-test.
+pub fn first_strip(cx: &App) -> Option<(Rect, PathBuf)> {
+    let slot = cx.try_global::<OverlaySlot>()?;
+    let r = slot.first_strip?;
+    let area = slot.cur.as_ref()?.area?;
+    let path = slot.names.first()?.0.clone();
+    Some((
+        Rect::new(
+            area.left + r.left,
+            area.top + r.top,
+            area.left + r.right,
+            area.top + r.bottom,
+        ),
+        path,
+    ))
+}
+
 pub fn take_out_first(cx: &mut App) -> bool {
     let name = cx
         .default_global::<OverlaySlot>()

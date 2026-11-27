@@ -206,6 +206,8 @@ pub struct Hover {
     /// The tree was dirty: a change moves every dot a step, and the WIP dot
     /// comes or goes, so the hover holds only while it doesn't.
     pub dirty: bool,
+    /// The window it is in: only that one shows its card.
+    pub window: Option<isize>,
 }
 
 /// What a queued load reads.
@@ -670,7 +672,13 @@ impl Timelines {
         moving
     }
 
-    fn scroll_home(&mut self, path: &Path, cx: &mut Context<Self>) {
+    /// Px `path`'s strip is scrolled into the past, as it will rest: for
+    /// the self-test.
+    pub fn scrolled(&self, path: &Path) -> Option<f32> {
+        self.slots.get(path).map(|s| s.scroll)
+    }
+
+    pub fn scroll_home(&mut self, path: &Path, cx: &mut Context<Self>) {
         if let Some(slot) = self.slots.get_mut(path) {
             let home = slot.graph.as_ref().map_or(0.0, |g| g.home() * STEP);
             slot.glide_to(home, Instant::now());
@@ -708,6 +716,7 @@ impl Timelines {
         path: &Path,
         pos: Point<Pixels>,
         hit: Option<(Dot, Point<Pixels>, bool, bool)>,
+        window: Option<isize>,
         cx: &mut Context<Self>,
     ) {
         let new = match hit {
@@ -717,6 +726,7 @@ impl Timelines {
                 at,
                 above,
                 dirty,
+                window,
             }),
             // Another strip's hover is not ours to clear.
             None if self.hover.as_ref().is_some_and(|h| h.repo != path) => return,
@@ -983,7 +993,8 @@ impl Timelines {
                             let above = at.y > window.viewport_size().height / 2.0;
                             (dot, at, above, dirty)
                         });
-                    e1.update(cx, |t, cx| t.hover_at(&path1, e.position, found, cx));
+                    let win = crate::win::hwnd(window);
+                    e1.update(cx, |t, cx| t.hover_at(&path1, e.position, found, win, cx));
                 });
                 window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
                     if phase != DispatchPhase::Bubble
@@ -1107,8 +1118,52 @@ impl Timelines {
 
     /// The card for the dot under the mouse, drawn above everything once
     /// the mouse has settled, beside the dot rather than over it.
-    pub fn hover_card(&self, p: &Palette, dark: bool, cx: &App) -> Option<AnyElement> {
-        let h = self.hover.as_ref().filter(|_| self.card)?;
+    pub fn hover_card(
+        &self,
+        p: &Palette,
+        dark: bool,
+        window: Option<isize>,
+        cx: &App,
+    ) -> Option<AnyElement> {
+        let (card, h) = self.card_for(p, dark, window, cx)?;
+        let gap = px(DOT_HOVER + CARD_GAP);
+        let x = h.at.x - px(12.);
+        let (corner, y) = if h.above {
+            (Corner::BottomLeft, h.at.y - gap)
+        } else {
+            (Corner::TopLeft, h.at.y + gap)
+        };
+        Some(
+            deferred(
+                anchored()
+                    .anchor(corner)
+                    .position(point(x, y))
+                    .snap_to_window_with_margin(px(8.))
+                    .child(card),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
+    }
+
+    /// How far from its dot a card sits, logical px: beside the dot's
+    /// hover ring, and that far to the left of it.
+    #[allow(dead_code)] // The floating view's tips, next.
+    pub const CARD_OFFSET: (f32, f32) = (12.0, DOT_HOVER + CARD_GAP);
+
+    /// The card for the dot under the mouse in `window`, unplaced, and
+    /// that hover, once the mouse has settled on it.
+    pub fn card_for(
+        &self,
+        p: &Palette,
+        dark: bool,
+        window: Option<isize>,
+        cx: &App,
+    ) -> Option<(AnyElement, Hover)> {
+        let h = self
+            .hover
+            .as_ref()
+            .filter(|h| self.card && h.window == window)?;
         // Gone with the dot when the tree turned clean or dirty under it.
         let state = self.state.read(cx);
         let dirty = state
@@ -1149,24 +1204,7 @@ impl Timelines {
                 Animation::new(CARD_FADE).with_easing(gpui::ease_out_quint()),
                 |card, k| card.opacity(k),
             );
-        let gap = px(DOT_HOVER + CARD_GAP);
-        let x = h.at.x - px(12.);
-        let (corner, y) = if h.above {
-            (Corner::BottomLeft, h.at.y - gap)
-        } else {
-            (Corner::TopLeft, h.at.y + gap)
-        };
-        Some(
-            deferred(
-                anchored()
-                    .anchor(corner)
-                    .position(point(x, y))
-                    .snap_to_window_with_margin(px(8.))
-                    .child(card),
-            )
-            .with_priority(1)
-            .into_any_element(),
-        )
+        Some((card.into_any_element(), h.clone()))
     }
 
     /// A commit card's lines.

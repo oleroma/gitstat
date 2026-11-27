@@ -319,7 +319,8 @@ impl Timelines {
                             let above = at.y > window.viewport_size().height / 2.0;
                             (dot, at, above, dirty)
                         });
-                    e1.update(cx, |t, cx| t.hover_at(&path1, e.position, found, cx));
+                    let win = crate::win::hwnd(window);
+                    e1.update(cx, |t, cx| t.hover_at(&path1, e.position, found, win, cx));
                 });
                 window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
                     if phase != DispatchPhase::Bubble
