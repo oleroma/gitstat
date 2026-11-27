@@ -259,6 +259,7 @@ pub fn sync(cx: &mut App) {
 }
 
 /// Hides whatever shows.
+#[track_caller]
 pub fn hide(cx: &mut App) {
     let Some(slot) = cx.try_global::<TipSlot>() else {
         return;
@@ -266,6 +267,11 @@ pub fn hide(cx: &mut App) {
     if slot.shows.is_none() && slot.lines.is_none() {
         return;
     }
+    trace(format!(
+        "hide from {}: {}",
+        std::panic::Location::caller(),
+        trace_where(cx)
+    ));
     let slot = cx.default_global::<TipSlot>();
     slot.shows = None;
     slot.lines = None;
@@ -352,6 +358,43 @@ pub fn shown_hwnd(cx: &App) -> Option<isize> {
     slot.hwnd.filter(|_| slot.visible && slot.shows.is_some())
 }
 
+/// A trace of what made the floating view's tooltip or card go, in
+/// %TEMP%\\gitstat-tip.log, kept short: to find what closes them.
+pub fn trace(what: impl AsRef<str>) {
+    use std::io::Write;
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let ms = EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis();
+    let path = std::env::temp_dir().join("gitstat-tip.log");
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 512 * 1024) {
+        let _ = std::fs::remove_file(&path);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "{ms:8} {}", what.as_ref());
+    }
+}
+
+/// Where the mouse is, and where what shows is, for the trace.
+pub fn trace_where(cx: &App) -> String {
+    let (x, y) = win::cursor_pos();
+    let slot = cx.try_global::<TipSlot>();
+    let content = slot
+        .and_then(|s| s.content)
+        .map(|r| (r.left, r.top, r.right, r.bottom));
+    let visible = slot.is_some_and(|s| s.visible);
+    let kind = slot.and_then(|s| s.shows.as_ref()).map(|s| match s {
+        Shows::Lines(..) => "lines",
+        Shows::Card(_) => "card",
+    });
+    format!("mouse ({x},{y}) shows {kind:?} visible {visible} content {content:?}")
+}
+
 /// The mouse is on what it shows: that stays while it is.
 pub fn holds_mouse(cx: &App) -> bool {
     let (x, y) = win::cursor_pos();
@@ -407,6 +450,7 @@ pub fn watch_mouse(cx: &mut App) {
                         return false;
                     }
                     cx.default_global::<TipSlot>().watching = false;
+                    trace(format!("watch lets go: {}", trace_where(cx)));
                     crate::overlay::let_go(cx);
                     true
                 })
