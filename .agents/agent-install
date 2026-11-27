@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Installs a build made by agent-build pc, which runs this itself after building.
 # Run it on its own to install without building.
-# Usage: .agents/agent-install [<version>-<commit> | <n>]   on the PC, in D:\dev\<repo> or build/src
+# Usage: .agents/agent-install [<version>-<commit> | <n>]   on the PC, in D:\dev\<repo>
 #   no argument: the newest build; <version>-<commit>: that build from build/builds/;
 #   <n>: build n (a CI build too), downloaded from its build/<n> pre-release if not in build/builds/
 # Installs each APK on the phone (in place, never a downgrade), then runs the repo's
@@ -18,12 +18,6 @@ INSTALL_NOTE=""
 PHONE_AWAY=0
 FAILED=0
 NOTES=()
-
-# Run from the main checkout, it runs build/src's copy, where the builds were made.
-if ! [ "$WORKTREE" -ef "$BUILD_DIR/src" ]; then
-  [ -f "$BUILD_DIR/src/.agents/agent-install" ] || die "No build/src yet: run agent-build pc first."
-  exec bash "$BUILD_DIR/src/.agents/agent-install" "$@" >&3 2>&3 3>&-
-fi
 
 build_id="${1:-}"
 if [ -z "$build_id" ]; then
