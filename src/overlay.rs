@@ -685,6 +685,11 @@ impl Element for Scene {
                 return;
             }
             moved(e.pressed_button == Some(MouseButton::Left), cx);
+            // Over its tooltip or card, the mouse is on them, not on what
+            // they cover.
+            if e.pressed_button.is_none() && crate::float_tip::holds_mouse(cx) {
+                return;
+            }
             hover(at_move.at(dev(e.position)), cx);
         });
         let at_up = spots.clone();
@@ -1248,6 +1253,11 @@ fn finish_swap(cx: &mut App) {
     let old = slot.cur.replace(next);
     win::dwm_flush();
     win::uncloak(new);
+    // What the view says stays over it.
+    if let Some(tip) = crate::float_tip::shown_hwnd(cx) {
+        cx.spawn(async move |_| unsafe { win::reassert_topmost(tip) })
+            .detach();
+    }
     if let Some(old) = old {
         win::cloak(old.hwnd);
         let slot = cx.default_global::<OverlaySlot>();
@@ -1319,10 +1329,15 @@ fn hover(spot: Spot, cx: &mut App) {
 /// The mouse left the window: nothing of it is hovered any more, and
 /// what was said of it goes.
 pub fn left(cx: &mut App) {
-    let slot = cx.default_global::<OverlaySlot>();
-    if !slot.mouse_in {
+    if !cx.default_global::<OverlaySlot>().mouse_in {
         return;
     }
+    // Onto its tooltip or card: they stay while the mouse is on them.
+    if crate::float_tip::holds_mouse(cx) {
+        crate::float_tip::watch_mouse(cx);
+        return;
+    }
+    let slot = cx.default_global::<OverlaySlot>();
     slot.mouse_in = false;
     slot.spot = Spot::Off;
     let own = slot.cur.as_ref().map(|cur| cur.hwnd);
@@ -1967,12 +1982,14 @@ pub fn over_flip(cx: &mut App) {
         return;
     }
     let slot = cx.default_global::<OverlaySlot>();
-    let panes: Vec<isize> = [&slot.cur, &slot.next]
+    let mut panes: Vec<isize> = [&slot.cur, &slot.next]
         .into_iter()
         .flatten()
         .map(|pane| pane.hwnd)
         .collect();
-    if slot.visible {
+    let visible = slot.visible;
+    panes.extend(crate::float_tip::shown_hwnd(cx));
+    if visible {
         cx.spawn(async move |_| {
             for h in panes {
                 unsafe { win::reassert_topmost(h) };
@@ -2526,8 +2543,13 @@ fn tick(id: u64, cx: &mut App) -> bool {
     let shown = slot.cur.as_ref().map(|cur| cur.hwnd);
     if let Some(h) = shown.filter(|_| slot.visible) {
         let panel = panel_over_badge(cx);
+        let tip = crate::float_tip::shown_hwnd(cx);
         cx.spawn(async move |_| unsafe {
             win::reassert_topmost(h);
+            // and what it says over it.
+            if let Some(tip) = tip {
+                win::reassert_topmost(tip);
+            }
             // Topmost puts the badge above the panel; put the panel back.
             if let Some(p) = panel {
                 win::panel_restack(p);

@@ -50,6 +50,10 @@ struct TipSlot {
     /// it is on the screen.
     drawn: u32,
     visible: bool,
+    /// Where what it shows is on the screen, as last drawn.
+    content: Option<Rect>,
+    /// A task follows the mouse while it is on what this shows.
+    watching: bool,
 }
 
 impl Global for TipSlot {}
@@ -111,6 +115,26 @@ impl Render for TipView {
             None => None,
         };
         let hwnd = win::hwnd(window);
+        let origin = area.map_or((0, 0), |a| (a.left, a.top));
+        // What it shows, and where that lands on the screen.
+        let body = body.map(|body| {
+            div().relative().child(body).child(
+                canvas(
+                    move |b, _, cx| {
+                        let e = |v: Pixels| (f32::from(v) * s).round() as i32;
+                        cx.default_global::<TipSlot>().content = Some(Rect::new(
+                            origin.0 + e(b.left()),
+                            origin.1 + e(b.top()),
+                            origin.0 + e(b.right()),
+                            origin.1 + e(b.bottom()),
+                        ));
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+        });
         div()
             .size_full()
             .when_some(body, |d, body| d.child(body))
@@ -215,6 +239,7 @@ pub fn sync(cx: &mut App) {
         return;
     }
     // Hidden while it is put in place; shown once drawn there.
+    slot.content = None;
     slot.area = Some(area);
     slot.drawn = 0;
     slot.visible = false;
@@ -242,6 +267,7 @@ pub fn hide(cx: &mut App) {
     slot.shows = None;
     slot.lines = None;
     slot.visible = false;
+    slot.content = None;
     if let Some(h) = slot.hwnd {
         win::cloak(h);
     }
@@ -304,4 +330,59 @@ fn ensure_open(cx: &mut App) {
     slot.hwnd = hwnd;
     slot.area = None;
     slot.visible = false;
+}
+
+/// Its window, while it shows: kept over the view.
+pub fn shown_hwnd(cx: &App) -> Option<isize> {
+    let slot = cx.try_global::<TipSlot>()?;
+    slot.hwnd.filter(|_| slot.visible && slot.shows.is_some())
+}
+
+/// The mouse is on what it shows: that stays while it is.
+pub fn holds_mouse(cx: &App) -> bool {
+    let Some(slot) = cx.try_global::<TipSlot>() else {
+        return false;
+    };
+    let (x, y) = win::cursor_pos();
+    slot.visible
+        && slot.shows.is_some()
+        && slot
+            .content
+            .is_some_and(|r| x >= r.left && x < r.right && y >= r.top && y < r.bottom)
+}
+
+/// The mouse went from the view onto what this shows: once it is off
+/// that too, and not back on the view, it all goes.
+pub fn watch_mouse(cx: &mut App) {
+    let slot = cx.default_global::<TipSlot>();
+    if slot.watching {
+        return;
+    }
+    slot.watching = true;
+    cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(40))
+                .await;
+            let done = cx
+                .update(|cx| {
+                    if holds_mouse(cx) {
+                        return false;
+                    }
+                    cx.default_global::<TipSlot>().watching = false;
+                    let (x, y) = win::cursor_pos();
+                    let on_view = crate::overlay::placed(cx)
+                        .is_some_and(|r| x >= r.left && x < r.right && y >= r.top && y < r.bottom);
+                    if !on_view {
+                        crate::overlay::left(cx);
+                    }
+                    true
+                })
+                .unwrap_or(true);
+            if done {
+                break;
+            }
+        }
+    })
+    .detach();
 }

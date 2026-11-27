@@ -1001,6 +1001,11 @@ impl Timelines {
                             let above = at.y > window.viewport_size().height / 2.0;
                             (dot, at, above, dirty)
                         });
+                    // On the floating view's card, over the tree: the
+                    // card holds.
+                    if crate::float_tip::holds_mouse(cx) {
+                        return;
+                    }
                     let win = crate::win::hwnd(window);
                     e1.update(cx, |t, cx| t.hover_at(&path1, e.position, found, win, cx));
                 });
