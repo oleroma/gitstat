@@ -961,7 +961,8 @@ impl Timelines {
                         window,
                     )
                 });
-                fade(bounds, surface, window);
+                let (older, newer) = strip_hidden(bounds, &g, scroll, dirty, window);
+                fade(bounds, surface, (older, newer), window);
                 if !tree {
                     return;
                 }
@@ -1846,17 +1847,92 @@ fn paint_strip_tree(
     });
 }
 
-/// Fades the tail into the background at the strip's left edge.
-fn fade(bounds: Bounds<Pixels>, bg: Hsla, window: &mut Window) {
-    let w = FADE.min(f32::from(bounds.size.width));
-    window.paint_quad(fill(
-        Bounds::new(bounds.origin, size(px(w), bounds.size.height)),
-        linear_gradient(
+/// How much of a strip lies past each end, 0 to 1 (1 a fade's width or
+/// more): older commits past its left end, newer ones past its right. An
+/// end the tree has room to show whole gets no fade.
+fn strip_hidden(
+    bounds: Bounds<Pixels>,
+    g: &RepoGraph,
+    scroll: f32,
+    dirty: bool,
+    window: &Window,
+) -> (f32, f32) {
+    let rows = g.layout.nodes.len();
+    if rows == 0 {
+        return (0.0, 0.0);
+    }
+    let geo = StripGeo::new(bounds, g, scroll, dirty, window.scale_factor());
+    let (left, right) = (f32::from(bounds.left()), f32::from(bounds.right()));
+    // Shown whole, the oldest dot sits PAD in from the left end; older
+    // history still to load is past it.
+    let older = if g.end {
+        ((left + PAD - geo.x((rows - 1) as f32)) / FADE).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let newest = if dirty {
+        geo.wip(g, DOT).0.0
+    } else {
+        geo.x(0.0)
+    };
+    let newer = ((newest - (right - PAD)) / FADE).clamp(0.0, 1.0);
+    (older, newer)
+}
+
+/// Fades the tree into the background at each end it runs on past, as
+/// strongly as `(start, end)` say: its left and right ends, or `down` its
+/// top and bottom.
+fn fade(bounds: Bounds<Pixels>, bg: Hsla, ends: (f32, f32), window: &mut Window) {
+    fade_ends(bounds, bg, ends, false, window);
+}
+
+fn fade_ends(
+    bounds: Bounds<Pixels>,
+    bg: Hsla,
+    (start, end): (f32, f32),
+    down: bool,
+    window: &mut Window,
+) {
+    let long = if down {
+        bounds.size.height
+    } else {
+        bounds.size.width
+    };
+    let w = px(FADE.min(f32::from(long) / 2.0));
+    // Along the tree: from its start towards its end.
+    let (angle, band, far) = if down {
+        (
+            180.,
+            size(bounds.size.width, w),
+            point(bounds.left(), bounds.bottom() - w),
+        )
+    } else {
+        (
             90.,
-            linear_color_stop(bg, 0.),
-            linear_color_stop(bg.opacity(0.), 1.),
-        ),
-    ));
+            size(w, bounds.size.height),
+            point(bounds.right() - w, bounds.top()),
+        )
+    };
+    if start > 0.0 {
+        window.paint_quad(fill(
+            Bounds::new(bounds.origin, band),
+            linear_gradient(
+                angle,
+                linear_color_stop(bg.opacity(start), 0.),
+                linear_color_stop(bg.opacity(0.), 1.),
+            ),
+        ));
+    }
+    if end > 0.0 {
+        window.paint_quad(fill(
+            Bounds::new(far, band),
+            linear_gradient(
+                angle,
+                linear_color_stop(bg.opacity(0.), 0.),
+                linear_color_stop(bg.opacity(end), 1.),
+            ),
+        ));
+    }
 }
 
 #[cfg(test)]

@@ -270,6 +270,12 @@ impl Timelines {
         }
 
         let loaded = graph.is_some();
+        // How far down the column's last row ends, and whether it is the
+        // oldest commit: for the fades at its ends.
+        let span = graph.as_ref().map(|g| {
+            let last = g.commits.len().saturating_sub(1);
+            (geo.y(geo.pos(last)) + ROW / 2.0, g.end)
+        });
         let entity = this.clone();
         let (shown, shown_path) = (this.clone(), path.clone());
         let paint_path = path.clone();
@@ -352,6 +358,28 @@ impl Timelines {
         .absolute()
         .inset_0();
 
+        // Over the rows and their words, a fade at each end the column
+        // runs on past: none at an end it shows whole.
+        let (surface, shown_top) = (p.surface, top);
+        let ends = canvas(
+            |_, _, _| (),
+            move |bounds, _, window, _| {
+                let Some((bottom, end)) = span else {
+                    return;
+                };
+                let h = f32::from(bounds.size.height);
+                let above = (shown_top * ROW / super::FADE).clamp(0.0, 1.0);
+                let below = if end {
+                    ((bottom - h) / super::FADE).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                super::fade_ends(bounds, surface, (above, below), true, window);
+            },
+        )
+        .absolute()
+        .inset_0();
+
         let entity = this.clone();
         let wheel_path = path.clone();
         let body = div()
@@ -373,6 +401,7 @@ impl Timelines {
             })
             .child(painter)
             .children(texts)
+            .child(ends)
             .when(!loaded, |b| {
                 b.child(
                     div()
