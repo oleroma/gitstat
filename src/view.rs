@@ -6,6 +6,7 @@ use crate::git::RepoStatus;
 use crate::github::{Checks, Mergeable, Pr, PrState, Review};
 use crate::monitor::WatchMode;
 use crate::panel;
+use crate::scene::text::text;
 use crate::state::{AppState, Input};
 use crate::timeline::Timelines;
 use crate::tray::TraySnapshot;
@@ -13,12 +14,18 @@ use crate::win;
 use futures::channel::mpsc::UnboundedSender;
 use gpui::{
     AnyElement, App, AppContext, Bounds, Context, Entity, FocusHandle, Global, Hsla, IntoElement,
-    ParentElement, Render, ScrollHandle, ScrollWheelEvent, SharedString, Styled, Window,
-    WindowAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions, canvas, div, point,
-    prelude::*, px, rgb, size,
+    ParentElement, Render, ScrollHandle, SharedString, Styled, Window, WindowAppearance,
+    WindowBounds, WindowHandle, WindowKind, WindowOptions, canvas, div, point, prelude::*, px, rgb,
+    size,
 };
 use std::path::PathBuf;
 use std::rc::Rc;
+
+mod panel_scene;
+pub(crate) use panel_scene::put;
+mod stage;
+mod window_scene;
+pub(crate) use window_scene::caption_font;
 
 /// The window's smallest opening size; big mode grows it to fit columns.
 const WINDOW_SIZE: (f32, f32) = (420.0, 520.0);
@@ -62,9 +69,35 @@ struct WindowSlot {
 
 impl Global for WindowSlot {}
 
+/// The big window's HWND while it is open.
+pub fn window_hwnd(cx: &mut App) -> Option<isize> {
+    let handle = cx.try_global::<WindowSlot>().and_then(|s| s.handle)?;
+    handle
+        .update(cx, |_, window, _| crate::win::hwnd(window))
+        .ok()
+        .flatten()
+}
+
+/// The big window, while it is open.
+pub fn window_handle(cx: &App) -> Option<WindowHandle<StatusView>> {
+    let handle = cx.try_global::<WindowSlot>().and_then(|s| s.handle)?;
+    is_live(handle.into(), cx).then_some(handle)
+}
+
 /// Brings the normal window to the front, opening it at the bottom-right of
 /// the primary work area if it isn't open.
 pub fn show_window(cx: &mut App) {
+    show_window_as(false, cx);
+}
+
+/// Opens the big window cloaked, for the flip to reveal: cloaked as it is
+/// made, before Windows first shows it, so neither it nor its shadow ever
+/// shows under the flip.
+pub fn show_window_cloaked(cx: &mut App) {
+    show_window_as(true, cx);
+}
+
+fn show_window_as(cloaked: bool, cx: &mut App) {
     if let Some(handle) = cx.try_global::<WindowSlot>().and_then(|s| s.handle)
         && handle
             .update(cx, |_, window, _| window.activate_window())
@@ -79,66 +112,50 @@ pub fn show_window(cx: &mut App) {
         t.update(cx, |t, cx| t.show_newest(cx));
     }
     let remembered = last_place(cx).is_some();
-    let (repos, known) = {
+    let (table, known) = {
         let s = state.read(cx);
-        (s.statuses.len(), s.has_result)
+        (table_width(s), s.has_result)
     };
-    let (place, scale) = window_place(repos, cx);
-    let bounds = place.get_bounds();
-    let maximized = matches!(place, WindowBounds::Maximized(_));
+    let (place, _) = window_place(table, cx);
+    crate::flip::note("big window: asking for it");
     let handle = cx
         .open_window(
             WindowOptions {
                 window_bounds: Some(place),
                 kind: WindowKind::Normal,
+                // gitstat draws the title bar itself (`window_scene`).
                 titlebar: Some(gpui::TitlebarOptions {
                     title: Some("gitstat".into()),
+                    appears_transparent: true,
                     ..Default::default()
                 }),
                 window_min_size: Some(size(px(300.), px(200.))),
+                // Cloaked, it is placed and shown as it activates, after
+                // the cloak below.
+                show: !cloaked,
                 ..Default::default()
             },
             |window, cx| {
-                // Safe: opened with show: true, so there is no parked placement.
+                crate::flip::note("big window: made, building its view");
+                if cloaked && let Some(h) = win::hwnd(window) {
+                    win::cloak(h);
+                }
+                // Shown, there is no parked placement; cloaked, activating
+                // places and shows it, cloaked.
                 window.activate_window();
-                // Where the client area came out, so the flip lands on it.
+                crate::flip::note("big window: activated");
                 if let Some(h) = win::hwnd(window) {
-                    let at = |v: gpui::Pixels| (f32::from(v) * scale).round() as i32;
-                    let requested = if maximized {
-                        maximized_area(bounds, scale)
-                    } else {
-                        crate::layout::Rect::new(
-                            at(bounds.origin.x),
-                            at(bounds.origin.y),
-                            at(bounds.origin.x + bounds.size.width),
-                            at(bounds.origin.y + bounds.size.height),
-                        )
-                    };
-                    cx.spawn(async move |cx| {
+                    let dark = matches!(
+                        window.appearance(),
+                        WindowAppearance::Dark | WindowAppearance::VibrantDark
+                    );
+                    cx.spawn(async move |_| {
                         // Minimising goes the way closing does.
                         unsafe { win::minimize_closes(h) };
-                        // A maximised window shows at its normal size and
-                        // maximises a moment later: measure it, and let
-                        // the flip reveal it, once it has.
-                        for _ in 0..50 {
-                            if !maximized || win::is_zoomed(h) {
-                                break;
-                            }
-                            cx.background_executor()
-                                .timer(std::time::Duration::from_millis(8))
-                                .await;
-                        }
-                        if maximized == win::is_zoomed(h)
-                            && let Some(client) = win::client_rect(h)
-                        {
-                            crate::morph::seen_client(
-                                requested,
-                                client,
-                                maximized,
-                                win::caption_height(h),
-                            );
-                        }
-                        crate::morph::big_settled();
+                        // Its rim and title bar in colours the flip draws,
+                        // as thick as Windows draws it.
+                        seen_rim(h);
+                        unsafe { win::set_frame_colors(h, rim_rgb(dark), title_bar_rgb(dark)) };
                     })
                     .detach();
                 }
@@ -150,20 +167,173 @@ pub fn show_window(cx: &mut App) {
                     if !known && !remembered {
                         view.fit = Some(window.bounds());
                     }
+                    crate::flip::note("big window: view built");
                     view
                 })
             },
         )
         .ok();
+    crate::flip::note("big window: open_window returned");
     cx.default_global::<WindowSlot>().handle = handle;
 }
 
-/// How far the open big window's table is scrolled sideways, logical px.
-pub fn table_scroll(cx: &App) -> f32 {
-    cx.try_global::<WindowSlot>()
-        .and_then(|s| s.handle)
-        .and_then(|h| h.read(cx).ok())
-        .map_or(0.0, |v| (-f32::from(v.table.offset().x)).max(0.0))
+/// Scrolls the panel's list to its top, or the big window's table to its
+/// left edge (and its pull requests to their top), over `over`, eased:
+/// true when it wasn't there already.
+pub fn glide_to_start(panel: bool, over: std::time::Duration, cx: &mut App) -> bool {
+    let also = (!panel).then(|| PRS_SCROLL.with(Clone::clone));
+    glide_scroll(panel, point(px(0.), px(0.)), also, over, cx)
+}
+
+thread_local! {
+    /// The big window's pull requests' own scroll, up and down.
+    static PRS_SCROLL: ScrollHandle = ScrollHandle::new();
+    /// Each view's latest glide (the list's, the table's), by number: a
+    /// new one takes over from one under way.
+    static GLIDES: std::cell::Cell<[u64; 2]> = const { std::cell::Cell::new([0; 2]) };
+    /// Until when each view's glide runs, while it does.
+    static GLIDING: std::cell::Cell<[Option<std::time::Instant>; 2]> =
+        const { std::cell::Cell::new([None; 2]) };
+    /// When a glide last took its last step.
+    static GLIDE_END: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Whether a list or table glide is under way.
+pub fn gliding() -> bool {
+    let now = std::time::Instant::now();
+    GLIDING.get().iter().flatten().any(|&until| now < until)
+}
+
+/// When a glide last took its last step.
+pub fn last_glide_end() -> Option<std::time::Instant> {
+    GLIDE_END.get()
+}
+
+/// One glide: the handle it moves, from where to where, and over how long.
+#[derive(Clone)]
+struct Glide {
+    slot: usize,
+    id: u64,
+    scroll: ScrollHandle,
+    from: gpui::Point<gpui::Pixels>,
+    to: gpui::Point<gpui::Pixels>,
+    /// Another handle glided with it to the top: the pull requests'.
+    also: Option<(ScrollHandle, gpui::Point<gpui::Pixels>)>,
+    start: std::time::Instant,
+    over: std::time::Duration,
+}
+
+/// Takes the glide's next step as each frame starts, until it ends or a
+/// newer one takes over.
+fn glide_step(window: &mut Window, g: Glide) {
+    window.on_next_frame(move |window, _| {
+        if GLIDES.get()[g.slot] != g.id {
+            return;
+        }
+        let t = (g.start.elapsed().as_secs_f32() / g.over.as_secs_f32().max(0.001)).min(1.0);
+        let k = crate::flip::ease(t);
+        let at = |from: gpui::Point<gpui::Pixels>, to: gpui::Point<gpui::Pixels>| {
+            point(from.x + (to.x - from.x) * k, from.y + (to.y - from.y) * k)
+        };
+        g.scroll.set_offset(at(g.from, g.to));
+        if let Some((also, from)) = &g.also {
+            also.set_offset(at(*from, point(px(0.), px(0.))));
+        }
+        window.refresh();
+        if t >= 1.0 {
+            let mut gliding = GLIDING.get();
+            gliding[g.slot] = None;
+            GLIDING.set(gliding);
+            GLIDE_END.set(Some(std::time::Instant::now()));
+        } else {
+            glide_step(window, g);
+        }
+    });
+}
+
+/// Moves the panel's list or the window's table to offset `to`, eased,
+/// a step each frame, taking over from a glide of it under way: true
+/// when it wasn't there already.
+fn glide_scroll(
+    panel: bool,
+    to: gpui::Point<gpui::Pixels>,
+    also: Option<ScrollHandle>,
+    over: std::time::Duration,
+    cx: &mut App,
+) -> bool {
+    // Through the scroll handles themselves: this runs from inside the
+    // view's own window handlers, where that window can't be read.
+    let handle = if panel {
+        cx.try_global::<panel::PanelSlot>().and_then(|s| s.handle())
+    } else {
+        cx.try_global::<WindowSlot>().and_then(|s| s.handle)
+    };
+    let (Some(handle), Some(scroll)) = (handle, SCROLLS.with(|s| s.borrow().get(panel))) else {
+        return false;
+    };
+    let from = scroll.offset();
+    let also = also
+        .map(|h| (h.clone(), h.offset()))
+        .filter(|(_, o)| f32::from(o.y).abs() >= 0.5);
+    let near = |a: gpui::Pixels, b: gpui::Pixels| f32::from(a - b).abs() < 0.5;
+    if near(from.x, to.x) && near(from.y, to.y) && also.is_none() {
+        return false;
+    }
+    let slot = usize::from(!panel);
+    let mut ids = GLIDES.get();
+    ids[slot] += 1;
+    GLIDES.set(ids);
+    let start = std::time::Instant::now();
+    let mut gliding = GLIDING.get();
+    // Never longer than this, should its window close under it.
+    gliding[slot] = Some(start + over + std::time::Duration::from_millis(100));
+    GLIDING.set(gliding);
+    let g = Glide {
+        slot,
+        id: ids[slot],
+        scroll,
+        from,
+        to,
+        also,
+        start,
+        over,
+    };
+    // Outside the update this may be called from.
+    cx.spawn(async move |cx| {
+        let started = handle
+            .update(cx, |_, window, _| glide_step(window, g))
+            .is_ok();
+        if !started {
+            let mut gliding = GLIDING.get();
+            gliding[slot] = None;
+            GLIDING.set(gliding);
+        }
+    })
+    .detach();
+    true
+}
+
+/// The open panel's list and big window's table scroll handles, kept apart
+/// from their views so they can be read and moved from anywhere.
+#[derive(Default)]
+struct Scrolls {
+    list: Option<ScrollHandle>,
+    table: Option<ScrollHandle>,
+}
+
+impl Scrolls {
+    fn get(&self, panel: bool) -> Option<ScrollHandle> {
+        if panel {
+            self.list.clone()
+        } else {
+            self.table.clone()
+        }
+    }
+}
+
+thread_local! {
+    static SCROLLS: std::cell::RefCell<Scrolls> = std::cell::RefCell::new(Scrolls::default());
 }
 
 /// Whether the big window is open.
@@ -173,8 +343,6 @@ pub fn window_open(cx: &App) -> bool {
         .is_some_and(|h| is_live(h.into(), cx))
 }
 
-/// Where the window goes for `repos` columns, in logical px, at the
-/// bottom-right of the primary work area, and that monitor's scale.
 /// Where the big window was left: its restored bounds in logical px, and
 /// whether it was maximised.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -184,17 +352,6 @@ struct Place {
     w: f32,
     h: f32,
     maximized: bool,
-    /// The window's frame, normal and maximised, for the flip to land on
-    /// (`morph::Delta`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    frame: Option<crate::morph::Delta>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    maximized_frame: Option<crate::morph::Delta>,
-    /// Its title bar's height, normal and maximised, physical px.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    caption: Option<i32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    maximized_caption: Option<i32>,
 }
 
 /// The last place, kept for this run and in window.json beside config.json.
@@ -213,54 +370,24 @@ fn last_place(cx: &App) -> Option<Place> {
         return known;
     }
     // Not closed yet this run: as the last run left it.
-    let place = place_file(cx)
+    place_file(cx)
         .and_then(|f| std::fs::read_to_string(f).ok())
         .and_then(|text| serde_json::from_str::<Place>(&text).ok())
-        .filter(|p| p.w >= 100.0 && p.h >= 100.0 && p.x.is_finite() && p.y.is_finite());
-    if let Some(p) = place {
-        crate::morph::learn_deltas(p.frame, p.maximized_frame);
-        crate::morph::learn_captions(p.caption, p.maximized_caption);
-    }
-    place
+        .filter(|p| p.w >= 100.0 && p.h >= 100.0 && p.x.is_finite() && p.y.is_finite())
 }
 
 /// Notes where the big window is, as it closes, so it opens there again.
-/// Its frame too, as it is now: settled, so the next flip lands on it.
 pub(crate) fn remember_place(window: &Window, cx: &mut App) {
     let (b, maximized) = match window.window_bounds() {
         WindowBounds::Maximized(b) => (b, true),
         WindowBounds::Windowed(b) | WindowBounds::Fullscreen(b) => (b, false),
     };
-    if let Some(h) = win::hwnd(window)
-        && maximized == win::is_zoomed(h)
-        && let Some(client) = win::client_rect(h)
-    {
-        let scale = sane_scale(window.scale_factor());
-        let requested = if maximized {
-            maximized_area(b, scale)
-        } else {
-            let at = |v: gpui::Pixels| (f32::from(v) * scale).round() as i32;
-            crate::layout::Rect::new(
-                at(b.origin.x),
-                at(b.origin.y),
-                at(b.origin.x + b.size.width),
-                at(b.origin.y + b.size.height),
-            )
-        };
-        crate::morph::seen_client(requested, client, maximized, win::caption_height(h));
-    }
-    let (frame, maximized_frame) = crate::morph::deltas();
-    let (caption, maximized_caption) = crate::morph::captions();
     let place = Place {
         x: f32::from(b.origin.x),
         y: f32::from(b.origin.y),
         w: f32::from(b.size.width),
         h: f32::from(b.size.height),
         maximized,
-        frame,
-        maximized_frame,
-        caption,
-        maximized_caption,
     };
     cx.default_global::<LastPlace>().0 = Some(Some(place));
     if let (Some(file), Ok(text)) = (place_file(cx), serde_json::to_string(&place)) {
@@ -268,18 +395,20 @@ pub(crate) fn remember_place(window: &Window, cx: &mut App) {
     }
 }
 
-/// A maximised window's area: the work area of the monitor its restored
-/// `bounds` (logical px at `scale`) centre on, physical px.
-pub(crate) fn maximized_area(bounds: Bounds<gpui::Pixels>, scale: f32) -> crate::layout::Rect {
-    let c = bounds.center();
-    let at = |v: gpui::Pixels| (f32::from(v) * scale).round() as i32;
-    win::monitor_at(at(c.x), at(c.y)).work
+/// Whether the big window opens maximised: as it was left.
+pub(crate) fn opens_maximized(cx: &App) -> bool {
+    let table = cx
+        .try_global::<Ui>()
+        .map_or(0.0, |ui| table_width(ui.state.read(cx)));
+    matches!(window_place(table, cx).0, WindowBounds::Maximized(_))
 }
 
 /// Where the big window opens: where it was left (maximised again if it
 /// was), else sized for `repos` columns at the primary monitor's corner.
 /// With the logical px' scale.
-pub(crate) fn window_place(repos: usize, cx: &App) -> (WindowBounds, f32) {
+/// Where the big window opens: where it last was, else wide enough for a
+/// `table` this wide (logical px).
+pub(crate) fn window_place(table: f32, cx: &App) -> (WindowBounds, f32) {
     let mon = win::primary_monitor();
     let scale = sane_scale(mon.scale);
     if let Some(p) = last_place(cx) {
@@ -299,11 +428,24 @@ pub(crate) fn window_place(repos: usize, cx: &App) -> (WindowBounds, f32) {
             );
         }
     }
-    let (b, s) = default_place(repos);
+    // GPUI places a window in workspace coordinates, which start at the
+    // primary work area's corner, not the screen's.
+    let (mut b, s) = default_place(table);
+    b.origin.x -= px((mon.work.left - mon.rect.left) as f32 / s);
+    b.origin.y -= px((mon.work.top - mon.rect.top) as f32 / s);
     (WindowBounds::Windowed(b), s)
 }
 
-fn default_place(repos: usize) -> (Bounds<gpui::Pixels>, f32) {
+/// The table's whole width, logical px: its columns and spines, as the
+/// window lays them out.
+pub(crate) fn table_width(state: &AppState) -> f32 {
+    table_cells(state).iter().map(Cell::width).sum()
+}
+
+/// Where the window goes for a table `table` logical px wide, in logical
+/// px, at the bottom-right of the primary work area, and that monitor's
+/// scale.
+fn default_place(table: f32) -> (Bounds<gpui::Pixels>, f32) {
     let mon = win::primary_monitor();
     let scale = sane_scale(mon.scale);
     let (left, top) = (mon.work.left as f32 / scale, mon.work.top as f32 / scale);
@@ -312,7 +454,7 @@ fn default_place(repos: usize) -> (Bounds<gpui::Pixels>, f32) {
         mon.work.height() as f32 / scale,
     );
     // Big mode: wide enough for every column, up to most of the screen.
-    let width = (repos.max(1) as f32 * crate::timeline::COLUMN_WIDTH + 2.0)
+    let width = (table.max(crate::timeline::COLUMN_WIDTH) + 2.0)
         .min(work_w * 0.9)
         .max(WINDOW_SIZE.0);
     let height = (work_h * 0.8).max(WINDOW_SIZE.1).min(work_h);
@@ -373,6 +515,8 @@ pub struct StatusView {
     mode: Mode,
     /// Big mode's table of columns, scrolled sideways.
     table: ScrollHandle,
+    /// The panel's list, scrolled up and down.
+    list: ScrollHandle,
     focus: FocusHandle,
     /// The panel has been active once, so a deactivation now means the user
     /// clicked elsewhere rather than the foreground lock refusing us.
@@ -407,11 +551,28 @@ impl StatusView {
         if let Some(marks) = cx.try_global::<Ui>().map(|ui| ui.marks.clone()) {
             cx.observe(&marks, |_, _, cx| cx.notify()).detach();
         }
-        cx.observe_window_appearance(window, |_, _, cx| cx.notify())
-            .detach();
+        cx.observe_window_appearance(window, move |_, window, cx| {
+            // The rim and title bar follow the theme, in the colours the
+            // flip draws.
+            if let Some(h) = win::hwnd(window) {
+                let dark = matches!(
+                    window.appearance(),
+                    WindowAppearance::Dark | WindowAppearance::VibrantDark
+                );
+                // The panel draws its own rim.
+                if mode == Mode::Window {
+                    cx.spawn(async move |_, _| unsafe {
+                        win::set_frame_colors(h, rim_rgb(dark), title_bar_rgb(dark))
+                    })
+                    .detach();
+                }
+            }
+            cx.notify()
+        })
+        .detach();
         if mode == Mode::Window {
             // Closing flips it back into the panel when it can.
-            window.on_window_should_close(cx, |window, cx| !crate::morph::flip_back(window, cx));
+            window.on_window_should_close(cx, |window, cx| !crate::flip::flip_back(window, cx));
         }
         if mode == Mode::Panel {
             cx.observe_window_activation(window, |this: &mut Self, window, cx| {
@@ -426,11 +587,20 @@ impl StatusView {
         // The root tracks this handle, so Esc reaches it without a click first.
         let focus = cx.focus_handle();
         focus.focus(window);
+        let (table, list) = (ScrollHandle::new(), ScrollHandle::new());
+        SCROLLS.with(|s| {
+            let mut s = s.borrow_mut();
+            match mode {
+                Mode::Panel => s.list = Some(list.clone()),
+                Mode::Window => s.table = Some(table.clone()),
+            }
+        });
         Self {
             state,
             timelines,
             mode,
-            table: ScrollHandle::new(),
+            table,
+            list,
             focus,
             seen_active: false,
             fit: None,
@@ -459,7 +629,7 @@ impl StatusView {
             && near(now.origin.y, opened.origin.y)
             && near(now.size.width, opened.size.width)
             && near(now.size.height, opened.size.height);
-        let (want, scale) = default_place(s.statuses.len());
+        let (want, scale) = default_place(table_width(s));
         if !untouched || near(want.size.width, opened.size.width) {
             return;
         }
@@ -498,20 +668,6 @@ pub fn panel_rows(state: &AppState) -> usize {
         n => section(n, Section::PullRequests),
     };
     repos + prs + section(state.remote_statuses.len(), Section::GithubOnly)
-}
-
-/// Notes where a panel section's heading is drawn, for the flip.
-fn seen_header(section: Section) -> impl IntoElement {
-    canvas(
-        |_, _, _| {},
-        move |bounds, _, window, _| {
-            if window.content_mask().bounds.intersects(&bounds) {
-                crate::morph::seen_header(section, bounds);
-            }
-        },
-    )
-    .absolute()
-    .inset_0()
 }
 
 /// Folds or opens `section` everywhere, saved in config.json.
@@ -573,19 +729,6 @@ pub(crate) fn table_cells(state: &AppState) -> Vec<Cell<'_>> {
     cells
 }
 
-/// Each cell's left edge in the unscrolled table, logical px.
-pub(crate) fn cell_lefts(cells: &[Cell]) -> Vec<f32> {
-    let mut x = 0.0;
-    cells
-        .iter()
-        .map(|c| {
-            let at = x;
-            x += c.width();
-            at
-        })
-        .collect()
-}
-
 /// The cell holding `path`'s column.
 pub(crate) fn cell_of(cells: &[Cell], path: &std::path::Path) -> Option<usize> {
     cells
@@ -593,41 +736,6 @@ pub(crate) fn cell_of(cells: &[Cell], path: &std::path::Path) -> Option<usize> {
         .position(|c| matches!(c, Cell::Repo(s) if s.path == path))
 }
 
-/// The big-mode cells worth building: the ones in view and one more on
-/// each side. The rest are empty boxes of the same width, so the table
-/// scrolls as far, but hovering or animating one column doesn't lay out
-/// every repo's. Scrolling redraws the view, which builds the new ones.
-fn shown_columns(
-    table: &ScrollHandle,
-    window: &Window,
-    lefts: &[f32],
-    focused: Option<usize>,
-) -> std::ops::Range<usize> {
-    let w = crate::timeline::COLUMN_WIDTH;
-    // Before the first paint the table has no size yet; the window's
-    // width is as wide as it can be.
-    let width = match f32::from(table.bounds().size.width) {
-        w if w > 0.0 => w,
-        _ => f32::from(window.viewport_size().width),
-    };
-    // A column about to be scrolled to may land at either edge.
-    let (from, to) = match focused.and_then(|i| lefts.get(i)) {
-        Some(&x) => (x - width, x + width + w),
-        None => {
-            let left = (-f32::from(table.offset().x)).max(0.0);
-            (left - w, left + width + w)
-        }
-    };
-    let first = lefts
-        .iter()
-        .position(|&x| x + w > from)
-        .unwrap_or(lefts.len());
-    let last = lefts.iter().rposition(|&x| x < to).map_or(0, |i| i + 1);
-    first..last.max(first)
-}
-
-/// A section's spine in big mode: its fold arrow, count and name down a
-/// narrow column; a click folds or opens it.
 /// A section's colour: its heading's words in the panel and its spine's
 /// in the big window.
 pub(crate) fn section_color(section: Section, p: &Palette) -> Hsla {
@@ -638,19 +746,15 @@ pub(crate) fn section_color(section: Section, p: &Palette) -> Hsla {
     }
 }
 
-/// A panel section heading's words, noted for the flip, which turns them
-/// into the spine's.
-fn heading_label(section: Section, text: String, p: &Palette) -> gpui::Div {
-    let color = section_color(section, p);
-    let words = text.clone();
-    div().flex_1().relative().child(text).child(
-        canvas(
-            |_, _, _| {},
-            move |bounds, _, _, _| crate::morph::seen_heading_label(section, bounds, &words, color),
-        )
-        .absolute()
-        .inset_0(),
-    )
+/// A panel section heading's words.
+/// A section's heading words, alike in the panel and on its spine.
+pub(crate) fn section_text(section: Section, n: usize) -> String {
+    match section {
+        Section::NeedsYou => format!("● {n} need you"),
+        Section::Synced => format!("✓ {n} synced"),
+        Section::PullRequests => format!("{n} pull requests"),
+        Section::GithubOnly => format!("◌ {n} on GitHub only"),
+    }
 }
 
 /// The faint wash of its colour behind a section's heading in the panel
@@ -659,121 +763,65 @@ pub(crate) fn section_tint(section: Section, p: &Palette) -> Hsla {
     section_color(section, p).opacity(0.10)
 }
 
-fn spine(section: Section, count: usize, folded: bool, p: &Palette) -> AnyElement {
-    let (name, color) = match section {
-        Section::NeedsYou => ("NEED YOU", p.red),
-        Section::Synced => ("SYNCED", p.green),
-        Section::GithubOnly => ("GITHUB ONLY", p.muted),
-        Section::PullRequests => ("PULL REQUESTS", p.muted),
-    };
+/// A section's spine in big mode: its fold arrow, count and name down a
+/// narrow column; a click folds or opens it. Its wash and the line at its
+/// side are the scene's parts, drawn under this.
+pub(crate) fn spine(section: Section, count: usize, folded: bool, p: &Palette) -> AnyElement {
+    let color = section_color(section, p);
     let id = match section {
         Section::NeedsYou => "spine-needs-you",
         Section::Synced => "spine-synced",
         Section::GithubOnly => "spine-github-only",
         Section::PullRequests => "spine-prs",
     };
+    let label = section_text(section, count);
+    let len = crate::turned_text::length(&label, SPINE_TEXT);
     div()
         .id(id)
-        .flex_none()
         .flex()
         .flex_col()
         .items_center()
         .gap_1()
-        .w(px(SPINE_WIDTH))
-        .h_full()
+        .size_full()
         .pt_2()
-        .border_r_1()
-        .border_color(p.border)
-        .bg(section_tint(section, p))
         .cursor_pointer()
         .hover(|s| s.bg(p.hover))
         .text_xs()
         .text_color(color)
-        .child({
-            // The section's heading turned a quarter turn anticlockwise,
-            // reading upwards: its count nearest the arrow, as in the panel.
-            let label = format!("{count}  {name}");
-            let len = crate::turned_text::length(&label, SPINE_TEXT);
-            canvas(
-                |_, _, _| {},
-                move |bounds, _, window, _| {
-                    crate::morph::seen_spine_label(section, bounds, &label, window);
-                    crate::turned_text::paint(window, bounds, &label, SPINE_TEXT, color)
-                },
-            )
-            .w_full()
-            .h(px(len))
-        })
-        // Open, its columns are to the right; folded, the arrow turns with
-        // the heading, as the panel's ▸ would.
+        // The panel's heading turned a quarter turn anticlockwise: its
+        // arrow at the top (open, its columns are to the right; folded,
+        // it points up), its words below reading upwards.
         .child(
             div()
                 .text_color(p.muted)
                 .child(if folded { "▴" } else { "▸" }),
         )
         .child(
-            // Where the flip lands this section's spine.
             canvas(
                 |_, _, _| {},
-                move |bounds, _, window, _| crate::morph::seen_spine(bounds, window),
+                move |bounds, _, window, _| {
+                    crate::turned_text::paint(window, bounds, &label, SPINE_TEXT, color)
+                },
             )
-            .absolute()
-            .inset_0(),
+            .w_full()
+            .h(px(len)),
         )
-        .relative()
         .on_click(fold(section))
-        .into_any_element()
-}
-
-/// An unbuilt column: as wide and tall as a real one, with its border.
-fn column_placeholder(p: &Palette) -> AnyElement {
-    div()
-        .flex_none()
-        .w(px(crate::timeline::COLUMN_WIDTH))
-        .h_full()
-        .border_r_1()
-        .border_color(p.border)
         .into_any_element()
 }
 
 /// Opens a repo the way config's `repo_click` says: its folder, or its
 /// GitHub page (the folder when it has none). Only opens; changes nothing.
 pub fn open_repo(path: &std::path::Path, cx: &mut App) {
-    // A repo with no clone has only its GitHub page.
-    if let Some(slug) = crate::github::remote_slug(path) {
-        cx.open_url(&format!("https://github.com/{slug}"));
-        return;
-    }
     let github = cx
         .try_global::<Ui>()
         .is_some_and(|ui| ui.state.read(cx).config.repo_click == crate::config::RepoClick::Github);
-    if github {
-        let web = cx
-            .try_global::<Ui>()
-            .and_then(|ui| ui.timelines.read(cx).web(path));
-        if let Some(web) = web {
-            cx.open_url(&web);
-            return;
-        }
-        // Not drawn yet: ask git off the UI thread, which a slow or busy
-        // disk would otherwise freeze.
-        let repo = path.to_path_buf();
-        let task = cx.background_spawn(async move {
-            let web = crate::repo_info::origin_web(&repo);
-            (repo, web)
-        });
-        cx.spawn(async move |cx| {
-            let (repo, web) = task.await;
-            cx.update(|cx| match web {
-                Some(web) => cx.open_url(&web),
-                None => cx.open_with_system(&repo),
-            })
-            .ok();
-        })
-        .detach();
-        return;
+    // A repo with no clone has only its GitHub page.
+    if github || crate::github::remote_slug(path).is_some() {
+        crate::repo_menu::open_github(path, cx);
+    } else {
+        cx.open_with_system(path);
     }
-    cx.open_with_system(path);
 }
 
 fn refresh(cx: &mut App) {
@@ -854,48 +902,46 @@ fn repo_row(index: usize, s: &RepoStatus, p: &Palette, mode: Mode, cx: &App) -> 
         .into_any_element()
 }
 
-/// A draft PR's mark in icons-only mode, drawn rather than typed.
-const DRAFT_GLYPH: &str = "◌";
-
 /// What a pull request's row says on its right, most pressing first:
-/// (glyph for icons-only mode, words, colour).
-fn pr_marks(pr: &Pr, p: &Palette) -> Vec<(&'static str, &'static str, Hsla)> {
+/// (words, colour).
+fn pr_marks(pr: &Pr, p: &Palette) -> Vec<(&'static str, Hsla)> {
     let mut marks = Vec::new();
     if pr.review_requested {
-        marks.push(("◉", "review requested", p.amber));
+        marks.push(("review requested", p.amber));
     }
     match pr.checks {
-        Checks::Failing => marks.push(("✗", "checks failing", p.red)),
-        Checks::Pending => marks.push(("●", "checks running", p.amber)),
-        Checks::Passing => marks.push(("✓", "checks pass", p.green)),
+        Checks::Failing => marks.push(("checks failing", p.red)),
+        Checks::Pending => marks.push(("checks running", p.amber)),
+        Checks::Passing => marks.push(("checks pass", p.green)),
         Checks::None => {}
     }
     if pr.mergeable == Mergeable::Conflicts {
-        marks.push(("⚠", "conflicts", p.red));
+        marks.push(("conflicts", p.red));
     }
     match pr.review {
-        Review::ChangesRequested => marks.push(("✎", "changes requested", p.red)),
-        Review::Approved => marks.push(("★", "approved", p.green)),
-        Review::Required if !pr.review_requested => marks.push(("…", "awaiting review", p.muted)),
+        Review::ChangesRequested => marks.push(("changes requested", p.red)),
+        Review::Approved => marks.push(("approved", p.green)),
+        Review::Required if !pr.review_requested => marks.push(("awaiting review", p.muted)),
         _ => {}
     }
     if pr.state == PrState::Draft {
-        marks.push((DRAFT_GLYPH, "draft", p.muted));
+        marks.push(("draft", p.muted));
     }
     marks
 }
 
+/// A pull request as one mark: the colour of what presses most about
+/// it, and all of it in words.
+pub(crate) fn pr_tone(pr: &Pr, p: &Palette) -> (Hsla, String) {
+    let marks = pr_marks(pr, p);
+    let color = marks.first().map_or(p.muted, |m| m.1);
+    let words: Vec<&str> = marks.iter().map(|m| m.0).collect();
+    (color, words.join(", "))
+}
+
 /// One open pull request; a click opens it on GitHub (and closes the
 /// panel, not the window). Only a browser link: nothing is changed on GitHub.
-fn pr_row(
-    index: usize,
-    s: &RepoStatus,
-    pr: &Pr,
-    p: &Palette,
-    mode: Mode,
-    icons_only: bool,
-    cx: &App,
-) -> AnyElement {
+fn pr_row(index: usize, s: &RepoStatus, pr: &Pr, p: &Palette, mode: Mode, cx: &App) -> AnyElement {
     let marks = pr_marks(pr, p);
     let url = pr.url.clone();
     let tone = if pr.needs_attention() {
@@ -910,7 +956,7 @@ fn pr_row(
         (pr.title.clone(), p.text),
         (format!("{} by {}", pr.head_branch, pr.author), p.muted),
     ];
-    lines.extend(marks.iter().map(|&(_, words, c)| (words.to_string(), c)));
+    lines.extend(marks.iter().map(|&(words, c)| (words.to_string(), c)));
     let right = div()
         .flex()
         .flex_none()
@@ -920,21 +966,8 @@ fn pr_row(
         .children(
             marks
                 .iter()
-                .take(if icons_only { 5 } else { 2 })
-                .map(|&(glyph, words, c)| match (icons_only, glyph) {
-                    // The font's dotted circle comes out jagged at this
-                    // size; a dashed ring is drawn smooth.
-                    (true, DRAFT_GLYPH) => div()
-                        .flex_none()
-                        .size(px(11.))
-                        .rounded_full()
-                        .border_1()
-                        .border_dashed()
-                        .border_color(c),
-                    _ => div()
-                        .text_color(c)
-                        .child(if icons_only { glyph } else { words }),
-                }),
+                .take(2)
+                .map(|&(words, c)| div().text_color(c).child(text(words))),
         );
     div()
         .id(("pr", index))
@@ -958,7 +991,7 @@ fn pr_row(
                 .flex_none()
                 .text_sm()
                 .text_color(p.muted)
-                .child(format!("#{}", pr.number)),
+                .child(text(format!("#{}", pr.number))),
         )
         .child(
             div()
@@ -966,7 +999,7 @@ fn pr_row(
                 .min_w_0()
                 .truncate()
                 .text_color(p.text)
-                .when(!icons_only, |d| d.child(pr.title.clone())),
+                .child(text(pr.title.clone())),
         )
         .child(right)
         .into_any_element()
@@ -981,7 +1014,6 @@ fn pr_rows(
     problem: Option<&str>,
     p: &Palette,
     mode: Mode,
-    icons_only: bool,
     // Big mode: whether the list is folded, and what folds or unfolds it.
     fold: Option<(bool, OnClick)>,
     cx: &App,
@@ -1010,23 +1042,23 @@ fn pr_rows(
             .text_xs()
             .font_weight(gpui::FontWeight::SEMIBOLD)
             .text_color(if asked > 0 { p.amber } else { p.muted })
-            .child(div().flex_1().min_w_0().truncate().child(heading));
+            .child(div().flex_1().min_w_0().truncate().child(text(heading)));
         let head = match fold {
             Some((folded, toggle)) => head
                 .when(folded, |d| d.pb_3())
                 .cursor_pointer()
                 .hover(|style| style.bg(p.hover))
-                .child(div().flex_none().text_color(p.muted).child(if folded {
+                .child(div().flex_none().text_color(p.muted).child(text(if folded {
                     "▸"
                 } else {
                     "▾"
-                }))
+                })))
                 .on_click(toggle),
             None => head,
         };
         out.push(head.into_any_element());
         for (i, (s, pr)) in open_prs.iter().enumerate().filter(|_| !folded) {
-            out.push(pr_row(i, s, pr, p, mode, icons_only, cx));
+            out.push(pr_row(i, s, pr, p, mode, cx));
         }
     } else if let Some(problem) = problem {
         out.push(
@@ -1038,7 +1070,7 @@ fn pr_rows(
                 .text_xs()
                 .text_color(p.muted)
                 .truncate()
-                .child(format!("Pull requests: {problem}"))
+                .child(text(format!("Pull requests: {problem}")))
                 .into_any_element(),
         );
     }
@@ -1056,753 +1088,125 @@ fn remote_problem_row(problem: &str, p: &Palette) -> AnyElement {
         .text_xs()
         .text_color(p.muted)
         .truncate()
-        .child(format!("GitHub repos: {problem}"))
+        .child(text(format!("GitHub repos: {problem}")))
         .into_any_element()
+}
+
+/// The pull requests' block: in the panel the last rows of its list, in
+/// the big window the list under the columns, a few rows high and
+/// scrolling when there are more. Tagged for the flip, which slides it
+/// out of and into the bottom bar. None when there's nothing to list.
+pub(crate) fn prs_block(state: &AppState, mode: Mode, p: &Palette, cx: &App) -> Option<AnyElement> {
+    let open_prs = state.open_prs();
+    let pr_problem = state
+        .github_problem
+        .as_deref()
+        .filter(|_| state.config.github_prs);
+    // The pull requests show a GitHub problem; without them, this does.
+    let remote_problem = if state.config.github_prs || !state.config.github_repos {
+        None
+    } else {
+        state.github_problem.as_deref()
+    };
+    let mut rows = pr_rows(
+        &open_prs,
+        pr_problem,
+        p,
+        mode,
+        Some((
+            state.folded(Section::PullRequests),
+            fold(Section::PullRequests),
+        )),
+        cx,
+    );
+    if mode == Mode::Window
+        && state.remote_statuses.is_empty()
+        && let Some(problem) = remote_problem
+    {
+        rows.push(remote_problem_row(problem, p));
+    }
+    if rows.is_empty() {
+        return None;
+    }
+    let block = div()
+        .id("prs")
+        .flex()
+        .flex_col()
+        .flex_none()
+        .bg(p.surface)
+        .children(rows);
+    Some(match mode {
+        Mode::Panel => block.into_any_element(),
+        Mode::Window => block
+            .max_h(px(WINDOW_PRS_HEIGHT))
+            .overflow_y_scroll()
+            .track_scroll(&PRS_SCROLL.with(Clone::clone))
+            .into_any_element(),
+    })
 }
 
 /// Big mode's pull request list at its tallest: the heading and about
 /// six rows.
 const WINDOW_PRS_HEIGHT: f32 = 230.;
 
-/// A small square glyph button for the panel header.
-fn icon_button(
-    id: &'static str,
-    glyph: &'static str,
-    enabled: bool,
-    p: &Palette,
-) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .flex()
-        .flex_none()
-        .items_center()
-        .justify_center()
-        .size_7()
-        .rounded_md()
-        .text_color(p.text)
-        .when(!enabled, |b| b.opacity(0.4))
-        .when(enabled, |b| b.cursor_pointer().hover(|s| s.bg(p.hover)))
-        .child(glyph)
+/// The top bar's words: the headline in its colour, and the line under it.
+fn titles(state: &AppState, p: &Palette) -> (SharedString, Hsla, String) {
+    let unsynced = state.unsynced();
+    let problem = state.problem();
+    let sweeping = state.sweeping;
+    let headline: SharedString = crate::tray::summary(
+        &TraySnapshot {
+            statuses: &state.statuses,
+            checking: sweeping,
+            has_result: state.has_result,
+            problem: problem.as_deref(),
+            incomplete: state.capped.is_some(),
+        },
+        unsynced,
+    )
+    .into();
+    let headline_color = if problem.is_some() || unsynced > 0 {
+        p.red
+    } else if state.has_result {
+        p.green
+    } else {
+        p.muted
+    };
+    let roots = state.config.roots();
+    let mut subline = roots
+        .first()
+        .map(|r| r.display().to_string())
+        .unwrap_or_default();
+    if roots.len() > 1 {
+        subline.push_str(&format!(" + {} more", roots.len() - 1));
+    }
+    if let Some(time) = &state.last_checked {
+        subline.push_str(&format!(" · checked {time}"));
+    }
+    if sweeping {
+        subline.push_str(" · checking…");
+    }
+    if !state.filter.is_empty() {
+        let found =
+            state.sorted(&state.statuses).len() + state.sorted(&state.remote_statuses).len();
+        subline = format!(
+            "Filter “{}”: {found} {} · Esc clears",
+            state.filter,
+            if found == 1 { "repo" } else { "repos" }
+        );
+    }
+    (headline, headline_color, subline)
 }
 
 impl Render for StatusView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = Palette::for_appearance(window.appearance());
-        let dark = matches!(
-            window.appearance(),
-            WindowAppearance::Dark | WindowAppearance::VibrantDark
-        );
-        let mode = self.mode;
-        // The panel's rows measured as laid out, so the panel can be made
-        // exactly as tall as what it shows.
-        let content_h = Rc::new(std::cell::Cell::new(0.0f32));
-        let filter_state = self.state.clone();
-        let timelines = self.timelines.clone();
-        // Pictures only: the panel's words move into tooltips.
-        let icons_only = mode == Mode::Panel && self.state.read(cx).config.icons_only;
-        // A repo row: a timeline strip in the panel, a plain row elsewhere.
-        let row = |i: usize, s: &RepoStatus, cx: &App| match (&timelines, mode) {
-            (Some(t), Mode::Panel) => Timelines::strip(t, i, s, &p, dark, icons_only, cx),
-            _ => repo_row(i, s, &p, mode, cx),
-        };
-        // A strip's label asked big mode for its repo's column.
-        let focus = match (&self.timelines, mode) {
-            (Some(t), Mode::Window) => t.update(cx, |t, _| t.take_focus()),
-            _ => None,
-        };
-        let state = self.state.clone();
-        let state = state.read(cx);
-        let unsynced = state.unsynced();
-        let problem = state.problem();
-        let sweeping = state.sweeping;
-        let headline: SharedString = crate::tray::summary(
-            &TraySnapshot {
-                statuses: &state.statuses,
-                checking: sweeping,
-                has_result: state.has_result,
-                problem: problem.as_deref(),
-                incomplete: state.capped.is_some(),
-            },
-            unsynced,
-        )
-        .into();
-        let headline_color = if problem.is_some() || unsynced > 0 {
-            p.red
-        } else if state.has_result {
-            p.green
-        } else {
-            p.muted
-        };
-        let roots = state.config.roots();
-        let mut subline = roots
-            .first()
-            .map(|r| r.display().to_string())
-            .unwrap_or_default();
-        if roots.len() > 1 {
-            subline.push_str(&format!(" + {} more", roots.len() - 1));
+        if self.mode == Mode::Panel {
+            return self.render_panel(window, cx);
         }
-        if let Some(time) = &state.last_checked {
-            subline.push_str(&format!(" · checked {time}"));
-        }
-        if sweeping {
-            subline.push_str(" · checking…");
-        }
-        if !state.filter.is_empty() {
-            let found =
-                state.sorted(&state.statuses).len() + state.sorted(&state.remote_statuses).len();
-            subline = format!(
-                "Filter “{}”: {found} {} · Esc clears",
-                state.filter,
-                if found == 1 { "repo" } else { "repos" }
-            );
-        }
-        let open_prs = state.open_prs();
-
-        // The top bar's parts, which the flip carries between the views.
-        let side = match mode {
-            Mode::Panel => crate::morph::Side::Panel,
-            Mode::Window => crate::morph::Side::Column,
-        };
-        let bar_tag = |part, words: Option<(SharedString, Hsla, f32, bool)>| {
-            crate::morph::tag(
-                side,
-                crate::morph::app(),
-                part,
-                words.map(|(t, color, size, bold)| (t, crate::morph::Look { color, size, bold })),
-            )
-        };
-        let headline_size = if mode == Mode::Panel { 16.0 } else { 18.0 };
-        let titles = div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_w_0()
-            .child(
-                div()
-                    .relative()
-                    .when(mode == Mode::Panel, |d| d.text_base())
-                    .when(mode == Mode::Window, |d| d.text_lg())
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(headline_color)
-                    .truncate()
-                    .child(headline.clone())
-                    .child(bar_tag(
-                        crate::morph::Part::Headline,
-                        Some((
-                            headline.to_string().into(),
-                            headline_color,
-                            headline_size,
-                            true,
-                        )),
-                    )),
-            )
-            .child(
-                div()
-                    .relative()
-                    .text_xs()
-                    .text_color(p.muted)
-                    .truncate()
-                    .child(subline.clone())
-                    .child(bar_tag(
-                        crate::morph::Part::Subline,
-                        Some((subline.clone().into(), p.muted, 12.0, false)),
-                    )),
-            )
-            .when(state.has_result && !state.statuses.is_empty(), |d| {
-                d.child(health_row(&state.statuses, sweeping, &p))
-            });
-
-        let titles = if icons_only {
-            let mut lines = vec![
-                (headline.to_string(), headline_color),
-                (subline.clone(), p.muted),
-                (mode_text(&state.mode), p.muted),
-            ];
-            if let Some(c) = &state.capped {
-                lines.push((format!("Repo list incomplete: {c}"), p.amber));
-            }
-            div()
-                .id("summary")
-                .flex()
-                .flex_1()
-                .items_center()
-                .h(px(28.))
-                .tooltip(tip(lines, &p))
-                .child(summary_bar(&state.statuses, sweeping, &p))
-                .into_any_element()
-        } else {
-            titles.into_any_element()
-        };
-        let header = div()
-            .relative()
-            .child(bar_tag(crate::morph::Part::Bar, None))
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_4()
-            .py_3()
-            .border_b_1()
-            .border_color(p.border)
-            .child(titles);
-        let header = match mode {
-            Mode::Panel => header
-                .child(
-                    icon_button("refresh", "↻", !sweeping, &p)
-                        .relative()
-                        .child(bar_tag(
-                            crate::morph::Part::Refresh,
-                            Some(("↻".into(), p.text, 16.0, false)),
-                        ))
-                        .on_click(move |_, _, cx| {
-                            if !sweeping {
-                                refresh(cx);
-                            }
-                        }),
-                )
-                .when(state.config.window, |h| {
-                    h.child(
-                        icon_button("pop-out", "⧉", true, &p).on_click(|_, window, cx| {
-                            crate::morph::open_window(window, None, cx);
-                        }),
-                    )
-                })
-                .child(
-                    icon_button("settings", "⚙", true, &p)
-                        .relative()
-                        .child(bar_tag(
-                            crate::morph::Part::Settings,
-                            Some(("⚙".into(), p.text, 16.0, false)),
-                        ))
-                        .on_click(|_, window, cx| {
-                            panel::dismiss(window, cx);
-                            crate::settings::show(cx);
-                        }),
-                ),
-            Mode::Window => header
-                .child(
-                    icon_button("settings", "⚙", true, &p)
-                        .relative()
-                        .child(bar_tag(
-                            crate::morph::Part::Settings,
-                            Some(("⚙".into(), p.text, 16.0, false)),
-                        ))
-                        .on_click(|_, _, cx| crate::settings::show(cx)),
-                )
-                .child(
-                    div()
-                        .id("refresh")
-                        .flex_none()
-                        .px_3()
-                        .py_1()
-                        .rounded_md()
-                        .text_sm()
-                        .bg(p.button)
-                        .text_color(p.button_text)
-                        .when(sweeping, |b| b.opacity(0.6))
-                        .when(!sweeping, |b| b.cursor_pointer().hover(|s| s.opacity(0.9)))
-                        .relative()
-                        .child(if sweeping {
-                            "Checking…"
-                        } else {
-                            "Refresh now"
-                        })
-                        .child(bar_tag(
-                            crate::morph::Part::Refresh,
-                            Some((
-                                if sweeping {
-                                    "Checking…"
-                                } else {
-                                    "Refresh now"
-                                }
-                                .into(),
-                                p.button_text,
-                                14.0,
-                                false,
-                            )),
-                        ))
-                        .on_click(move |_, _, cx| {
-                            if !sweeping {
-                                refresh(cx);
-                            }
-                        }),
-                ),
-        };
-
-        let pr_problem = state
-            .github_problem
-            .as_deref()
-            .filter(|_| state.config.github_prs);
-        // The pull requests show a GitHub problem; without them, this does.
-        let remote_problem = if state.config.github_prs || !state.config.github_repos {
-            None
-        } else {
-            state.github_problem.as_deref()
-        };
-        let mut rows: Vec<AnyElement> = Vec::new();
-        match mode {
-            // Without timelines (never, once the app is up) a plain list.
-            Mode::Window if timelines.is_none() => {
-                for (i, s) in state.statuses.iter().enumerate() {
-                    rows.push(repo_row(i, s, &p, mode, cx));
-                }
-            }
-            Mode::Window => {}
-            Mode::Panel => {
-                let sorted = state.sorted_for_panel();
-                let (bad, good): (Vec<&RepoStatus>, Vec<&RepoStatus>) =
-                    sorted.into_iter().partition(|s| !s.is_synced());
-                if !bad.is_empty() {
-                    let open = !state.folded(Section::NeedsYou);
-                    let label = if icons_only {
-                        div()
-                            .flex()
-                            .flex_1()
-                            .min_w_0()
-                            .gap_1()
-                            .overflow_hidden()
-                            .when(!open, |d| {
-                                d.children(bad.iter().map(|s| {
-                                    crate::repo_marks::global_mark(s, 16.0, status_color(s, &p), cx)
-                                }))
-                            })
-                    } else {
-                        heading_label(Section::NeedsYou, format!("● {} need you", bad.len()), &p)
-                    };
-                    rows.push(
-                        div()
-                            .id("needs-you")
-                            .bg(section_tint(Section::NeedsYou, &p))
-                            .relative()
-                            .child(seen_header(Section::NeedsYou))
-                            .flex()
-                            .items_center()
-                            .gap(px(10.))
-                            .px_4()
-                            .py(px(6.))
-                            .cursor_pointer()
-                            .hover(|style| style.bg(p.hover))
-                            .text_sm()
-                            .text_color(p.red)
-                            .when(icons_only, |d| {
-                                d.tooltip(tip(vec![(format!("{} need you", bad.len()), p.red)], &p))
-                            })
-                            .child(label)
-                            .child(div().flex_none().text_color(p.muted).child(if open {
-                                "▾"
-                            } else {
-                                "▸"
-                            }))
-                            .on_click(fold(Section::NeedsYou))
-                            .into_any_element(),
-                    );
-                    if open {
-                        for (i, s) in bad.iter().enumerate() {
-                            rows.push(row(i, s, cx));
-                        }
-                    }
-                }
-                if !good.is_empty() {
-                    let open = !state.folded(Section::Synced);
-                    let label =
-                        if icons_only {
-                            // The synced repos' icons in a row, while collapsed.
-                            div()
-                                .flex()
-                                .flex_1()
-                                .min_w_0()
-                                .gap_1()
-                                .overflow_hidden()
-                                .when(!open, |d| {
-                                    d.children(good.iter().map(|s| {
-                                        crate::repo_marks::global_mark(s, 16.0, p.green, cx)
-                                    }))
-                                })
-                        } else {
-                            heading_label(Section::Synced, format!("✓ {} synced", good.len()), &p)
-                        };
-                    rows.push(
-                        div()
-                            .id("synced")
-                            .bg(section_tint(Section::Synced, &p))
-                            .relative()
-                            .child(seen_header(Section::Synced))
-                            .flex()
-                            .items_center()
-                            .gap(px(10.))
-                            .px_4()
-                            .py(px(6.))
-                            .cursor_pointer()
-                            .hover(|style| style.bg(p.hover))
-                            .text_sm()
-                            .text_color(p.green)
-                            .when(icons_only, |d| {
-                                d.tooltip(tip(
-                                    vec![(format!("{} synced", good.len()), p.green)],
-                                    &p,
-                                ))
-                            })
-                            .child(label)
-                            .child(div().flex_none().text_color(p.muted).child(if open {
-                                "▾"
-                            } else {
-                                "▸"
-                            }))
-                            .on_click(fold(Section::Synced))
-                            .into_any_element(),
-                    );
-                    if open {
-                        let offset = bad.len();
-                        for (i, s) in good.iter().enumerate() {
-                            rows.push(row(offset + i, s, cx));
-                        }
-                    }
-                }
-                // The GitHub repos with no clone, last, folded like the
-                // synced ones.
-                let remote = state.sorted(&state.remote_statuses);
-                if !remote.is_empty() {
-                    let open = !state.folded(Section::GithubOnly);
-                    let label =
-                        if icons_only {
-                            div()
-                                .flex()
-                                .flex_1()
-                                .min_w_0()
-                                .gap_1()
-                                .overflow_hidden()
-                                .when(!open, |d| {
-                                    d.children(remote.iter().map(|s| {
-                                        crate::repo_marks::global_mark(s, 16.0, p.muted, cx)
-                                    }))
-                                })
-                        } else {
-                            heading_label(
-                                Section::GithubOnly,
-                                format!("◌ {} on GitHub only", remote.len()),
-                                &p,
-                            )
-                        };
-                    rows.push(
-                        div()
-                            .id("remote")
-                            .bg(section_tint(Section::GithubOnly, &p))
-                            .relative()
-                            .child(seen_header(Section::GithubOnly))
-                            .flex()
-                            .items_center()
-                            .gap(px(10.))
-                            .px_4()
-                            .py(px(6.))
-                            .cursor_pointer()
-                            .hover(|style| style.bg(p.hover))
-                            .text_sm()
-                            .text_color(p.muted)
-                            .tooltip(tip(
-                                vec![
-                                    (
-                                        format!("{} GitHub repos not cloned here", remote.len()),
-                                        p.text,
-                                    ),
-                                    ("Their trees come from GitHub".to_string(), p.muted),
-                                ],
-                                &p,
-                            ))
-                            .child(label)
-                            .child(div().flex_none().child(if open { "▾" } else { "▸" }))
-                            .on_click(fold(Section::GithubOnly))
-                            .into_any_element(),
-                    );
-                    if open {
-                        let offset = bad.len() + good.len();
-                        for (i, s) in remote.iter().enumerate() {
-                            rows.push(row(offset + i, s, cx));
-                        }
-                    }
-                } else if let Some(problem) = remote_problem {
-                    rows.push(remote_problem_row(problem, &p));
-                }
-                rows.extend(pr_rows(
-                    &open_prs,
-                    pr_problem,
-                    &p,
-                    mode,
-                    icons_only,
-                    Some((
-                        state.folded(Section::PullRequests),
-                        fold(Section::PullRequests),
-                    )),
-                    cx,
-                ));
-            }
-        }
-
-        let empty = state.has_result && state.statuses.is_empty() && problem.is_none();
-        let empty_text = match state.config.depth() {
-            1 => "No git repos directly inside this folder. Set \"path\" or \"depth\" in \
-                  config.json."
-                .to_string(),
-            depth => format!(
-                "No git repos in this folder, down to {depth} levels below it. Set \"path\" or \
-                 \"depth\" in config.json."
-            ),
-        };
-        let table = match (&timelines, mode) {
-            (Some(t), Mode::Window) => {
-                // Each section's spine, then its repos' columns unless
-                // folded; the GitHub repos with no clone come last.
-                let cells = table_cells(state);
-                let lefts = cell_lefts(&cells);
-                let focused = focus.as_deref().and_then(|f| cell_of(&cells, f));
-                if let Some(i) = focused {
-                    self.table.scroll_to_item(i);
-                }
-                let shown = shown_columns(&self.table, window, &lefts, focused);
-                let columns: Vec<AnyElement> = cells
-                    .iter()
-                    .enumerate()
-                    .map(|(i, cell)| match *cell {
-                        Cell::Spine(section, n) => spine(section, n, state.folded(section), &p),
-                        Cell::Repo(s) if shown.contains(&i) => {
-                            Timelines::column(t, i, s, &p, dark, window, cx)
-                        }
-                        Cell::Repo(_) => column_placeholder(&p),
-                    })
-                    .collect();
-                Some(
-                    div()
-                        .id("table")
-                        .flex()
-                        .flex_row()
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_x_scroll()
-                        .track_scroll(&self.table)
-                        .bg(p.surface)
-                        .children(columns),
-                )
-            }
-            _ => None,
-        };
-        let list_h = content_h.clone();
-        let list = div()
-            .on_children_prepainted(move |rows, _, _| {
-                let h = match (rows.first(), rows.last()) {
-                    (Some(first), Some(last)) => f32::from(last.bottom()) - f32::from(first.top()),
-                    _ => 0.0,
-                };
-                list_h.set(h);
-            })
-            .id("repos")
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .bg(p.surface)
-            .children(rows)
-            .when(empty, |list| {
-                list.child(div().p_4().text_sm().text_color(p.muted).child(empty_text))
-            });
-
-        // Big mode lists the pull requests under the columns, a few rows
-        // high, scrolling when there are more.
-        let window_prs = (mode == Mode::Window)
-            .then(|| {
-                let mut rows = pr_rows(
-                    &open_prs,
-                    pr_problem,
-                    &p,
-                    mode,
-                    false,
-                    Some((
-                        state.folded(Section::PullRequests),
-                        fold(Section::PullRequests),
-                    )),
-                    cx,
-                );
-                if state.remote_statuses.is_empty()
-                    && let Some(problem) = remote_problem
-                {
-                    rows.push(remote_problem_row(problem, &p));
-                }
-                rows
-            })
-            .filter(|rows| !rows.is_empty())
-            .map(|rows| {
-                div()
-                    .id("prs")
-                    .flex()
-                    .flex_col()
-                    .flex_none()
-                    .max_h(px(WINDOW_PRS_HEIGHT))
-                    .overflow_y_scroll()
-                    .bg(p.surface)
-                    .children(rows)
-            });
-
-        let config_file: PathBuf = state.config_file.clone();
-        let edit_config = div()
-            .id("config")
-            .flex_none()
-            .cursor_pointer()
-            .hover(|s| s.text_color(p.text))
-            .child("Edit config.json")
-            .on_click(move |_, window, cx| {
-                cx.open_with_system(&config_file);
-                if mode == Mode::Panel {
-                    panel::dismiss(window, cx);
-                }
-            });
-        let footer = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap_3()
-            .px_4()
-            .py_2()
-            .border_t_1()
-            .border_color(p.border)
-            .text_xs()
-            .text_color(p.muted);
-        // The cap message, e.g. "showing the first 500 repos found".
-        let capped = state
-            .capped
-            .as_ref()
-            .map(|c| format!("Repo list incomplete: {c}"));
-        let footer = match mode {
-            Mode::Panel => {
-                let skips = state.folder_skips.len();
-                footer
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .min_w_0()
-                            .child(div().truncate().child(mode_text(&state.mode)))
-                            .when_some(capped, |d, capped| {
-                                d.child(div().truncate().text_color(p.amber).child(capped))
-                            })
-                            .when(skips > 0, |d| {
-                                d.child(
-                                    div()
-                                        .truncate()
-                                        .child(format!("Folder icons: {skips} skipped")),
-                                )
-                            }),
-                    )
-                    .child(edit_config)
-            }
-            Mode::Window => footer
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .when_some(capped.clone(), |d, _| d.text_color(p.amber))
-                        .child(capped.unwrap_or_else(|| {
-                            match state.config.repo_click {
-                                crate::config::RepoClick::Folder => {
-                                    "Click a repo's name to open its folder. Wheel over the \
-                                     commits scrolls them, anywhere else the table."
-                                }
-                                crate::config::RepoClick::Github => {
-                                    "Click a repo's name to open it on GitHub. Wheel over the \
-                                     commits scrolls them, anywhere else the table."
-                                }
-                            }
-                            .into()
-                        })),
-                )
-                .child(edit_config),
-        };
-
-        div()
-            .when(mode == Mode::Panel, |d| {
-                // Header, rows, footer: grow or shrink the panel to them
-                // whenever they change (a section folded, repos or pull
-                // requests come or go), with no empty space below.
-                d.on_children_prepainted(move |parts, _, cx| {
-                    let header = parts.first().map_or(0.0, |b| f32::from(b.size.height));
-                    let footer = if icons_only {
-                        0.0
-                    } else {
-                        parts.get(2).map_or(0.0, |b| f32::from(b.size.height))
-                    };
-                    panel::fit(header + content_h.get() + footer, cx);
-                })
-            })
-            .id("root")
-            // Digits of one width, so counts and ⬆⬇ numbers line up.
-            .map(|mut d| {
-                d.text_style()
-                    .get_or_insert_with(Default::default)
-                    .font_features = Some(gpui::FontFeatures(std::sync::Arc::new(vec![(
-                    "tnum".to_string(),
-                    1,
-                )])));
-                d
-            })
-            .track_focus(&self.focus)
-            .key_context("StatusView")
-            .on_key_down(move |event, window, cx| {
-                if filter_key(&filter_state, event, mode, window, cx) {
-                    cx.stop_propagation();
-                    return;
-                }
-                if event.keystroke.key == "escape" {
-                    match mode {
-                        Mode::Panel => panel::dismiss(window, cx),
-                        Mode::Window => {
-                            if !crate::morph::flip_back(window, cx) {
-                                window.remove_window();
-                            }
-                        }
-                    }
-                }
-            })
-            .flex()
-            .flex_col()
-            .size_full()
-            .bg(p.bg)
-            .text_color(p.text)
-            .child(sideways(header, mode, cx))
-            .map(|d| match table {
-                Some(table) if !empty => d.child(table),
-                _ => d.child(list),
-            })
-            .children(window_prs)
-            .when(!icons_only, |d| d.child(sideways(footer, mode, cx)))
-            // Windows draws no rim while the panel slides clipped (the
-            // badge's slide): drawn here meanwhile, along the panel's edge.
-            .when(mode == Mode::Panel && panel::drawn_rim(cx), |d| {
-                d.relative().child(
-                    canvas(
-                        |_, _, _| {},
-                        move |bounds, _, window, _| {
-                            window.paint_quad(gpui::quad(
-                                bounds,
-                                px(win::PANEL_RADIUS),
-                                gpui::transparent_black(),
-                                px(1.0 / window.scale_factor()),
-                                rim(dark),
-                                gpui::BorderStyle::Solid,
-                            ));
-                        },
-                    )
-                    .absolute()
-                    .inset_0(),
-                )
-            })
-            .children(
-                self.timelines
-                    .as_ref()
-                    .and_then(|t| t.read(cx).hover_card(&p, dark, cx)),
-            )
+        self.render_window(window, cx)
     }
 }
 
-/// In the window, a wheel over `part` (the header or the footer) scrolls the
-/// table sideways, as it does over the columns' headers; only over a
-/// column's commits does it scroll up and down.
 /// Typing filters the repos: letters add to the filter, Backspace takes
 /// one off, Esc clears it, Enter opens the first repo listed. True when
 /// the key was the filter's.
@@ -1859,42 +1263,60 @@ fn filter_key(
     true
 }
 
-fn sideways(part: impl IntoElement, mode: Mode, cx: &mut Context<StatusView>) -> AnyElement {
-    if mode != Mode::Window {
-        return part.into_any_element();
-    }
-    div()
-        .flex_none()
-        .child(part)
-        .on_scroll_wheel(cx.listener(|this, e: &ScrollWheelEvent, window, cx| {
-            let d = e.delta.pixel_delta(window.line_height());
-            let dx = if d.x.abs() > d.y.abs() { d.x } else { d.y };
-            let table = &this.table;
-            let o = table.offset();
-            let max = table.max_offset().width;
-            let x = (o.x + dx).clamp(-max, px(0.));
-            if x != o.x {
-                table.set_offset(point(x, o.y));
-                cx.notify();
-            }
-        }))
-        .into_any_element()
-}
-
 /// The light rim Windows 11 draws around a window, for where gitstat
 /// draws it itself (the flip, a clipped slide).
+/// gitstat sets it on its windows itself (`win::set_frame_colors`), so the
+/// one it draws is exactly the same and they hand over unseen.
 pub(crate) fn rim(dark: bool) -> Hsla {
-    if dark {
-        gpui::white().opacity(0.16)
-    } else {
-        gpui::black().opacity(0.16)
+    gpui::rgb(rim_rgb(dark)).into()
+}
+
+thread_local! {
+    /// How thick Windows draws the rim, physical px, by the scale (in
+    /// hundredths) it was read at: each monitor's scale has its own.
+    static RIM_PX: std::cell::RefCell<std::collections::HashMap<u32, u32>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn scale_key(s: f32) -> u32 {
+    (s * 100.0).round() as u32
+}
+
+/// Notes how thick Windows draws `h`'s rim at the scale it draws at, for
+/// gitstat to draw its own exactly as thick.
+pub(crate) fn seen_rim(h: isize) {
+    if let (Some(v), Some(s)) = (win::rim_thickness(h), win::window_scale(h)) {
+        RIM_PX.with(|c| {
+            c.borrow_mut().insert(scale_key(s), v);
+        });
     }
 }
 
-/// A bar of the repos' tones: green synced, amber local work, red needs
-/// action, each as wide as its share; dimmed while a check runs.
+/// The rim's thickness, physical px, at scale `s`: as Windows draws it
+/// there, else one logical px.
+pub(crate) fn rim_width(s: f32) -> f32 {
+    RIM_PX
+        .with(|c| c.borrow().get(&scale_key(s)).copied())
+        .map_or(s.round().max(1.0), |v| v as f32)
+}
+
+/// The rim's colour, 0xRRGGBB.
+pub(crate) fn rim_rgb(dark: bool) -> u32 {
+    if dark { 0x444444 } else { 0xd6d6d6 }
+}
+
+/// The big window's title bar colour, set on it and drawn by the flip.
+pub(crate) fn title_bar(dark: bool) -> Hsla {
+    gpui::rgb(title_bar_rgb(dark)).into()
+}
+
+/// The title bar's colour, 0xRRGGBB.
+pub(crate) fn title_bar_rgb(dark: bool) -> u32 {
+    if dark { 0x202020 } else { 0xf3f3f3 }
+}
+
 /// Repos synced, with local work, and needing a look.
-fn tone_counts(statuses: &[RepoStatus]) -> [usize; 3] {
+pub(crate) fn tone_counts(statuses: &[RepoStatus]) -> [usize; 3] {
     let mut counts = [0usize; 3];
     for s in statuses {
         let i = match crate::icon::FolderState::of(s).tone() {
@@ -1907,56 +1329,11 @@ fn tone_counts(statuses: &[RepoStatus]) -> [usize; 3] {
     counts
 }
 
-/// The header's health: a thin bar of synced, local-work and
-/// needs-a-look repos, and their counts.
-fn health_row(statuses: &[RepoStatus], checking: bool, p: &Palette) -> gpui::Div {
-    let counts = tone_counts(statuses);
-    let count = |n: usize, mark: &str, color: Hsla| {
-        div()
-            .flex_none()
-            .text_color(if n > 0 { color } else { p.muted.opacity(0.6) })
-            .child(format!("{mark}{n}"))
-    };
-    div()
-        .flex()
-        .items_center()
-        .gap_2()
-        .pt_1()
-        .text_xs()
-        .child(summary_bar(statuses, checking, p).h(px(4.)))
-        .child(count(counts[0], "✓ ", p.green))
-        .child(count(counts[1], "● ", p.amber))
-        .child(count(counts[2], "! ", p.red))
-}
-
-fn summary_bar(statuses: &[RepoStatus], checking: bool, p: &Palette) -> gpui::Div {
-    let counts = tone_counts(statuses);
-    let total = statuses.len().max(1) as f32;
-    let bar = div()
-        .flex()
-        .flex_1()
-        .h(px(6.))
-        .rounded_full()
-        .overflow_hidden()
-        .bg(p.hover)
-        .when(checking, |b| b.opacity(0.6));
-    [
-        (counts[0], p.green),
-        (counts[1], p.amber),
-        (counts[2], p.red),
-    ]
-    .into_iter()
-    .filter(|&(n, _)| n > 0)
-    .fold(bar, |bar, (n, color)| {
-        bar.child(div().h_full().w(gpui::relative(n as f32 / total)).bg(color))
-    })
-}
-
-/// A tooltip of coloured lines.
 /// The tooltip's widest, and the characters of `text_xs` that fit in it.
 const TIP_WIDTH: f32 = 320.;
 const TIP_LINE_CHARS: usize = 44;
 
+/// A tooltip of coloured lines.
 struct Tip {
     lines: Vec<(SharedString, Hsla)>,
     bg: Hsla,
@@ -1965,35 +1342,39 @@ struct Tip {
 
 impl Render for Tip {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        // A line that wraps needs a definite width: under only a max width
-        // its height is measured as one line and the next line overlaps it.
-        let wraps = self
-            .lines
-            .iter()
-            .any(|(text, _)| text.chars().count() > TIP_LINE_CHARS);
-        div()
-            .flex()
-            .flex_col()
-            .max_w(px(TIP_WIDTH))
-            .when(wraps, |d| d.w(px(TIP_WIDTH)))
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .border_1()
-            .border_color(self.border)
-            .bg(self.bg)
-            .shadow_md()
-            .text_xs()
-            .children(
-                self.lines
-                    .iter()
-                    .filter(|(text, _)| !text.is_empty())
-                    .map(|(text, color)| div().text_color(*color).child(text.clone())),
-            )
+        tip_body(&self.lines, self.bg, self.border)
     }
 }
 
-/// A tooltip builder showing `lines`, for icons-only mode.
+/// What a tooltip shows: its lines on the app's tooltip plate. The
+/// floating view draws the same in a window of its own.
+pub(crate) fn tip_body(lines: &[(SharedString, Hsla)], bg: Hsla, border: Hsla) -> gpui::Div {
+    // A line that wraps needs a definite width: under only a max width
+    // its height is measured as one line and the next line overlaps it.
+    let wraps = lines
+        .iter()
+        .any(|(text, _)| text.chars().count() > TIP_LINE_CHARS);
+    div()
+        .flex()
+        .flex_col()
+        .max_w(px(TIP_WIDTH))
+        .when(wraps, |d| d.w(px(TIP_WIDTH)))
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .border_1()
+        .border_color(border)
+        .bg(bg)
+        .shadow_md()
+        .text_xs()
+        .children(
+            lines
+                .iter()
+                .filter(|(text, _)| !text.is_empty())
+                .map(|(text, color)| div().text_color(*color).child(text.clone())),
+        )
+}
+
 /// What a repo's tooltip adds below its name and status: the rest of a
 /// fetch error, the unpushed branches by name, the stash, and where the
 /// actions are.
@@ -2020,6 +1401,7 @@ pub(crate) fn status_details(s: &RepoStatus, p: &Palette) -> Vec<(String, Hsla)>
     lines
 }
 
+/// A tooltip builder showing `lines`.
 pub(crate) fn tip(
     lines: Vec<(String, Hsla)>,
     p: &Palette,
@@ -2027,11 +1409,16 @@ pub(crate) fn tip(
     let lines: Vec<(SharedString, Hsla)> = lines.into_iter().map(|(t, c)| (t.into(), c)).collect();
     let (bg, border) = (p.bg, p.border);
     move |_, cx| {
+        // Nothing is pointed at while the views turn into one another.
+        if crate::flip::running(cx) {
+            return cx.new(|_| gpui::EmptyView).into();
+        }
         let lines = lines.clone();
         cx.new(|_| Tip { lines, bg, border }).into()
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct Palette {
     pub bg: Hsla,
     pub surface: Hsla,

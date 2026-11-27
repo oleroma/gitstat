@@ -10,7 +10,7 @@
 # It also stops with "workflow-change" when everything the branch changed since main is pipeline
 # files or documentation: Olex tests those himself. Only Olex passes --force to build anyway.
 # Usage:
-#   .agents/agent-build pc <branch> [--replace] [--force]   on the PC, in D:\dev\<repo>: builds <branch> in build/src
+#   .agents/agent-build pc <branch> [--replace] [--force]   on the PC, in D:\dev\<repo>: checks out <branch> there and builds it
 #   .agents/agent-build ci <branch> [--replace] [--force]   in the cloud: checks out <branch>, builds it in CI
 # Without <branch> it builds what's checked out where it runs.
 source "$(dirname "$0")/lib.sh"
@@ -135,7 +135,6 @@ installed_emoji() {
 
 build_pc() {
   report() { report_pr "PC build" "$@"; }
-  [ "$WORKTREE" -ef "$BUILD_DIR/src" ] || die "Run this from the build/src worktree, as in AGENTS.md step 3."
 
   take_lock "$(git rev-parse --short=7 HEAD)"
   # The commit is read once: everything below builds, publishes and reports this one.
@@ -347,14 +346,15 @@ for arg in "$@"; do
   esac
 done
 
-# With a branch, first bring the build checkout to that branch, then build there: on the PC
-# that's the build/src worktree (made the first time), in the cloud the branch itself.
+# With a branch, first check out that branch, then build it with its own scripts. On the PC that
+# happens in the repo itself, from copies of the scripts (run_from_copy).
 if [ -n "$BRANCH" ]; then
+  if [ "$MODE" = pc ]; then run_from_copy agent-build pc "$BRANCH" "${FLAGS[@]}"; fi
   git fetch origin "$BRANCH" || die "Couldn't fetch $BRANCH."
   case "$MODE" in
     pc)
-      checkout_src "$BRANCH"
-      exec bash "$MAIN_REPO/build/src/.agents/agent-build" pc "${FLAGS[@]}" >&3 2>&3 3>&-
+      checkout_branch "$BRANCH"
+      AGENTS_DIR="" run_from_copy agent-build pc "${FLAGS[@]}"
       ;;
     ci)
       git checkout "$BRANCH" && git merge --ff-only "origin/$BRANCH" || die "Couldn't check out $BRANCH."

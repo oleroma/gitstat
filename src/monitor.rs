@@ -60,7 +60,7 @@ pub enum Command {
     /// A config the app changed in memory, e.g. a menu toggle that
     /// config.json (unparsable mid-edit) couldn't take. A later good reload
     /// of the file replaces it, as it does in the app.
-    Apply(Config),
+    Apply(Box<Config>),
     /// Fetch this repo now, if this monitor watches it.
     Fetch(PathBuf),
     /// When GitHub last saw a push to each repo with a GitHub `origin`, from
@@ -83,7 +83,9 @@ pub enum Update {
         #[cfg_attr(not(test), allow(dead_code))]
         fetch: bool,
     },
-    Status(RepoStatus),
+    /// A repo's status, and whether it comes right after gitstat's own
+    /// fetch: only then did gitstat move its remote branches.
+    Status(RepoStatus, bool),
     SweepStarted,
     SweepDone,
     Mode(WatchMode),
@@ -95,7 +97,7 @@ pub enum Update {
 enum Msg {
     Cmd(Command),
     Fs(notify::Result<notify::Event>),
-    Done(Done),
+    Done(Box<Done>),
     Walked(Walked),
 }
 
@@ -125,16 +127,20 @@ pub struct Monitor {
 }
 
 impl Monitor {
+    #[cfg(test)]
     pub fn start(config_file: PathBuf, sink: impl Fn(Update) + Send + 'static) -> Monitor {
-        Self::start_slot(config_file, 0, sink)
+        Self::start_slot(config_file, 0, None, sink)
     }
 
     /// A monitor for the folder at `slot` in the config's
-    /// [`Config::roots`]. Every monitor reads the config file itself; only
-    /// slot 0 reports it. A slot past the list watches nothing.
+    /// [`Config::roots`]. It starts from `config` when given (the app's,
+    /// which may hold more than the file), else from the file. Every
+    /// monitor rereads the config file itself; only slot 0 reports it. A
+    /// slot past the list watches nothing.
     pub fn start_slot(
         config_file: PathBuf,
         slot: usize,
+        config: Option<Config>,
         sink: impl Fn(Update) + Send + 'static,
     ) -> Monitor {
         let (tx, rx) = mpsc::channel();
@@ -144,7 +150,9 @@ impl Monitor {
         let scheduler_tx = tx.clone();
         let thread = thread::Builder::new()
             .name("gitstat-monitor".into())
-            .spawn(move || Scheduler::new(config_file, slot, Box::new(sink), scheduler_tx).run(rx))
+            .spawn(move || {
+                Scheduler::new(config_file, slot, config, Box::new(sink), scheduler_tx).run(rx)
+            })
             .ok();
         Monitor { tx, thread }
     }
@@ -155,18 +163,30 @@ impl Monitor {
 }
 
 impl Drop for Monitor {
-    /// Waits briefly for the scheduler; running `git` workers are left to finish.
+    /// Tells the scheduler to stop; running `git` workers are left to
+    /// finish. The app drops a monitor on the UI thread, so the wait for
+    /// the scheduler runs on a thread of its own; tests wait here, so a
+    /// test's folder is let go before it is removed.
     fn drop(&mut self) {
         self.send(Command::Shutdown);
         let Some(thread) = self.thread.take() else {
             return;
         };
-        let deadline = Instant::now() + SHUTDOWN_WAIT;
-        while !thread.is_finished() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
-        }
-        if thread.is_finished() {
-            let _ = thread.join();
+        let reap = move || {
+            let deadline = Instant::now() + SHUTDOWN_WAIT;
+            while !thread.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if thread.is_finished() {
+                let _ = thread.join();
+            }
+        };
+        if cfg!(test) {
+            reap();
+        } else {
+            let _ = thread::Builder::new()
+                .name("gitstat-monitor-reap".into())
+                .spawn(reap);
         }
     }
 }
@@ -249,17 +269,20 @@ struct Scheduler {
     last_mono: Instant,
     /// The deadline the loop last waited for, to notice oversleeping.
     waited_until: Option<Instant>,
+    /// When that wait ended.
+    woke: Option<Instant>,
 }
 
 impl Scheduler {
     fn new(
         config_file: PathBuf,
         slot: usize,
+        start: Option<Config>,
         sink: Box<dyn Fn(Update) + Send>,
         tx: mpsc::Sender<Msg>,
     ) -> Self {
         let loaded = Config::load_or_create(&config_file);
-        let config = loaded.clone().unwrap_or_default();
+        let config = start.unwrap_or_else(|| loaded.clone().unwrap_or_default());
         let root = config.root(slot).unwrap_or_default();
         let name_base = config.name_base(&root);
         let depth = config.depth();
@@ -308,6 +331,7 @@ impl Scheduler {
             last_wall: SystemTime::now(),
             last_mono: Instant::now(),
             waited_until: None,
+            woke: None,
         }
     }
 
@@ -336,6 +360,9 @@ impl Scheduler {
                 Some(at) => rx.recv_timeout(at.saturating_duration_since(Instant::now())),
                 None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
             };
+            // Only how late the wait itself ended counts toward a resume,
+            // not the work done for the message after it.
+            self.woke = Some(Instant::now());
             match msg {
                 Ok(Msg::Cmd(Command::Shutdown)) | Err(RecvTimeoutError::Disconnected) => break,
                 Ok(Msg::Cmd(Command::RefreshAll)) => {
@@ -352,12 +379,12 @@ impl Scheduler {
                 }
                 Ok(Msg::Cmd(Command::Pushed(pushed))) => self.on_pushed(pushed, Instant::now()),
                 Ok(Msg::Cmd(Command::Apply(config))) => {
-                    if config != self.config {
-                        self.apply_config(config, Instant::now());
+                    if *config != self.config {
+                        self.apply_config(*config, Instant::now());
                     }
                 }
                 Ok(Msg::Fs(event)) => self.on_fs(event, Instant::now()),
-                Ok(Msg::Done(done)) => self.on_done(done, Instant::now()),
+                Ok(Msg::Done(done)) => self.on_done(*done, Instant::now()),
                 Ok(Msg::Walked(walked)) => self.on_walked(walked, Instant::now()),
                 Err(RecvTimeoutError::Timeout) => {}
             }
@@ -403,9 +430,10 @@ impl Scheduler {
         let wall = SystemTime::now();
         let mono = now.saturating_duration_since(self.last_mono);
         let wall_delta = wall.duration_since(self.last_wall).unwrap_or_default();
+        let woke = self.woke.take().unwrap_or(now);
         let late = self
             .waited_until
-            .map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
+            .map_or(Duration::ZERO, |at| woke.saturating_duration_since(at));
         self.last_wall = wall;
         self.last_mono = now;
         self.waited_until = None;
@@ -496,13 +524,13 @@ impl Scheduler {
                         let status = git::failed(&root, &worker_repo, "internal error");
                         (status, Vec::new())
                     });
-                    let _ = tx.send(Msg::Done(Done {
+                    let _ = tx.send(Msg::Done(Box::new(Done {
                         generation,
                         repo: worker_repo,
                         need,
                         status,
                         ignored,
-                    }));
+                    })));
                 });
             self.emit(Update::Started {
                 repo: repo.clone(),
@@ -568,7 +596,8 @@ impl Scheduler {
             }
         }
         self.statuses.insert(repo.clone(), status.clone());
-        self.emit(Update::Status(status));
+        let fetched = need == Need::Fetch && !status.fetch_errored;
+        self.emit(Update::Status(status, fetched));
         if need == Need::Fetch && self.sweep.remove(&repo) {
             self.finish_sweep_if_done(now);
         }
@@ -640,7 +669,10 @@ impl Scheduler {
         if self.sweeping && self.sweep_walk.is_none() && self.sweep.is_empty() {
             self.sweeping = false;
             let interval = jittered(self.config.interval(), &self.root, self.sweeps);
-            self.next_sweep = Some(now + interval);
+            // Keep an earlier one: the fetch a resume asked for while this
+            // sweep was still running.
+            let at = now + interval;
+            self.next_sweep = Some(self.next_sweep.map_or(at, |n| n.min(at)));
             self.emit(Update::SweepDone);
         }
     }
@@ -1364,9 +1396,9 @@ mod tests {
             let path = self.root.join(repo);
             match self.wait_for(
                 timeout,
-                |u| matches!(u, Update::Status(s) if s.path == path),
+                |u| matches!(u, Update::Status(s, _) if s.path == path),
             ) {
-                Some(Update::Status(s)) => Some(s),
+                Some(Update::Status(s, _)) => Some(s),
                 _ => None,
             }
         }
@@ -1410,7 +1442,7 @@ mod tests {
         );
         assert!(updates.iter().any(|u| matches!(
             u,
-            Update::Status(s) if s.path == a && s.error.is_none() && !s.dirty
+            Update::Status(s, _) if s.path == a && s.error.is_none() && !s.dirty
         )));
     }
 
@@ -1424,7 +1456,7 @@ mod tests {
         let a = h.root.join("a");
         let dirty = h.wait_for(
             WAIT,
-            |u| matches!(u, Update::Status(s) if s.path == a && s.dirty),
+            |u| matches!(u, Update::Status(s, _) if s.path == a && s.dirty),
         );
         assert!(dirty.is_some(), "no dirty status after an edit");
     }
@@ -1445,7 +1477,7 @@ mod tests {
         git(&a, &["commit", "-q", "-m", "add"]);
         let clean = h.wait_for(
             WAIT,
-            |u| matches!(u, Update::Status(s) if s.path == a && !s.dirty && s.error.is_none()),
+            |u| matches!(u, Update::Status(s, _) if s.path == a && !s.dirty && s.error.is_none()),
         );
         assert!(clean.is_some(), "no clean status after the commit");
     }
@@ -1504,7 +1536,7 @@ mod tests {
         std::fs::write(b.join("README"), "changed\n").unwrap();
         let dirty = h.wait_for(
             WAIT,
-            |u| matches!(u, Update::Status(s) if s.path == b && s.dirty),
+            |u| matches!(u, Update::Status(s, _) if s.path == b && s.dirty),
         );
         assert!(dirty.is_some(), "no dirty status after an edit");
 
@@ -1686,7 +1718,7 @@ mod tests {
         assert!(
             refresh
                 .iter()
-                .any(|u| matches!(u, Update::Status(s) if s.path == a && s.is_synced()))
+                .any(|u| matches!(u, Update::Status(s, _) if s.path == a && s.is_synced()))
         );
         // ReadDirectoryChangesW can deliver the fetch's own ref writes after
         // it ends, which buys one local recheck (a push from a terminal looks
@@ -1806,7 +1838,7 @@ mod tests {
         assert!(
             !sweep
                 .iter()
-                .any(|u| matches!(u, Update::Status(s) if s.path == a)),
+                .any(|u| matches!(u, Update::Status(s, _) if s.path == a)),
             "{sweep:?}"
         );
         // The old root is no longer watched.
@@ -1897,7 +1929,7 @@ mod tests {
         );
         // A menu toggle that couldn't be saved.
         config.watch = false;
-        h.send(Command::Apply(config));
+        h.send(Command::Apply(Box::new(config)));
         assert!(
             h.wait_for(WAIT, |u| matches!(u, Update::Mode(WatchMode::Off)))
                 .is_some(),

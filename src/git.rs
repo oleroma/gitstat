@@ -1,6 +1,6 @@
 //! Fetching repos and working out how each one compares to its upstream.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{OnceLock, mpsc};
@@ -49,6 +49,8 @@ pub struct RepoStatus {
     pub detached: Option<String>,
     /// The checked-out branch's name.
     pub branch: Option<String>,
+    /// The default branch's own name (`main`), when known.
+    pub trunk: Option<String>,
     /// Local branches other than the checked-out one with commits no
     /// remote has: ahead of their upstream, or never pushed. Name and count.
     pub unpushed_branches: Vec<(String, u32)>,
@@ -60,6 +62,19 @@ pub struct RepoStatus {
 }
 
 impl RepoStatus {
+    /// Checked out on something other than the default branch: another
+    /// branch, or no branch at all.
+    pub fn off_trunk(&self) -> bool {
+        if self.remote_only {
+            return false;
+        }
+        match (&self.branch, &self.trunk) {
+            _ if self.detached.is_some() => true,
+            (Some(branch), Some(trunk)) => branch != trunk,
+            _ => false,
+        }
+    }
+
     pub fn is_synced(&self) -> bool {
         self.error.is_none()
             && self.has_upstream
@@ -439,7 +454,8 @@ pub fn check_repo_detailed(root: &Path, repo: &Path, fetch: bool) -> (RepoStatus
                 .iter()
                 .any(|(r, _)| r.starts_with("refs/remotes/"));
             if has_remotes {
-                status.unpushed_branches = unpushed_branches(repo);
+                status.unpushed_branches =
+                    unpushed_cached(repo, &status.tips, status.branch.as_deref());
             }
             status.fetch_failed = fetch_error.is_some();
             status.error = fetch_error;
@@ -450,6 +466,7 @@ pub fn check_repo_detailed(root: &Path, repo: &Path, fetch: bool) -> (RepoStatus
                 status.last_commit = facts.last_commit;
                 status.last_worked = facts.last_worked;
                 status.unmerged = facts.unmerged;
+                status.trunk = facts.trunk;
             }
             (status, local.ignored)
         }
@@ -464,7 +481,7 @@ pub fn check_repo_detailed(root: &Path, repo: &Path, fetch: bool) -> (RepoStatus
 /// The repo's git dir and common dir read straight from disk, without
 /// running git: `.git` is the git dir, or a file naming it (a linked
 /// worktree), whose `commondir` file names the shared one.
-fn quick_git_dirs(repo: &Path) -> Option<(PathBuf, PathBuf)> {
+pub(crate) fn quick_git_dirs(repo: &Path) -> Option<(PathBuf, PathBuf)> {
     let dot_git = repo.join(".git");
     let git_dir = if dot_git.is_dir() {
         dot_git
@@ -571,6 +588,34 @@ fn ref_tips(repo: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
+/// [`unpushed_branches`], read again only when a ref or the checked-out
+/// branch moved since the last check: otherwise its answer can't change,
+/// and it can cost a `rev-list` per branch.
+fn unpushed_cached(
+    repo: &Path,
+    tips: &[(String, String)],
+    branch: Option<&str>,
+) -> Vec<(String, u32)> {
+    type Seen = (Vec<(String, String)>, Option<String>, Vec<(String, u32)>);
+    static CACHE: OnceLock<std::sync::Mutex<HashMap<PathBuf, Seen>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Ok(c) = cache.lock()
+        && let Some((t, b, found)) = c.get(repo)
+        && t == tips
+        && b.as_deref() == branch
+    {
+        return found.clone();
+    }
+    let found = unpushed_branches(repo);
+    if let Ok(mut c) = cache.lock() {
+        c.insert(
+            repo.to_path_buf(),
+            (tips.to_vec(), branch.map(str::to_string), found.clone()),
+        );
+    }
+    found
+}
+
 /// At most this many never-pushed branches get a `rev-list` each.
 const MAX_LOCAL_ONLY_CHECKS: usize = 30;
 
@@ -588,7 +633,9 @@ fn unpushed_branches(repo: &Path) -> Vec<(String, u32)> {
     };
     let Some(heads) = text(&[
         "for-each-ref",
-        "--format=%(HEAD)%1f%(refname:short)%1f%(upstream)%1f%(upstream:track)",
+        // The full refname: `refname:short` gives `heads/x` when a tag is
+        // also called x.
+        "--format=%(HEAD)%1f%(refname)%1f%(upstream)%1f%(upstream:track)",
         "refs/heads",
     ]) else {
         return Vec::new();
@@ -628,6 +675,7 @@ enum HeadLine {
 fn parse_head_line(line: &str) -> Option<HeadLine> {
     let mut f = line.split('\x1f');
     let (head, name, upstream, track) = (f.next()?, f.next()?, f.next()?, f.next().unwrap_or(""));
+    let name = name.strip_prefix("refs/heads/").unwrap_or(name);
     if head.trim() == "*" || name.is_empty() {
         return None;
     }
@@ -669,7 +717,15 @@ const MAX_IGNORED: usize = 2048;
 fn fetch_repo(repo: &Path) -> Result<(), String> {
     // Without these, every fetch writes FETCH_HEAD and may start a background
     // gc in the user's repo, both of which the watcher would see.
-    let mut args = vec!["fetch", "--quiet", "--all", "--prune"];
+    // No submodules: a fetch that recurses runs git inside each submodule,
+    // under that submodule's own config, which the guard never reads.
+    let mut args = vec![
+        "fetch",
+        "--quiet",
+        "--all",
+        "--prune",
+        "--no-recurse-submodules",
+    ];
     if supports(FETCH_QUIET_FLAGS) {
         args.extend(["--no-write-fetch-head", "--no-auto-maintenance"]);
     }
@@ -706,7 +762,16 @@ fn fetch_repo(repo: &Path) -> Result<(), String> {
 
 fn local_status(repo: &Path, v2: bool) -> Result<Parsed, String> {
     if v2 {
-        let base = ["status", "--porcelain=v2", "-z", "--branch"];
+        // `dirty` compares each submodule's HEAD only: a full check would
+        // run `git status` inside it, under its own config (fsmonitor,
+        // filters), which the guard never reads.
+        let base = [
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--branch",
+            "--ignore-submodules=dirty",
+        ];
         let out = git(
             repo,
             &[&base[..], &["--ignored=matching"]].concat(),
@@ -726,7 +791,11 @@ fn local_status(repo: &Path, v2: bool) -> Result<Parsed, String> {
     }
 
     let mut parsed = Parsed::default();
-    let out = git(repo, &["status", "--porcelain"], LOCAL_TIMEOUT)?;
+    let out = git(
+        repo,
+        &["status", "--porcelain", "--ignore-submodules=dirty"],
+        LOCAL_TIMEOUT,
+    )?;
     if !out.status.success() {
         return Err("not readable".to_string());
     }
@@ -912,11 +981,12 @@ pub fn ensure_excluded(repo: &Path, pattern: &str) -> Result<bool, String> {
     Ok(true)
 }
 
-/// Whether git tracks `rel` (relative to the repo). Case-insensitive, and
-/// any answer other than a clean "no" counts as tracked, so a caller that
-/// skips tracked files never writes into a repo it couldn't read.
+/// Whether git tracks `rel` (relative to the repo), case-insensitively.
+/// None when git couldn't say (a timeout, dubious ownership, a corrupt
+/// index): a caller that writes treats that as tracked, one that would
+/// forget its own changes treats it as "try again later".
 #[cfg(any(windows, test))]
-pub fn is_tracked(repo: &Path, rel: &Path) -> bool {
+pub fn is_tracked(repo: &Path, rel: &Path) -> Option<bool> {
     let rel = rel.to_string_lossy().replace('\\', "/");
     let spec = format!(":(literal,icase){rel}");
     match git(
@@ -924,8 +994,12 @@ pub fn is_tracked(repo: &Path, rel: &Path) -> bool {
         &["ls-files", "--error-unmatch", "--", &spec],
         LOCAL_TIMEOUT,
     ) {
-        Ok(out) => out.status.code() != Some(1),
-        Err(_) => true,
+        Ok(out) => match out.status.code() {
+            Some(0) => Some(true),
+            Some(1) => Some(false),
+            _ => None,
+        },
+        Err(_) => None,
     }
 }
 
@@ -1138,6 +1212,21 @@ fn file_name(path: &Path) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn off_trunk_is_another_branch_or_none() {
+        let on = |branch: Option<&str>, trunk: Option<&str>, detached: bool| RepoStatus {
+            branch: branch.map(String::from),
+            trunk: trunk.map(String::from),
+            detached: detached.then(|| "abc1234".to_string()),
+            ..Default::default()
+        };
+        assert!(!on(Some("main"), Some("main"), false).off_trunk());
+        assert!(on(Some("wip"), Some("main"), false).off_trunk());
+        assert!(on(None, Some("main"), true).off_trunk());
+        // Without a known default branch, nothing to say.
+        assert!(!on(Some("wip"), None, false).off_trunk());
+    }
+
     fn run(dir: &Path, args: &[&str]) {
         let ok = Command::new("git")
             .arg("-C")
@@ -1219,6 +1308,11 @@ mod tests {
             Some(HeadLine::Ahead("wip".into(), 2))
         );
         assert_eq!(l(" |local||"), Some(HeadLine::NoUpstream("local".into())));
+        // Full refnames, which stay plain when a tag has the same name.
+        assert_eq!(
+            l(" |refs/heads/x||"),
+            Some(HeadLine::NoUpstream("x".into()))
+        );
     }
 
     #[test]
@@ -1261,6 +1355,10 @@ mod tests {
         assert_eq!(s.unpushed_branches, [("wip".to_string(), 1)]);
         assert!(!s.is_synced());
         assert_eq!(s.label(), "wip unpushed");
+        // A tag of the same name doesn't turn it into `heads/wip`.
+        run(&repo, &["tag", "wip"]);
+        assert_eq!(check().unpushed_branches, [("wip".to_string(), 1)]);
+        run(&repo, &["tag", "-d", "wip"]);
         // A stash shows but doesn't unsync.
         run(&repo, &["branch", "-q", "-D", "wip"]);
         std::fs::write(repo.join("f.txt"), "x").unwrap();
@@ -1681,15 +1779,18 @@ mod tests {
         assert_eq!(canon(wt_common), main_git);
         assert_eq!(git_dirs(&root), None);
 
-        assert!(is_tracked(&repo, Path::new("Desktop.ini")));
-        assert!(is_tracked(&repo, Path::new("desktop.ini")));
-        assert!(!is_tracked(&repo, Path::new("other.ini")));
+        assert_eq!(is_tracked(&repo, Path::new("Desktop.ini")), Some(true));
+        assert_eq!(is_tracked(&repo, Path::new("desktop.ini")), Some(true));
+        assert_eq!(is_tracked(&repo, Path::new("other.ini")), Some(false));
         // Literal pathspec: a glob in the name matches nothing.
-        assert!(!is_tracked(&repo, Path::new("*.ini")));
+        assert_eq!(is_tracked(&repo, Path::new("*.ini")), Some(false));
         std::fs::write(repo.join("untracked.ini"), "x").unwrap();
-        assert!(!is_tracked(&repo, Path::new("untracked.ini")));
-        // Can't tell, so assume tracked and leave the folder alone.
-        assert!(is_tracked(&root.join("missing"), Path::new("desktop.ini")));
+        assert_eq!(is_tracked(&repo, Path::new("untracked.ini")), Some(false));
+        // Can't tell.
+        assert_eq!(
+            is_tracked(&root.join("missing"), Path::new("desktop.ini")),
+            None
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

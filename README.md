@@ -148,6 +148,21 @@ its place relative to that corner when the resolution or the taskbar changes.
 Picking a **Corner** in the settings puts it back `margin` from the edges. By default it hides while a fullscreen app or a presentation
 is running; it can also hide while everything is synced.
 
+**Right-click it** and it grows into a small floating view that stays on top
+like the badge: a row per repo, its tree and its icon, with the words in
+tooltips. It lists the repos you pin (**Pin to the floating view** in a repo's
+right-click menu in the panel) and the ones you worked on in the last few
+days. Click a repo's icon for its GitHub page, right-click it for its folder,
+drag it to put the row somewhere else, and middle-click it to take the repo
+out of the view (it asks first). After a change an undo button shows on its
+own small plate under the view for a few seconds. The wheel over a tree
+scrolls that tree through time, and resting the mouse on a commit's dot
+shows its card, as in the panel. Drag the view by any empty spot, and drag its
+free side edge to make it wider or narrower; a right click anywhere else on it
+turns it back into the badge. **Settings ▸ Icon and badge ▸ Floating view**
+has its corners, how see-through it is, how many days count as lately, its
+health bar and pull request marks, and its commit cards.
+
 ### Folder icons in Explorer
 
 **Settings ▸ Folder icons** gives each repo folder an icon that
@@ -359,14 +374,24 @@ from an older version keeps working:
   "watch": true,
   "panel": true,
   "window": true,
-  "icons_only": false,
   "overlay": {
     "enabled": false,
     "corner": "bottom-right",
     "size": 44,
     "margin": 16,
     "hide_when_synced": false,
-    "hide_in_fullscreen": true
+    "hide_in_fullscreen": true,
+    "grown": false
+  },
+  "float": {
+    "pinned": [],
+    "hidden": [],
+    "order": [],
+    "recent_days": 3.0,
+    "width": 220,
+    "opacity": 1.0,
+    "health": true,
+    "prs": true
   },
   "folder_icons": false,
   "folder_icon_mode": "status",
@@ -400,7 +425,6 @@ from an older version keeps working:
 | `watch` | true | Pick up local changes from file-system events. false checks on the interval only. |
 | `panel` | true | A tray left-click (and a badge click) opens the status panel. |
 | `window` | true | The status window is available from the menu, a double-click and the panel's ⧉ button. |
-| `icons_only` | false | **Settings ▸ Status views ▸ Icons only**: the panel and the badge show pictures, no words. Each repo is its `.gitstat/icon.svg` (or a status dot) beside its graph, the header a bar of green, amber and red repos, the badge a ring of the same colours around a dot in the most urgent one. Hover any of them for the words. |
 | `scroll_together` | true | **Settings ▸ Status views ▸ Scroll columns together**: every column of the big view scrolls with the one under the mouse, with thin lines between the rows. Off, each column scrolls on its own. |
 | `overlay.enabled` | false | Show the corner badge. |
 | `overlay.corner` | `bottom-right` | `top-left`, `top-right`, `bottom-left` or `bottom-right`. |
@@ -409,6 +433,20 @@ from an older version keeps working:
 | `overlay.margin` | 16 | Distance from the screen edges in px at 100% scale, 0 to 200, unless the badge was dragged. |
 | `overlay.hide_when_synced` | false | Hide the badge while every repo is synced. |
 | `overlay.hide_in_fullscreen` | true | Hide the badge while a fullscreen app or a presentation runs. |
+| `overlay.radius` | unset | **Settings ▸ Icon and badge ▸ Corners**: the radius of the badge's and the floating view's corners in px at 100% scale. Unset is half the size: a disc. |
+| `overlay.grown` | false | The badge is grown into the floating view. A right click on either turns it into the other. |
+| `float.pinned` | `[]` | The repos pinned to the floating view, by name, from a repo's right-click menu. |
+| `float.hidden` | `[]` | Repos taken out of the floating view (middle-click). Each stays out until something new happens in it after `float.taken_out` says it went; pinning one brings it back. |
+| `float.taken_out` | `{}` | When each repo was taken out, Unix seconds, by name. |
+| `float.order` | `[]` | The order the view's rows were dragged into; repos not named here follow. |
+| `float.recent_days` | 3 | Repos something new happened in within this many days are listed after the pinned ones. 0 lists the pinned ones alone. |
+| `float.on_commit`, `float.on_branch`, `float.on_pr`, `float.on_changes` | true | What counts as something new: a commit on any branch or a checkout, a new branch (made or fetched), a new pull request, files starting to change. |
+| `float.events` | `{}` | When a new branch, pull request or change last came in each repo, by name, kept by gitstat. |
+| `float.width` | 220 | The view's width in px at 100% scale, 120 to 1600. Drag its free side edge to change it. |
+| `float.opacity` | 1.0 | How solid the view's background is, 0.2 to 1. |
+| `float.health` | true | The bar of green, amber and red repos along the view's top. |
+| `float.prs` | true | A mark per open pull request along the view's bottom. |
+| `float.cards` | true | A commit's card when the mouse rests on its dot in the floating view. |
 | `folder_icons` | false | Status icons on the repo folders, see above. Setting it by hand skips the confirmation. |
 | `folder_icon_mode` | `status` | `status` for the status folders, `repo-svg` for each repo's own `.gitstat/icon.svg` where it has one, see [Repo icons](#repo-icons). Only matters while `folder_icons` is on. |
 | `github_prs` | true | **Settings ▸ GitHub ▸ Pull requests**: open pull requests in the panel and big mode, read through `gh`, see [GitHub pull requests](#github-pull-requests). Also lets a sweep skip fetching repos with no new push, see [How status stays current](#how-status-stays-current). |
@@ -443,7 +481,8 @@ gitstat --remove-folder-icons   turn folder icons off, restore every folder that
 exits with code 1 if some folder couldn't be restored (it lists them, and they
 stay on the list for the next try), and refuses to run while the tray app is
 running. gitstat.exe is a windowed app, so run it from PowerShell as
-`.\gitstat.exe --once | Out-Host` to have the terminal wait for its output.
+`.\gitstat.exe --once | Out-Host` to have the terminal wait for its output
+and set `$LASTEXITCODE`, or from cmd as `start /wait gitstat.exe --once`.
 
 ## Build from source
 

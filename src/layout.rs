@@ -2,7 +2,7 @@
 
 use crate::config::Corner;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Rect {
     pub left: i32,
     pub top: i32,
@@ -315,10 +315,12 @@ const HEADER: f32 = 64.0;
 const ROW: f32 = 36.0;
 const FOOTER: f32 = 48.0;
 const MIN_PANEL: f32 = 200.0;
-const MAX_SHARE: f32 = 0.6;
+/// The panel may grow to the whole work area (less its gaps, which
+/// `flyout` keeps) before its list scrolls.
+const MAX_SHARE: f32 = 1.0;
 
-/// A measured panel height in logical px, kept on the screen: at most 60%
-/// of the work area, like `panel_height`, but with no minimum, so the panel
+/// A measured panel height in logical px, kept on the screen: at most the
+/// work area, like `panel_height`, but with no minimum, so the panel
 /// is exactly as tall as what it shows.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn fit_panel_height(wanted: f32, work_h_logical: f32) -> f32 {
@@ -328,7 +330,7 @@ pub fn fit_panel_height(wanted: f32, work_h_logical: f32) -> f32 {
 }
 
 /// Panel height in logical px for `rows` repo rows: room for every row, at
-/// least `MIN_PANEL`, at most 60% of the work area (the screen wins on a
+/// least `MIN_PANEL`, at most the work area (the screen wins on a
 /// tiny one). Extra rows scroll.
 pub fn panel_height(rows: usize, work_h_logical: f32) -> f32 {
     let wanted = (HEADER + rows as f32 * ROW + FOOTER).max(MIN_PANEL);
@@ -734,7 +736,8 @@ mod tests {
     fn fit_panel_height_has_no_minimum_but_stays_on_screen() {
         assert_eq!(fit_panel_height(150.0, 1000.0), 150.0);
         assert_eq!(fit_panel_height(10.0, 1000.0), HEADER);
-        assert_eq!(fit_panel_height(900.0, 1000.0), 600.0);
+        assert_eq!(fit_panel_height(900.0, 1000.0), 900.0);
+        assert_eq!(fit_panel_height(1200.0, 1000.0), 1000.0);
         assert_eq!(fit_panel_height(150.0, 0.0), 150.0);
     }
 
@@ -742,9 +745,9 @@ mod tests {
     fn panel_height_fits_rows_within_bounds() {
         assert_eq!(panel_height(0, 1000.0), 200.0);
         assert_eq!(panel_height(5, 1000.0), 64.0 + 5.0 * 36.0 + 48.0);
-        assert_eq!(panel_height(100, 1000.0), 600.0);
+        assert_eq!(panel_height(100, 1000.0), 1000.0);
         // The screen wins over the minimum on a tiny work area.
-        assert_eq!(panel_height(3, 250.0), 150.0);
+        assert_eq!(panel_height(0, 150.0), 150.0);
         assert_eq!(panel_height(3, f32::NAN), 220.0);
         assert_eq!(panel_height(3, 0.0), 220.0);
     }

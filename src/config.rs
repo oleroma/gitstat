@@ -3,9 +3,14 @@
 
 use crate::git::{DEFAULT_DEPTH, MAX_DEPTH};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub const FILE_NAME: &str = "config.json";
+
+/// The floating view's width, logical px, at its least and at its most.
+pub const FLOAT_MIN_WIDTH: f32 = 120.0;
+pub const FLOAT_MAX_WIDTH: f32 = 1600.0;
 
 /// Work-area corner of the primary monitor that holds the overlay badge.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,6 +110,137 @@ pub struct OverlayConfig {
     pub offset_y: Option<f32>,
     pub hide_when_synced: bool,
     pub hide_in_fullscreen: bool,
+    /// Its corners' radius in logical px; unset, half its size: a disc.
+    /// Grown into the floating view it keeps this radius.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub radius: Option<f32>,
+    /// Grown into the floating view (a right click on it), which it comes
+    /// back as after a restart.
+    pub grown: bool,
+}
+
+/// The floating view the badge grows into: a row per repo, its icon and
+/// its tree, always on top.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FloatConfig {
+    /// The repos pinned to it, by name as gitstat shows them, in the
+    /// order they are listed.
+    pub pinned: Vec<String>,
+    /// Repos taken out of it, by name: each stays out until something
+    /// new happens in it after `taken_out` says it went.
+    pub hidden: Vec<String>,
+    /// When each repo was taken out, Unix seconds, by name. One in
+    /// `hidden` without a time (from before) stays out for good.
+    pub taken_out: BTreeMap<String, i64>,
+    /// The order its rows were put in by hand, by name: the repos named
+    /// here come first, in this order, then the rest.
+    pub order: Vec<String>,
+    /// A repo something new happened in (what the `on_` switches pick)
+    /// within this many days is listed after the pinned ones; 0 lists
+    /// the pinned ones alone.
+    pub recent_days: f64,
+    /// What brings a repo in: a commit on any branch or a checkout, a
+    /// new branch, a new pull request, files starting to change.
+    pub on_commit: bool,
+    pub on_branch: bool,
+    pub on_pr: bool,
+    pub on_changes: bool,
+    /// When each of those last happened in a repo, by name, for those
+    /// git doesn't keep a time of.
+    pub events: BTreeMap<String, FloatEvents>,
+    /// Its width in logical px.
+    pub width: f32,
+    /// How solid its background is, 0.2 to 1.
+    pub opacity: f32,
+    /// The health bar along its top.
+    pub health: bool,
+    /// The open pull requests along its bottom.
+    pub prs: bool,
+    /// A commit's card when the mouse rests on its dot.
+    pub cards: bool,
+}
+
+/// When something new last happened in a repo, of the kinds git keeps no
+/// time of, Unix seconds; 0 for never.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FloatEvents {
+    pub branch: i64,
+    pub pr: i64,
+    pub changes: i64,
+}
+
+/// A kind of thing that happens in a repo and brings it into the
+/// floating view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FloatEvent {
+    Branch,
+    Pr,
+    Changes,
+}
+
+impl FloatConfig {
+    /// Notes that `what` happened in the repo listed as `name` at `at`.
+    pub fn note(&mut self, name: &str, what: FloatEvent, at: i64) {
+        let key = self
+            .events
+            .keys()
+            .find(|k| same_name(k, name))
+            .cloned()
+            .unwrap_or_else(|| name.to_string());
+        let e = self.events.entry(key).or_default();
+        let slot = match what {
+            FloatEvent::Branch => &mut e.branch,
+            FloatEvent::Pr => &mut e.pr,
+            FloatEvent::Changes => &mut e.changes,
+        };
+        *slot = (*slot).max(at);
+    }
+
+    /// The last time something that brings it in happened in the repo
+    /// listed as `name`, with `worked` its newest commit or checkout.
+    pub fn last_event(&self, name: &str, worked: i64) -> i64 {
+        let e = self
+            .events
+            .iter()
+            .find(|(k, _)| same_name(k, name))
+            .map(|(_, e)| *e)
+            .unwrap_or_default();
+        [
+            (self.on_commit, worked),
+            (self.on_branch, e.branch),
+            (self.on_pr, e.pr),
+            (self.on_changes, e.changes),
+        ]
+        .into_iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, t)| t)
+        .max()
+        .unwrap_or(0)
+    }
+}
+
+impl Default for FloatConfig {
+    fn default() -> Self {
+        Self {
+            pinned: Vec::new(),
+            hidden: Vec::new(),
+            taken_out: BTreeMap::new(),
+            order: Vec::new(),
+            recent_days: 3.0,
+            on_commit: true,
+            on_branch: true,
+            on_pr: true,
+            on_changes: true,
+            events: BTreeMap::new(),
+            width: 220.0,
+            opacity: 1.0,
+            health: true,
+            prs: true,
+            cards: true,
+        }
+    }
 }
 
 impl Default for OverlayConfig {
@@ -118,8 +254,21 @@ impl Default for OverlayConfig {
             offset_y: None,
             hide_when_synced: false,
             hide_in_fullscreen: true,
+            radius: None,
+            grown: false,
         }
     }
+}
+
+/// What becomes of one of the config's folders: see [`Config::folders`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Folder {
+    Watched(PathBuf),
+    /// A blank entry of `more_paths`.
+    Blank,
+    /// The same as, inside, or holding this earlier folder, which already
+    /// covers it.
+    Overlaps(PathBuf),
 }
 
 /// `PartialEq` lets the app ignore reloads of its own writes.
@@ -140,10 +289,9 @@ pub struct Config {
     pub panel: bool,
     /// The normal status window is available.
     pub window: bool,
-    /// The panel and the badge show pictures only: repo icons, the graph
-    /// and coloured marks, their words in tooltips.
-    pub icons_only: bool,
     pub overlay: OverlayConfig,
+    /// The floating view the badge grows into.
+    pub float: FloatConfig,
     /// desktop.ini status icons on the repo folders.
     pub folder_icons: bool,
     /// What those icons are drawn from; only matters with `folder_icons`.
@@ -172,6 +320,14 @@ pub struct Config {
     pub panel_slide_ms: u32,
     /// How long the flip between the panel and the window takes, in ms.
     pub flip_ms: u32,
+    /// For checking the flip and the panel's slide: each saves every frame
+    /// of the screen under it, and a few after, as numbered PNGs, into
+    /// [`Config::frames_folder`]. Settings › Diagnostics. Recording slows
+    /// the animations it records.
+    pub record_frames: bool,
+    /// Where `record_frames` saves them; empty is `frames` in gitstat's
+    /// data folder.
+    pub flip_frames: String,
     /// Which sections of the repo list are folded, in the panel and the
     /// big window alike.
     pub folds: Folds,
@@ -205,7 +361,7 @@ pub struct NotifyConfig {
 /// The sections the panel lists, and the big window shows as groups of
 /// columns (the pull requests as the list under them).
 #[cfg_attr(not(windows), allow(dead_code))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Section {
     /// Repos with something to do: dirty, ahead, behind, erroring.
     NeedsYou,
@@ -276,8 +432,8 @@ impl Default for Config {
             watch: true,
             panel: true,
             window: true,
-            icons_only: false,
             overlay: OverlayConfig::default(),
+            float: FloatConfig::default(),
             folder_icons: false,
             folder_icon_mode: FolderIconMode::default(),
             github_prs: true,
@@ -289,6 +445,8 @@ impl Default for Config {
             flip_animation: true,
             panel_slide_ms: 150,
             flip_ms: 560,
+            record_frames: false,
+            flip_frames: String::new(),
             folds: Folds::default(),
             ignore: Vec::new(),
             notify: NotifyConfig::default(),
@@ -306,6 +464,15 @@ pub enum ClickAction {
 }
 
 impl Config {
+    /// Where frame recordings go (`record_frames`).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn frames_folder(&self) -> PathBuf {
+        match self.flip_frames.trim() {
+            "" => data_dir().join("frames"),
+            f => PathBuf::from(f),
+        }
+    }
+
     /// Whether the repo named `name` is on the `ignore` list.
     pub fn is_ignored(&self, name: &str) -> bool {
         self.ignore.iter().any(|pattern| glob_match(pattern, name))
@@ -341,13 +508,26 @@ impl Config {
     /// same as, inside, or around one already listed, so no repo is listed
     /// twice.
     pub fn roots(&self) -> Vec<PathBuf> {
-        let mut roots: Vec<PathBuf> = Vec::new();
-        let mut keys: Vec<String> = Vec::new();
+        self.folders()
+            .into_iter()
+            .filter_map(|f| match f {
+                Folder::Watched(dir) => Some(dir),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `path` then each of `more_paths`, and what becomes of it: watched,
+    /// blank, or left out because it is, holds or sits in an earlier one.
+    pub fn folders(&self) -> Vec<Folder> {
+        let mut out = Vec::new();
+        let mut keys: Vec<(String, PathBuf)> = Vec::new();
         let candidates =
             std::iter::once(self.path.as_str()).chain(self.more_paths.iter().map(String::as_str));
         for (i, raw) in candidates.enumerate() {
             // `path` always counts, even blank, as it always has.
             if i > 0 && raw.trim().is_empty() {
+                out.push(Folder::Blank);
                 continue;
             }
             let dir = if i == 0 {
@@ -356,15 +536,18 @@ impl Config {
                 PathBuf::from(expand(raw.trim()))
             };
             let key = path_key(&dir);
-            let overlaps = keys.iter().any(|k| {
+            let overlap = keys.iter().find(|(k, _)| {
                 k == &key || key.starts_with(&format!("{k}/")) || k.starts_with(&format!("{key}/"))
             });
-            if !overlaps {
-                keys.push(key);
-                roots.push(dir);
+            match overlap {
+                Some((_, earlier)) => out.push(Folder::Overlaps(earlier.clone())),
+                None => {
+                    keys.push((key, dir.clone()));
+                    out.push(Folder::Watched(dir));
+                }
             }
         }
-        roots
+        out
     }
 
     /// The folder at `slot` in [`Config::roots`].
@@ -415,13 +598,76 @@ impl Config {
             // Locked or unreadable: we can't tell whether it holds an edit, so leave it.
             Err(e) => return Err(format!("{}: {e}", file.display())),
         }
-        let text = serde_json::to_string_pretty(self).map_err(|e| e.to_string())? + "\n";
+        let text = serde_json::to_string_pretty(&self.finite()).map_err(|e| e.to_string())? + "\n";
         let tmp = file.with_extension("json.tmp");
         std::fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
         std::fs::rename(&tmp, file).map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
             format!("{}: {e}", file.display())
         })
+    }
+
+    /// A copy whose floats are all finite. A hand-edited `1e39` reads as an
+    /// infinite f32, which JSON writes as `null`, a file that won't load.
+    fn finite(&self) -> Config {
+        let mut c = self.clone();
+        let defaults = (Config::default(), OverlayConfig::default());
+        if !c.interval_minutes.is_finite() {
+            c.interval_minutes = defaults.0.interval_minutes;
+        }
+        if !c.overlay.size.is_finite() {
+            c.overlay.size = defaults.1.size;
+        }
+        if !c.overlay.margin.is_finite() {
+            c.overlay.margin = defaults.1.margin;
+        }
+        c.overlay.offset_x = c.overlay.offset_x.filter(|v| v.is_finite());
+        c.overlay.offset_y = c.overlay.offset_y.filter(|v| v.is_finite());
+        c
+    }
+
+    /// Writes `file` like [`save`](Self::save), but only while `file` still
+    /// holds `base` (what the app last read or wrote): a hand edit the app
+    /// hasn't reloaded yet is never overwritten. The reload that follows
+    /// brings the edit in.
+    pub fn save_over(&self, file: &Path, base: &Config) -> Result<(), String> {
+        if let Ok(text) = std::fs::read_to_string(file)
+            && let Ok(on_disk) = serde_json::from_str::<Config>(&text)
+            && on_disk != *base
+            && on_disk != *self
+        {
+            return Err(format!(
+                "{} was changed outside gitstat; not overwriting it",
+                file.display()
+            ));
+        }
+        self.save(file)?;
+        self.remember_good(file);
+        Ok(())
+    }
+
+    /// Keeps a copy of a config that loaded or saved cleanly beside `file`,
+    /// so a start with a broken `file` runs on it instead of the defaults.
+    /// Best effort.
+    pub fn remember_good(&self, file: &Path) {
+        let Ok(text) = serde_json::to_string_pretty(self) else {
+            return;
+        };
+        let text = text + "\n";
+        let good = last_good_file(file);
+        if std::fs::read_to_string(&good).is_ok_and(|old| old == text) {
+            return;
+        }
+        let tmp = good.with_extension("tmp");
+        if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &good).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    /// The copy [`remember_good`](Self::remember_good) kept for `file`.
+    pub fn last_good(file: &Path) -> Option<Config> {
+        let text = std::fs::read_to_string(last_good_file(file)).ok()?;
+        serde_json::from_str(&text).ok()
     }
 
     /// The panel, else the window, else the menu, so a click always does something.
@@ -452,6 +698,39 @@ impl Config {
         )
     }
 
+    /// The badge's corners' radius, logical px: at most half its size,
+    /// which makes it a disc.
+    pub fn overlay_radius(&self) -> f32 {
+        let half = self.overlay_size() / 2.0;
+        match self.overlay.radius {
+            Some(r) if r.is_finite() => r.clamp(0.0, half),
+            _ => half,
+        }
+    }
+
+    /// The floating view's width, logical px, never narrower than the
+    /// badge it grows from.
+    pub fn float_width(&self) -> f32 {
+        clamp_f32(
+            self.float.width,
+            FLOAT_MIN_WIDTH,
+            FLOAT_MAX_WIDTH,
+            FloatConfig::default().width,
+        )
+        .max(self.overlay_size())
+    }
+
+    pub fn float_opacity(&self) -> f32 {
+        clamp_f32(self.float.opacity, 0.2, 1.0, 1.0)
+    }
+
+    /// How long ago a repo may have been worked on to be listed in the
+    /// floating view unpinned, in seconds; none when that is off.
+    pub fn float_recent_secs(&self) -> Option<i64> {
+        let days = self.float.recent_days;
+        (days.is_finite() && days > 0.0).then(|| (days.min(3650.0) * 86_400.0) as i64)
+    }
+
     pub fn overlay_margin(&self) -> f32 {
         clamp_f32(
             self.overlay.margin,
@@ -471,6 +750,19 @@ impl Config {
     }
 }
 
+/// Whether two repo names are the same repo's: case and the slash's
+/// direction don't matter.
+pub fn same_name(a: &str, b: &str) -> bool {
+    let fold = |c: char| {
+        if c == '\\' {
+            '/'
+        } else {
+            c.to_ascii_lowercase()
+        }
+    };
+    a.chars().map(fold).eq(b.chars().map(fold))
+}
+
 fn clamp_f32(value: f32, min: f32, max: f32, default: f32) -> f32 {
     if value.is_nan() {
         default
@@ -487,6 +779,12 @@ fn clamp_minutes(minutes: f64) -> f64 {
     } else {
         Config::default().interval_minutes
     }
+}
+
+/// `config.json` -> `config.last-good.json`, beside it.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn last_good_file(file: &Path) -> PathBuf {
+    file.with_extension("last-good.json")
 }
 
 /// Default location: `config.json` beside the executable.
@@ -993,6 +1291,40 @@ mod tests {
             .collect();
         assert_eq!(names, [FILE_NAME]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_writes_no_null_for_an_infinite_float() {
+        let file = temp_dir("finite").join("config.json");
+        let mut config = Config::default();
+        config.overlay.size = f32::INFINITY;
+        config.overlay.offset_x = Some(f32::NAN);
+        config.interval_minutes = f64::NAN;
+        config.save(&file).unwrap();
+        let loaded = Config::load_or_create(&file).unwrap();
+        assert_eq!(loaded.overlay.size, OverlayConfig::default().size);
+        assert_eq!(loaded.overlay.offset_x, None);
+        assert_eq!(loaded.interval_minutes, Config::default().interval_minutes);
+    }
+
+    #[test]
+    fn save_over_keeps_an_unreloaded_hand_edit() {
+        let file = temp_dir("save-over").join("config.json");
+        let base = Config::default();
+        base.save(&file).unwrap();
+        let mut edit = base.clone();
+        edit.interval_minutes += 7.0;
+        edit.save(&file).unwrap();
+        let mut change = base.clone();
+        change.watch = !change.watch;
+        assert!(change.save_over(&file, &base).is_err());
+        assert_eq!(Config::load_or_create(&file).unwrap(), edit);
+        // Once the edit is the base, saves go through, and are remembered.
+        let mut change = edit.clone();
+        change.watch = !change.watch;
+        change.save_over(&file, &edit).unwrap();
+        assert_eq!(Config::load_or_create(&file).unwrap(), change);
+        assert_eq!(Config::last_good(&file), Some(change));
     }
 
     #[test]

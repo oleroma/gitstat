@@ -32,6 +32,8 @@ mod repo_icon;
 #[cfg(any(windows, test))]
 mod repo_info;
 #[cfg(any(windows, test))]
+mod scene;
+#[cfg(any(windows, test))]
 mod self_update;
 #[cfg(any(windows, test))]
 mod state;
@@ -43,15 +45,25 @@ mod app;
 #[cfg(windows)]
 mod autostart;
 #[cfg(windows)]
-mod morph;
+mod flip;
+#[cfg(windows)]
+mod float_tip;
+#[cfg(windows)]
+mod frames;
+#[cfg(windows)]
+mod glyph_path;
 #[cfg(windows)]
 mod overlay;
 #[cfg(windows)]
 mod panel;
 #[cfg(windows)]
+mod probe;
+#[cfg(windows)]
 mod repo_marks;
 #[cfg(windows)]
 mod repo_menu;
+#[cfg(windows)]
+mod selftest;
 #[cfg(windows)]
 mod settings;
 #[cfg(windows)]
@@ -78,7 +90,11 @@ Usage:
   gitstat --config FILE   use FILE instead of config.json next to gitstat.exe
   gitstat --remove-folder-icons
                           turn folder icons off in the config, restore every repo
-                          folder gitstat gave a status icon, and exit";
+                          folder gitstat gave a status icon, and exit
+
+gitstat.exe is a windowed app, so a terminal doesn't wait for it. To see its
+output and exit code, run it as `.\\gitstat.exe --once | Out-Host` in
+PowerShell, or `start /wait gitstat.exe --once` in cmd.";
 
 struct Args {
     once: bool,
@@ -87,6 +103,9 @@ struct Args {
     config_file: PathBuf,
     /// Started by a gitstat that just swapped in a new build (self_update.rs).
     after_update: bool,
+    /// Test itself on the screen, leaving what it saw in this folder
+    /// (selftest.rs).
+    self_test: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -96,6 +115,7 @@ fn parse_args() -> Result<Args, String> {
         fetch: true,
         config_file: config::default_file(),
         after_update: false,
+        self_test: None,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -104,6 +124,9 @@ fn parse_args() -> Result<Args, String> {
             "--no-fetch" => args.fetch = false,
             "--remove-folder-icons" => args.remove_folder_icons = true,
             "--after-update" => args.after_update = true,
+            "--self-test" => {
+                args.self_test = Some(iter.next().ok_or("--self-test needs a folder")?.into());
+            }
             "--config" => args.config_file = iter.next().ok_or("--config needs a file")?.into(),
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument: {other}")),
@@ -145,29 +168,54 @@ fn main() {
         std::process::exit(run_once(&args));
     }
 
+    // Testing itself, it runs beside the gitstat that is running, and is
+    // no build to update or hand over to.
+    #[cfg(windows)]
+    if let Some(out) = args.self_test {
+        log_panics();
+        app::run(args.config_file, Some(out));
+        return;
+    }
+
     #[cfg(windows)]
     {
-        // A build an install left while gitstat wasn't running.
+        let first = if args.after_update {
+            wait_for_single_instance(self_update::HANDOVER)
+        } else {
+            single_instance()
+        };
+        if !first {
+            // The tray instance, by the id it wrote; anything else holding
+            // the mutex is a `--remove-folder-icons` run, left to finish.
+            let Some(tray) = running_tray() else {
+                let _ = error_box(
+                    "gitstat is restoring folder icons (--remove-folder-icons). Start it \
+                     again once that has finished."
+                        .into(),
+                )
+                .join();
+                return;
+            };
+            if !(ask_restart()
+                && tray.into_iter().all(stop_gitstat)
+                && wait_for_single_instance(self_update::HANDOVER))
+            {
+                return;
+            }
+        }
+        // A build an install left while gitstat wasn't running. Only once
+        // this is the one gitstat: a running one swaps in its own update,
+        // and a second start must not rename its exe from under it. The
+        // restarted one waits for this one to quit.
         if let Ok(exe) = std::env::current_exe()
             && self_update::swap(&exe).unwrap_or(false)
             && self_update::restart(&exe).is_ok()
         {
             return;
         }
-        let first = if args.after_update {
-            wait_for_single_instance(self_update::HANDOVER)
-        } else {
-            single_instance()
-        };
-        if !first
-            && !(ask_restart()
-                && stop_other_gitstats()
-                && wait_for_single_instance(self_update::HANDOVER))
-        {
-            return;
-        }
+        write_tray_pid();
         log_panics();
-        app::run(args.config_file);
+        app::run(args.config_file, None);
     }
 }
 
@@ -369,25 +417,50 @@ fn ask_restart() -> bool {
     answer == IDYES
 }
 
-/// Ends every other gitstat.exe process and waits for each to be gone.
-/// False when one couldn't be ended, with a warning saying so.
+/// Where the tray instance notes its process id, for a second start's
+/// Restart to end just that one.
 #[cfg(windows)]
-fn stop_other_gitstats() -> bool {
+fn tray_pid_file() -> std::path::PathBuf {
+    config::data_dir().join("tray.pid")
+}
+
+#[cfg(windows)]
+fn write_tray_pid() {
+    let file = tray_pid_file();
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(file, std::process::id().to_string());
+}
+
+/// The running tray instance: the id it noted, while a gitstat.exe other
+/// than this one still has it. With no note (a build from before notes
+/// were kept), every other gitstat.exe.
+#[cfg(windows)]
+fn running_tray() -> Option<Vec<u32>> {
+    let others = other_gitstats();
+    let Ok(text) = std::fs::read_to_string(tray_pid_file()) else {
+        return (!others.is_empty()).then_some(others);
+    };
+    let pid: u32 = text.trim().parse().ok()?;
+    others.contains(&pid).then(|| vec![pid])
+}
+
+/// Every gitstat.exe process but this one.
+#[cfg(windows)]
+fn other_gitstats() -> Vec<u32> {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
         TH32CS_SNAPPROCESS,
     };
-    use windows_sys::Win32::System::Threading::{
-        GetCurrentProcessId, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
-        WaitForSingleObject,
-    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     let me = unsafe { GetCurrentProcessId() };
     let mut others = Vec::new();
     unsafe {
         let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if snap == INVALID_HANDLE_VALUE {
-            return false;
+            return others;
         }
         let mut entry = PROCESSENTRY32W {
             dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
@@ -404,22 +477,28 @@ fn stop_other_gitstats() -> bool {
         }
         CloseHandle(snap);
     }
-    let mut stopped = true;
-    for pid in others {
-        unsafe {
-            let process = OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid);
-            if process.is_null() {
-                stopped = false;
-                continue;
-            }
-            if TerminateProcess(process, 0) != 0 {
+    others
+}
+
+/// Ends the gitstat `pid` and waits for it to be gone. False when it
+/// couldn't be ended, with a warning saying so.
+#[cfg(windows)]
+fn stop_gitstat(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+    };
+    let stopped = unsafe {
+        let process = OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid);
+        !process.is_null() && {
+            let ended = TerminateProcess(process, 0) != 0;
+            if ended {
                 WaitForSingleObject(process, 5000);
-            } else {
-                stopped = false;
             }
             CloseHandle(process);
+            ended
         }
-    }
+    };
     if !stopped {
         let _ = error_box(
             "gitstat couldn't quit the gitstat that is running. Quit it from its \

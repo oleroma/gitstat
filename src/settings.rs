@@ -24,8 +24,14 @@ pub enum Setting {
     Watch,
     Panel,
     Window,
-    IconsOnly,
     Overlay,
+    FloatHealth,
+    FloatPrs,
+    FloatCards,
+    FloatOnCommit,
+    FloatOnBranch,
+    FloatOnPr,
+    FloatOnChanges,
     OverlayHideSynced,
     OverlayHideFullscreen,
     FolderIcons,
@@ -33,6 +39,7 @@ pub enum Setting {
     GithubRepos,
     ScrollTogether,
     FlipAnimation,
+    RecordFrames,
     NotifyReview,
     NotifyChecks,
     NotifyBehind,
@@ -47,7 +54,13 @@ impl Setting {
             Setting::Watch => cfg.watch,
             Setting::Panel => cfg.panel,
             Setting::Window => cfg.window,
-            Setting::IconsOnly => cfg.icons_only,
+            Setting::FloatHealth => cfg.float.health,
+            Setting::FloatPrs => cfg.float.prs,
+            Setting::FloatCards => cfg.float.cards,
+            Setting::FloatOnCommit => cfg.float.on_commit,
+            Setting::FloatOnBranch => cfg.float.on_branch,
+            Setting::FloatOnPr => cfg.float.on_pr,
+            Setting::FloatOnChanges => cfg.float.on_changes,
             Setting::Overlay => cfg.overlay.enabled,
             Setting::OverlayHideSynced => cfg.overlay.hide_when_synced,
             Setting::OverlayHideFullscreen => cfg.overlay.hide_in_fullscreen,
@@ -56,6 +69,7 @@ impl Setting {
             Setting::GithubRepos => cfg.github_repos,
             Setting::ScrollTogether => cfg.scroll_together,
             Setting::FlipAnimation => cfg.flip_animation,
+            Setting::RecordFrames => cfg.record_frames,
             Setting::NotifyReview => cfg.notify.review_requested,
             Setting::NotifyChecks => cfg.notify.checks_failed,
             Setting::NotifyBehind => cfg.notify.behind,
@@ -70,7 +84,13 @@ impl Setting {
             Setting::Watch => &mut cfg.watch,
             Setting::Panel => &mut cfg.panel,
             Setting::Window => &mut cfg.window,
-            Setting::IconsOnly => &mut cfg.icons_only,
+            Setting::FloatHealth => &mut cfg.float.health,
+            Setting::FloatPrs => &mut cfg.float.prs,
+            Setting::FloatCards => &mut cfg.float.cards,
+            Setting::FloatOnCommit => &mut cfg.float.on_commit,
+            Setting::FloatOnBranch => &mut cfg.float.on_branch,
+            Setting::FloatOnPr => &mut cfg.float.on_pr,
+            Setting::FloatOnChanges => &mut cfg.float.on_changes,
             Setting::Overlay => &mut cfg.overlay.enabled,
             Setting::OverlayHideSynced => &mut cfg.overlay.hide_when_synced,
             Setting::OverlayHideFullscreen => &mut cfg.overlay.hide_in_fullscreen,
@@ -79,6 +99,7 @@ impl Setting {
             Setting::GithubRepos => &mut cfg.github_repos,
             Setting::ScrollTogether => &mut cfg.scroll_together,
             Setting::FlipAnimation => &mut cfg.flip_animation,
+            Setting::RecordFrames => &mut cfg.record_frames,
             Setting::NotifyReview => &mut cfg.notify.review_requested,
             Setting::NotifyChecks => &mut cfg.notify.checks_failed,
             Setting::NotifyBehind => &mut cfg.notify.behind,
@@ -98,14 +119,16 @@ enum Page {
     Badges,
     FolderIcons,
     Github,
+    Diagnostics,
 }
 
-const PAGES: [(Page, &str, &str); 5] = [
+const PAGES: [(Page, &str, &str); 6] = [
     (Page::General, "⚙", "General"),
     (Page::Views, "▤", "Status views"),
     (Page::Badges, "◉", "Icon and badge"),
     (Page::FolderIcons, "▣", "Folder icons"),
     (Page::Github, "⑂", "GitHub"),
+    (Page::Diagnostics, "⚑", "Diagnostics"),
 ];
 
 const SORTS: [(RepoSort, &str, &str); 7] = [
@@ -355,6 +378,7 @@ impl Render for SettingsView {
             Page::Badges => ("Icon and badge", badges(&cfg, &p)),
             Page::FolderIcons => ("Folder icons", folder_icons(&cfg, &p)),
             Page::Github => ("GitHub", github(&cfg, github_problem.as_deref(), &p)),
+            Page::Diagnostics => ("Diagnostics", diagnostics(&cfg, &p)),
         };
         let content = div()
             .id("content")
@@ -395,10 +419,11 @@ impl Render for SettingsView {
 
 impl SettingsView {
     fn general(&self, cfg: &Config, p: &Palette) -> Vec<AnyElement> {
+        let fates = cfg.folders();
         let mut folders: Vec<AnyElement> = std::iter::once(&cfg.path)
             .chain(&cfg.more_paths)
             .enumerate()
-            .map(|(i, path)| folder_row(i, path, p))
+            .map(|(i, path)| folder_row(i, path, fates.get(i), p))
             .collect();
         folders.push(
             row_base()
@@ -488,6 +513,50 @@ impl SettingsView {
     }
 }
 
+/// Tools for looking into how gitstat behaves, all off by default.
+fn diagnostics(cfg: &Config, p: &Palette) -> Vec<AnyElement> {
+    let folder = cfg.frames_folder();
+    let shown = folder.display().to_string();
+    vec![group_with_note(
+        "Animations",
+        "For checking the flip and the panel's slide frame by frame.",
+        vec![
+            flag(
+                "record-frames",
+                "Record frames",
+                "Each flip and slide saves every frame of the screen under it as \
+                 pictures. Grabbing the screen slows the animations a little while on.",
+                Setting::RecordFrames,
+                true,
+                cfg,
+                p,
+            ),
+            row_base()
+                .child(row_text("Recordings folder", shown, p))
+                .child(
+                    text_button("open-frames", "Open", p).on_click(move |_, _, cx| {
+                        let _ = std::fs::create_dir_all(&folder);
+                        cx.open_with_system(&folder);
+                    }),
+                )
+                .into_any_element(),
+            row_base()
+                .child(row_text(
+                    "Measure",
+                    "Opens two test windows for about fifteen seconds and writes what it \
+                     measured (window swaps, drawing speed) into the recordings folder. \
+                     Leave the mouse and the screen under them alone meanwhile.",
+                    p,
+                ))
+                .child(
+                    text_button("run-probes", "Run", p).on_click(|_, _, cx| crate::probe::run(cx)),
+                )
+                .into_any_element(),
+        ],
+        p,
+    )]
+}
+
 fn views(cfg: &Config, p: &Palette) -> Vec<AnyElement> {
     let sorts = SORTS
         .iter()
@@ -521,15 +590,6 @@ fn views(cfg: &Config, p: &Palette) -> Vec<AnyElement> {
                     "Status window",
                     "A normal window with every repo's history side by side.",
                     Setting::Window,
-                    true,
-                    cfg,
-                    p,
-                ),
-                flag(
-                    "icons-only",
-                    "Icons only",
-                    "The panel and the badge show pictures only; the words move to tooltips.",
-                    Setting::IconsOnly,
                     true,
                     cfg,
                     p,
@@ -642,6 +702,21 @@ fn badges(cfg: &Config, p: &Palette) -> Vec<AnyElement> {
         })
         .collect();
     let on = cfg.overlay.enabled;
+    let days = if cfg.float_recent_secs().is_some() {
+        cfg.float.recent_days
+    } else {
+        0.0
+    };
+    let auto = on && days > 0.0;
+    let recent = [
+        (0.0, "Off"),
+        (1.0, "1 day"),
+        (3.0, "3 days"),
+        (7.0, "A week"),
+    ]
+    .into_iter()
+    .map(|(d, label)| (label, d == days, TrayAction::SetFloatRecent(d)))
+    .collect();
     let corners = CORNERS
         .iter()
         .map(|&(c, label)| (label, c == cfg.overlay.corner, TrayAction::SetCorner(c)))
@@ -714,7 +789,7 @@ fn badges(cfg: &Config, p: &Palette) -> Vec<AnyElement> {
                 toggle_row(
                     "overlay",
                     "Show the corner badge",
-                    "A round badge in a corner of the screen. Drag it to move it.",
+                    "A badge in a corner of the screen. Drag it to move it.",
                     on,
                     true,
                     TrayAction::Toggle(Setting::Overlay),
@@ -741,6 +816,112 @@ fn badges(cfg: &Config, p: &Palette) -> Vec<AnyElement> {
                     "Hide in fullscreen",
                     "While a fullscreen app or game is in front.",
                     Setting::OverlayHideFullscreen,
+                    on,
+                    cfg,
+                    p,
+                ),
+            ],
+            p,
+        ),
+        group_with_note(
+            "Floating view",
+            "Right-click the badge and it grows into a small view that stays on top: a row \
+             per repo, its tree and its icon. It lists the repos you pin from their menu and \
+             the ones something new happened in lately. Right-click it again and it is the badge.",
+            vec![
+                setting_row(
+                    "Corners",
+                    "Of the badge and the view, from square to round.",
+                    slider(
+                        1,
+                        cfg.overlay_radius(),
+                        (0.0, cfg.overlay_size() / 2.0, 1.0),
+                        on,
+                        TrayAction::SetOverlayRadius,
+                        p,
+                    ),
+                    p,
+                ),
+                setting_row(
+                    "Background",
+                    "From see-through to solid.",
+                    slider(
+                        2,
+                        cfg.float_opacity(),
+                        (0.2, 1.0, 0.05),
+                        on,
+                        TrayAction::SetFloatOpacity,
+                        p,
+                    ),
+                    p,
+                ),
+                setting_row(
+                    "Active repos",
+                    "Something new in a repo brings it in, after the pinned ones, the latest \
+                     first, for this long. Middle-click one and it stays out until something \
+                     new happens in it again.",
+                    segmented("float-recent", recent, on, p),
+                    p,
+                ),
+                flag(
+                    "float-on-commit",
+                    "New commits",
+                    "A commit on any branch, yours or fetched, or a checkout.",
+                    Setting::FloatOnCommit,
+                    auto,
+                    cfg,
+                    p,
+                ),
+                flag(
+                    "float-on-branch",
+                    "New branches",
+                    "A branch made here, or one a fetch brings in.",
+                    Setting::FloatOnBranch,
+                    auto,
+                    cfg,
+                    p,
+                ),
+                flag(
+                    "float-on-pr",
+                    "New pull requests",
+                    "One opened on its GitHub repo.",
+                    Setting::FloatOnPr,
+                    auto && cfg.github_prs,
+                    cfg,
+                    p,
+                ),
+                flag(
+                    "float-on-changes",
+                    "Local changes",
+                    "Files in it start to change.",
+                    Setting::FloatOnChanges,
+                    auto,
+                    cfg,
+                    p,
+                ),
+                flag(
+                    "float-health",
+                    "Health bar",
+                    "Along its top: how many repos are synced, need you, or have a problem.",
+                    Setting::FloatHealth,
+                    on,
+                    cfg,
+                    p,
+                ),
+                flag(
+                    "float-prs",
+                    "Pull requests",
+                    "Along its bottom: a mark per open pull request.",
+                    Setting::FloatPrs,
+                    on && cfg.github_prs,
+                    cfg,
+                    p,
+                ),
+                flag(
+                    "float-cards",
+                    "Commit cards",
+                    "A commit's card when the mouse rests on its dot, as in the panel.",
+                    Setting::FloatCards,
                     on,
                     cfg,
                     p,
@@ -844,8 +1025,16 @@ fn github(cfg: &Config, problem: Option<&str>, p: &Palette) -> Vec<AnyElement> {
 }
 
 /// Opens a folder picker; the folder replaces entry `replace` of the
-/// folder list (0 is `path`), or is added to it.
+/// folder list (0 is `path`), or is added to it. The entry is found again
+/// by its value once the dialog closes: the list may have changed meanwhile.
 fn pick_folder(replace: Option<usize>, cx: &mut App) {
+    let replace = replace.and_then(|i| {
+        let cfg = &cx.global::<Ui>().state.read(cx).config;
+        std::iter::once(&cfg.path)
+            .chain(&cfg.more_paths)
+            .nth(i)
+            .map(|old| (i, old.clone()))
+    });
     let picked = cx.prompt_for_paths(PathPromptOptions {
         files: false,
         directories: true,
@@ -863,6 +1052,15 @@ fn pick_folder(replace: Option<usize>, cx: &mut App) {
         let dir = dir.to_string_lossy().replace('\\', "/");
         cx.update(|cx| {
             let cfg = cx.global::<Ui>().state.read(cx).config.clone();
+            // The entry's place now, if it is still listed; else the folder is added.
+            let replace = replace.and_then(|(i, old)| {
+                let now: Vec<&String> = std::iter::once(&cfg.path).chain(&cfg.more_paths).collect();
+                if now.get(i) == Some(&&old) {
+                    Some(i)
+                } else {
+                    now.iter().position(|f| **f == old)
+                }
+            });
             if let Some(folders) = with_folder(&cfg, replace, dir) {
                 send(TrayAction::SetFolders(folders.0, folders.1), cx);
             }
@@ -1042,6 +1240,96 @@ fn toggle_row(
         .into_any_element()
 }
 
+/// The slider the mouse has hold of, by its id; 0 for none.
+static SLIDING: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// A slider from `min` to `max` in whole `step`s. A press on it, and a
+/// drag from there, send what `action` makes of the value under the mouse.
+fn slider(
+    id: u32,
+    value: f32,
+    (min, max, step): (f32, f32, f32),
+    enabled: bool,
+    action: fn(f32) -> TrayAction,
+    p: &Palette,
+) -> AnyElement {
+    use gpui::{DispatchPhase, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent};
+    use std::sync::atomic::Ordering;
+    let dim = if enabled { 1.0 } else { 0.45 };
+    let (track, filled, knob) = (
+        p.border.opacity(dim),
+        p.button.opacity(dim),
+        p.text.opacity(dim),
+    );
+    let span = (max - min).max(f32::EPSILON);
+    let share = ((value - min) / span).clamp(0.0, 1.0);
+    gpui::canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let (h, d) = (px(4.), px(12.));
+            let top = bounds.origin.y + (bounds.size.height - h) / 2.;
+            let run = bounds.size.width - d;
+            let line = |from: gpui::Pixels, w: gpui::Pixels, color| {
+                gpui::fill(Bounds::new(point(from, top), size(w, h)), color).corner_radii(px(2.))
+            };
+            window.paint_quad(line(bounds.origin.x, bounds.size.width, track));
+            window.paint_quad(line(bounds.origin.x, run * share + d / 2., filled));
+            window.paint_quad(
+                gpui::fill(
+                    Bounds::new(
+                        point(
+                            bounds.origin.x + run * share,
+                            bounds.origin.y + (bounds.size.height - d) / 2.,
+                        ),
+                        size(d, d),
+                    ),
+                    knob,
+                )
+                .corner_radii(d / 2.),
+            );
+            if !enabled {
+                return;
+            }
+            let pick = move |x: gpui::Pixels, cx: &mut App| {
+                let t = (f32::from(x - bounds.origin.x - d / 2.) / f32::from(run).max(1.0))
+                    .clamp(0.0, 1.0);
+                let v = (min + (t * span / step).round() * step).clamp(min, max);
+                if (v - value).abs() > step / 4.0 {
+                    send(action(v), cx);
+                }
+            };
+            window.on_mouse_event(move |e: &MouseDownEvent, phase, _, cx| {
+                if phase == DispatchPhase::Bubble
+                    && e.button == MouseButton::Left
+                    && bounds.contains(&e.position)
+                {
+                    SLIDING.store(id, Ordering::Relaxed);
+                    pick(e.position.x, cx);
+                }
+            });
+            window.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
+                if phase != DispatchPhase::Bubble || SLIDING.load(Ordering::Relaxed) != id {
+                    return;
+                }
+                if e.pressed_button == Some(MouseButton::Left) {
+                    pick(e.position.x, cx);
+                } else {
+                    SLIDING.store(0, Ordering::Relaxed);
+                }
+            });
+            window.on_mouse_event(move |e: &MouseUpEvent, phase, _, _| {
+                if phase == DispatchPhase::Bubble && e.button == MouseButton::Left {
+                    SLIDING.store(0, Ordering::Relaxed);
+                }
+            });
+        },
+    )
+    .flex_none()
+    .w(px(160.))
+    .h(px(20.))
+    .into_any_element()
+}
+
 fn switch(on: bool, p: &Palette) -> Div {
     div()
         .flex()
@@ -1212,8 +1500,21 @@ fn text_button(
 }
 
 /// Folder `i` of the list (0 is `path`), with its buttons.
-fn folder_row(i: usize, path: &str, p: &Palette) -> AnyElement {
-    let desc = if i == 0 { "Main folder" } else { "" };
+fn folder_row(
+    i: usize,
+    path: &str,
+    fate: Option<&crate::config::Folder>,
+    p: &Palette,
+) -> AnyElement {
+    use crate::config::Folder;
+    // A folder another one already covers is never looked in on its own.
+    let desc = match fate {
+        Some(Folder::Overlaps(earlier)) => {
+            format!("Not looked in: {} already covers it", earlier.display())
+        }
+        _ if i == 0 => "Main folder".to_string(),
+        _ => String::new(),
+    };
     let shown = if path.trim().is_empty() {
         "(none)".to_string()
     } else {
@@ -1265,7 +1566,13 @@ mod tests {
             Setting::Watch,
             Setting::Panel,
             Setting::Window,
-            Setting::IconsOnly,
+            Setting::FloatHealth,
+            Setting::FloatPrs,
+            Setting::FloatCards,
+            Setting::FloatOnCommit,
+            Setting::FloatOnBranch,
+            Setting::FloatOnPr,
+            Setting::FloatOnChanges,
             Setting::Overlay,
             Setting::OverlayHideSynced,
             Setting::OverlayHideFullscreen,

@@ -11,10 +11,10 @@
 
 mod column;
 pub(crate) mod ink;
-mod morph;
+mod turn;
 
-pub use column::COLUMN_WIDTH;
-pub use morph::{Ends, paint_tree};
+pub use column::{COLUMN_WIDTH, row_lines};
+pub use turn::{Turning, paint_turning, turned};
 
 use crate::git::RepoStatus;
 use crate::graph::{self, Class, PrColors, PrState, Seg};
@@ -34,15 +34,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// A strip's height; the panel's row height in `layout`.
-pub const STRIP_HEIGHT: f32 = 36.0;
-/// The label column at the strip's right.
-pub const LABEL_WIDTH: f32 = 168.0;
-/// The label column in icons-only mode: the repo's icon alone.
-pub const ICON_LABEL_WIDTH: f32 = 40.0;
-/// A repo icon beside its name, and alone in icons-only mode; logical px.
-const MARK: f32 = 16.0;
-const ICON_MARK: f32 = 22.0;
 /// Px between commits along a strip.
 const STEP: f32 = 14.0;
 /// Px between lanes across a strip.
@@ -53,7 +44,7 @@ const LANE: f32 = 5.0;
 const LANES: usize = 5;
 /// Px a strip may paint past its top and bottom, into its neighbours'
 /// empty margins, so nothing near its edge is cut flat.
-const BLEED: f32 = 6.0;
+pub const BLEED: f32 = 6.0;
 const DOT: f32 = 3.0;
 const DOT_HOVER: f32 = 4.5;
 const STROKE: f32 = 1.5;
@@ -61,8 +52,6 @@ const STROKE: f32 = 1.5;
 const BAND: f32 = 7.0;
 /// Px from the strip's right edge to HEAD.
 const PAD: f32 = 12.0;
-/// `PAD`, for the flip: the newest row's distance from a strip's right edge.
-pub const STRIP_PAD: f32 = PAD;
 /// The tail fades out over this many px at the left edge.
 const FADE: f32 = 24.0;
 /// A dot is hit within this many px.
@@ -83,6 +72,41 @@ const GLIDE: Duration = Duration::from_millis(140);
 const GROW: Duration = Duration::from_millis(110);
 /// A card fades in over this long.
 const CARD_FADE: Duration = Duration::from_millis(120);
+/// How long a card stays once the mouse is off its dot, for the mouse to
+/// get onto it.
+const CARD_GRACE: Duration = Duration::from_millis(350);
+
+/// Where the card that shows is on the screen, physical px, as last laid
+/// out; and in which window.
+#[derive(Default)]
+struct CardRect(Option<(i32, i32, i32, i32)>);
+
+impl gpui::Global for CardRect {}
+
+/// The mouse is on the card that shows.
+fn card_holds_mouse(cx: &App) -> bool {
+    if on_float_tip(cx) {
+        return true;
+    }
+    let Some(CardRect(Some((l, t, r, b)))) = cx.try_global::<CardRect>() else {
+        return false;
+    };
+    let (x, y) = crate::win::cursor_pos();
+    x >= *l && x < *r && y >= *t && y < *b
+}
+
+/// The mouse is on the floating view's card, as its window drew it.
+#[cfg(windows)]
+fn on_float_tip(cx: &App) -> bool {
+    crate::float_tip::holds_mouse(cx)
+}
+
+#[cfg(not(windows))]
+fn on_float_tip(_: &App) -> bool {
+    false
+}
+/// How long a failed page of older history waits before it is asked again.
+const MORE_RETRY: Duration = Duration::from_secs(10);
 
 #[derive(Default)]
 struct Slot {
@@ -96,25 +120,27 @@ struct Slot {
     /// A reload is queued or running.
     loading: bool,
     loading_more: bool,
+    /// When a page of older history last failed: the next waits a while.
+    more_failed: Option<Instant>,
     /// Px the strip is scrolled into the past from the newest row; HEAD's
     /// row, `RepoGraph::home`, is where it rests.
     scroll: f32,
     /// Where the strip was shown when the wheel last moved it, and when:
     /// it glides from there to `scroll`.
-    glide: Option<(f32, Instant)>,
+    glide: Option<(f32, Instant, Duration)>,
     /// Big mode's column scrolls on its own, apart from the strip: the row
     /// at its top, 0 for the newest.
     top: f32,
     /// Like `glide`, for `top`.
-    top_glide: Option<(f32, Instant)>,
+    top_glide: Option<(f32, Instant, Duration)>,
 }
 
 /// Where a glide from `glide` to `to` is at `now`, and whether it is still
 /// going.
-fn glided(to: f32, glide: Option<(f32, Instant)>, now: Instant) -> (f32, bool) {
+fn glided(to: f32, glide: Option<(f32, Instant, Duration)>, now: Instant) -> (f32, bool) {
     match glide {
-        Some((from, start)) => {
-            let t = progress(start, now, GLIDE);
+        Some((from, start, over)) => {
+            let t = progress(start, now, over);
             (from + (to - from) * t, t < 1.0)
         }
         None => (to, false),
@@ -130,8 +156,14 @@ impl Slot {
 
     /// Moves the scroll to `to`, gliding from wherever it shows now.
     fn glide_to(&mut self, to: f32, now: Instant) {
+        self.glide_over(to, now, GLIDE);
+    }
+
+    /// Moves the scroll to `to` over `over`, gliding from wherever it
+    /// shows now.
+    fn glide_over(&mut self, to: f32, now: Instant, over: Duration) {
         let (shown, _) = self.shown_scroll(now);
-        self.glide = Some((shown, now));
+        self.glide = Some((shown, now, over));
         self.scroll = to;
     }
 
@@ -142,8 +174,12 @@ impl Slot {
 
     /// Moves the column's top to `to`, gliding from wherever it shows now.
     fn glide_top_to(&mut self, to: f32, now: Instant) {
+        self.glide_top_over(to, now, GLIDE);
+    }
+
+    fn glide_top_over(&mut self, to: f32, now: Instant, over: Duration) {
         let (shown, _) = self.shown_top(now);
-        self.top_glide = Some((shown, now));
+        self.top_glide = Some((shown, now, over));
         self.top = to;
     }
 }
@@ -203,6 +239,8 @@ pub struct Hover {
     /// The tree was dirty: a change moves every dot a step, and the WIP dot
     /// comes or goes, so the hover holds only while it doesn't.
     pub dirty: bool,
+    /// The window it is in: only that one shows its card.
+    pub window: Option<isize>,
 }
 
 /// What a queued load reads.
@@ -241,6 +279,9 @@ pub struct Timelines {
     card_shown: u64,
     /// Bumped on every hover change, so an older card timer does nothing.
     hover_generation: u64,
+    /// The mouse went off the hovered dot while its card showed: the card
+    /// waits a moment for it.
+    letting_go: bool,
     /// The commit whose id was just copied, flashed until its timer ends.
     copied: Option<(PathBuf, usize)>,
     copied_generation: u64,
@@ -262,7 +303,37 @@ pub struct Timelines {
     messages_pending: HashSet<String>,
 }
 
+/// A repo's strip in the panel ([`Timelines::strip`]).
+pub struct Strip {
+    /// Its tree, as big as the row's graph box.
+    pub graph: AnyElement,
+    /// Where the mouse finds its label, as big as that.
+    pub label: AnyElement,
+    /// Its label's second line: what is checked out, and how it stands.
+    pub checkout: String,
+    pub status: String,
+}
+
+/// How many commits' line stats and messages are kept: past that, the
+/// cache starts over, and the rows in view ask again.
+const MAX_STATS: usize = 50_000;
+const MAX_MESSAGES: usize = 2_000;
+
 impl Timelines {
+    fn keep_stat(&mut self, id: String, stat: Stat) {
+        if self.stats.len() >= MAX_STATS {
+            self.stats.clear();
+        }
+        self.stats.insert(id, stat);
+    }
+
+    fn keep_message(&mut self, id: String, message: Arc<str>) {
+        if self.messages.len() >= MAX_MESSAGES {
+            self.messages.clear();
+        }
+        self.messages.insert(id, message);
+    }
+
     pub fn new(state: &Entity<AppState>, cx: &mut Context<Self>) -> Self {
         cx.observe(state, |this, state, cx| this.sync(&state, cx))
             .detach();
@@ -278,6 +349,7 @@ impl Timelines {
             card: false,
             card_shown: 0,
             hover_generation: 0,
+            letting_go: false,
             copied: None,
             copied_generation: 0,
             stats: HashMap::new(),
@@ -291,12 +363,12 @@ impl Timelines {
         }
     }
 
-    /// Whether `path`'s column header shows its details.
     /// A repo's loaded graph, for the flip.
     pub fn graph_of(&self, path: &Path) -> Option<Arc<RepoGraph>> {
         self.slots.get(path)?.graph.clone()
     }
 
+    /// Whether `path`'s column header shows its details.
     pub fn header_open(&self, path: &Path) -> bool {
         self.expanded.contains(path)
     }
@@ -441,6 +513,24 @@ impl Timelines {
         result: Result<Loaded, String>,
         cx: &mut Context<Self>,
     ) {
+        // Never under a flip, or the glide home before one: the trees it
+        // turns stay as it planned them, and the new ones land after.
+        if crate::flip::running(cx) {
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(50))
+                        .await;
+                    if !cx.update(|cx| crate::flip::running(cx)).unwrap_or(false) {
+                        break;
+                    }
+                }
+                this.update(cx, |this, cx| this.landed(path, generation, result, cx))
+                    .ok();
+            })
+            .detach();
+            return;
+        }
         let Some(slot) = self.slots.get_mut(&path) else {
             return;
         };
@@ -470,6 +560,7 @@ impl Timelines {
                 }
                 slot.graph = Some(Arc::new(g));
                 slot.error = None;
+                slot.more_failed = None;
                 if self.hover.as_ref().is_some_and(|h| h.repo == path) {
                     self.unhover();
                 }
@@ -487,6 +578,16 @@ impl Timelines {
                 }
             }
             Ok(Loaded::Page(More::Reload)) => self.reload(path, cx),
+            // A repo with a graph keeps it, and its status label: a page
+            // of older history that failed (or a reload) is no reason to
+            // call the whole history unreadable.
+            Err(_) if slot.graph.is_some() => {
+                if slot.loading_more && !slot.loading {
+                    slot.more_failed = Some(Instant::now());
+                }
+                slot.loading = false;
+                slot.loading_more = false;
+            }
             Err(e) => {
                 slot.loading = false;
                 slot.loading_more = false;
@@ -505,6 +606,9 @@ impl Timelines {
         };
         // A reload under way would land under the page, or the page on it.
         if slot.loading || slot.loading_more || graph.end {
+            return;
+        }
+        if slot.more_failed.is_some_and(|at| at.elapsed() < MORE_RETRY) {
             return;
         }
         slot.loading_more = true;
@@ -537,7 +641,25 @@ impl Timelines {
         cx.notify();
     }
 
+    /// No dot is hovered any more, and its card goes: the view under the
+    /// mouse is moving away.
+    pub fn drop_hover(&mut self, cx: &mut Context<Self>) {
+        if self.hover.is_some() {
+            self.unhover();
+            cx.notify();
+        }
+    }
+
+    /// No dot of `window` is hovered any more: the mouse left it.
+    pub fn drop_hover_in(&mut self, window: Option<isize>, cx: &mut Context<Self>) {
+        if self.hover.as_ref().is_some_and(|h| h.window == window) {
+            self.unhover();
+            cx.notify();
+        }
+    }
+
     fn unhover(&mut self) {
+        self.letting_go = false;
         self.leave(Instant::now());
         self.hover = None;
         self.card = false;
@@ -558,7 +680,51 @@ impl Timelines {
         cx.notify();
     }
 
-    fn scroll_home(&mut self, path: &Path, cx: &mut Context<Self>) {
+    /// Whether any strip or column is gliding now.
+    pub fn gliding(&self) -> bool {
+        let now = Instant::now();
+        self.slots
+            .values()
+            .any(|s| s.shown_scroll(now).1 || s.shown_top(now).1)
+    }
+
+    /// Every strip and column scrolls back to its newest commits over
+    /// `over`, as the flip starts from them: true when any had to, false
+    /// when all are there already.
+    pub fn glide_newest(&mut self, over: Duration, cx: &mut Context<Self>) -> bool {
+        let now = Instant::now();
+        let mut moving = false;
+        for slot in self.slots.values_mut() {
+            if slot.shown_scroll(now).0.abs() > 0.5 {
+                slot.glide_over(0.0, now, over);
+                moving = true;
+            } else {
+                slot.scroll = 0.0;
+                slot.glide = None;
+            }
+            if slot.shown_top(now).0.abs() > 0.01 {
+                slot.glide_top_over(0.0, now, over);
+                moving = true;
+            } else {
+                slot.top = 0.0;
+                slot.top_glide = None;
+            }
+        }
+        self.table_top = 0.0;
+        if moving {
+            self.unhover();
+            cx.notify();
+        }
+        moving
+    }
+
+    /// Px `path`'s strip is scrolled into the past, as it will rest: for
+    /// the self-test.
+    pub fn scrolled(&self, path: &Path) -> Option<f32> {
+        self.slots.get(path).map(|s| s.scroll)
+    }
+
+    pub fn scroll_home(&mut self, path: &Path, cx: &mut Context<Self>) {
         if let Some(slot) = self.slots.get_mut(path) {
             let home = slot.graph.as_ref().map_or(0.0, |g| g.home() * STEP);
             slot.glide_to(home, Instant::now());
@@ -596,8 +762,13 @@ impl Timelines {
         path: &Path,
         pos: Point<Pixels>,
         hit: Option<(Dot, Point<Pixels>, bool, bool)>,
+        window: Option<isize>,
         cx: &mut Context<Self>,
     ) {
+        // On the card that shows, the dots it covers are out of reach.
+        if self.card && self.hover.is_some() && card_holds_mouse(cx) {
+            return;
+        }
         let new = match hit {
             Some((dot, at, above, dirty)) => Some(Hover {
                 repo: path.to_path_buf(),
@@ -605,6 +776,7 @@ impl Timelines {
                 at,
                 above,
                 dirty,
+                window,
             }),
             // Another strip's hover is not ours to clear.
             None if self.hover.as_ref().is_some_and(|h| h.repo != path) => return,
@@ -616,6 +788,45 @@ impl Timelines {
                     f32::from(h.at.x - pos.x).hypot(f32::from(h.at.y - pos.y)) <= HIT
                 }) =>
             {
+                return;
+            }
+            // Off a dot whose card shows: the mouse may be on its way to
+            // the card, which stays a moment for it to get there, and for
+            // as long as it is on it.
+            None if self.card && self.hover.is_some() => {
+                if !self.letting_go {
+                    self.letting_go = true;
+                    let held = self.hover.clone();
+                    let timer = cx.background_executor().timer(CARD_GRACE);
+                    cx.spawn(async move |this, cx| {
+                        timer.await;
+                        let mut wait = Duration::from_millis(40);
+                        loop {
+                            let on_card = cx.update(|cx| card_holds_mouse(cx)).unwrap_or(false);
+                            let again = this
+                                .update(cx, |this, cx| {
+                                    if this.hover != held {
+                                        this.letting_go = false;
+                                        return false;
+                                    }
+                                    if on_card {
+                                        return true;
+                                    }
+                                    this.letting_go = false;
+                                    this.unhover();
+                                    cx.notify();
+                                    false
+                                })
+                                .unwrap_or(false);
+                            if !again {
+                                break;
+                            }
+                            cx.background_executor().timer(wait).await;
+                            wait = Duration::from_millis(40);
+                        }
+                    })
+                    .detach();
+                }
                 return;
             }
             None => None,
@@ -632,6 +843,7 @@ impl Timelines {
             self.request_hovered_stat(new.as_ref(), cx);
         }
         let now = Instant::now();
+        self.letting_go = false;
         self.leave(now);
         self.hover_since = now;
         self.hover = new;
@@ -710,7 +922,7 @@ impl Timelines {
             this.update(cx, |this, cx| {
                 this.messages_pending.remove(&id);
                 if let Ok(message) = result {
-                    this.messages.insert(id, message.into());
+                    this.keep_message(id, message.into());
                     cx.notify();
                 }
             })
@@ -738,7 +950,7 @@ impl Timelines {
             this.update(cx, |this, cx| {
                 this.stats_pending.remove(&id);
                 if let Ok(stat) = result {
-                    this.stats.insert(id, stat);
+                    this.keep_stat(id, stat);
                     cx.notify();
                 }
             })
@@ -752,16 +964,22 @@ impl Timelines {
         Some(g.commits.get(row)?.id.clone())
     }
 
-    /// One repo's strip: the graph, then the name, checkout and status.
+    /// One repo's strip in the panel: what lies under its row's parts (its
+    /// tree, and where the mouse finds its label), and its label's words
+    /// for the scene to draw. `float`, it is the floating view's: that
+    /// window is no bigger than the view, so it says what the mouse rests
+    /// on itself, and a click opens the big window through the panel.
+    #[allow(clippy::too_many_arguments)]
     pub fn strip(
         this: &Entity<Timelines>,
         index: usize,
         status: &RepoStatus,
         p: &Palette,
         dark: bool,
-        icons_only: bool,
+        tree: bool,
+        float: bool,
         cx: &App,
-    ) -> AnyElement {
+    ) -> Strip {
         let t = this.read(cx);
         let path = status.path.clone();
         let slot = t.slots.get(&path);
@@ -804,10 +1022,6 @@ impl Timelines {
                 window.insert_hitbox(bounds, HitboxBehavior::Normal)
             },
             move |bounds, hitbox, window, _cx| {
-                // Where the flip starts this repo's tree, if it's in view.
-                if window.content_mask().bounds.intersects(&bounds) {
-                    crate::morph::seen_strip(&paint_path, bounds);
-                }
                 let Some(g) = graph else { return };
                 if moving {
                     window.request_animation_frame();
@@ -817,10 +1031,31 @@ impl Timelines {
                     size(bounds.size.width, bounds.size.height + px(2.0 * BLEED)),
                 );
                 let dots = window.with_content_mask(Some(ContentMask { bounds: mask }), |window| {
-                    paint_strip(bounds, &g, scroll, grow, copied, dirty, &colors, window)
+                    paint_strip(
+                        bounds,
+                        &g,
+                        scroll,
+                        grow,
+                        copied,
+                        dirty,
+                        (tree, true),
+                        &colors,
+                        window,
+                    )
                 });
-                fade(bounds, surface, window);
+                let (older, newer) = strip_hidden(bounds, &g, scroll, dirty, window);
+                fade(bounds, surface, (older, newer), window);
+                if !tree {
+                    return;
+                }
 
+                // Only dots that show can be hovered: not ones past the
+                // strip's ends, nor ones the list clips away.
+                let shown = window.content_mask().bounds.intersect(&mask);
+                let dots: Vec<_> = dots
+                    .into_iter()
+                    .filter(|(at, _)| shown.contains(at))
+                    .collect();
                 let (e1, e2) = (entity.clone(), entity);
                 let (path1, path2) = (paint_path.clone(), paint_path);
                 let dots = Arc::new(dots);
@@ -841,15 +1076,21 @@ impl Timelines {
                     if phase != DispatchPhase::Bubble {
                         return;
                     }
-                    let found = hitbox
-                        .is_hovered(window)
+                    // Not while the panel slides away under the mouse.
+                    let found = (hitbox.is_hovered(window) && !crate::panel::is_leaving(cx))
                         .then(|| nearest(&dots, e.position))
                         .flatten()
                         .map(|(dot, at)| {
                             let above = at.y > window.viewport_size().height / 2.0;
                             (dot, at, above, dirty)
                         });
-                    e1.update(cx, |t, cx| t.hover_at(&path1, e.position, found, cx));
+                    // On the floating view's card, over the tree: the
+                    // card holds.
+                    if crate::float_tip::holds_event(e.position, window, cx) {
+                        return;
+                    }
+                    let win = crate::win::hwnd(window);
+                    e1.update(cx, |t, cx| t.hover_at(&path1, e.position, found, win, cx));
                 });
                 window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
                     if phase != DispatchPhase::Bubble
@@ -879,238 +1120,154 @@ impl Timelines {
             },
         )
         .size_full();
-        let painter = div()
-            .id(("strip-graph", index))
-            .flex_1()
-            .h_full()
-            .child(painter);
 
         let entity = this.clone();
-        let this_for_label = this.clone();
         let wheel_path = path.clone();
+        // A plain wheel scrolls the panel's list, anywhere on the strip.
+        // Shift+wheel, which Windows sends sideways, scrolls every strip
+        // through time; a sideways swipe or tilt scrolls this one. Up or
+        // left goes back in time.
+        let wheel = std::rc::Rc::new(move |e: &ScrollWheelEvent, cx: &mut App| {
+            let d = e.delta.pixel_delta(px(STEP * 3.0));
+            let (x, y) = (f32::from(d.x), f32::from(d.y));
+            let (dx, all) = if e.modifiers.shift {
+                (if x != 0.0 { x } else { y }, true)
+            } else if x.abs() > y.abs() {
+                (x, false)
+            } else if float {
+                // The floating view's trees each go their own way, with
+                // the plain wheel too.
+                (y, false)
+            } else {
+                // The strips move under the mouse, and no mouse move
+                // follows to say so: the hover and its card go.
+                entity.update(cx, |t, cx| {
+                    if t.hover.is_some() {
+                        t.unhover();
+                        cx.notify();
+                    }
+                });
+                return;
+            };
+            // The list would read a sideways delta as a vertical one.
+            cx.stop_propagation();
+            entity.update(cx, |t, cx| t.scroll(&wheel_path, dx, all, cx));
+        });
+        let on_graph = wheel.clone();
+        let graph_slot = div()
+            .id(("strip-graph", index))
+            .size_full()
+            .on_scroll_wheel(move |e: &ScrollWheelEvent, _, cx| on_graph(e, cx))
+            .child(painter)
+            .into_any_element();
+
+        let this_for_label = this.clone();
         let open_path = path.clone();
         let status_text = match &error {
             Some(_) if status.error.is_none() => "history unreadable".to_string(),
             _ => status.label(),
         };
+        // Its icon and words are the scene's parts, drawn over this: here
+        // only where the mouse finds them, and what it says when it rests.
+        let mut lines = vec![(status.name.clone(), p.text)];
+        if float {
+            lines.push((checkout.clone(), p.muted));
+        }
+        lines.push((status_text.clone(), status_color));
+        lines.extend(crate::view::status_details(status, p));
+        // In the floating view the view itself handles an icon's clicks
+        // (it is dragged by it too) and the wheel over it, which scrolls
+        // its rows.
         let label = div()
             .id(("label", index))
-            .flex()
-            .items_center()
-            .flex_none()
-            .h_full()
+            .size_full()
             .cursor_pointer()
             .hover(|s| s.bg(p.hover))
-            // Big mode, scrolled to this repo's column; the folder when the
-            // window is turned off.
-            .on_mouse_down(gpui::MouseButton::Right, {
+            .when(!float, |d| {
                 let status = status.clone();
-                move |_, window, cx| {
-                    cx.stop_propagation();
-                    crate::repo_menu::show(&status, window, cx);
-                }
-            })
-            .on_click(move |_, window, cx| {
-                let big = this_for_label.read(cx).state.read(cx).config.window;
-                if big {
-                    crate::morph::open_window(window, Some(open_path.clone()), cx);
-                } else {
-                    crate::panel::dismiss(window, cx);
-                    crate::view::open_repo(&open_path, cx);
-                }
-            });
-        let label = if icons_only {
-            // The icon alone; its words in a tooltip.
-            let mut lines = vec![
-                (status.name.clone(), p.text),
-                (checkout, p.muted),
-                (status_text, status_color),
-            ];
-            lines.extend(crate::view::status_details(status, p));
-            label
-                .justify_center()
-                .w(px(ICON_LABEL_WIDTH))
-                .tooltip(crate::view::tip(lines, p))
-                .child(
-                    div()
-                        .relative()
-                        .flex_none()
-                        .child(crate::repo_marks::global_mark(
-                            status,
-                            ICON_MARK,
-                            status_color,
-                            cx,
-                        ))
-                        .child(crate::morph::tag(
-                            crate::morph::Side::Panel,
-                            &status.path,
-                            crate::morph::Part::Icon,
-                            None,
-                        )),
-                )
-        } else {
-            let mut lines = vec![
-                (status.name.clone(), p.text),
-                (status_text.clone(), status_color),
-            ];
-            lines.extend(crate::view::status_details(status, p));
-            label
-                .tooltip(crate::view::tip(lines, p))
-                .gap_2()
-                .w(px(LABEL_WIDTH))
-                .pl_2()
-                .pr_4()
-                .child(
-                    div()
-                        .relative()
-                        .flex_none()
-                        .child(crate::repo_marks::global_mark(
-                            status,
-                            MARK,
-                            status_color,
-                            cx,
-                        ))
-                        .child(crate::morph::tag(
-                            crate::morph::Side::Panel,
-                            &status.path,
-                            crate::morph::Part::Icon,
-                            None,
-                        )),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .justify_center()
-                        .flex_1()
-                        .min_w_0()
-                        .child(
-                            div()
-                                .relative()
-                                .truncate()
-                                .text_sm()
-                                .text_color(p.text)
-                                .child(status.name.clone())
-                                .child(crate::morph::tag(
-                                    crate::morph::Side::Panel,
-                                    &status.path,
-                                    crate::morph::Part::Name,
-                                    Some((
-                                        status.name.clone().into(),
-                                        crate::morph::Look {
-                                            color: p.text,
-                                            size: 14.0,
-                                            bold: false,
-                                        },
-                                    )),
-                                )),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .gap_1()
-                                .text_xs()
-                                .child(
-                                    div()
-                                        .relative()
-                                        .flex_shrink()
-                                        .min_w_0()
-                                        .truncate()
-                                        .text_color(p.muted)
-                                        .child(checkout.clone())
-                                        .child(crate::morph::tag(
-                                            crate::morph::Side::Panel,
-                                            &status.path,
-                                            crate::morph::Part::Checkout,
-                                            Some((
-                                                checkout.into(),
-                                                crate::morph::Look {
-                                                    color: p.muted,
-                                                    size: 12.0,
-                                                    bold: false,
-                                                },
-                                            )),
-                                        )),
-                                )
-                                .child(
-                                    div()
-                                        .relative()
-                                        .flex_none()
-                                        .max_w(px(LABEL_WIDTH * 0.6))
-                                        .truncate()
-                                        .text_color(status_color)
-                                        .child(status_text.clone())
-                                        .child(crate::morph::tag(
-                                            crate::morph::Side::Panel,
-                                            &status.path,
-                                            crate::morph::Part::Status,
-                                            Some((
-                                                status_text.into(),
-                                                crate::morph::Look {
-                                                    color: status_color,
-                                                    size: 12.0,
-                                                    bold: false,
-                                                },
-                                            )),
-                                        )),
-                                ),
-                        ),
-                )
-        };
-        div()
-            .id(("strip", index))
-            .flex()
-            .items_center()
-            .h(px(STRIP_HEIGHT))
-            .on_scroll_wheel(move |e: &ScrollWheelEvent, _, cx| {
-                let d = e.delta.pixel_delta(px(STEP * 3.0));
-                let (x, y) = (f32::from(d.x), f32::from(d.y));
-                // A plain wheel scrolls the panel's list, anywhere on the
-                // strip. Shift+wheel, which Windows sends sideways, scrolls
-                // every strip through time; a sideways swipe or tilt scrolls
-                // this one. Up or left goes back in time.
-                let (dx, all) = if e.modifiers.shift {
-                    (if x != 0.0 { x } else { y }, true)
-                } else if x.abs() > y.abs() {
-                    (x, false)
-                } else {
-                    // The strips move under the mouse, and no mouse move
-                    // follows to say so: the hover and its card go.
-                    entity.update(cx, |t, cx| {
-                        if t.hover.is_some() {
-                            t.unhover();
-                            cx.notify();
+                d.on_scroll_wheel(move |e: &ScrollWheelEvent, _, cx| wheel(e, cx))
+                    .on_mouse_down(gpui::MouseButton::Right, move |_, window, cx| {
+                        cx.stop_propagation();
+                        crate::repo_menu::show(&status, window, cx);
+                    })
+                    // Big mode, scrolled to this repo's column; the folder
+                    // when the window is turned off.
+                    .on_click(move |_, window, cx| {
+                        let big = this_for_label.read(cx).state.read(cx).config.window;
+                        if big {
+                            crate::flip::open_window(window, Some(open_path.clone()), cx);
+                        } else {
+                            crate::panel::dismiss(window, cx);
+                            crate::view::open_repo(&open_path, cx);
                         }
-                    });
-                    return;
-                };
-                // The list would read a sideways delta as a vertical one.
-                cx.stop_propagation();
-                entity.update(cx, |t, cx| t.scroll(&wheel_path, dx, all, cx));
+                    })
             })
-            .relative()
-            .child(painter)
-            .child(label)
-            // An edge in the status colour on a repo that needs something.
-            .when(!status.is_synced() && !status.remote_only, |d| {
-                d.child(
-                    div()
-                        .absolute()
-                        .left_0()
-                        .top(px(3.))
-                        .bottom(px(3.))
-                        .w(px(3.))
-                        .rounded_r_sm()
-                        .bg(crate::view::status_color(status, p)),
-                )
-            })
-            .into_any_element()
+            .when(!float, |d| d.tooltip(crate::view::tip(lines, p)))
+            .into_any_element();
+        Strip {
+            graph: graph_slot,
+            label,
+            checkout,
+            status: status_text,
+        }
     }
 
     /// The card for the dot under the mouse, drawn above everything once
     /// the mouse has settled, beside the dot rather than over it.
-    pub fn hover_card(&self, p: &Palette, dark: bool, cx: &App) -> Option<AnyElement> {
-        let h = self.hover.as_ref().filter(|_| self.card)?;
+    pub fn hover_card(
+        &self,
+        p: &Palette,
+        dark: bool,
+        window: Option<isize>,
+        cx: &App,
+    ) -> Option<AnyElement> {
+        let (card, h) = self.card_for(p, dark, window, cx)?;
+        let gap = px(DOT_HOVER + CARD_GAP);
+        let x = h.at.x - px(12.);
+        let (corner, y) = if h.above {
+            (Corner::BottomLeft, h.at.y - gap)
+        } else {
+            (Corner::TopLeft, h.at.y + gap)
+        };
+        Some(
+            deferred(
+                anchored()
+                    .anchor(corner)
+                    .position(point(x, y))
+                    .snap_to_window_with_margin(px(8.))
+                    .child(card),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
+    }
+
+    /// How far from its dot a card sits, logical px: beside the dot's
+    /// hover ring, and that far to the left of it.
+    pub const CARD_OFFSET: (f32, f32) = (12.0, DOT_HOVER + CARD_GAP);
+
+    /// Where in `window` the dot is whose card shows, once the mouse has
+    /// settled on it.
+    pub fn card_at(&self, window: Option<isize>) -> Option<Point<Pixels>> {
+        self.hover
+            .as_ref()
+            .filter(|h| self.card && h.window == window)
+            .map(|h| h.at)
+    }
+
+    /// The card for the dot under the mouse in `window`, unplaced, and
+    /// that hover, once the mouse has settled on it.
+    pub fn card_for(
+        &self,
+        p: &Palette,
+        dark: bool,
+        window: Option<isize>,
+        cx: &App,
+    ) -> Option<(AnyElement, Hover)> {
+        let h = self
+            .hover
+            .as_ref()
+            .filter(|h| self.card && h.window == window)?;
         // Gone with the dot when the tree turned clean or dirty under it.
         let state = self.state.read(cx);
         let dirty = state
@@ -1145,30 +1302,39 @@ impl Timelines {
             // The strips under it don't see the mouse, so a click here
             // copies nothing.
             .occlude()
+            .relative()
             .children(card)
+            // Where it lands on the screen: the mouse may stay on it.
+            .child(
+                canvas(
+                    |b, window, cx| {
+                        // From the window's inside on the screen: GPUI's
+                        // own window bounds are off by the work area's
+                        // corner.
+                        let s = window.scale_factor();
+                        let Some(c) = crate::win::hwnd(window).and_then(crate::win::client_rect)
+                        else {
+                            return;
+                        };
+                        let e = |v: Pixels| (f32::from(v) * s).round() as i32;
+                        cx.set_global(CardRect(Some((
+                            c.left + e(b.left()),
+                            c.top + e(b.top()),
+                            c.left + e(b.right()),
+                            c.top + e(b.bottom()),
+                        ))));
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
+            )
             .with_animation(
                 ("card", self.card_shown),
                 Animation::new(CARD_FADE).with_easing(gpui::ease_out_quint()),
                 |card, k| card.opacity(k),
             );
-        let gap = px(DOT_HOVER + CARD_GAP);
-        let x = h.at.x - px(12.);
-        let (corner, y) = if h.above {
-            (Corner::BottomLeft, h.at.y - gap)
-        } else {
-            (Corner::TopLeft, h.at.y + gap)
-        };
-        Some(
-            deferred(
-                anchored()
-                    .anchor(corner)
-                    .position(point(x, y))
-                    .snap_to_window_with_margin(px(8.))
-                    .child(card),
-            )
-            .with_priority(1)
-            .into_any_element(),
-        )
+        Some((card.into_any_element(), h.clone()))
     }
 
     /// A commit card's lines.
@@ -1231,29 +1397,29 @@ impl Timelines {
             .or_else(|| (!c.message.is_empty()).then(|| c.message.clone()))
             .unwrap_or_else(|| c.subject.clone());
         let (subject, body) = message_parts(&message);
+        // The id, then the subject wrapping under itself: a column's width
+        // is known when its text is laid out, a flexible row's isn't, which
+        // let a wrapped subject run over the line under it.
+        let id_width = c.short().chars().count() as f32 * CARD_MONO_ADVANCE + 8.0;
         let mut lines = vec![
             div()
-                .flex()
-                .gap_2()
+                .relative()
+                .pl(px(id_width))
                 .child(
                     div()
-                        .flex_none()
+                        .absolute()
+                        .left_0()
+                        .top_0()
                         .font_family("Consolas")
                         .text_color(colors.node(g, row))
                         .child(c.short().to_string()),
                 )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .child(subject),
-                )
-                .when(copied, |d| {
-                    d.child(div().flex_none().text_color(p.muted).child("copied"))
-                })
+                .child(div().font_weight(gpui::FontWeight::SEMIBOLD).child(subject))
                 .into_any_element(),
         ];
+        if copied {
+            lines.push(div().text_color(p.muted).child("Copied").into_any_element());
+        }
         if !body.is_empty() {
             lines.push(
                 div()
@@ -1320,6 +1486,9 @@ impl Timelines {
 
 /// Lines of a message body a card shows at most; longer ones end in "…".
 const BODY_LINES: usize = 24;
+/// How far a card's Consolas glyph advances, logical px at its text size
+/// (0.55 em of 12 px).
+const CARD_MONO_ADVANCE: f32 = 6.6;
 /// Characters of one body line a card shows at most.
 const BODY_LINE_CHARS: usize = 400;
 
@@ -1481,8 +1650,92 @@ fn lane_offset(lane: usize) -> f32 {
     if lane % 2 == 1 { -step } else { step }
 }
 
+/// The work-in-progress dot's centre, and the ends of the dashed noodle
+/// that joins it to HEAD (at HEAD, at the dot) when there is a HEAD commit.
+pub(crate) type Wip = ((f32, f32), Option<[(f32, f32); 2]>);
+
+/// Where a strip in `bounds` puts its tree: every row and lane on the
+/// device pixel grid, so runs are crisp and bends meet them exactly.
+#[derive(Clone, Copy)]
+pub(crate) struct StripGeo {
+    s: f32,
+    /// The newest row's x; at home HEAD sits PAD in, one step further when
+    /// the work-in-progress dot leads it.
+    top_x: f32,
+    cy: f32,
+    /// The work-in-progress dot takes a column of its own right of HEAD:
+    /// rows newer than HEAD move a step further right to make room.
+    gap: f32,
+    left: f32,
+    right: f32,
+}
+
+impl StripGeo {
+    pub(crate) fn new(
+        bounds: Bounds<Pixels>,
+        g: &RepoGraph,
+        scroll: f32,
+        dirty: bool,
+        s: f32,
+    ) -> Self {
+        let rows = g.layout.nodes.len();
+        let (left, right) = (f32::from(bounds.left()), f32::from(bounds.right()));
+        let head = g.head_row.filter(|&row| row < rows);
+        let gap = head
+            .filter(|&row| dirty && row > 0)
+            .map_or(0.0, |row| row as f32);
+        Self {
+            s,
+            top_x: right - PAD - if dirty { STEP } else { 0.0 } + scroll,
+            cy: f32::from(bounds.center().y),
+            gap,
+            left,
+            right,
+        }
+    }
+
+    pub(crate) fn x(&self, row: f32) -> f32 {
+        let x = self.top_x - row * STEP + if row < self.gap - 0.5 { STEP } else { 0.0 };
+        ink::pos(self.s, x, STROKE)
+    }
+
+    pub(crate) fn y(&self, lane: f32) -> f32 {
+        ink::pos(self.s, self.cy + lane_offset(lane.round() as usize), STROKE)
+    }
+
+    /// The rows whose dots are in view, one step of slack each side.
+    pub(crate) fn rows(&self, rows: usize) -> (usize, usize) {
+        let lo = (((self.top_x - self.right) / STEP).floor() - 1.0).max(0.0) as usize;
+        let hi = ((((self.top_x - self.left) / STEP).ceil() + 1.0).max(0.0) as usize).min(rows);
+        (lo, hi)
+    }
+
+    /// The work-in-progress dot: its centre, and the ends of the dashed
+    /// noodle that joins it to HEAD (at HEAD, at the dot), when there is
+    /// a HEAD commit. `r` is the dot's radius.
+    pub(crate) fn wip(&self, g: &RepoGraph, r: f32) -> Wip {
+        let rows = g.layout.nodes.len();
+        let head = g.head_row.filter(|&row| row < rows);
+        // Right of HEAD, on a lane no noodle crosses that column in; with no
+        // HEAD commit (unborn, or not loaded yet) right of the newest row.
+        let (hx, hy, lane) = match head {
+            Some(row) => (
+                self.x(row as f32),
+                self.y(g.layout.nodes[row].lane as f32),
+                g.layout.free_lane_above(row),
+            ),
+            None => (self.x(0.0), self.cy, 0),
+        };
+        let center = (ink::pos(self.s, hx + STEP, STROKE), self.y(lane as f32));
+        let noodle = head.map(|_| [(hx + DOT, hy), (hx + STEP - r, center.1)]);
+        (center, noodle)
+    }
+}
+
 /// Paints the visible part of a strip; returns where each painted dot is
-/// and what it is, for hit-testing.
+/// and what it is, for hit-testing. Without `tree`, only its tag and
+/// stash marks (when `marks`): what the flip fades with the panel while it
+/// draws the tree itself.
 #[allow(clippy::too_many_arguments)]
 fn paint_strip(
     bounds: Bounds<Pixels>,
@@ -1491,41 +1744,31 @@ fn paint_strip(
     grow: Grow,
     copied: Option<usize>,
     dirty: bool,
+    (tree, marks): (bool, bool),
     colors: &Colors,
     window: &mut Window,
 ) -> Vec<(Point<Pixels>, Dot)> {
     let rows = g.layout.nodes.len();
-    let (left, right) = (f32::from(bounds.left()), f32::from(bounds.right()));
-    let head = g.head_row.filter(|&row| row < rows);
-    // The work-in-progress dot takes a column of its own right of HEAD:
-    // rows newer than HEAD move a step further right to make room.
-    let gap = head
-        .filter(|&row| dirty && row > 0)
-        .map_or(0.0, |row| row as f32);
-    // The newest row's x; at home HEAD sits PAD in, one step further when
-    // the work-in-progress dot leads it.
-    let top_x = right - PAD - if dirty { STEP } else { 0.0 } + scroll;
-    let cy = f32::from(bounds.center().y);
-    // On the device pixel grid, so runs are crisp and bends meet them
-    // exactly.
+    let left = f32::from(bounds.left());
     let s = window.scale_factor();
-    let x = |row: f32| {
-        let x = top_x - row * STEP + if row < gap - 0.5 { STEP } else { 0.0 };
-        ink::pos(s, x, STROKE)
-    };
-    let y = |lane: f32| ink::pos(s, cy + lane_offset(lane.round() as usize), STROKE);
+    let geo = StripGeo::new(bounds, g, scroll, dirty, s);
+    let x = |row: f32| geo.x(row);
+    let y = |lane: f32| geo.y(lane);
     let at = |pos: graph::Pos| point(px(x(pos.row)), px(y(pos.lane)));
     let folded = |lane: f32| lane.round() as usize >= LANES;
 
     // Rows whose dots are in view, one step of slack each side.
-    let lo = (((top_x - right) / STEP).floor() - 1.0).max(0.0) as usize;
-    let hi = ((((top_x - left) / STEP).ceil() + 1.0).max(0.0) as usize).min(rows);
+    let (lo, hi) = geo.rows(rows);
     if lo >= hi && rows > 0 && lo >= rows {
         return Vec::new();
     }
 
     // Under everything, a soft band along each other worktree's line.
-    for b in g.bands.iter().filter(|b| b.top < hi && b.bottom + 1 >= lo) {
+    for b in g
+        .bands
+        .iter()
+        .filter(|b| tree && b.top < hi && b.bottom + 1 >= lo)
+    {
         let color = colors.band(g, b, b.lane >= LANES);
         let yb = y(b.lane as f32);
         let r = BAND / 2.0;
@@ -1540,7 +1783,7 @@ fn paint_strip(
     }
 
     let mut dots = Vec::with_capacity(hi.saturating_sub(lo) + 1);
-    for e in g.layout.visible_edges(lo, hi) {
+    for e in g.layout.visible_edges(lo, hi).filter(|_| tree) {
         let base = if e.first {
             colors.node(g, e.child.0)
         } else {
@@ -1575,22 +1818,11 @@ fn paint_strip(
     }
 
     if dirty {
-        // Right of HEAD, on a lane no noodle crosses that column in; with no
-        // HEAD commit (unborn, or not loaded yet) right of the newest row.
-        let (hx, hy, lane) = match head {
-            Some(row) => (
-                x(row as f32),
-                y(g.layout.nodes[row].lane as f32),
-                g.layout.free_lane_above(row),
-            ),
-            None => (x(0.0), cy, 0),
-        };
-        let center = point(px(ink::pos(s, hx + STEP, STROKE)), px(y(lane as f32)));
-        dots.push((center, Dot::Wip));
         let r = grow.radius(Dot::Wip, DOT + 0.5, DOT_HOVER);
-        if head.is_some() {
+        let (c, noodle) = geo.wip(g, r);
+        dots.push((point(px(c.0), px(c.1)), Dot::Wip));
+        if let Some([from, to]) = noodle.filter(|_| tree) {
             // Joined to HEAD by a short dashed noodle.
-            let (from, to) = ((hx + DOT, hy), (hx + STEP - r, f32::from(center.y)));
             let [a, c1, c2, b] = graph::noodle(to, from, (-1.0, 0.0));
             ink::cubic(
                 window,
@@ -1600,14 +1832,15 @@ fn paint_strip(
                 Some(ink::Dash { on: 2.0, off: 2.0 }),
             );
         }
-        let c = (f32::from(center.x), f32::from(center.y));
-        ink::circle(
-            window,
-            c,
-            r,
-            Some(colors.bg),
-            Some((1.0, colors.unpushed, true)),
-        );
+        if tree {
+            ink::circle(
+                window,
+                c,
+                r,
+                Some(colors.bg),
+                Some((1.0, colors.unpushed, true)),
+            );
+        }
     }
 
     for row in lo..hi {
@@ -1624,12 +1857,13 @@ fn paint_strip(
         let head = g.ctx.refs.is_head(id);
         let r = grow.radius(Dot::Commit(row), DOT, DOT_HOVER);
         let c = (f32::from(center.x), f32::from(center.y));
-        if copied == Some(row) {
+        if copied == Some(row) && tree {
             // Its id just went to the clipboard.
             let ring = r + 3.0;
             ink::circle(window, c, ring, None, Some((1.0, colors.head, false)));
         }
-        if head {
+        if !tree {
+        } else if head {
             ink::circle(window, c, r + 3.0, Some(colors.head.opacity(0.22)), None);
             ink::circle(window, c, r, Some(colors.head), None);
         } else if node.class == Class::Unpulled || node.merge {
@@ -1640,6 +1874,9 @@ fn paint_strip(
             ink::circle(window, c, r, Some(colors.bg), Some((1.5, color, false)));
         } else {
             ink::circle(window, c, r, Some(color), None);
+        }
+        if !marks {
+            continue;
         }
         if g.ctx.refs.at(id).iter().any(|r| matches!(r, Ref::Tag(_))) {
             diamond(point(center.x, center.y - px(r + 4.0)), 2.5, color, window);
@@ -1691,17 +1928,122 @@ fn diamond(c: Point<Pixels>, r: f32, color: Hsla, window: &mut Window) {
     }
 }
 
-/// Fades the tail into the background at the strip's left edge.
-fn fade(bounds: Bounds<Pixels>, bg: Hsla, window: &mut Window) {
-    let w = FADE.min(f32::from(bounds.size.width));
-    window.paint_quad(fill(
-        Bounds::new(bounds.origin, size(px(w), bounds.size.height)),
-        linear_gradient(
+/// A strip's tree at rest, for the flip: exactly as the panel draws it
+/// with its newest commits home and nothing hovered, without the fade at
+/// its tail and the tag and stash marks, which are the panel's own.
+/// `bounds` are the strip's graph box, logical px.
+fn paint_strip_tree(
+    bounds: Bounds<Pixels>,
+    g: &RepoGraph,
+    dirty: bool,
+    colors: &Colors,
+    window: &mut Window,
+) {
+    let mask = Bounds::new(
+        point(bounds.left(), bounds.top() - px(BLEED)),
+        size(bounds.size.width, bounds.size.height + px(2.0 * BLEED)),
+    );
+    window.with_content_mask(Some(ContentMask { bounds: mask }), |window| {
+        paint_strip(
+            bounds,
+            g,
+            0.0,
+            Grow::default(),
+            None,
+            dirty,
+            (true, false),
+            colors,
+            window,
+        );
+    });
+}
+
+/// How much of a strip lies past each end, 0 to 1 (1 a fade's width or
+/// more): older commits past its left end, newer ones past its right. An
+/// end the tree has room to show whole gets no fade.
+fn strip_hidden(
+    bounds: Bounds<Pixels>,
+    g: &RepoGraph,
+    scroll: f32,
+    dirty: bool,
+    window: &Window,
+) -> (f32, f32) {
+    let rows = g.layout.nodes.len();
+    if rows == 0 {
+        return (0.0, 0.0);
+    }
+    let geo = StripGeo::new(bounds, g, scroll, dirty, window.scale_factor());
+    let (left, right) = (f32::from(bounds.left()), f32::from(bounds.right()));
+    // Shown whole, the oldest dot sits PAD in from the left end; older
+    // history still to load is past it.
+    let older = if g.end {
+        ((left + PAD - geo.x((rows - 1) as f32)) / FADE).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let newest = if dirty {
+        geo.wip(g, DOT).0.0
+    } else {
+        geo.x(0.0)
+    };
+    let newer = ((newest - (right - PAD)) / FADE).clamp(0.0, 1.0);
+    (older, newer)
+}
+
+/// Fades the tree into the background at each end it runs on past, as
+/// strongly as `(start, end)` say: its left and right ends, or `down` its
+/// top and bottom.
+fn fade(bounds: Bounds<Pixels>, bg: Hsla, ends: (f32, f32), window: &mut Window) {
+    fade_ends(bounds, bg, ends, false, window);
+}
+
+fn fade_ends(
+    bounds: Bounds<Pixels>,
+    bg: Hsla,
+    (start, end): (f32, f32),
+    down: bool,
+    window: &mut Window,
+) {
+    let long = if down {
+        bounds.size.height
+    } else {
+        bounds.size.width
+    };
+    let w = px(FADE.min(f32::from(long) / 2.0));
+    // Along the tree: from its start towards its end.
+    let (angle, band, far) = if down {
+        (
+            180.,
+            size(bounds.size.width, w),
+            point(bounds.left(), bounds.bottom() - w),
+        )
+    } else {
+        (
             90.,
-            linear_color_stop(bg, 0.),
-            linear_color_stop(bg.opacity(0.), 1.),
-        ),
-    ));
+            size(w, bounds.size.height),
+            point(bounds.right() - w, bounds.top()),
+        )
+    };
+    if start > 0.0 {
+        window.paint_quad(fill(
+            Bounds::new(bounds.origin, band),
+            linear_gradient(
+                angle,
+                linear_color_stop(bg.opacity(start), 0.),
+                linear_color_stop(bg.opacity(0.), 1.),
+            ),
+        ));
+    }
+    if end > 0.0 {
+        window.paint_quad(fill(
+            Bounds::new(far, band),
+            linear_gradient(
+                angle,
+                linear_color_stop(bg.opacity(0.), 0.),
+                linear_color_stop(bg.opacity(end), 1.),
+            ),
+        ));
+    }
 }
 
 #[cfg(test)]

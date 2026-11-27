@@ -17,11 +17,36 @@ pub struct Note {
     pub body: String,
 }
 
-/// Repos that a fetch put behind: they were known, not behind, and now are.
+/// Repos that a fetch put behind: they were known, read cleanly, not
+/// behind, and now are, on the same branch, with its remote branch moved.
+/// A failed check (which reads as not behind) or your own checkout of a
+/// branch that is behind says nothing.
 pub fn behind(cfg: &NotifyConfig, old: Option<&RepoStatus>, new: &RepoStatus) -> Option<String> {
-    let old = old?;
-    (cfg.behind && !new.remote_only && old.behind == 0 && new.behind > 0)
+    let old = old.filter(|o| o.error.is_none() && !o.tips.is_empty())?;
+    let fetched = old.branch.is_some() && old.branch == new.branch && upstream_moved(old, new);
+    (cfg.behind && !new.remote_only && old.behind == 0 && new.behind > 0 && fetched)
         .then(|| format!("{} ⬇{}", new.name, new.behind))
+}
+
+/// Whether the checked-out branch's remote branch moved between two
+/// checks: `refs/remotes/<remote>/<branch>`, else, when no remote branch
+/// has its name (an upstream named otherwise), any remote branch.
+fn upstream_moved(old: &RepoStatus, new: &RepoStatus) -> bool {
+    let Some(branch) = &new.branch else {
+        return false;
+    };
+    let suffix = format!("/{branch}");
+    let remote = |r: &str| r.starts_with("refs/remotes/");
+    let named = |r: &str| remote(r) && r.ends_with(&suffix);
+    let pick: &dyn Fn(&str) -> bool = if new.tips.iter().any(|(r, _)| named(r)) {
+        &named
+    } else {
+        &remote
+    };
+    new.tips
+        .iter()
+        .filter(|(r, _)| pick(r))
+        .any(|(r, oid)| !old.tips.iter().any(|(o, before)| o == r && before == oid))
 }
 
 /// The pull request changes since the last poll that `cfg` asks about. A
@@ -38,6 +63,10 @@ pub fn pr_changes(
             continue;
         };
         let name = names.get(path).map_or("", String::as_str);
+        // Only the newest open PRs are read, so one missing before may just
+        // have been updated into the list; numbers only grow, so a new one
+        // is past every number seen before.
+        let newest = before.iter().map(|b| b.number).max().unwrap_or(0);
         for pr in prs.iter().filter(|p| p.is_open()) {
             let was = before.iter().find(|b| b.number == pr.number);
             let what = if cfg.review_requested
@@ -45,9 +74,10 @@ pub fn pr_changes(
                 && !was.is_some_and(|b| b.review_requested)
             {
                 "review asked"
-            } else if cfg.new_pr && was.is_none() {
+            } else if cfg.new_pr && was.is_none() && pr.number > newest {
                 "new pull request"
             } else if cfg.checks_failed
+                && (was.is_some() || pr.number > newest)
                 && pr.checks == Checks::Failing
                 && !was.is_some_and(|b| b.checks == Checks::Failing && b.head_oid == pr.head_oid)
             {
@@ -268,16 +298,40 @@ mod tests {
         );
         // The first poll says nothing.
         assert!(pr_changes(&on, &names, &HashMap::new(), &new).is_empty());
+        // An older PR updated into the newest read isn't new.
+        let later = HashMap::from([(
+            path.clone(),
+            vec![pr(3, false, Checks::Failing), pr(1, false, Checks::Failing)],
+        )]);
+        let before = HashMap::from([(path.clone(), vec![pr(3, false, Checks::Failing)])]);
+        assert!(pr_changes(&on, &names, &before, &later).is_empty());
         assert!(pr_changes(&NotifyConfig::default(), &names, &old, &new).is_empty());
 
+        let tip = |r: &str, oid: &str| (r.to_string(), oid.to_string());
         let mut a = RepoStatus {
             name: "x".into(),
+            branch: Some("main".into()),
+            tips: vec![
+                tip("refs/heads/main", "1"),
+                tip("refs/remotes/origin/main", "1"),
+            ],
             ..Default::default()
         };
         let mut b = a.clone();
         b.behind = 2;
+        // Behind with origin/main where it was: a checkout or reset, not a fetch.
+        assert_eq!(behind(&on, Some(&a), &b), None);
+        b.tips[1].1 = "3".into();
         assert_eq!(behind(&on, Some(&a), &b).as_deref(), Some("x ⬇2"));
         assert_eq!(behind(&on, None, &b), None);
+        // A failed check reads as not behind: it is no baseline.
+        let mut failed = a.clone();
+        failed.error = Some("not readable".into());
+        assert_eq!(behind(&on, Some(&failed), &b), None);
+        // Switching to a branch that is behind.
+        let mut other = a.clone();
+        other.branch = Some("dev".into());
+        assert_eq!(behind(&on, Some(&other), &b), None);
         a.behind = 1;
         assert_eq!(behind(&on, Some(&a), &b), None);
         assert_eq!(note(&[]), None);

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Before the merge (step 5), or when Olex says "check": runs the full checks (the full-check
 # hook) once on <branch>'s newest commit and marks the commit checked for agent-merge. Builds
-# don't run them. On the PC it runs in build/src and posts its result on the feature's PR, like
+# don't run them. On the PC it checks out <branch> in the repo and posts its result on the feature's PR, like
 # agent-build pc; in CI it runs fallback.yml with checks only.
 # Usage:
 #   .agents/agent-check pc <branch>   on the PC, in D:\dev\<repo>
@@ -31,16 +31,16 @@ if [ "$MODE" = ci ]; then
 fi
 [ "$MODE" = pc ] || die "$USAGE"
 
-# First bring build/src to the branch, then run there (the build's own worktree, so the checks
-# reuse its build outputs).
+# First check out the branch in the repo (where the builds ran, so the checks reuse their build
+# outputs), then run the branch's own agent-check, from copies of the scripts (run_from_copy).
 if [ -n "$BRANCH" ]; then
+  run_from_copy agent-check pc "$BRANCH"
   git fetch origin "$BRANCH" || die "Couldn't fetch $BRANCH."
-  checkout_src "$BRANCH"
-  exec bash "$MAIN_REPO/build/src/.agents/agent-check" pc >&3 2>&3 3>&-
+  checkout_branch "$BRANCH"
+  AGENTS_DIR="" run_from_copy agent-check pc
 fi
 
 report() { report_pr "PC full checks" "$@"; }
-[ "$WORKTREE" -ef "$BUILD_DIR/src" ] || die "Run this as agent-check pc <branch>, as in AGENTS.md step 5."
 take_lock "$(git rev-parse --short=7 HEAD)"
 cleanup() { release_lock; }
 

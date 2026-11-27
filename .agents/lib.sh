@@ -7,9 +7,9 @@ set -euo pipefail
 shopt -s inherit_errexit
 
 AGENTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The repo, also when a PC run goes on from its copy of .agents/ in build/run/ (run_from_copy).
 WORKTREE="$(git -C "$AGENTS_DIR" rev-parse --show-toplevel)"
-# The main checkout, which holds build/, also when running from the build/src worktree.
-MAIN_REPO="$(dirname "$(git -C "$WORKTREE" rev-parse --path-format=absolute --git-common-dir)")"
+MAIN_REPO="$WORKTREE"
 BUILD_DIR="$MAIN_REPO/build"
 SCRIPT_NAME="$(basename "$0")"
 mkdir -p "$BUILD_DIR/logs"
@@ -263,7 +263,8 @@ report_pr() {
 LOCK="$(dirname "$MAIN_REPO")/.build-lock"
 
 # take_lock <branch>: waits for the lock and takes it. When agent-build pc <branch> or
-# agent-check pc <branch> already took it before checking out build/src, the run there takes it over.
+# agent-check pc <branch> already took it before checking out the branch, the run of the branch's
+# own scripts takes it over.
 take_lock() {
   local owner pid shown=""
   if [ -n "${AGENT_LOCKED:-}" ]; then
@@ -298,18 +299,54 @@ release_lock() {
   if [ "$(cut -d' ' -f1 "$LOCK" 2>/dev/null)" = "$$" ]; then rm -f "$LOCK"; fi
 }
 
-# checkout_src <branch>: takes the lock, then brings the build/src worktree (made the first time)
-# to <branch>. The run in build/src takes the lock over.
-checkout_src() {
-  local src="$MAIN_REPO/build/src"
+# run_from_copy <script> <args>...: a PC run of <script> (agent-build or agent-check) goes on from
+# a fresh copy of .agents/ in build/run/<PID>-<n>, so checking out another commit in the repo never
+# changes a script while bash is reading it (Windows can't replace a file bash has open). A copy
+# holds a .run-copy file, so a run from it returns at once (comparing paths fails in Git Bash,
+# where pwd says /d/dev/... and git says D:/dev/...). AGENTS_DIR="" run_from_copy makes a new copy
+# anyway (after the checkout, for the branch's own scripts). Copies of ended runs, and this run's
+# earlier copies, are removed. More than two copies in one run is a bug: it stops.
+run_from_copy() {
+  local script="$1" run d name mine=""
+  shift
+  if [ -n "$AGENTS_DIR" ] && [ -f "$AGENTS_DIR/.run-copy" ]; then return 0; fi
+  AGENT_COPIES=$(( ${AGENT_COPIES:-0} + 1 ))
+  export AGENT_COPIES
+  [ "$AGENT_COPIES" -le 2 ] || die "run_from_copy made more than two copies of .agents in one run: a bug in the pipeline scripts."
+  if [ -n "${AGENT_COPY_DIR:-}" ]; then mine="${AGENT_COPY_DIR##*/}"; fi
+  mkdir -p "$BUILD_DIR/run"
+  for d in "$BUILD_DIR"/run/*/; do
+    [ -d "$d" ] || continue
+    d="${d%/}"
+    name="${d##*/}"
+    if [ "$name" = "$mine" ]; then continue; fi
+    if [ "${name%%-*}" = "$$" ] || ! kill -0 "${name%%-*}" 2>/dev/null; then rm -rf "$d" || true; fi
+  done
+  run="$(mktemp -d "$BUILD_DIR/run/$$-XXXXXX")" || die "Couldn't make a folder in $BUILD_DIR/run."
+  cp -r "$WORKTREE/.agents" "$run/" || die "Couldn't copy .agents to $run."
+  : >"$run/.agents/.run-copy"
+  export AGENT_COPY_DIR="$run"
+  exec bash "$run/.agents/$script" "$@" >&3 2>&3 3>&-
+}
+
+# checkout_branch <branch>: takes the lock, then checks out <branch> (fetched) in the repo, which
+# nobody edits on the PC: edits happen in the cloud. Stops when tracked files have changes, so
+# nothing is lost. Also fast-forwards the local main to origin/main, so the repo stays current
+# after merges. The branch's own scripts then run from a fresh copy (run_from_copy) and take the
+# lock over.
+checkout_branch() {
   take_lock "$1"
   cleanup() { release_lock; }
   export AGENT_LOCKED="$1"
-  if [ -e "$src/.git" ]; then
-    git -C "$src" checkout --detach "origin/$1" || die "Couldn't check out $1 in build/src."
-  else
-    git -C "$MAIN_REPO" worktree add --detach "$src" "origin/$1" || die "Couldn't make build/src."
-  fi
+  local dirty
+  dirty="$(git -C "$MAIN_REPO" status --porcelain --untracked-files=no)"
+  [ -z "$dirty" ] || die "$MAIN_REPO has changes, so the branch isn't checked out over them:" "$dirty" \
+    "Ask Olex what to do with them."
+  # The old build/src worktree, from before builds ran in the repo itself.
+  if [ -e "$MAIN_REPO/build/src/.git" ]; then git -C "$MAIN_REPO" worktree remove --force "$MAIN_REPO/build/src" || true; fi
+  git -C "$MAIN_REPO" worktree prune
+  git -C "$MAIN_REPO" checkout --detach "origin/$1" || die "Couldn't check out $1 in $MAIN_REPO."
+  git -C "$MAIN_REPO" fetch -q origin main:main 2>/dev/null || true
 }
 
 # Olex tests changes to the pipeline himself (AGENTS.md, "Scripts and hooks"), so a branch that

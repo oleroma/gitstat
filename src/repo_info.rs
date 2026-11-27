@@ -188,7 +188,7 @@ pub fn read(repo: &Path, refs: &Refs, setup: &Setup) -> Result<Info, String> {
         Default::default()
     };
 
-    let web = text(repo, &["remote", "get-url", "origin"]).and_then(|u| github_web(u.trim()));
+    let web = origin_web(repo);
 
     Ok(Info {
         web,
@@ -280,6 +280,8 @@ pub struct SortFacts {
     pub last_commit: i64,
     pub last_worked: i64,
     pub unmerged: Vec<String>,
+    /// The default branch's own name, without its remote: `main`.
+    pub trunk: Option<String>,
 }
 
 /// Three read-only git calls: every branch with its commit time, the ones
@@ -317,6 +319,15 @@ pub fn sort_facts(repo: &Path) -> SortFacts {
             .to_string()
     });
     let branches = parse_branches(&all, &merged, short.as_deref());
+    let trunk = default
+        .as_deref()
+        .map(|d| match d.strip_prefix("refs/remotes/") {
+            Some(remote) => remote
+                .split_once('/')
+                .map_or(remote, |(_, n)| n)
+                .to_string(),
+            None => d.strip_prefix("refs/heads/").unwrap_or(d).to_string(),
+        });
     let last_worked = text(
         repo,
         &[
@@ -343,15 +354,18 @@ pub fn sort_facts(repo: &Path) -> SortFacts {
             .filter(|b| !b.merged)
             .map(|b| b.name)
             .collect(),
+        trunk,
     }
 }
 
 /// The default branch's full refname: what `origin/HEAD` points at, else
 /// the first of the usual names among `refnames`.
 fn default_ref(origin_head: Option<&str>, refnames: &[&str]) -> Option<String> {
+    // origin/HEAD can dangle (the default branch renamed on GitHub): use
+    // it only when its target exists.
     if let Some(r) = origin_head
         .map(str::trim)
-        .filter(|r| r.starts_with("refs/"))
+        .filter(|r| r.starts_with("refs/") && refnames.contains(r))
     {
         return Some(r.to_string());
     }
@@ -381,10 +395,12 @@ fn text(repo: &Path, args: &[&str]) -> Option<String> {
 
 /// `origin/HEAD`'s branch, else the first of the usual names that exists.
 fn default_branch(setup: &Setup, refs: &Refs) -> Option<String> {
+    // Only when its target exists: origin/HEAD can dangle.
     if let Some(name) = setup
         .origin_head
         .as_deref()
         .and_then(|t| t.trim().strip_prefix("refs/remotes/").map(str::to_string))
+        .filter(|name| refs.tip(&Ref::Remote(name.clone())).is_some())
     {
         return Some(name);
     }
@@ -690,12 +706,30 @@ mod tests {
         // `commit` dates commits 60 s apart from 1_700_000_000.
         assert_eq!(f.last_commit, 1_700_000_120);
         assert_eq!(f.unmerged, ["wip"]);
+        assert_eq!(f.trunk.as_deref(), Some("main"));
         assert!(f.last_worked > 1_700_000_000, "{}", f.last_worked);
         assert_eq!(reflog_time("HEAD@{1730000000}\n"), Some(1_730_000_000));
         assert_eq!(reflog_time(""), None);
         assert_eq!(
             default_ref(None, &["refs/heads/main", "refs/heads/x"]).as_deref(),
             Some("refs/heads/main")
+        );
+        // A dangling origin/HEAD (default branch renamed) is passed over.
+        assert_eq!(
+            default_ref(
+                Some("refs/remotes/origin/master\n"),
+                &["refs/remotes/origin/main", "refs/heads/x"]
+            )
+            .as_deref(),
+            Some("refs/remotes/origin/main")
+        );
+        assert_eq!(
+            default_ref(
+                Some("refs/remotes/origin/trunk"),
+                &["refs/remotes/origin/trunk"]
+            )
+            .as_deref(),
+            Some("refs/remotes/origin/trunk")
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -30,8 +30,8 @@ done
 export MSYS_NO_PATHCONV=1
 dest="$(cygpath -u "$LOCALAPPDATA")/Programs/gitstat"
 dest_win="$(cygpath -w "$dest")"
-# This hook sits in build/src/.agents/hooks; the repo's build folder is three levels up.
-build_dir="$(cd "$(dirname "$0")/../../.." && pwd)"
+# This hook sits in .agents/hooks; the repo's build folder is two levels up.
+build_dir="$(cd "$(dirname "$0")/../.." && pwd)/build"
 
 ps() { powershell.exe -NoProfile -NonInteractive -Command "$1"; }
 

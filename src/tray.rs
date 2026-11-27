@@ -64,6 +64,14 @@ pub enum TrayAction {
     /// How long the panel slides in for, in ms; 0 for no slide.
     SetPanelSlide(u32),
     SetFlipSpeed(u32),
+    /// The badge's corners' radius, logical px; half its side or more
+    /// makes it a disc.
+    SetOverlayRadius(f32),
+    /// How solid the floating view's background is, 0.2 to 1.
+    SetFloatOpacity(f32),
+    /// Repos worked on in this many days are in the floating view; 0 for
+    /// the pinned ones alone.
+    SetFloatRecent(f64),
     /// Folds or opens a section of the repo list, in the panel and big
     /// mode both.
     Fold(crate::config::Section),

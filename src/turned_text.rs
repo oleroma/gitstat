@@ -3,9 +3,8 @@
 //! ab_glyph from Segoe UI, turned, and painted as a picture, kept per text,
 //! size and colour.
 
-use ab_glyph::{Font, PxScale, ScaleFont};
+use ab_glyph::{Font, PxScale};
 use gpui::{Bounds, Hsla, Pixels, RenderImage, Window, point, px, size};
-use resvg::tiny_skia;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -18,28 +17,10 @@ thread_local! {
         RefCell::new(HashMap::new());
 }
 
-/// How long `text` runs at `height` logical px: the turned picture's
-/// height. 0 without the font.
-pub fn length(text: &str, height: f32) -> f32 {
-    let Some(font) = crate::icon::system_font() else {
-        return 0.0;
-    };
-    advance(font, text, height).ceil()
-}
-
-fn advance(font: &impl Font, text: &str, height: f32) -> f32 {
-    let f = font.as_scaled(PxScale::from(height));
-    let mut pen = 0.0;
-    let mut prev = None;
-    for c in text.chars() {
-        let id = f.glyph_id(c);
-        if let Some(prev) = prev {
-            pen += f.kern(prev, id);
-        }
-        pen += f.h_advance(id);
-        prev = Some(id);
-    }
-    pen
+/// How long `text` runs at `size` logical px (its em): the turned
+/// picture's height.
+pub fn length(text: &str, size: f32) -> f32 {
+    crate::glyph_path::advance(text, size).ceil()
 }
 
 /// Paints `text`, turned to read upwards, at `height` logical px, centred
@@ -80,26 +61,36 @@ pub fn paint(window: &mut Window, bounds: Bounds<Pixels>, text: &str, height: f3
         .ok();
 }
 
-/// The line drawn `height` device px tall, then turned: straight-alpha BGRA.
-fn draw(text: &str, height: u32, [r, g, b, a]: [u8; 4]) -> Option<Arc<RenderImage>> {
-    let font = crate::icon::system_font()?;
-    let h = height as f32;
-    let f = font.as_scaled(PxScale::from(h));
-    let w = advance(font, text, h).ceil() as usize + 2;
-    let rows = (f.ascent() - f.descent()).ceil() as usize + 2;
+/// The line drawn at `size` device px (its em), then turned:
+/// straight-alpha BGRA.
+fn draw(text: &str, size: u32, [r, g, b, a]: [u8; 4]) -> Option<Arc<RenderImage>> {
+    let (font, _) = crate::glyph_path::glyph('a')?;
+    let em = size as f32;
+    let k = em / font.units_per_em().unwrap_or(2048.0);
+    let (ascent, descent) = (font.ascent_unscaled() * k, font.descent_unscaled() * k);
+    let w = crate::glyph_path::advance(text, em).ceil() as usize + 2;
+    let rows = (ascent - descent).ceil() as usize + 2;
     if w == 0 || rows == 0 || w > 4096 {
         return None;
     }
     // The line as it reads, left to right: coverage per px.
     let mut mask = vec![0f32; w * rows];
-    let baseline = f.ascent().round() + 1.0;
-    let (mut pen, mut prev) = (1.0f32, None);
+    let baseline = ascent.round() + 1.0;
+    let mut pen = 1.0f32;
+    let mut prev: Option<(&ab_glyph::FontVec, ab_glyph::GlyphId)> = None;
     for c in text.chars() {
-        let id = f.glyph_id(c);
-        if let Some(prev) = prev {
-            pen += f.kern(prev, id);
+        let Some((font, id)) = crate::glyph_path::glyph(c) else {
+            continue;
+        };
+        let k = em / font.units_per_em().unwrap_or(2048.0);
+        if let Some((pf, pid)) = prev
+            && std::ptr::eq(pf, font)
+        {
+            pen += font.kern_unscaled(pid, id) * k;
         }
-        let glyph = id.with_scale_and_position(PxScale::from(h), ab_glyph::point(pen, baseline));
+        // ab_glyph scales by a line's height, not its em.
+        let scale = PxScale::from(font.height_unscaled() * k);
+        let glyph = id.with_scale_and_position(scale, ab_glyph::point(pen, baseline));
         if let Some(outlined) = font.outline_glyph(glyph) {
             let bb = outlined.px_bounds();
             let (left, top) = (bb.min.x as i32, bb.min.y as i32);
@@ -111,8 +102,8 @@ fn draw(text: &str, height: u32, [r, g, b, a]: [u8; 4]) -> Option<Arc<RenderImag
                 }
             });
         }
-        pen += f.h_advance(id);
-        prev = Some(id);
+        pen += font.h_advance_unscaled(id) * k;
+        prev = Some((font, id));
     }
     // Turned anticlockwise: the line's start at the bottom, its top edge
     // to the left. Source (x, y) lands at (y, w - 1 - x).
@@ -131,130 +122,4 @@ fn draw(text: &str, height: u32, [r, g, b, a]: [u8; 4]) -> Option<Arc<RenderImag
     }
     let buffer = image::RgbaImage::from_raw(iw as u32, ih as u32, data)?;
     Some(Arc::new(RenderImage::new([image::Frame::new(buffer)])))
-}
-
-/// Paints `text` at `height` logical px, turned `turn` quarter turns
-/// anticlockwise (0 reads across, 1 reads upwards like a spine), centred on
-/// `center`. Drawn afresh each call: for the flip, where angle and size
-/// change every frame.
-pub fn paint_turning(
-    window: &mut Window,
-    center: gpui::Point<Pixels>,
-    text: &str,
-    height: f32,
-    color: Hsla,
-    turn: f32,
-) {
-    let Some(font) = crate::icon::system_font() else {
-        return;
-    };
-    let s = window.scale_factor();
-    let h = height * s;
-    if h < 1.0 || text.is_empty() {
-        return;
-    }
-    let scale = h / font.height_unscaled();
-    // The line's outline in device px, from its left end on the middle of
-    // its height, y down.
-    let mut path = tiny_skia::PathBuilder::new();
-    let mid = (font.ascent_unscaled() + font.descent_unscaled()) / 2.0;
-    let (mut pen, mut prev) = (0.0f32, None);
-    for c in text.chars() {
-        let id = font.glyph_id(c);
-        if let Some(prev) = prev {
-            pen += font.kern_unscaled(prev, id);
-        }
-        if let Some(outline) = font.outline(id) {
-            let at = |p: ab_glyph::Point| ((pen + p.x) * scale, (mid - p.y) * scale);
-            let mut last: Option<(f32, f32)> = None;
-            for curve in &outline.curves {
-                let (a, b) = match curve {
-                    ab_glyph::OutlineCurve::Line(a, b) => (at(*a), at(*b)),
-                    ab_glyph::OutlineCurve::Quad(a, _, c) => (at(*a), at(*c)),
-                    ab_glyph::OutlineCurve::Cubic(a, _, _, d) => (at(*a), at(*d)),
-                };
-                if last != Some(a) {
-                    if last.is_some() {
-                        path.close();
-                    }
-                    path.move_to(a.0, a.1);
-                }
-                match curve {
-                    ab_glyph::OutlineCurve::Line(_, _) => path.line_to(b.0, b.1),
-                    ab_glyph::OutlineCurve::Quad(_, q, _) => {
-                        let q = at(*q);
-                        path.quad_to(q.0, q.1, b.0, b.1)
-                    }
-                    ab_glyph::OutlineCurve::Cubic(_, c1, c2, _) => {
-                        let (c1, c2) = (at(*c1), at(*c2));
-                        path.cubic_to(c1.0, c1.1, c2.0, c2.1, b.0, b.1)
-                    }
-                }
-                last = Some(b);
-            }
-            if last.is_some() {
-                path.close();
-            }
-        }
-        pen += font.h_advance_unscaled(id);
-        prev = Some(id);
-    }
-    let Some(path) = path.finish() else { return };
-    let width = pen * scale;
-    // Turned about the line's middle, anticlockwise on screen.
-    let deg = -90.0 * turn;
-    let t = tiny_skia::Transform::from_translate(-width / 2.0, 0.0).post_rotate(deg);
-    let Some(turned) = path.clone().transform(t) else {
-        return;
-    };
-    let b = turned.bounds();
-    let (ox, oy) = (b.left().floor() - 1.0, b.top().floor() - 1.0);
-    let (iw, ih) = (
-        (b.right().ceil() + 1.0 - ox) as u32,
-        (b.bottom().ceil() + 1.0 - oy) as u32,
-    );
-    if iw == 0 || ih == 0 || iw > 4096 || ih > 4096 {
-        return;
-    }
-    let Some(mut pixmap) = tiny_skia::Pixmap::new(iw, ih) else {
-        return;
-    };
-    let rgba = color.to_rgb();
-    let mut paint = tiny_skia::Paint::default();
-    let Some(c) = tiny_skia::Color::from_rgba(rgba.r, rgba.g, rgba.b, rgba.a) else {
-        return;
-    };
-    paint.set_color(c);
-    paint.anti_alias = true;
-    pixmap.fill_path(
-        &turned,
-        &paint,
-        tiny_skia::FillRule::Winding,
-        tiny_skia::Transform::from_translate(-ox, -oy),
-        None,
-    );
-    let mut data = pixmap.take_demultiplied();
-    for px in data.as_chunks_mut::<4>().0 {
-        px.swap(0, 2);
-    }
-    let Some(buffer) = image::RgbaImage::from_raw(iw, ih, data) else {
-        return;
-    };
-    let image = Arc::new(RenderImage::new([image::Frame::new(buffer)]));
-    let cx_ = f32::from(center.x) * s;
-    let cy_ = f32::from(center.y) * s;
-    let left = ((cx_ + ox).round()) / s;
-    let top = ((cy_ + oy).round()) / s;
-    window
-        .paint_image(
-            Bounds::new(
-                point(px(left), px(top)),
-                size(px(iw as f32 / s), px(ih as f32 / s)),
-            ),
-            Default::default(),
-            image,
-            0,
-            false,
-        )
-        .ok();
 }

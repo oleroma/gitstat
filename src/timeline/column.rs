@@ -43,6 +43,23 @@ const STATS_BATCH: usize = 64;
 /// How long after a failed batch its line stats are asked for again.
 const STATS_RETRY: Duration = Duration::from_secs(10);
 
+/// A repo's column in pieces, for the scene: the words its header shows
+/// beside the name, and its elements.
+pub struct Column {
+    pub checkout: gpui::SharedString,
+    pub status: gpui::SharedString,
+    /// Over the header's name and the line under it, for the mouse.
+    pub title: AnyElement,
+    /// The repo at a glance, under them; none until its history is read.
+    pub glance: Option<AnyElement>,
+    /// The tree with its rows' words.
+    pub body: AnyElement,
+    /// With lines between its rows (the columns scroll together, so they
+    /// run across the table): the row at its body's top, for
+    /// [`row_lines`].
+    pub lines: Option<f32>,
+}
+
 impl Timelines {
     /// The repo to bring into view when big mode next draws, once.
     pub fn take_focus(&mut self) -> Option<PathBuf> {
@@ -159,10 +176,12 @@ impl Timelines {
                     // Git failed as a whole (timed out, busy): ask again a
                     // little later instead of keeping no change for good.
                     retry.timer(STATS_RETRY).await;
-                    this.update(cx, |this, _| {
+                    // Drawn again, the column asks for them again.
+                    this.update(cx, |this, cx| {
                         for id in &ids {
                             this.stats_pending.remove(id);
                         }
+                        cx.notify();
                     })
                     .ok();
                     return;
@@ -174,7 +193,7 @@ impl Timelines {
                     // A commit git couldn't show counts as no change, so it
                     // isn't asked for again on every frame.
                     let stat = found.get(&id).copied().unwrap_or_default();
-                    this.stats.insert(id, stat);
+                    this.keep_stat(id, stat);
                 }
                 cx.notify();
             })
@@ -183,16 +202,20 @@ impl Timelines {
         .detach();
     }
 
-    /// One repo's column: its header, then its tree.
+    /// One repo's column, for the scene to put together: what its header
+    /// says, and its tree under it. Without `tree` the body draws its
+    /// rows' lines and words alone, for the flip, which draws the tree.
+    #[allow(clippy::too_many_arguments)]
     pub fn column(
         this: &Entity<Timelines>,
         index: usize,
         status: &RepoStatus,
         p: &Palette,
         dark: bool,
+        tree: bool,
         window: &Window,
         cx: &App,
-    ) -> AnyElement {
+    ) -> Column {
         let t = this.read(cx);
         let together = t.state.read(cx).config.scroll_together;
         let path = status.path.clone();
@@ -224,7 +247,6 @@ impl Timelines {
             &colors,
             &path,
             (t.header_open(&path), this.clone()),
-            cx,
         );
 
         // The rows' text, for the rows that fit the window; the body clips
@@ -248,13 +270,16 @@ impl Timelines {
         }
 
         let loaded = graph.is_some();
+        // How far down the column's last row ends, and whether it is the
+        // oldest commit: for the fades at its ends.
+        let span = graph.as_ref().map(|g| {
+            let last = g.commits.len().saturating_sub(1);
+            (geo.y(geo.pos(last)) + ROW / 2.0, g.end)
+        });
         let entity = this.clone();
         let (shown, shown_path) = (this.clone(), path.clone());
         let paint_path = path.clone();
         let web = graph.as_ref().and_then(|g| g.info.web.clone());
-        // Rows scrolled together line up across the table, so they get
-        // lines like the columns'.
-        let row_lines = together.then_some(p.border);
         let painter = canvas(
             move |bounds, window, cx| {
                 if window.content_mask().bounds.intersects(&bounds) {
@@ -267,14 +292,12 @@ impl Timelines {
                 window.insert_hitbox(bounds, HitboxBehavior::Normal)
             },
             move |bounds, hitbox, window, _cx| {
-                // Where the flip lands the trees next time.
-                crate::morph::seen_column(bounds, window);
-                if let Some(color) = row_lines {
-                    paint_row_lines(bounds, top, color, window);
-                }
                 let Some(g) = graph else { return };
                 if moving {
                     window.request_animation_frame();
+                }
+                if !tree {
+                    return;
                 }
                 let dots = window.with_content_mask(Some(ContentMask { bounds }), |window| {
                     paint_column(bounds, &g, &geo, grow, copied, &colors, window)
@@ -302,7 +325,8 @@ impl Timelines {
                             let above = at.y > window.viewport_size().height / 2.0;
                             (dot, at, above, dirty)
                         });
-                    e1.update(cx, |t, cx| t.hover_at(&path1, e.position, found, cx));
+                    let win = crate::win::hwnd(window);
+                    e1.update(cx, |t, cx| t.hover_at(&path1, e.position, found, win, cx));
                 });
                 window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
                     if phase != DispatchPhase::Bubble
@@ -334,15 +358,35 @@ impl Timelines {
         .absolute()
         .inset_0();
 
+        // Over the rows and their words, a fade at each end the column
+        // runs on past: none at an end it shows whole.
+        let (surface, shown_top) = (p.surface, top);
+        let ends = canvas(
+            |_, _, _| (),
+            move |bounds, _, window, _| {
+                let Some((bottom, end)) = span else {
+                    return;
+                };
+                let h = f32::from(bounds.size.height);
+                let above = (shown_top * ROW / super::FADE).clamp(0.0, 1.0);
+                let below = if end {
+                    ((bottom - h) / super::FADE).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                super::fade_ends(bounds, surface, (above, below), true, window);
+            },
+        )
+        .absolute()
+        .inset_0();
+
         let entity = this.clone();
         let wheel_path = path.clone();
         let body = div()
             .id(("column-body", index))
             .relative()
-            .flex_1()
-            .min_h_0()
+            .size_full()
             .overflow_hidden()
-            .bg(p.surface)
             .on_scroll_wheel(move |e: &ScrollWheelEvent, _, cx| {
                 let d = e.delta.pixel_delta(px(ROW));
                 let (x, y) = (f32::from(d.x), f32::from(d.y));
@@ -357,6 +401,7 @@ impl Timelines {
             })
             .child(painter)
             .children(texts)
+            .child(ends)
             .when(!loaded, |b| {
                 b.child(
                     div()
@@ -371,18 +416,16 @@ impl Timelines {
                 )
             });
 
-        div()
-            .id(("column", index))
-            .flex()
-            .flex_col()
-            .flex_none()
-            .w(px(COLUMN_WIDTH))
-            .h_full()
-            .border_r_1()
-            .border_color(p.border)
-            .child(header)
-            .child(body)
-            .into_any_element()
+        Column {
+            checkout: header.checkout.into(),
+            status: header.label.into(),
+            title: header.title,
+            glance: header.glance,
+            body: body.into_any_element(),
+            // Rows scrolled together line up across the table, so they
+            // get lines like the columns'.
+            lines: together.then_some(top),
+        }
     }
 
     /// A row's text beside its dot: hash, refs, subject, stats, age.
@@ -495,11 +538,22 @@ fn pill(text: String, color: Hsla) -> AnyElement {
         .into_any_element()
 }
 
-/// The column's header: name, checkout and status, then the repo at a
-/// glance: its branches by fate (merged, in review, hanging), worktrees and
-/// last merge. Folded, that is one row of coloured counts; open, a bar,
-/// a legend and the names behind the counts. A click on the name opens the
-/// repo, a click on the counts folds or opens the details.
+/// What a column's header is made of. The scene paints its icon, name,
+/// checkout and status where `scene::window::head` puts them; these are
+/// the rest.
+struct Head {
+    checkout: String,
+    label: String,
+    /// Over the name and the line under it: a click opens the repo, a
+    /// right click its menu, and resting there says how it stands.
+    title: AnyElement,
+    /// The repo at a glance: its branches by fate (merged, in review,
+    /// hanging), worktrees and last merge. Folded, one row of coloured
+    /// counts; open, a bar, a legend and the names behind the counts. A
+    /// click on the counts folds or opens the details.
+    glance: Option<AnyElement>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn header(
     index: usize,
@@ -510,8 +564,7 @@ fn header(
     colors: &Colors,
     path: &Path,
     (open, timelines): (bool, Entity<Timelines>),
-    cx: &App,
-) -> AnyElement {
+) -> Head {
     let checkout = match g.map(|g| &g.info.checkout) {
         Some(Checkout::Branch(b)) => b.clone(),
         Some(Checkout::Unborn(b)) => format!("{b} (no commits)"),
@@ -530,10 +583,8 @@ fn header(
     tip_lines.extend(crate::view::status_details(status, p));
     let title = div()
         .id(("column-title", index))
+        .size_full()
         .tooltip(crate::view::tip(tip_lines, p))
-        .flex()
-        .flex_col()
-        .gap(px(2.))
         .cursor_pointer()
         .on_click(move |_, _, cx| crate::view::open_repo(&repo, cx))
         .on_mouse_down(gpui::MouseButton::Right, {
@@ -543,126 +594,32 @@ fn header(
                 crate::repo_menu::show(&status, window, cx);
             }
         })
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .relative()
-                        .flex_none()
-                        .child(crate::repo_marks::global_mark(
-                            status,
-                            20.0,
-                            crate::view::status_color(status, p),
-                            cx,
-                        ))
-                        .child(crate::morph::tag(
-                            crate::morph::Side::Column,
-                            path,
-                            crate::morph::Part::Icon,
-                            None,
-                        )),
-                )
-                .child(
-                    div()
-                        .relative()
-                        .min_w_0()
-                        .truncate()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(p.text)
-                        .child(status.name.clone())
-                        .child(crate::morph::tag(
-                            crate::morph::Side::Column,
-                            path,
-                            crate::morph::Part::Name,
-                            Some((
-                                status.name.clone().into(),
-                                crate::morph::Look {
-                                    color: p.text,
-                                    size: 16.0,
-                                    bold: true,
-                                },
-                            )),
-                        )),
-                ),
-        )
-        .child(
-            div()
-                .flex()
-                .gap_2()
-                .text_sm()
-                .child(
-                    div()
-                        .relative()
-                        .min_w_0()
-                        .truncate()
-                        .text_color(p.text)
-                        .child(checkout.clone())
-                        .child(crate::morph::tag(
-                            crate::morph::Side::Column,
-                            path,
-                            crate::morph::Part::Checkout,
-                            Some((
-                                checkout.into(),
-                                crate::morph::Look {
-                                    color: p.text,
-                                    size: 14.0,
-                                    bold: false,
-                                },
-                            )),
-                        )),
-                )
-                .child(
-                    div()
-                        .relative()
-                        .flex_none()
-                        .text_color(crate::view::status_color(status, p))
-                        .child(label.clone())
-                        .child(crate::morph::tag(
-                            crate::morph::Side::Column,
-                            path,
-                            crate::morph::Part::Status,
-                            Some((
-                                label.into(),
-                                crate::morph::Look {
-                                    color: crate::view::status_color(status, p),
-                                    size: 14.0,
-                                    bold: false,
-                                },
-                            )),
-                        )),
-                ),
-        );
-    let head = div()
-        .relative()
-        .child(crate::morph::tag_header(path))
-        .flex()
-        .flex_col()
-        .flex_none()
-        .gap(px(6.))
-        .px_3()
-        .py_2()
-        .border_b_1()
-        .border_color(p.border)
-        .child(title);
-    let Some(g) = g else {
-        return head.into_any_element();
-    };
-    let glance = Glance::new(g);
-    let toggle_path = path.to_path_buf();
-    let summary = glance
-        .summary_row(index, open, p, colors)
-        .cursor_pointer()
-        .rounded_sm()
-        .hover(|s| s.bg(p.hover))
-        .on_click(move |_, _, cx| {
-            timelines.update(cx, |t, cx| t.toggle_header(&toggle_path, cx));
-        });
-    head.child(summary)
-        .when(open, |d| d.child(glance.details(p, colors)))
-        .into_any_element()
+        .into_any_element();
+    let glance = g.map(|g| {
+        let glance = Glance::new(g);
+        let toggle_path = path.to_path_buf();
+        let summary = glance
+            .summary_row(index, open, p, colors)
+            .cursor_pointer()
+            .rounded_sm()
+            .hover(|s| s.bg(p.hover))
+            .on_click(move |_, _, cx| {
+                timelines.update(cx, |t, cx| t.toggle_header(&toggle_path, cx));
+            });
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .child(summary)
+            .when(open, |d| d.child(glance.details(p, colors)))
+            .into_any_element()
+    });
+    Head {
+        checkout,
+        label,
+        title,
+        glance,
+    }
 }
 
 /// What a column header shows about a repo beyond its status.
@@ -990,6 +947,22 @@ impl Geometry {
         self.x(self.lanes.max(1) - 1) + PAD
     }
 
+    /// Where `row` on `lane` is drawn in a body whose corner is at `o`,
+    /// in a window of scale `s`, of a tree `rows` rows long: on the device
+    /// pixel grid, so runs are crisp and bends meet them exactly.
+    fn at(&self, s: f32, o: (f32, f32), rows: usize, row: f32, lane: f32) -> (f32, f32) {
+        // Fractional rows only come from segment ends, which are whole.
+        let pos = if row >= rows as f32 {
+            row + if self.dirty { 1.0 } else { 0.0 }
+        } else {
+            self.pos(row as usize)
+        };
+        (
+            ink::pos(s, o.0 + self.x(lane.round() as usize), STROKE),
+            ink::pos(s, o.1 + self.y(pos), STROKE),
+        )
+    }
+
     /// The rows in view for a body this tall.
     fn rows_in(&self, height: Pixels) -> std::ops::Range<usize> {
         let first = self.top.floor().max(0.0) as usize;
@@ -998,20 +971,87 @@ impl Geometry {
     }
 }
 
-/// The rows' thin lines across a column, one between each two rows, the
-/// same colour and width as the lines between the columns.
-fn paint_row_lines(bounds: Bounds<Pixels>, top: f32, color: Hsla, window: &mut Window) {
-    let s = window.scale_factor();
-    let (ox, oy) = (f32::from(bounds.left()), f32::from(bounds.top()));
-    let (x1, h) = (f32::from(bounds.right()), f32::from(bounds.size.height));
+/// Where a column body at its newest commits puts its tree, for the flip
+/// to turn the tree to.
+#[derive(Clone, Copy)]
+pub(super) struct ColumnGeo {
+    geo: Geometry,
+    s: f32,
+    o: (f32, f32),
+    bottom: f32,
+    rows: usize,
+}
+
+impl ColumnGeo {
+    pub(super) fn new(bounds: Bounds<Pixels>, g: &RepoGraph, dirty: bool, s: f32) -> Self {
+        Self {
+            geo: Geometry::new(g, dirty, 0.0),
+            s,
+            o: (f32::from(bounds.left()), f32::from(bounds.top())),
+            bottom: f32::from(bounds.bottom()),
+            rows: g.layout.nodes.len(),
+        }
+    }
+
+    pub(super) fn at(&self, row: f32, lane: f32) -> (f32, f32) {
+        self.geo.at(self.s, self.o, self.rows, row, lane)
+    }
+
+    /// The body's bottom edge.
+    pub(super) fn bottom(&self) -> f32 {
+        self.bottom
+    }
+
+    /// The rows it draws, a row of slack each side.
+    pub(super) fn rows(&self) -> (usize, usize) {
+        let span = self.geo.rows_in(px(self.bottom - self.o.1));
+        (span.start.saturating_sub(1), (span.end + 1).min(self.rows))
+    }
+
+    /// The work-in-progress dot's centre, and the ends of the dashed
+    /// noodle that joins it to HEAD (at HEAD, at the dot) when there is a
+    /// HEAD commit. `r` is the dot's radius.
+    pub(super) fn wip(&self, g: &RepoGraph, r: f32) -> super::Wip {
+        let c = (
+            ink::pos(self.s, self.o.0 + self.geo.x(self.geo.wip_lane), STROKE),
+            ink::pos(self.s, self.o.1 + self.geo.y(self.geo.wip_pos), STROKE),
+        );
+        let noodle = self.geo.head.map(|h| {
+            let to = self.at(h as f32, g.layout.nodes[h].lane as f32);
+            [(to.0, to.1 - DOT), (c.0, c.1 + r)]
+        });
+        (c, noodle)
+    }
+}
+
+/// A column's tree at rest, for the flip: exactly as the big window
+/// draws it at its newest commits with nothing hovered. `bounds` are the
+/// column's body, logical px.
+pub(super) fn paint_column_tree(
+    bounds: Bounds<Pixels>,
+    g: &RepoGraph,
+    dirty: bool,
+    colors: &Colors,
+    window: &mut Window,
+) {
+    let geo = Geometry::new(g, dirty, 0.0);
+    window.with_content_mask(Some(ContentMask { bounds }), |window| {
+        paint_column(bounds, g, &geo, Grow::default(), None, colors, window);
+    });
+}
+
+/// Where the rows' thin lines cross a column's body `height` logical px
+/// tall whose top row is `top`, one between each two rows: device px down
+/// from the body's top, each a crisp px there.
+pub fn row_lines(top: f32, height: f32, s: f32) -> Vec<i32> {
+    let mut out = Vec::new();
     // The line under row k sits where row k + 1 starts.
     let mut y = (1.0 - top.fract()) * ROW;
-    while y < h {
-        // On the device pixel grid, so a line stays one crisp pixel.
-        let at = ink::pos(s, oy + y, 1.0);
-        ink::line(window, (ox, at), (x1, at), 1.0, color, None);
+    while y < height {
+        out.push((y * s).floor() as i32);
         y += ROW;
     }
+    out
 }
 
 /// A column's highest top: its last row.
@@ -1049,18 +1089,8 @@ fn paint_column(
     let s = window.scale_factor();
     let (ox, oy) = (f32::from(bounds.left()), f32::from(bounds.top()));
     let at = |row: f32, lane: f32| {
-        // Fractional rows only come from segment ends, which are whole.
-        let pos = if row >= rows as f32 {
-            row + if geo.dirty { 1.0 } else { 0.0 }
-        } else {
-            geo.pos(row as usize)
-        };
-        // On the device pixel grid, so runs are crisp and bends meet them
-        // exactly.
-        point(
-            px(ink::pos(s, ox + geo.x(lane.round() as usize), STROKE)),
-            px(ink::pos(s, oy + geo.y(pos), STROKE)),
-        )
+        let (x, y) = geo.at(s, (ox, oy), rows, row, lane);
+        point(px(x), px(y))
     };
     let folded = |lane: f32| lane.round() as usize >= LANES;
     let span = geo.rows_in(bounds.size.height);

@@ -39,6 +39,10 @@ pub struct Target {
     pub branch: Option<String>,
     /// Only on GitHub: just its page, and hiding it.
     pub remote_only: bool,
+    /// Pinned to the floating view, and whether there is one to pin to
+    /// (the badge is on).
+    pub pinned: bool,
+    pub float: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +55,9 @@ pub enum RepoAction {
     CopyPath,
     Fetch,
     Hide,
+    /// Pin it to the floating view, or take it off.
+    Pin,
+    Unpin,
 }
 
 impl RepoAction {
@@ -68,12 +75,20 @@ impl RepoAction {
 fn items(target: &Target) -> Vec<Option<(RepoAction, String)>> {
     use RepoAction::*;
     let item = |a, t: &str| Some((a, t.to_string()));
+    let pin = || {
+        if target.pinned {
+            item(Unpin, "Unpin from the floating view")
+        } else {
+            item(Pin, "Pin to the floating view")
+        }
+    };
     if target.remote_only {
-        return vec![
-            item(GitHub, "Open on GitHub"),
-            None,
-            item(Hide, "Hide this repo"),
-        ];
+        let mut items = vec![item(GitHub, "Open on GitHub"), None];
+        if target.float {
+            items.push(pin());
+        }
+        items.push(item(Hide, "Hide this repo"));
+        return items;
     }
     let mut items = vec![
         item(OpenFolder, "Open folder"),
@@ -90,6 +105,9 @@ fn items(target: &Target) -> Vec<Option<(RepoAction, String)>> {
     items.push(item(CopyPath, "Copy path"));
     items.push(None);
     items.push(item(Fetch, "Fetch now"));
+    if target.float {
+        items.push(pin());
+    }
     items.push(item(Hide, "Hide this repo"));
     items
 }
@@ -97,19 +115,28 @@ fn items(target: &Target) -> Vec<Option<(RepoAction, String)>> {
 /// Shows the menu for `status` at the mouse. `window` gets the focus back
 /// when the menu closes without leaving.
 pub fn show(status: &RepoStatus, window: &Window, cx: &mut App) {
-    let Some(input) = cx.try_global::<Ui>().map(|ui| ui.input.clone()) else {
+    show_from(status, crate::win::hwnd(window), cx);
+}
+
+/// Shows the menu for `status` at the mouse; `return_to`, if any, is the
+/// window that gets the focus back.
+pub fn show_from(status: &RepoStatus, return_to: Option<isize>, cx: &mut App) {
+    let Some(ui) = cx.try_global::<Ui>() else {
         return;
     };
-    if OPEN.swap(true, Ordering::SeqCst) {
-        return;
-    }
+    let input = ui.input.clone();
+    let state = ui.state.read(cx);
     let target = Target {
         path: status.path.clone(),
         name: status.name.clone(),
         branch: status.branch.clone(),
         remote_only: status.remote_only,
+        pinned: state.pinned(status),
+        float: state.config.overlay.enabled,
     };
-    let return_to = crate::win::hwnd(window);
+    if OPEN.swap(true, Ordering::SeqCst) {
+        return;
+    }
     let spawned = std::thread::Builder::new()
         .name("gitstat-repo-menu".into())
         .spawn(move || {
@@ -239,9 +266,11 @@ pub fn run(action: RepoAction, target: &Target, cx: &mut App) {
         }
         RepoAction::Editor => {
             if let Some(code) = editor() {
-                let spawned = Command::new("cmd.exe")
-                    .arg("/c")
-                    .arg(code)
+                // Run directly, not through `cmd /c`: Rust quotes the
+                // arguments of a .cmd for cmd itself (so a `&` or a space
+                // in the folder name stays part of the path), but only when
+                // the program it runs is the .cmd.
+                let spawned = Command::new(code)
                     .arg(path)
                     .creation_flags(CREATE_NO_WINDOW)
                     .spawn();
@@ -259,15 +288,23 @@ pub fn run(action: RepoAction, target: &Target, cx: &mut App) {
         RepoAction::CopyPath => {
             cx.write_to_clipboard(ClipboardItem::new_string(path.display().to_string()));
         }
-        RepoAction::Fetch | RepoAction::Hide => {}
+        RepoAction::Fetch | RepoAction::Hide | RepoAction::Pin | RepoAction::Unpin => {}
     }
 }
 
-/// The repo's GitHub page, read from its `origin` off the UI thread; its
-/// folder when it has none.
-fn open_github(path: &Path, cx: &mut App) {
+/// The repo's GitHub page: its slug for a repo with no clone, the one its
+/// drawn tree read, else read from its `origin` off the UI thread, which a
+/// slow or busy disk would otherwise freeze. Its folder when it has none.
+pub(crate) fn open_github(path: &Path, cx: &mut App) {
     if let Some(slug) = crate::github::remote_slug(path) {
         cx.open_url(&format!("https://github.com/{slug}"));
+        return;
+    }
+    let known = cx
+        .try_global::<Ui>()
+        .and_then(|ui| ui.timelines.read(cx).web(path));
+    if let Some(web) = known {
+        cx.open_url(&web);
         return;
     }
     let repo = path.to_path_buf();
