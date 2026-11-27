@@ -22,6 +22,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 mod panel_scene;
+pub(crate) use panel_scene::put;
 mod stage;
 mod window_scene;
 

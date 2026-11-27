@@ -102,34 +102,6 @@ pub fn cubic(window: &mut Window, c: [P; 4], width: f32, color: Hsla, dash: Opti
     stroke(window, &c, width, color, dash);
 }
 
-/// An arc of the circle of radius `r` around `center`, from angle `start`
-/// to `end` in radians, clockwise from the top.
-pub fn arc(window: &mut Window, center: P, r: f32, start: f32, end: f32, width: f32, color: Hsla) {
-    // Cubics of at most a quarter turn each, which stay within 0.03% of
-    // the circle.
-    let n = ((end - start).abs() / std::f32::consts::FRAC_PI_2)
-        .ceil()
-        .max(1.0) as usize;
-    let step = (end - start) / n as f32;
-    let k = 4.0 / 3.0 * (step / 4.0).tan();
-    let at = |a: f32| (center.0 + r * a.sin(), center.1 - r * a.cos());
-    // The tangent, clockwise from the top.
-    let dir = |a: f32| (a.cos(), a.sin());
-    let mut pts = Vec::with_capacity(3 * n + 1);
-    for i in 0..n {
-        let (a0, a1) = (start + step * i as f32, start + step * (i + 1) as f32);
-        let (p0, p3) = (at(a0), at(a1));
-        let (d0, d1) = (dir(a0), dir(a1));
-        if i == 0 {
-            pts.push(p0);
-        }
-        pts.push((p0.0 + d0.0 * k * r, p0.1 + d0.1 * k * r));
-        pts.push((p3.0 - d1.0 * k * r, p3.1 - d1.1 * k * r));
-        pts.push(p3);
-    }
-    stroke(window, &pts, width, color, None);
-}
-
 /// Strokes the cubics through `pts` (a start, then three points per
 /// cubic) with round caps, as a picture drawn once per shape.
 fn stroke(window: &mut Window, pts: &[P], width: f32, color: Hsla, dash: Option<Dash>) {

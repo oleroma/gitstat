@@ -7,6 +7,10 @@ use std::path::{Path, PathBuf};
 
 pub const FILE_NAME: &str = "config.json";
 
+/// The floating view's width, logical px, at its least and at its most.
+pub const FLOAT_MIN_WIDTH: f32 = 120.0;
+pub const FLOAT_MAX_WIDTH: f32 = 480.0;
+
 /// Work-area corner of the primary monitor that holds the overlay badge.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -105,6 +109,50 @@ pub struct OverlayConfig {
     pub offset_y: Option<f32>,
     pub hide_when_synced: bool,
     pub hide_in_fullscreen: bool,
+    /// Its corners' radius in logical px; unset, half its size: a disc.
+    /// Grown into the floating view it keeps this radius.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub radius: Option<f32>,
+    /// Grown into the floating view (a right click on it), which it comes
+    /// back as after a restart.
+    pub grown: bool,
+}
+
+/// The floating view the badge grows into: a row per repo, its icon and
+/// its tree, always on top.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FloatConfig {
+    /// The repos pinned to it, by name as gitstat shows them, in the
+    /// order they are listed.
+    pub pinned: Vec<String>,
+    /// Repos taken out of it though lately worked on, by name.
+    pub hidden: Vec<String>,
+    /// Repos worked on in this many days are listed after the pinned
+    /// ones; 0 lists the pinned ones alone.
+    pub recent_days: f64,
+    /// Its width in logical px.
+    pub width: f32,
+    /// How solid its background is, 0.2 to 1.
+    pub opacity: f32,
+    /// The health bar along its top.
+    pub health: bool,
+    /// The open pull requests along its bottom.
+    pub prs: bool,
+}
+
+impl Default for FloatConfig {
+    fn default() -> Self {
+        Self {
+            pinned: Vec::new(),
+            hidden: Vec::new(),
+            recent_days: 3.0,
+            width: 220.0,
+            opacity: 1.0,
+            health: true,
+            prs: true,
+        }
+    }
 }
 
 impl Default for OverlayConfig {
@@ -118,6 +166,8 @@ impl Default for OverlayConfig {
             offset_y: None,
             hide_when_synced: false,
             hide_in_fullscreen: true,
+            radius: None,
+            grown: false,
         }
     }
 }
@@ -155,6 +205,8 @@ pub struct Config {
     /// and coloured marks, their words in tooltips.
     pub icons_only: bool,
     pub overlay: OverlayConfig,
+    /// The floating view the badge grows into.
+    pub float: FloatConfig,
     /// desktop.ini status icons on the repo folders.
     pub folder_icons: bool,
     /// What those icons are drawn from; only matters with `folder_icons`.
@@ -297,6 +349,7 @@ impl Default for Config {
             window: true,
             icons_only: false,
             overlay: OverlayConfig::default(),
+            float: FloatConfig::default(),
             folder_icons: false,
             folder_icon_mode: FolderIconMode::default(),
             github_prs: true,
@@ -561,6 +614,39 @@ impl Config {
         )
     }
 
+    /// The badge's corners' radius, logical px: at most half its size,
+    /// which makes it a disc.
+    pub fn overlay_radius(&self) -> f32 {
+        let half = self.overlay_size() / 2.0;
+        match self.overlay.radius {
+            Some(r) if r.is_finite() => r.clamp(0.0, half),
+            _ => half,
+        }
+    }
+
+    /// The floating view's width, logical px, never narrower than the
+    /// badge it grows from.
+    pub fn float_width(&self) -> f32 {
+        clamp_f32(
+            self.float.width,
+            FLOAT_MIN_WIDTH,
+            FLOAT_MAX_WIDTH,
+            FloatConfig::default().width,
+        )
+        .max(self.overlay_size())
+    }
+
+    pub fn float_opacity(&self) -> f32 {
+        clamp_f32(self.float.opacity, 0.2, 1.0, 1.0)
+    }
+
+    /// How long ago a repo may have been worked on to be listed in the
+    /// floating view unpinned, in seconds; none when that is off.
+    pub fn float_recent_secs(&self) -> Option<i64> {
+        let days = self.float.recent_days;
+        (days.is_finite() && days > 0.0).then(|| (days.min(3650.0) * 86_400.0) as i64)
+    }
+
     pub fn overlay_margin(&self) -> f32 {
         clamp_f32(
             self.overlay.margin,
@@ -578,6 +664,19 @@ impl Config {
         let offset = |v: Option<f32>| v.map_or(margin, |v| clamp_f32(v, 0.0, 100_000.0, margin));
         (offset(self.overlay.offset_x), offset(self.overlay.offset_y))
     }
+}
+
+/// Whether two repo names are the same repo's: case and the slash's
+/// direction don't matter.
+pub fn same_name(a: &str, b: &str) -> bool {
+    let fold = |c: char| {
+        if c == '\\' {
+            '/'
+        } else {
+            c.to_ascii_lowercase()
+        }
+    };
+    a.chars().map(fold).eq(b.chars().map(fold))
 }
 
 fn clamp_f32(value: f32, min: f32, max: f32, default: f32) -> f32 {

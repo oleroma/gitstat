@@ -60,7 +60,7 @@ pub enum Command {
     /// A config the app changed in memory, e.g. a menu toggle that
     /// config.json (unparsable mid-edit) couldn't take. A later good reload
     /// of the file replaces it, as it does in the app.
-    Apply(Config),
+    Apply(Box<Config>),
     /// Fetch this repo now, if this monitor watches it.
     Fetch(PathBuf),
     /// When GitHub last saw a push to each repo with a GitHub `origin`, from
@@ -379,8 +379,8 @@ impl Scheduler {
                 }
                 Ok(Msg::Cmd(Command::Pushed(pushed))) => self.on_pushed(pushed, Instant::now()),
                 Ok(Msg::Cmd(Command::Apply(config))) => {
-                    if config != self.config {
-                        self.apply_config(config, Instant::now());
+                    if *config != self.config {
+                        self.apply_config(*config, Instant::now());
                     }
                 }
                 Ok(Msg::Fs(event)) => self.on_fs(event, Instant::now()),
@@ -1929,7 +1929,7 @@ mod tests {
         );
         // A menu toggle that couldn't be saved.
         config.watch = false;
-        h.send(Command::Apply(config));
+        h.send(Command::Apply(Box::new(config)));
         assert!(
             h.wait_for(WAIT, |u| matches!(u, Update::Mode(WatchMode::Off)))
                 .is_some(),

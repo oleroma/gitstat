@@ -116,7 +116,7 @@ pub(super) struct Slots {
 
 /// `slot` in a box of its own, `r` device px from the corner at `at`,
 /// laid out and ready to paint, at `alpha` of its strength.
-pub(super) fn put(
+pub(crate) fn put(
     slot: AnyElement,
     r: Rect,
     at: (i32, i32),
@@ -942,6 +942,7 @@ impl StatusView {
                                     dark,
                                     icons_only,
                                     !staged,
+                                    false,
                                     cx,
                                 );
                                 RowPart {

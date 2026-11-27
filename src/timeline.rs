@@ -866,7 +866,9 @@ impl Timelines {
 
     /// One repo's strip in the panel: what lies under its row's parts (its
     /// tree, and where the mouse finds its label), and its label's words
-    /// for the scene to draw.
+    /// for the scene to draw. `float`, it is the floating view's: that
+    /// window is no bigger than the view, so it says what the mouse rests
+    /// on itself, and a click opens the big window through the panel.
     #[allow(clippy::too_many_arguments)]
     pub fn strip(
         this: &Entity<Timelines>,
@@ -876,6 +878,7 @@ impl Timelines {
         dark: bool,
         icons_only: bool,
         tree: bool,
+        float: bool,
         cx: &App,
     ) -> Strip {
         let t = this.read(cx);
@@ -1072,12 +1075,21 @@ impl Timelines {
                 let status = status.clone();
                 move |_, window, cx| {
                     cx.stop_propagation();
-                    crate::repo_menu::show(&status, window, cx);
+                    if float {
+                        // The badge's window never takes the keyboard.
+                        crate::repo_menu::show_from(&status, None, cx);
+                    } else {
+                        crate::repo_menu::show(&status, window, cx);
+                    }
                 }
             })
             // Big mode, scrolled to this repo's column; the folder when the
             // window is turned off.
             .on_click(move |_, window, cx| {
+                if float {
+                    crate::overlay::open_repo(&open_path, cx);
+                    return;
+                }
                 let big = this_for_label.read(cx).state.read(cx).config.window;
                 if big {
                     crate::flip::open_window(window, Some(open_path.clone()), cx);
@@ -1086,7 +1098,7 @@ impl Timelines {
                     crate::view::open_repo(&open_path, cx);
                 }
             })
-            .tooltip(crate::view::tip(lines, p))
+            .when(!float, |d| d.tooltip(crate::view::tip(lines, p)))
             .into_any_element();
         Strip {
             graph: graph_slot,

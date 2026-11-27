@@ -303,6 +303,10 @@ fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
                     Some(ClickAction::Menu) | None => {}
                 }
             }
+            Input::OverlayGrown(grown) => {
+                change_setting(|c| c.overlay.grown = grown, cx);
+                changed = true;
+            }
             Input::OverlayMoved(rect) => {
                 let (corner, x, y) = overlay::drop_position(rect);
                 change_setting(
@@ -516,14 +520,25 @@ fn on_action(action: TrayAction, cx: &mut App) -> bool {
                     cx.global::<Shared>()
                         .send_monitors(Command::Fetch(target.path.clone()));
                 }
+                RepoAction::Pin | RepoAction::Unpin => {
+                    use crate::config::same_name;
+                    let name = listed_name(&target);
+                    let pin = action == RepoAction::Pin;
+                    change_setting(
+                        move |c| {
+                            let float = &mut c.float;
+                            float.pinned.retain(|p| !same_name(p, &name));
+                            if pin {
+                                // Pinned, it is no longer one taken out.
+                                float.hidden.retain(|h| !same_name(h, &name));
+                                float.pinned.push(name);
+                            }
+                        },
+                        cx,
+                    );
+                }
                 RepoAction::Hide => {
-                    let name = if target.remote_only {
-                        crate::github::remote_slug(&target.path)
-                            .unwrap_or(&target.name)
-                            .to_string()
-                    } else {
-                        target.name.clone()
-                    };
+                    let name = listed_name(&target);
                     change_setting(
                         move |c| {
                             if !c.is_ignored(&name) {
@@ -677,6 +692,18 @@ fn ask_folder_icons(cx: &mut App) {
 /// (config.json doesn't parse) keeps the change in memory, with one notice
 /// per session. The monitor gets the change directly either way: it only
 /// rereads a file that saved.
+/// The name a repo menu's repo is hidden or pinned by: as gitstat shows
+/// it, `owner/name` for one only on GitHub.
+fn listed_name(target: &crate::repo_menu::Target) -> String {
+    if target.remote_only {
+        crate::github::remote_slug(&target.path)
+            .unwrap_or(&target.name)
+            .to_string()
+    } else {
+        target.name.clone()
+    }
+}
+
 fn change_setting(f: impl FnOnce(&mut Config), cx: &mut App) {
     let state = cx.global::<Ui>().state.clone();
     let (old, file) = {
@@ -699,7 +726,7 @@ fn change_setting(f: impl FnOnce(&mut Config), cx: &mut App) {
         }
     }
     cx.global::<Shared>()
-        .send_monitors(Command::Apply(new.clone()));
+        .send_monitors(Command::Apply(Box::new(new.clone())));
     apply_config(&old, new, cx);
 }
 
@@ -722,7 +749,7 @@ fn apply_config(old: &Config, new: Config, cx: &mut App) {
     if !new.window {
         view::close_window(cx);
     }
-    if new.overlay != old.overlay {
+    if new.overlay != old.overlay || new.float != old.float {
         overlay::sync(cx);
     }
     let s = state.read(cx);

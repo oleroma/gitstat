@@ -371,6 +371,61 @@ impl AppState {
             .collect()
     }
 
+    /// The name a repo is pinned, hidden or ignored by: as gitstat shows
+    /// it, `owner/name` for one only on GitHub.
+    pub fn listed_name(s: &RepoStatus) -> String {
+        if s.remote_only {
+            crate::github::remote_slug(&s.path)
+                .unwrap_or(&s.name)
+                .to_string()
+        } else {
+            s.name.clone()
+        }
+    }
+
+    /// The floating view's repos at `now` (Unix seconds): the pinned ones
+    /// in their order, then those worked on lately, the latest first,
+    /// but for the ones taken out of it.
+    pub fn float_repos(&self, now: i64) -> Vec<&RepoStatus> {
+        use crate::config::same_name;
+        let float = &self.config.float;
+        let all = || self.statuses.iter().chain(&self.remote_statuses);
+        let mut listed: Vec<&RepoStatus> = Vec::new();
+        for name in &float.pinned {
+            if let Some(s) = all().find(|s| same_name(&Self::listed_name(s), name))
+                && !listed.iter().any(|l| l.path == s.path)
+            {
+                listed.push(s);
+            }
+        }
+        if let Some(within) = self.config.float_recent_secs() {
+            let worked = |s: &RepoStatus| s.last_worked.max(s.last_commit);
+            let mut recent: Vec<&RepoStatus> = self
+                .statuses
+                .iter()
+                .filter(|s| worked(s) > 0 && now - worked(s) <= within)
+                .filter(|s| {
+                    let name = Self::listed_name(s);
+                    !float.hidden.iter().any(|h| same_name(h, &name))
+                        && !listed.iter().any(|l| l.path == s.path)
+                })
+                .collect();
+            recent.sort_by_cached_key(|s| (std::cmp::Reverse(worked(s)), s.name.to_lowercase()));
+            listed.extend(recent);
+        }
+        listed
+    }
+
+    /// Whether `s` is pinned to the floating view.
+    pub fn pinned(&self, s: &RepoStatus) -> bool {
+        let name = Self::listed_name(s);
+        self.config
+            .float
+            .pinned
+            .iter()
+            .any(|p| crate::config::same_name(p, &name))
+    }
+
     /// The cloned repos in the configured order; the panel splits them
     /// into unsynced and synced keeping it.
     pub fn sorted_for_panel(&self) -> Vec<&RepoStatus> {
@@ -496,6 +551,8 @@ pub enum Input {
     Monitor(usize, crate::monitor::Update),
     /// A click on the badge.
     Overlay,
+    /// The badge was asked to grow into the floating view, or back.
+    OverlayGrown(bool),
     /// The badge was dragged and dropped with its disc here (physical px).
     OverlayMoved(crate::layout::Rect),
     /// The folder-icon worker's report: skipped folders and why.
@@ -519,6 +576,31 @@ mod tests {
             has_upstream: true,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn float_lists_pinned_then_lately_worked() {
+        let day = 86_400;
+        let now = 100 * day;
+        let mut old = repo("old");
+        old.last_worked = now - 10 * day;
+        let mut today = repo("today");
+        today.last_commit = now - 60;
+        let mut yesterday = repo("Yesterday");
+        yesterday.last_worked = now - day;
+        let mut gone = repo("gone");
+        gone.last_worked = now - 30;
+        let mut s = state(vec![old, today, yesterday, gone, repo("never")]);
+        s.config.float.pinned = vec!["OLD".into(), "missing".into(), "yesterday".into()];
+        s.config.float.hidden = vec!["gone".into()];
+        let names = |s: &AppState| -> Vec<String> {
+            s.float_repos(now).iter().map(|r| r.name.clone()).collect()
+        };
+        assert_eq!(names(&s), ["old", "Yesterday", "today"]);
+        // Lately worked on turned off: the pinned ones alone.
+        s.config.float.recent_days = 0.0;
+        assert_eq!(names(&s), ["old", "Yesterday"]);
+        assert!(s.pinned(&s.statuses[0]) && !s.pinned(&s.statuses[1]));
     }
 
     fn state(statuses: Vec<RepoStatus>) -> AppState {

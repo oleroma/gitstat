@@ -7,12 +7,14 @@
 //! wherever it is drawn, to the pixel.
 //!
 //! - [`panel`]: where the panel's parts go.
+//! - [`float`]: where the floating view's parts go.
 //! - [`window`]: where the big window's parts go.
 //! - [`text`]: words on whole device px, the same in every window.
 //! - [`paint`]: the other parts' painters.
 //! - [`parts`]: a view as a list of parts, and the list part way between
 //!   two views.
 
+pub mod float;
 pub mod panel;
 pub mod window;
 

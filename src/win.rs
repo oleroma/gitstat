@@ -14,7 +14,7 @@ use windows_sys::Win32::Graphics::Dwm::{
     DWMWCP_DONOTROUND, DwmFlush, DwmGetWindowAttribute, DwmSetWindowAttribute,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    ClientToScreen, CreateEllipticRgn, DeleteObject, GetMonitorInfoW, HMONITOR,
+    ClientToScreen, CreateRoundRectRgn, DeleteObject, GetMonitorInfoW, HMONITOR,
     MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
     ScreenToClient, SetWindowRgn,
 };
@@ -210,14 +210,12 @@ unsafe fn frame(hwnd: HWND) -> (i32, i32, i32, i32) {
 }
 
 /// Puts the overlay's client area at `r`, topmost and shown without
-/// activation, and clips it (drawing and clicks) to the ellipse inscribed
-/// in `r`. The region is 1-bit, so its edge is jagged: `r` includes
-/// transparent padding around the drawn disc, which keeps the disc's own
-/// anti-aliased edge away from it.
+/// activation, and cuts it (drawing and clicks) to `shape`: see
+/// [`shape_overlay`].
 ///
 /// # Safety
 /// Call only from a spawned task outside `update`.
-pub unsafe fn place_overlay(h: isize, r: Rect) {
+pub unsafe fn place_overlay(h: isize, r: Rect, shape: Option<i32>) {
     let Some(hwnd) = live(h) else { return };
     unsafe {
         // Size the window so the client area is exactly `r`.
@@ -231,8 +229,46 @@ pub unsafe fn place_overlay(h: isize, r: Rect) {
             r.height() + bh,
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
+        set_shape(hwnd, (dx, dy), (r.width(), r.height()), shape);
+    }
+}
+
+/// Cuts the overlay (drawing and clicks) to its client area with its
+/// corners rounded by `shape` px, a disc when that is half its side; with
+/// none, to nothing: all of it shows, as while what it draws grows inside
+/// it. The cut is 1-bit, so its edge is jagged: the client area includes
+/// transparent padding around what is drawn, which keeps that one's own
+/// anti-aliased edge away from it.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn shape_overlay(h: isize, shape: Option<i32>) {
+    let Some(hwnd) = live(h) else { return };
+    unsafe {
+        let (dx, dy, _, _) = frame(hwnd);
+        let mut cr = RECT::default();
+        if GetClientRect(hwnd, &mut cr) != 0 {
+            set_shape(hwnd, (dx, dy), (cr.right, cr.bottom), shape);
+        }
+    }
+}
+
+/// The region for a client area `size` at `at` in its window.
+unsafe fn set_shape(hwnd: HWND, at: (i32, i32), size: (i32, i32), shape: Option<i32>) {
+    unsafe {
+        let Some(radius) = shape else {
+            SetWindowRgn(hwnd, std::ptr::null_mut(), 1);
+            return;
+        };
         // Region coordinates are relative to the window, not the client area.
-        let rgn = CreateEllipticRgn(dx, dy, dx + r.width() + 1, dy + r.height() + 1);
+        let rgn = CreateRoundRectRgn(
+            at.0,
+            at.1,
+            at.0 + size.0 + 1,
+            at.1 + size.1 + 1,
+            2 * radius,
+            2 * radius,
+        );
         // On success the system owns the region; on failure it is ours to free.
         if !rgn.is_null() && SetWindowRgn(hwnd, rgn, 1) == 0 {
             DeleteObject(rgn);

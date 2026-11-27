@@ -565,7 +565,141 @@ async fn run(out: &std::path::Path, report: &mut String, cx: &mut AsyncApp) -> R
     let _ = window_now;
     cx.update(panel::slide_away).map_err(gone)?;
     pause(800, cx).await;
+    let grown = float(out, report, cx).await;
     crate::frames::mute(false);
+    grown
+}
+
+/// The badge grows into the floating view and shrinks back, twice: every
+/// picture that can be caught, against the badge and the view at rest.
+/// While it is the badge, in whichever window, the screen must show the
+/// badge as it rests, to the px; the same of the view the second time,
+/// once its trees are read.
+async fn float(
+    out: &std::path::Path,
+    report: &mut String,
+    cx: &mut AsyncApp,
+) -> Result<(), String> {
+    let gone = |_| "the app went away".to_string();
+    let mon = win::primary_monitor();
+    let Some(badge) = cx.update(|cx| crate::overlay::placed(cx)).map_err(gone)? else {
+        return Err("no badge to grow".into());
+    };
+    let room = (520.0 * mon.scale) as i32;
+    let o = badge.outset(room);
+    let area = Rect::new(
+        o.left.max(mon.rect.left),
+        o.top.max(mon.rect.top),
+        o.right.min(mon.rect.right),
+        o.bottom.min(mon.rect.bottom),
+    );
+    // What is surely the sheet's own, whatever lies under its corners.
+    let inner = |r: Rect| {
+        let d = (r.width().min(r.height()) as f32 * 0.16) as i32;
+        Rect::new(r.left + d, r.top + d, r.right - d, r.bottom - d)
+    };
+    let Some(small) = shot(out, "float-badge-rest", area, cx).await else {
+        return Err("no picture of the screen".into());
+    };
+    let mut big: Option<(Shot, Rect)> = None;
+    for round in 1..=2 {
+        for grow in [true, false] {
+            let what = format!("float {} {round}", if grow { "grow" } else { "shrink" });
+            let watch = Watch::start_on(
+                area,
+                out.join(what.replace(' ', "-")),
+                crate::overlay::drawn,
+            );
+            pause(150, cx).await;
+            cx.update(|cx| {
+                cx.global::<Ui>()
+                    .input
+                    .unbounded_send(crate::state::Input::OverlayGrown(grow))
+                    .ok();
+            })
+            .map_err(gone)?;
+            let began = Instant::now();
+            pause(60, cx).await;
+            loop {
+                let resting = cx.update(|cx| crate::overlay::resting(cx)).map_err(gone)?;
+                if resting == Some(grow) {
+                    break;
+                }
+                if began.elapsed() > Duration::from_secs(6) {
+                    return Err(format!("{what}: it never came to rest ({resting:?})"));
+                }
+                pause(10, cx).await;
+            }
+            let took = began.elapsed().as_millis();
+            pause(if grow && round == 1 { 1500 } else { 350 }, cx).await;
+            let frames = watch.stop(cx).await;
+            let sheet = cx.update(|cx| crate::overlay::placed(cx)).map_err(gone)?;
+            let _ = writeln!(
+                report,
+                "{what}: at rest after {took} ms, as {sheet:?} (the badge {badge:?}); {} pictures; \
+                 each: ms, thousandths grown, px changed since the one before, px unlike the \
+                 badge at rest, px unlike the view at rest",
+                frames.len()
+            );
+            if grow {
+                let Some(sheet) = sheet else {
+                    return Err(format!("{what}: no view"));
+                };
+                let Some(now) = shot(out, &format!("float-view-rest-{round}"), area, cx).await
+                else {
+                    return Err("no picture of the screen".into());
+                };
+                big = Some((now, sheet));
+            }
+            let Some((view, sheet)) = &big else {
+                return Err(format!("{what}: no view to compare with"));
+            };
+            let mut wrong = Vec::new();
+            for (i, c) in frames.iter().enumerate() {
+                let moved = match i.checked_sub(1).and_then(|j| frames.get(j)) {
+                    Some(last) => changed(&c.shot, &last.shot, area),
+                    None => 0,
+                };
+                let unlike_badge = changed(&c.shot, &small, inner(badge));
+                let unlike_view = changed(&c.shot, view, inner(*sheet));
+                let g = c.drawn.map(|d| d.0);
+                let _ = writeln!(
+                    report,
+                    "{what}: {:5} {:>5} {}{moved:8} {unlike_badge:8} {unlike_view:8}",
+                    c.ms,
+                    g.map_or("-".to_string(), |g| g.to_string()),
+                    if c.steady { " " } else { "~" },
+                );
+                // While it is the badge it shows as the badge at rest,
+                // whichever window draws it; and the view as the view,
+                // once its trees are read.
+                if c.steady && g == Some(0) && unlike_badge > 0 {
+                    wrong.push(format!("{} ms: the badge, {unlike_badge} px off", c.ms));
+                }
+                if c.steady && g == Some(1000) && unlike_view > 0 && (round == 2 || !grow) {
+                    wrong.push(format!("{} ms: the view, {unlike_view} px off", c.ms));
+                }
+            }
+            if let Some(first) = wrong.first() {
+                let _ = writeln!(report, "{what}: {} pictures off: {wrong:?}", wrong.len());
+                return Err(format!("{what}: {first}"));
+            }
+            if !grow {
+                let Some(now) = shot(out, &format!("float-badge-after-{round}"), area, cx).await
+                else {
+                    return Err("no picture of the screen".into());
+                };
+                let off = changed(&now, &small, inner(badge));
+                let _ = writeln!(
+                    report,
+                    "{what}: the badge it ended as against the badge before, px that differ: {off}"
+                );
+                if off > 0 {
+                    return Err(format!("{what}: the badge came back {off} px off"));
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -641,8 +775,14 @@ struct Watch {
 struct Caught {
     ms: u128,
     drawn: Option<(u16, u16, u16)>,
+    /// No new frame was drawn while it was taken: it shows `drawn`, or
+    /// the frame before it, never a later one.
+    steady: bool,
     shot: Shot,
 }
+
+/// What says which frame was drawn last.
+type Drawn = fn() -> Option<(u16, u16, u16)>;
 
 /// No more pictures than this are kept of one flip.
 const MOST: usize = 110;
@@ -650,6 +790,11 @@ const MOST: usize = 110;
 impl Watch {
     /// Starts taking `rect`; the pictures also go in `folder`.
     fn start(rect: Rect, folder: PathBuf) -> Self {
+        Self::start_on(rect, folder, crate::flip::drawn)
+    }
+
+    /// The same, of whatever `read` says the frame drawn last was.
+    fn start_on(rect: Rect, folder: PathBuf, read: Drawn) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
         let thread = std::thread::spawn(move || {
@@ -657,15 +802,16 @@ impl Watch {
             let began = Instant::now();
             let mut caught = Vec::new();
             while !stopped.load(Ordering::Relaxed) && caught.len() < MOST {
-                let before = crate::flip::drawn();
+                let before = read();
                 let Some((w, _, pixels)) = win::capture(rect) else {
                     break;
                 };
                 // Only pictures the flip did not draw a new frame under.
-                let drawn = crate::flip::drawn();
+                let drawn = read();
                 caught.push(Caught {
                     ms: began.elapsed().as_millis(),
                     drawn: if before == drawn { drawn } else { before },
+                    steady: before == drawn,
                     shot: Shot { rect, w, pixels },
                 });
             }
