@@ -23,7 +23,19 @@ if grep -qx exe <<<"$parts"; then
 fi
 
 if grep -qx apk <<<"$parts"; then
-  bash .agents/hooks/phone-gradle :app:assembleRelease "-PappVersion=$version" >&2
+  # Right after a build, Windows (Defender, or the last build's daemon) can still hold a dex
+  # file Gradle rewrites; that one failure is waited out once and tried again.
+  mkdir -p build/android
+  log=build/android/assemble.log
+  if ! bash .agents/hooks/phone-gradle :app:assembleRelease "-PappVersion=$version" >"$log" 2>&1; then
+    cat "$log" >&2
+    grep -q "being used by another process" "$log" || exit 1
+    echo "A build file was locked by another process; trying again in 20 s." >&2
+    sleep 20
+    bash .agents/hooks/phone-gradle :app:assembleRelease "-PappVersion=$version" >&2
+  else
+    cat "$log" >&2
+  fi
   apk=build/android/gitstat-phone.apk
   cp build/android/app/outputs/apk/release/app-release.apk "$apk"
   echo "build-file: $apk $version"
