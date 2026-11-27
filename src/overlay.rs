@@ -665,6 +665,7 @@ impl Element for Scene {
                 return;
             }
             let spot = at_down.at(dev(e.position));
+            hush(cx);
             match (e.button, spot) {
                 (MouseButton::Left, _) => down(spot, cx),
                 // An icon: its folder; anywhere else on it, the badge.
@@ -675,6 +676,9 @@ impl Element for Scene {
                 _ => {}
             }
         });
+        if !window.is_window_hovered() && cx.default_global::<OverlaySlot>().mouse_in {
+            cx.defer(left);
+        }
         let at_move = spots.clone();
         window.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
             if phase != DispatchPhase::Bubble {
@@ -805,7 +809,7 @@ impl Render for OverlayView {
         let mut tips = Vec::new();
         let mut names = Vec::new();
         let mut prs = Vec::new();
-        let mut pr_tip = String::new();
+        let mut pr_tip = Lines::new();
         if pose.rows > 0.0 {
             // The trees end on the sheet itself: see-through, they fade
             // into nothing rather than into a colour that isn't there.
@@ -836,15 +840,16 @@ impl Render for OverlayView {
                     }
                     None => (None, None, String::new(), s.label()),
                 };
-                let mut tip = s.name.clone();
-                for line in [checkout, status]
-                    .into_iter()
-                    .chain(view::status_details(s, &p).into_iter().map(|(l, _)| l))
-                    .filter(|l| !l.is_empty())
-                {
-                    tip.push('\n');
-                    tip.push_str(&line);
+                let mut tip = vec![(s.name.clone(), p.text)];
+                if !checkout.is_empty() {
+                    tip.push((checkout, p.muted));
                 }
+                tip.push((status, color));
+                tip.extend(
+                    view::status_details(s, &p)
+                        .into_iter()
+                        .map(|(l, c)| (l.to_string(), c)),
+                );
                 tips.push(tip);
                 names.push((s.path.clone(), AppState::listed_name(s)));
                 rows.push(RowPart {
@@ -859,13 +864,11 @@ impl Render for OverlayView {
                 for (repo, pr) in state.open_prs() {
                     let (color, words) = view::pr_tone(pr, &p);
                     prs.push(color);
-                    if !pr_tip.is_empty() {
-                        pr_tip.push('\n');
-                    }
-                    pr_tip.push_str(&format!("{} #{}: {}", repo.name, pr.number, pr.title));
+                    let mut line = format!("{} #{}: {}", repo.name, pr.number, pr.title);
                     if !words.is_empty() {
-                        pr_tip.push_str(&format!(" ({words})"));
+                        line.push_str(&format!(" ({words})"));
                     }
+                    pr_tip.push((line, color));
                 }
             }
         }
@@ -884,6 +887,7 @@ impl Render for OverlayView {
         slot.tips = tips;
         slot.names = names;
         slot.pr_tip = pr_tip;
+        slot.ink = (p.text, p.muted);
         slot.strip = strip;
         Scene {
             hwnd,
@@ -961,12 +965,17 @@ pub struct OverlaySlot {
     /// The running timer's id; a timer whose id is no longer here stops.
     timer: Option<u64>,
     timers_started: u64,
-    /// The native tooltip of `cur`: its HWND once made, and the text it
-    /// was last given. The window is no bigger than what it shows, so a
-    /// tooltip GPUI drew would have no room.
-    tip: Option<isize>,
-    tip_pending: bool,
-    tip_text: String,
+    /// The tooltip asked for last, and where it shows once it does: drawn
+    /// by `float_tip`, as this window is no bigger than what it shows.
+    tip_text: Lines,
+    tip_at: Option<(i32, i32)>,
+    /// Counts the tooltips asked for: one whose wait is over shows only
+    /// if no other was asked for meanwhile.
+    tip_asked: u64,
+    /// A press hushed the tooltip, until the mouse goes somewhere else.
+    tip_hushed: bool,
+    /// The mouse is over the window.
+    mouse_in: bool,
     /// Whether it is the view (or on its way to it); none before the
     /// first sync.
     grown: Option<bool>,
@@ -980,9 +989,11 @@ pub struct OverlaySlot {
     armed: Option<Spot>,
     /// What each row says under the mouse, the pull requests' marks, and
     /// the view as a whole.
-    tips: Vec<String>,
-    pr_tip: String,
-    summary: String,
+    tips: Vec<Lines>,
+    pr_tip: Lines,
+    summary: Lines,
+    /// The colours of a tooltip's words and of its hints.
+    ink: (Hsla, Hsla),
     /// The rows as drawn last: each repo's path and the name it is
     /// listed by; and a row's height, device px.
     names: Vec<(PathBuf, String)>,
@@ -1018,6 +1029,9 @@ pub struct OverlaySlot {
 }
 
 impl Global for OverlaySlot {}
+
+/// A tooltip's lines, each in its colour.
+type Lines = Vec<(String, Hsla)>;
 
 /// The undo plate's coming and going.
 #[derive(Clone, Copy, Debug)]
@@ -1232,8 +1246,6 @@ fn finish_swap(cx: &mut App) {
     };
     let new = next.hwnd;
     let old = slot.cur.replace(next);
-    slot.tip = None;
-    slot.tip_text.clear();
     win::dwm_flush();
     win::uncloak(new);
     if let Some(old) = old {
@@ -1279,6 +1291,11 @@ fn toggle(cx: &mut App) {
         slot.reorder = None;
         slot.armed = None;
         slot.icon_press = None;
+        // and any card: the dot under the mouse goes.
+        let own = slot.cur.as_ref().map(|cur| cur.hwnd);
+        if let Some(t) = cx.try_global::<Ui>().map(|ui| ui.timelines.clone()) {
+            t.update(cx, |t, cx| t.drop_hover_in(own, cx));
+        }
     }
     if let Some(ui) = cx.try_global::<Ui>() {
         ui.input.unbounded_send(Input::OverlayGrown(!grown)).ok();
@@ -1288,34 +1305,68 @@ fn toggle(cx: &mut App) {
 /// The mouse moved: what it rests on says what it is, and shows it.
 fn hover(spot: Spot, cx: &mut App) {
     let slot = cx.default_global::<OverlaySlot>();
+    slot.mouse_in = true;
     if slot.spot == spot {
         return;
     }
     slot.spot = spot;
+    slot.tip_hushed = false;
     let text = tip_for(slot);
     sync_tooltip(text, cx);
     redraw(cx);
 }
 
-/// What the tooltip says now: what the mouse is on, else, grown, the
-/// tray's summary.
-fn tip_for(slot: &OverlaySlot) -> String {
-    if slot.growth().0 < 1.0 || slot.reorder.is_some() || slot.resize.is_some() {
-        return String::new();
+/// The mouse left the window: nothing of it is hovered any more, and
+/// what was said of it goes.
+pub fn left(cx: &mut App) {
+    let slot = cx.default_global::<OverlaySlot>();
+    if !slot.mouse_in {
+        return;
     }
+    slot.mouse_in = false;
+    slot.spot = Spot::Off;
+    let own = slot.cur.as_ref().map(|cur| cur.hwnd);
+    sync_tooltip(Vec::new(), cx);
+    if let Some(t) = cx.try_global::<Ui>().map(|ui| ui.timelines.clone()) {
+        t.update(cx, |t, cx| t.drop_hover_in(own, cx));
+    }
+    redraw(cx);
+}
+
+/// A press: the tooltip goes, until the mouse moves on to something else.
+fn hush(cx: &mut App) {
+    cx.default_global::<OverlaySlot>().tip_hushed = true;
+    sync_tooltip(Vec::new(), cx);
+}
+
+/// What the tooltip says now: what the mouse is on, else, grown, the
+/// tray's summary. A tree says nothing: its dots have their cards.
+fn tip_for(slot: &OverlaySlot) -> Lines {
+    if slot.growth().0 < 1.0
+        || slot.reorder.is_some()
+        || slot.resize.is_some()
+        || slot.tip_hushed
+        || !slot.mouse_in
+    {
+        return Lines::new();
+    }
+    let hint = |t: &str| (t.to_string(), slot.ink.1);
     match slot.spot {
         Spot::Icon(row) => match slot.tips.get(row) {
-            Some(tip) => format!(
-                "{tip}\n\nClick: its GitHub page. Right-click: its folder.\n\
-                 Drag: another place. Middle-click: take it out."
-            ),
-            None => String::new(),
+            Some(tip) => {
+                let mut tip = tip.clone();
+                tip.push(hint("Click: its GitHub page. Right-click: its folder."));
+                tip.push(hint("Drag: another place. Middle-click: take it out."));
+                tip
+            }
+            None => Lines::new(),
         },
-        Spot::Strip(row) => slot.tips.get(row).cloned().unwrap_or_default(),
-        Spot::Undo => "Undo".into(),
-        Spot::Edge => "Drag to make it wider or narrower".into(),
+        Spot::Strip(_) => Lines::new(),
+        Spot::Undo => vec![("Undo".into(), slot.ink.0)],
+        Spot::Edge => vec![hint("Drag to make it wider or narrower")],
         Spot::Tail => slot.pr_tip.clone(),
-        Spot::Sheet | Spot::Off => slot.summary.clone(),
+        Spot::Sheet => slot.summary.clone(),
+        Spot::Off => Lines::new(),
     }
 }
 
@@ -1466,7 +1517,6 @@ pub fn hwnd(cx: &App) -> Option<isize> {
 }
 
 /// Where that window's inside starts on the screen, physical px.
-#[allow(dead_code)] // The floating view's tips, next.
 pub fn origin(cx: &App) -> Option<(i32, i32)> {
     let area = cx.try_global::<OverlaySlot>()?.cur.as_ref()?.area?;
     Some((area.left, area.top))
@@ -1605,7 +1655,7 @@ fn start_reorder(row: usize, start: i32, cx: &mut App) {
         start,
         dy: 0,
     });
-    sync_tooltip(String::new(), cx);
+    sync_tooltip(Vec::new(), cx);
     reorder_to(cx);
     redraw(cx);
 }
@@ -1690,7 +1740,7 @@ fn start_resize(cx: &mut App) {
     slot.resize = Some((win::cursor_pos().0, width));
     slot.width = Some((width, true));
     hold(cx);
-    sync_tooltip(String::new(), cx);
+    sync_tooltip(Vec::new(), cx);
     cx.defer(sync);
 }
 
@@ -2022,7 +2072,10 @@ pub fn sync(cx: &mut App) {
         width: place::px(crate::config::FLOAT_MAX_WIDTH, scale),
         ..view
     };
-    let summary = tooltip_text(s);
+    let ink = cx
+        .try_global::<OverlaySlot>()
+        .map_or_else(|| (gpui::black(), gpui::black()), |slot| slot.ink);
+    let summary = tooltip_text(s, ink);
 
     ensure_open(state.clone(), cx);
     ensure_timer(cx);
@@ -2207,11 +2260,12 @@ pub fn sync(cx: &mut App) {
     }
     let text = tip_for(cx.default_global::<OverlaySlot>());
     sync_tooltip(text, cx);
+    crate::float_tip::sync(cx);
 }
 
 /// What the view says on hover, off its rows: the tray's summary, then a
 /// line per repo that isn't synced.
-fn tooltip_text(s: &AppState) -> String {
+fn tooltip_text(s: &AppState, (text, muted): (Hsla, Hsla)) -> Lines {
     let problem = s.problem();
     let summary = crate::tray::summary(
         &crate::tray::TraySnapshot {
@@ -2223,9 +2277,9 @@ fn tooltip_text(s: &AppState) -> String {
         },
         s.unsynced(),
     );
-    let mut text = format!("gitstat: {summary}");
+    let mut lines = vec![(format!("gitstat: {summary}"), text)];
     if let Some(note) = s.badge_note() {
-        text.push_str(&format!("\nBadge: {note}"));
+        lines.push((format!("Badge: {note}"), muted));
     }
     const SHOWN: usize = 12;
     let unsynced: Vec<_> = s
@@ -2234,52 +2288,53 @@ fn tooltip_text(s: &AppState) -> String {
         .filter(|r| !r.is_synced())
         .collect();
     for r in unsynced.iter().take(SHOWN) {
-        text.push_str(&format!("\n{}: {}", r.name, r.label()));
+        lines.push((format!("{}: {}", r.name, r.label()), muted));
     }
     if unsynced.len() > SHOWN {
-        text.push_str(&format!("\n…and {} more", unsynced.len() - SHOWN));
+        lines.push((format!("…and {} more", unsynced.len() - SHOWN), muted));
     }
-    text
+    lines
 }
 
-/// Gives the badge its tooltip text, making the tooltip first if needed.
-/// An empty text shows none.
-fn sync_tooltip(text: String, cx: &mut App) {
+/// Asks for the tooltip `lines` say, none when empty. As GPUI's own: it
+/// shows once the mouse has rested on what it is of for a moment, a px
+/// off the mouse; one that shows takes new words in place.
+fn sync_tooltip(lines: Lines, cx: &mut App) {
     let slot = cx.default_global::<OverlaySlot>();
-    let Some(h) = slot.cur.as_ref().map(|cur| cur.hwnd) else {
-        return;
-    };
-    if slot.tip_text == text && (slot.tip.is_some() || text.is_empty()) {
+    if slot.tip_text == lines {
         return;
     }
-    match slot.tip {
-        Some(tip) => {
-            slot.tip_text = text.clone();
-            cx.spawn(async move |_| unsafe { win::set_tooltip(tip, h, &text) })
-                .detach();
-        }
-        None if text.is_empty() || slot.tip_pending => {}
-        None => {
-            slot.tip_pending = true;
-            cx.spawn(async move |cx| {
-                let tip = unsafe { win::create_tooltip(h) };
-                cx.update(|cx| {
-                    let slot = cx.default_global::<OverlaySlot>();
-                    slot.tip_pending = false;
-                    // The badge was closed or made again meanwhile; the
-                    // tooltip went with its owner.
-                    if slot.cur.as_ref().map(|cur| cur.hwnd) != Some(h) {
-                        return;
-                    }
-                    slot.tip = tip;
-                    slot.tip_text = String::new();
-                    sync(cx);
-                })
-                .ok();
-            })
-            .detach();
-        }
+    let same_spot = !slot.tip_text.is_empty() && !lines.is_empty();
+    slot.tip_text = lines.clone();
+    slot.tip_asked += 1;
+    if let (true, Some(at)) = (same_spot, slot.tip_at) {
+        // The same thing says something new.
+        crate::float_tip::set_lines(Some((lines, at)), cx);
+        return;
     }
+    slot.tip_at = None;
+    let asked = slot.tip_asked;
+    crate::float_tip::set_lines(None, cx);
+    if lines.is_empty() {
+        return;
+    }
+    cx.spawn(async move |cx| {
+        cx.background_executor()
+            .timer(crate::float_tip::DELAY)
+            .await;
+        cx.update(|cx| {
+            let slot = cx.default_global::<OverlaySlot>();
+            if slot.tip_asked != asked || !steady(slot) {
+                return;
+            }
+            let at = win::cursor_pos();
+            slot.tip_at = Some(at);
+            let lines = slot.tip_text.clone();
+            crate::float_tip::set_lines(Some((lines, at)), cx);
+        })
+        .ok();
+    })
+    .detach();
 }
 
 /// Removes the badge and stops its timer.
@@ -2294,13 +2349,14 @@ pub fn close(cx: &mut App) {
     slot.drag = None;
     slot.held = None;
     slot.timer = None;
-    slot.tip = None;
     slot.tip_text.clear();
+    slot.tip_at = None;
     slot.grown = None;
     slot.anim = None;
     for pane in panes.into_iter().flatten() {
         view::remove(pane.handle.into(), cx);
     }
+    crate::float_tip::close(cx);
 }
 
 /// The panel's anchor for a badge click: the badge's rect and corner, or

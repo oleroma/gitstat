@@ -47,6 +47,8 @@ mod autostart;
 #[cfg(windows)]
 mod flip;
 #[cfg(windows)]
+mod float_tip;
+#[cfg(windows)]
 mod frames;
 #[cfg(windows)]
 mod glyph_path;

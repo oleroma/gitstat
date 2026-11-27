@@ -156,11 +156,12 @@ days. Click a repo's icon for its GitHub page, right-click it for its folder,
 drag it to put the row somewhere else, and middle-click it to take the repo
 out of the view (it asks first). After a change an undo button shows on its
 own small plate under the view for a few seconds. The wheel over a tree
-scrolls that tree through time. Drag the view by any empty spot, and drag its
+scrolls that tree through time, and resting the mouse on a commit's dot
+shows its card, as in the panel. Drag the view by any empty spot, and drag its
 free side edge to make it wider or narrower; a right click anywhere else on it
 turns it back into the badge. **Settings ▸ Icon and badge ▸ Floating view**
-has its corners, how see-through it is, how many days count as lately, and its
-health bar and pull request marks.
+has its corners, how see-through it is, how many days count as lately, its
+health bar and pull request marks, and its commit cards.
 
 ### Folder icons in Explorer
 
@@ -442,6 +443,7 @@ from an older version keeps working:
 | `float.opacity` | 1.0 | How solid the view's background is, 0.2 to 1. |
 | `float.health` | true | The bar of green, amber and red repos along the view's top. |
 | `float.prs` | true | A mark per open pull request along the view's bottom. |
+| `float.cards` | true | A commit's card when the mouse rests on its dot in the floating view. |
 | `folder_icons` | false | Status icons on the repo folders, see above. Setting it by hand skips the confirmation. |
 | `folder_icon_mode` | `status` | `status` for the status folders, `repo-svg` for each repo's own `.gitstat/icon.svg` where it has one, see [Repo icons](#repo-icons). Only matters while `folder_icons` is on. |
 | `github_prs` | true | **Settings ▸ GitHub ▸ Pull requests**: open pull requests in the panel and big mode, read through `gh`, see [GitHub pull requests](#github-pull-requests). Also lets a sweep skip fetching repos with no new push, see [How status stays current](#how-status-stays-current). |

@@ -613,6 +613,14 @@ impl Timelines {
         }
     }
 
+    /// No dot of `window` is hovered any more: the mouse left it.
+    pub fn drop_hover_in(&mut self, window: Option<isize>, cx: &mut Context<Self>) {
+        if self.hover.as_ref().is_some_and(|h| h.window == window) {
+            self.unhover();
+            cx.notify();
+        }
+    }
+
     fn unhover(&mut self) {
         self.leave(Instant::now());
         self.hover = None;
@@ -1148,8 +1156,16 @@ impl Timelines {
 
     /// How far from its dot a card sits, logical px: beside the dot's
     /// hover ring, and that far to the left of it.
-    #[allow(dead_code)] // The floating view's tips, next.
     pub const CARD_OFFSET: (f32, f32) = (12.0, DOT_HOVER + CARD_GAP);
+
+    /// Where in `window` the dot is whose card shows, once the mouse has
+    /// settled on it.
+    pub fn card_at(&self, window: Option<isize>) -> Option<Point<Pixels>> {
+        self.hover
+            .as_ref()
+            .filter(|h| self.card && h.window == window)
+            .map(|h| h.at)
+    }
 
     /// The card for the dot under the mouse in `window`, unplaced, and
     /// that hover, once the mouse has settled on it.

@@ -142,6 +142,8 @@ pub struct FloatConfig {
     pub health: bool,
     /// The open pull requests along its bottom.
     pub prs: bool,
+    /// A commit's card when the mouse rests on its dot.
+    pub cards: bool,
 }
 
 impl Default for FloatConfig {
@@ -155,6 +157,7 @@ impl Default for FloatConfig {
             opacity: 1.0,
             health: true,
             prs: true,
+            cards: true,
         }
     }
 }

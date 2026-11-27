@@ -871,6 +871,8 @@ async fn float_wheel(
         return Err("no picture of the screen".into());
     };
     let px = changed(&moved, &plain, strip);
+    // The mouse the wheel was told of is gone again.
+    cx.update(crate::overlay::left).map_err(gone)?;
     let _ = writeln!(
         report,
         "float wheel: 2 notches up over the first tree at ({x}, {y}) in {strip:?}, the view's \
