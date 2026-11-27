@@ -49,7 +49,6 @@ import gitstat.core.tree
 private val ROW = 32.dp
 private val LANE = 16.dp
 private val DOT = 5.dp
-private val HEADER = 60.dp
 
 /** A commit picked on a tree, for the card at the bottom of the screen. */
 data class Picked(val repo: Repo, val commit: Commit, val branch: String?)
@@ -96,7 +95,7 @@ private fun RepoPage(
             .verticalScroll(rememberScrollState()),
     ) {
         Column(
-            Modifier.fillMaxWidth().height(HEADER).clickable { onRepo(repo) }.padding(horizontal = 14.dp, vertical = 8.dp),
+            Modifier.fillMaxWidth().clickable { onRepo(repo) }.padding(horizontal = 14.dp, vertical = 8.dp),
         ) {
             Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
                 Box(Modifier.size(12.dp).background(c.of(repo.health), CircleShape))
