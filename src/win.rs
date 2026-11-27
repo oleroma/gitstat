@@ -693,6 +693,12 @@ pub unsafe fn minimize_closes(h: isize) {
 /// The close under way came from minimising.
 static MINIMIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The next close counts as a minimise: the self-test's, which can't press
+/// the button.
+pub fn mark_minimized() {
+    MINIMIZED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Whether the close under way came from minimising; clears it.
 pub fn take_minimized() -> bool {
     MINIMIZED.swap(false, std::sync::atomic::Ordering::Relaxed)

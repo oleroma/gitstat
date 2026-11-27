@@ -26,6 +26,13 @@ thread_local! {
     /// The part of the screen recorded instead of what a recording asks
     /// for: the self-test's, around the view it is testing.
     static CROP: std::cell::Cell<Option<Rect>> = const { std::cell::Cell::new(None) };
+    static MUTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Records nothing from now on (or again): the self-test's flips, which it
+/// takes its own pictures of.
+pub fn mute(on: bool) {
+    MUTED.set(on);
 }
 
 /// Records only `rect` (physical px) from now on, whatever a recording
@@ -78,7 +85,7 @@ fn start_named(rect: Rect, name: &str, cx: &gpui::App) {
     };
     let rect = CROP.get().unwrap_or(rect);
     let config = &ui.state.read(cx).config;
-    if !config.record_frames {
+    if !config.record_frames || MUTED.get() {
         RECORDER.with(|r| r.borrow_mut().take());
         return;
     }

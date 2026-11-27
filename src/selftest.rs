@@ -433,98 +433,128 @@ async fn run(out: &std::path::Path, report: &mut String, cx: &mut AsyncApp) -> R
     cx.update(view::close_window).map_err(gone)?;
     pause(500, cx).await;
 
-    // The flip: panel to big window and back, every frame that can be
-    // caught, against the views at rest.
+    // The flip: panel to big window and back (closed, then minimised),
+    // every frame that can be caught, against the views at rest.
     let window_rest = whole;
+    crate::frames::mute(true);
     cx.update(|cx| panel::toggle(anchor, cx)).map_err(gone)?;
     pause(1500, cx).await;
     let panel_rest = shot(out, "flip-panel-rest", mon.rect, cx).await;
     let (Some(panel_rest), Some(window_rest)) = (panel_rest, window_rest) else {
         return Err("no picture of the screen".into());
     };
+    let _ = writeln!(
+        report,
+        "flip: the mouse is at {:?} (over a view, it changes what shows)",
+        win::cursor_pos()
+    );
     let (panel_rest, window_rest) = (Arc::new(panel_rest), Arc::new(window_rest));
-    let watch = Watch::start(mon.rect, out.join("flip-open"));
-    let asked = cx
-        .update(|cx| {
-            let handle = cx
-                .try_global::<panel::PanelSlot>()
-                .and_then(|s| s.handle())?;
-            handle
-                .update(cx, |_, window, cx| {
-                    crate::flip::open_window(window, None, cx)
-                })
-                .ok()
-        })
-        .map_err(gone)?;
-    if asked.is_none() {
-        return Err("no panel to flip from".into());
+    let mut window_now = window_rest.clone();
+    for (round, minimise) in [(1, false), (2, true)] {
+        let what = format!("flip open {round}");
+        if !cx.update(|cx| panel::is_open(cx)).map_err(gone)? {
+            cx.update(|cx| panel::toggle(anchor, cx)).map_err(gone)?;
+            pause(1500, cx).await;
+        }
+        crate::flip::take_log();
+        let watch = Watch::start(mon.rect, out.join(what.replace(' ', "-")));
+        pause(120, cx).await;
+        let asked = cx
+            .update(|cx| {
+                let handle = cx
+                    .try_global::<panel::PanelSlot>()
+                    .and_then(|s| s.handle())?;
+                handle
+                    .update(cx, |_, window, cx| {
+                        crate::flip::open_window(window, None, cx);
+                    })
+                    .ok()
+            })
+            .map_err(gone)?;
+        if asked.is_none() {
+            return Err("no panel to flip from".into());
+        }
+        flip_ends(cx).await?;
+        pause(300, cx).await;
+        let frames = watch.stop(cx).await;
+        let open = cx.update(|cx| view::window_open(cx)).map_err(gone)?;
+        let now = cx
+            .update(|cx| view::window_hwnd(cx).and_then(win::client_rect))
+            .map_err(gone)?;
+        let _ = writeln!(
+            report,
+            "{what}: window open {open}, client {now:?} (was {client:?}), panel open {}",
+            cx.update(|cx| panel::is_open(cx)).map_err(gone)?
+        );
+        tell(
+            report,
+            out,
+            &what,
+            &frames,
+            (&panel_rest, rect, (1000, 0, 0)),
+            (&window_rest, client, (0, 1000, 1000)),
+        );
+        drop(frames);
+        if !open {
+            return Err("the flip did not open the big window".into());
+        }
+        pause(600, cx).await;
+        let Some(now) = shot(out, &format!("flip-window-rest-{round}"), mon.rect, cx).await else {
+            return Err("no picture of the screen".into());
+        };
+        let _ = writeln!(
+            report,
+            "{what}: the window it ended in against the window opened plainly, px that differ \
+             inside it: {}",
+            changed(&now, &window_rest, client)
+        );
+        window_now = Arc::new(now);
+
+        let what = format!(
+            "flip {} {round}",
+            if minimise { "minimise" } else { "close" }
+        );
+        crate::flip::take_log();
+        let watch = Watch::start(mon.rect, out.join(what.replace(' ', "-")));
+        pause(120, cx).await;
+        let asked = cx
+            .update(|cx| {
+                let handle = view::window_handle(cx)?;
+                if minimise {
+                    win::mark_minimized();
+                }
+                handle
+                    .update(cx, |_, window, cx| crate::flip::flip_back(window, cx))
+                    .ok()
+            })
+            .map_err(gone)?;
+        let _ = writeln!(report, "{what}: taken by the flip: {asked:?}");
+        if asked != Some(true) {
+            return Err("the flip back did not start".into());
+        }
+        flip_ends(cx).await?;
+        pause(if minimise { 300 } else { 900 }, cx).await;
+        let frames = watch.stop(cx).await;
+        tell(
+            report,
+            out,
+            &what,
+            &frames,
+            (&window_now, client, (0, 1000, 1000)),
+            (&panel_rest, rect, (1000, 0, 0)),
+        );
+        drop(frames);
+        let _ = writeln!(
+            report,
+            "{what}: window open {}, panel open {}",
+            cx.update(|cx| view::window_open(cx)).map_err(gone)?,
+            cx.update(|cx| panel::is_open(cx)).map_err(gone)?
+        );
     }
-    flip_ends(cx).await?;
-    pause(400, cx).await;
-    let frames = watch.stop(cx).await;
-    let open = cx.update(|cx| view::window_open(cx)).map_err(gone)?;
-    let now = cx
-        .update(|cx| view::window_hwnd(cx).and_then(win::client_rect))
-        .map_err(gone)?;
-    let _ = writeln!(
-        report,
-        "flip open: window open {open}, client {now:?} (was {client:?}), panel open {}",
-        cx.update(|cx| panel::is_open(cx)).map_err(gone)?
-    );
-    tell(
-        report,
-        "flip open",
-        &frames,
-        &panel_rest,
-        rect,
-        &window_rest,
-        client,
-    );
-    if !open {
-        return Err("the flip did not open the big window".into());
-    }
-    pause(600, cx).await;
-    let Some(window_now) = shot(out, "flip-window-rest", mon.rect, cx).await else {
-        return Err("no picture of the screen".into());
-    };
-    let _ = writeln!(
-        report,
-        "flip open: the window it ended in against the window opened plainly, px that differ \
-         inside it: {}",
-        changed(&window_now, &window_rest, client)
-    );
-    let window_now = Arc::new(window_now);
-    let watch = Watch::start(mon.rect, out.join("flip-close"));
-    let asked = cx
-        .update(|cx| {
-            let handle = view::window_handle(cx)?;
-            handle
-                .update(cx, |_, window, cx| crate::flip::flip_back(window, cx))
-                .ok()
-        })
-        .map_err(gone)?;
-    let _ = writeln!(report, "flip close: taken by the flip: {asked:?}");
-    if asked != Some(true) {
-        return Err("the flip back did not start".into());
-    }
-    flip_ends(cx).await?;
-    pause(1500, cx).await;
-    let frames = watch.stop(cx).await;
-    tell(
-        report,
-        "flip close",
-        &frames,
-        &window_now,
-        client,
-        &panel_rest,
-        rect,
-    );
-    let _ = writeln!(
-        report,
-        "flip close: window open {}, panel open {}",
-        cx.update(|cx| view::window_open(cx)).map_err(gone)?,
-        cx.update(|cx| panel::is_open(cx)).map_err(gone)?
-    );
+    let _ = window_now;
+    cx.update(panel::slide_away).map_err(gone)?;
+    pause(800, cx).await;
+    crate::frames::mute(false);
     Ok(())
 }
 
@@ -594,7 +624,7 @@ struct Caught {
 }
 
 /// No more pictures than this are kept of one flip.
-const MOST: usize = 90;
+const MOST: usize = 110;
 
 impl Watch {
     /// Starts taking `rect`; the pictures also go in `folder`.
@@ -654,40 +684,130 @@ impl Watch {
     }
 }
 
+/// The box around the px that differ between `a` and `b` inside `r`.
+fn unlike_box(a: &Shot, b: &Shot, r: Rect) -> Option<Rect> {
+    let mut found: Option<Rect> = None;
+    for y in r.top..r.bottom {
+        let mut row: Option<(i32, i32)> = None;
+        for x in r.left..r.right {
+            let (p, q) = (a.at(x, y), b.at(x, y));
+            if (0..3).any(|c| p[c].abs_diff(q[c]) > 2) {
+                row = Some(row.map_or((x, x), |(l, _)| (l, x)));
+            }
+        }
+        if let Some((l, right)) = row {
+            found = Some(found.map_or(Rect::new(l, y, right + 1, y + 1), |f| {
+                Rect::new(f.left.min(l), f.top, f.right.max(right + 1), y + 1)
+            }));
+        }
+    }
+    found
+}
+
+/// Saves `shot` inside `r` as `name`.png in `out`.
+fn save_part(out: &std::path::Path, name: &str, shot: &Shot, r: Rect) {
+    let (w, h) = (r.width().max(0) as u32, r.height().max(0) as u32);
+    let mut pixels = Vec::with_capacity((w * h * 4) as usize);
+    for y in r.top..r.bottom {
+        for x in r.left..r.right {
+            let p = shot.at(x, y);
+            pixels.extend_from_slice(&[p[0], p[1], p[2], 255]);
+        }
+    }
+    let _ = image::save_buffer(
+        out.join(format!("{name}.png")),
+        &pixels,
+        w,
+        h,
+        image::ExtendedColorType::Rgba8,
+    );
+}
+
+/// A view at rest: its picture, where it is, and the flip's frame that
+/// must look the same.
+type Rest<'a> = (&'a Shot, Rect, (u16, u16, u16));
+
 /// Writes what the pictures of a flip show: for each, how many px differ
 /// from the picture before it (over the whole screen), from the view it
-/// started from (inside `from_in`) and from the view it ends in (inside
-/// `to_in`).
+/// started from and from the view it ends in (each inside that view).
+/// Where a picture is of the frame that must look like a view at rest and
+/// doesn't, also where they differ, and both saved there.
 fn tell(
     report: &mut String,
+    out: &std::path::Path,
     what: &str,
     frames: &[Caught],
-    from: &Shot,
-    from_in: Rect,
-    to: &Shot,
-    to_in: Rect,
+    from: Rest,
+    to: Rest,
 ) {
+    for line in crate::flip::take_log() {
+        let _ = writeln!(report, "{what}: log {line}");
+    }
     let _ = writeln!(
         report,
         "{what}: {} pictures; each: ms, frame drawn (panel/turn/window, thousandths), px changed \
-         since the one before, px unlike the start inside {from_in:?}, px unlike the end inside \
-         {to_in:?}",
-        frames.len()
+         since the one before, px unlike the start inside {:?}, px unlike the end inside {:?}",
+        frames.len(),
+        from.1,
+        to.1
     );
     let mut before: Option<&Shot> = None;
-    for c in frames {
+    let mut saved = [false; 2];
+    for (i, c) in frames.iter().enumerate() {
         let drawn = match c.drawn {
             Some((p, t, w)) => format!("{p}/{t}/{w}"),
             None => "rest".into(),
         };
-        let _ = writeln!(
+        let unlike = [
+            changed(&c.shot, from.0, from.1),
+            changed(&c.shot, to.0, to.1),
+        ];
+        let _ = write!(
             report,
             "{what}: {:5} {drawn:>14} {:8} {:8} {:8}",
             c.ms,
             before.map_or(0, |b| changed(&c.shot, b, c.shot.rect)),
-            changed(&c.shot, from, from_in),
-            changed(&c.shot, to, to_in),
+            unlike[0],
+            unlike[1],
         );
+        for (k, rest) in [from, to].into_iter().enumerate() {
+            if c.drawn == Some(rest.2)
+                && unlike[k] > 0
+                && let Some(b) = unlike_box(&c.shot, rest.0, rest.1)
+            {
+                let _ = write!(report, "  unlike its view at rest inside {b:?}");
+                if !saved[k] {
+                    saved[k] = true;
+                    let name = what.replace(' ', "-");
+                    let part = Rect::new(
+                        b.left - 8,
+                        b.top - 8,
+                        (b.right + 8).min(b.left + 1400),
+                        (b.bottom + 8).min(b.top + 700),
+                    );
+                    let part = Rect::new(
+                        part.left.max(c.shot.rect.left),
+                        part.top.max(c.shot.rect.top),
+                        part.right.min(c.shot.rect.right),
+                        part.bottom.min(c.shot.rect.bottom),
+                    );
+                    let end = ["start", "end"][k];
+                    save_part(
+                        out,
+                        &format!("{name}-unlike-{end}-{i:03}-flip"),
+                        &c.shot,
+                        part,
+                    );
+                    save_part(
+                        out,
+                        &format!("{name}-unlike-{end}-{i:03}-rest"),
+                        rest.0,
+                        part,
+                    );
+                }
+            }
+        }
+        let _ = writeln!(report);
         before = Some(&c.shot);
     }
 }

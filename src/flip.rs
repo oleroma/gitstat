@@ -131,6 +131,26 @@ pub fn drawn() -> Option<(u16, u16, u16)> {
     DRAWN.lock().ok().and_then(|d| *d)
 }
 
+/// What the flips did and when, for the self-test's report.
+static LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn note(what: impl AsRef<str>) {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let ms = EPOCH.get_or_init(Instant::now).elapsed().as_millis();
+    if let Ok(mut log) = LOG.lock()
+        && log.len() < 4000
+    {
+        log.push(format!("{ms:6} {}", what.as_ref()));
+    }
+}
+
+/// What the flips did since this was last asked.
+pub fn take_log() -> Vec<String> {
+    LOG.lock()
+        .map(|mut l| std::mem::take(&mut *l))
+        .unwrap_or_default()
+}
+
 fn set_drawn(pose: Option<&Pose>) {
     if let Ok(mut d) = DRAWN.lock() {
         let k = |v: f32| (v * 1000.0).round() as u16;
@@ -255,6 +275,19 @@ pub fn drew(pose: &Pose, window: &mut Window, cx: &mut App) {
     };
     run.frames += 1;
     set_drawn(Some(pose));
+    note(format!(
+        "frame {} {:.3}/{:.3}/{:.3}{}{}",
+        run.frames,
+        pose.panel,
+        pose.turn,
+        pose.window,
+        if run.held { " held" } else { "" },
+        if pose.target.is_none() {
+            " no target"
+        } else {
+            ""
+        },
+    ));
     // The clock starts with the first frame on the screen: that frame is
     // the view the flip starts from.
     if run.clock.is_none() && !run.held {
@@ -289,6 +322,7 @@ fn finish(cx: &mut App) {
     let Some(run) = cx.default_global::<Slot>().run.take() else {
         return;
     };
+    note(format!("finish {:?}", run.direction));
     match run.direction {
         Direction::Open => {
             // The big window, drawn the same under its cloak, shows as
@@ -438,6 +472,9 @@ fn newest_first(direction: Direction, then: impl FnOnce(&mut App) + 'static, cx:
     let wait = SCROLL_HOME.mul_f32(length(cx).as_millis() as f32 / DEFAULT_MS);
     let trees = t.update(cx, |t, cx| t.glide_newest(wait, cx));
     let view = view::glide_to_start(from_panel, wait, cx);
+    note(format!(
+        "{direction:?}: glide home: trees {trees}, view {view}"
+    ));
     if !trees && !view {
         return false;
     }
@@ -465,6 +502,10 @@ fn newest_first(direction: Direction, then: impl FnOnce(&mut App) + 'static, cx:
             cx.background_executor().timer(POLL).await;
         }
         cx.update(|cx| {
+            note(format!(
+                "glided home after {} ms",
+                start.elapsed().as_millis()
+            ));
             let slot = cx.default_global::<Slot>();
             slot.waiting = None;
             if std::mem::take(&mut slot.called_off) {
@@ -607,6 +648,7 @@ pub fn open_window(panel: &mut Window, focus: Option<PathBuf>, cx: &mut App) {
 /// to fade at once, while the big window comes up, cloaked, to be
 /// travelled to as soon as it is where it belongs and has drawn itself.
 fn start_open(cx: &mut App) {
+    note("start open");
     cx.default_global::<Slot>().run = Some(Run {
         direction: Direction::Open,
         len: length(cx),
@@ -677,6 +719,10 @@ fn start_open(cx: &mut App) {
             let Some(run) = slot.run.as_mut() else {
                 return;
             };
+            note(format!(
+                "window {found:?} fits {fits} after {} ms",
+                opened.elapsed().as_millis()
+            ));
             match found.filter(|_| fits) {
                 Some((rect, _)) => {
                     run.target = Some(Target {
@@ -787,6 +833,7 @@ fn start_close(direction: Direction, cx: &mut App) -> bool {
     let (Some(rect), maximized) = (win::client_rect(big), win::is_zoomed(big)) else {
         return false;
     };
+    note(format!("start {direction:?} from {rect:?}"));
     cx.default_global::<Slot>().run = Some(Run {
         direction,
         len: length(cx),
@@ -859,6 +906,11 @@ fn start_close(direction: Direction, cx: &mut App) -> bool {
             let Some(run) = slot.run.as_mut() else {
                 return;
             };
+            note(format!(
+                "stage ready {ready} after {} ms, {} frames",
+                opened.elapsed().as_millis(),
+                run.frames
+            ));
             match stage.filter(|_| ready) {
                 Some(stage) => {
                     run.held = false;
