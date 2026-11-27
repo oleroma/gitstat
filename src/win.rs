@@ -132,6 +132,12 @@ pub fn tray_icon_size() -> u32 {
     }
 }
 
+/// Puts the mouse at (`x`, `y`), physical px: the self-test's, which
+/// keeps it off the views it compares px for px and puts it back after.
+pub fn set_cursor_pos(x: i32, y: i32) {
+    unsafe { windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos(x, y) };
+}
+
 /// The cursor in physical px, or (0, 0) if it can't be read (secure desktop).
 pub fn cursor_pos() -> (i32, i32) {
     let mut p = POINT { x: 0, y: 0 };

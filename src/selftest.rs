@@ -24,7 +24,13 @@ use std::time::{Duration, Instant};
 pub fn start(out: PathBuf, cx: &mut App) {
     cx.spawn(async move |cx| {
         let mut report = String::new();
+        // The mouse, off the views while they are compared px for px (a
+        // row under it lights up), and back after.
+        let mouse = win::cursor_pos();
+        let work = win::primary_monitor().work;
+        win::set_cursor_pos(work.left + 150, work.top + 60);
         let verdict = run(&out, &mut report, cx).await;
+        win::set_cursor_pos(mouse.0, mouse.1);
         let _ = writeln!(
             report,
             "{}",
@@ -443,9 +449,10 @@ async fn run(out: &std::path::Path, report: &mut String, cx: &mut AsyncApp) -> R
     let (Some(panel_rest), Some(window_rest)) = (panel_rest, window_rest) else {
         return Err("no picture of the screen".into());
     };
+    let badge = cx.update(|cx| crate::overlay::placed(cx)).map_err(gone)?;
     let _ = writeln!(
         report,
-        "flip: the mouse is at {:?} (over a view, it changes what shows)",
+        "flip: the mouse is at {:?}, the badge at {badge:?}",
         win::cursor_pos()
     );
     let (panel_rest, window_rest) = (Arc::new(panel_rest), Arc::new(window_rest));
@@ -493,6 +500,7 @@ async fn run(out: &std::path::Path, report: &mut String, cx: &mut AsyncApp) -> R
             &frames,
             (&panel_rest, rect, (1000, 0, 0)),
             (&window_rest, client, (0, 1000, 1000)),
+            badge,
         );
         drop(frames);
         if !open {
@@ -542,6 +550,7 @@ async fn run(out: &std::path::Path, report: &mut String, cx: &mut AsyncApp) -> R
             &frames,
             (&window_now, client, (0, 1000, 1000)),
             (&panel_rest, rect, (1000, 0, 0)),
+            badge,
         );
         drop(frames);
         let _ = writeln!(
@@ -738,14 +747,56 @@ fn unlike_cells(out: &std::path::Path, name: &str, a: &Shot, b: &Shot, r: Rect) 
         "{squares} of {} squares of {CELL} px differ; the most:",
         cols * ((h + CELL - 1) / CELL)
     )];
-    for ((row, col), (n, at, p, q)) in most.into_iter().take(30) {
+    for (i, ((row, col), (n, at, p, q))) in most.into_iter().take(30).enumerate() {
+        let (left, top) = (r.left + col * CELL, r.top + row * CELL);
         lines.push(format!(
-            "square at ({}, {}): {n} px, first at {at:?} flip {p:?} rest {q:?}",
-            r.left + col * CELL,
-            r.top + row * CELL
+            "square {i} at ({left}, {top}): {n} px, first at {at:?} flip {p:?} rest {q:?}"
         ));
+        // The first few, eight times as large: the flip's beside the
+        // view's.
+        if i < 10 {
+            let square = Rect::new(left - 8, top - 8, left + CELL + 8, top + CELL + 8);
+            save_zoomed(out, &format!("{name}-square-{i}"), a, b, square);
+        }
     }
     lines
+}
+
+/// Saves `r` of `a` (left) and of `b` (right) side by side as `name`.png
+/// in `out`, each px eight px wide.
+fn save_zoomed(out: &std::path::Path, name: &str, a: &Shot, b: &Shot, r: Rect) {
+    const ZOOM: i32 = 8;
+    const GAP: i32 = 16;
+    let (w, h) = (r.width().max(0), r.height().max(0));
+    let (wide, high) = (w * ZOOM * 2 + GAP, h * ZOOM);
+    let inside = |s: &Shot, x: i32, y: i32| {
+        x >= s.rect.left && x < s.rect.right && y >= s.rect.top && y < s.rect.bottom
+    };
+    let mut pixels = Vec::with_capacity((wide * high * 3) as usize);
+    for y in 0..high {
+        for x in 0..wide {
+            let (shot, x) = if x < w * ZOOM {
+                (Some(a), x)
+            } else if x >= w * ZOOM + GAP {
+                (Some(b), x - w * ZOOM - GAP)
+            } else {
+                (None, 0)
+            };
+            let (sx, sy) = (r.left + x / ZOOM, r.top + y / ZOOM);
+            let p = match shot {
+                Some(s) if inside(s, sx, sy) => s.at(sx, sy),
+                _ => [255, 0, 255],
+            };
+            pixels.extend_from_slice(&p);
+        }
+    }
+    let _ = image::save_buffer(
+        out.join(format!("{name}.png")),
+        &pixels,
+        wide as u32,
+        high as u32,
+        image::ExtendedColorType::Rgb8,
+    );
 }
 
 /// A view at rest: its picture, where it is, and the flip's frame that
@@ -764,7 +815,25 @@ fn tell(
     frames: &[Caught],
     from: Rest,
     to: Rest,
+    badge: Option<Rect>,
 ) {
+    // The badge shows over both views and over the flip: its px never
+    // change.
+    if let (Some(badge), Some(first)) = (badge, frames.first()) {
+        let inner = badge.outset(-badge.width() / 5);
+        let changed: Vec<String> = frames
+            .iter()
+            .filter(|c| changed(&c.shot, &first.shot, inner) > 0)
+            .map(|c| format!("{} ms", c.ms))
+            .collect();
+        let _ = writeln!(
+            report,
+            "{what}: the badge changed in {} of {} pictures (must be 0): {}",
+            changed.len(),
+            frames.len(),
+            changed.join(", ")
+        );
+    }
     for line in crate::flip::take_log() {
         let _ = writeln!(report, "{what}: log {line}");
     }

@@ -378,6 +378,12 @@ fn panel_over_badge(cx: &App) -> Option<isize> {
     panel::hwnd(cx).filter(|_| !badge_over_flip(cx))
 }
 
+/// Where the badge's disc is on the screen, physical px, while it shows.
+pub fn placed(cx: &App) -> Option<Rect> {
+    let slot = cx.try_global::<OverlaySlot>()?;
+    slot.placed.filter(|_| slot.visible)
+}
+
 /// A flip starts in the panel's window: the badge goes over it, where it
 /// stays over the big window.
 pub fn over_flip(cx: &mut App) {

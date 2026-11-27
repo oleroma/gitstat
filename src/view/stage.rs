@@ -21,6 +21,11 @@ use gpui::{
     InspectorElementId, IntoElement, LayoutId, Pixels, Style, Window, relative,
 };
 
+/// The big window's slots' names here, apart from the panel's: both views
+/// name their rows alike, and what one's row remembers (a tooltip showing,
+/// a scroll) is not the other's.
+const BIG: &str = "big-window";
+
 pub(super) struct Stage {
     pub panel: PanelScene,
     /// The big window, once it is known where it is.
@@ -88,10 +93,9 @@ impl Element for Stage {
         let began = std::time::Instant::now();
         let mut panel_laid = self.panel.lay(bounds, pose.panel, window, cx);
         let panel_picture = self.panel.picture(&panel_laid, s);
-        let mut window_laid = self
-            .window
-            .as_mut()
-            .map(|scene| scene.lay(bounds, pose.window, window, cx));
+        let mut window_laid = self.window.as_mut().map(|scene| {
+            window.with_element_namespace(BIG, |window| scene.lay(bounds, pose.window, window, cx))
+        });
         let window_picture = self
             .window
             .as_ref()
@@ -152,7 +156,9 @@ impl Element for Stage {
             (pose.panel > 0.0).then(|| self.panel.slots(&mut panel_laid, pose.panel, window, cx));
         let slots = match (&mut self.window, &mut window_laid) {
             (Some(scene), Some(laid)) if pose.window > 0.0 => {
-                Some(scene.slots(laid, pose.window, window, cx))
+                Some(window.with_element_namespace(BIG, |window| {
+                    scene.slots(laid, pose.window, window, cx)
+                }))
             }
             _ => None,
         };
@@ -190,7 +196,9 @@ impl Element for Stage {
             PanelScene::paint_slots(slots, None, window, cx);
         }
         if let Some(slots) = &mut laid.window {
-            WindowScene::paint_slots(slots, window, cx);
+            window.with_element_namespace(BIG, |window| {
+                WindowScene::paint_slots(slots, window, cx);
+            });
         }
         laid.picture.paint_over(window, cx);
         crate::flip::took(self.laid_in, began.elapsed());

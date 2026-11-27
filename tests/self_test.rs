@@ -38,6 +38,9 @@ fn gitstat_tests_itself_on_screen() {
         "record_frames": true,
         "flip_frames": out.join("frames"),
         "panel_slide_ms": 300,
+        // Its badge, where the big window opens: it must show all through
+        // a flip.
+        "overlay": {"enabled": true, "offset_x": 400.0, "offset_y": 300.0},
     });
     let config_file = out.join("config.json");
     std::fs::write(&config_file, config.to_string()).expect("write its config");
