@@ -276,8 +276,11 @@ pub fn close(cx: &mut App) {
 
 /// Makes the open panel, cloaked under a flip back, the active window,
 /// once the big window has gone from the screen: the flip then shows it.
-/// Activating places it where it was opened, so it then goes back where
-/// its window belongs.
+/// By Windows' own call: GPUI's first activation of a window also puts
+/// it where it was opened, a little off where it belongs, and one frame
+/// of the flip would show there. Only when Windows won't have it (the
+/// foreground is another app's) does GPUI's way stand in, put right at
+/// once after.
 pub fn activate(cx: &mut App) {
     let slot = cx.default_global::<PanelSlot>();
     let (Some(handle), Some(h), Some(area)) = (slot.handle, slot.hwnd, slot.area) else {
@@ -285,6 +288,10 @@ pub fn activate(cx: &mut App) {
     };
     slot.shown = true;
     slot.held = false;
+    win::to_front(h);
+    if win::is_front(h) {
+        return;
+    }
     handle
         .update(cx, |_, window, _| window.activate_window())
         .ok();

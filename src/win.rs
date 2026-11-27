@@ -370,6 +370,12 @@ pub fn to_front(h: isize) {
     }
 }
 
+/// Whether `h` is the foreground window.
+pub fn is_front(h: isize) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    live(h).is_some_and(|hwnd| unsafe { GetForegroundWindow() } == hwnd)
+}
+
 /// Waits for Windows to put the next frame on the screen. Changes made to
 /// windows right after it returns have a whole refresh to land together.
 pub fn dwm_flush() {
