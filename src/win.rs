@@ -896,6 +896,50 @@ pub fn confirm_box(text: String) -> std::thread::JoinHandle<bool> {
     })
 }
 
+/// The window the wheel goes to whenever the mouse is over it, focused or
+/// not; 0 for none.
+static WHEEL_TO: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static WHEEL_HOOK: std::sync::Once = std::sync::Once::new();
+
+/// Sends the wheel to `h` whenever the mouse is over it, though another
+/// window has the focus: with "Scroll inactive windows when I hover over
+/// them" off, Windows sends it to the focused window, and the floating
+/// view, which never takes the focus, would never hear of it. `None`
+/// stops it. Call on the thread that runs the windows: the hook is heard
+/// through its message loop.
+pub fn wheel_to(h: Option<isize>) {
+    use std::sync::atomic::Ordering;
+    WHEEL_TO.store(h.unwrap_or(0), Ordering::Relaxed);
+    if h.is_some() {
+        WHEEL_HOOK.call_once(|| unsafe {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowsHookExW, WH_MOUSE_LL};
+            SetWindowsHookExW(WH_MOUSE_LL, Some(wheel_hook), std::ptr::null_mut(), 0);
+        });
+    }
+}
+
+unsafe extern "system" fn wheel_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, GA_ROOT, GetAncestor, HC_ACTION, MSLLHOOKSTRUCT, WM_MOUSEHWHEEL,
+    };
+    let to = WHEEL_TO.load(std::sync::atomic::Ordering::Relaxed);
+    let msg = wparam as u32;
+    if code == HC_ACTION as i32 && to != 0 && (msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL) {
+        let info = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
+        let under = unsafe { WindowFromPoint(info.pt) };
+        let target = to as HWND;
+        if !under.is_null() && unsafe { GetAncestor(under, GA_ROOT) } == target {
+            // The delta in the high word, as the wheel message has it; the
+            // position on the screen.
+            let delta = (info.mouseData & 0xFFFF_0000) as usize;
+            let at = ((info.pt.y as u16 as isize) << 16) | (info.pt.x as u16 as isize);
+            unsafe { PostMessageW(target, msg, delta, at) };
+            return 1;
+        }
+    }
+    unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+}
+
 /// The screen's pixels in `r` (physical px) as they are shown now, layered
 /// windows included: straight RGBA rows, top down. For the flip's frame
 /// recorder.

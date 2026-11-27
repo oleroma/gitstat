@@ -2261,6 +2261,10 @@ pub fn sync(cx: &mut App) {
     let text = tip_for(cx.default_global::<OverlaySlot>());
     sync_tooltip(text, cx);
     crate::float_tip::sync(cx);
+    // The view's trees hear the wheel though it never has the focus.
+    let slot = cx.default_global::<OverlaySlot>();
+    let view = slot.cur.as_ref().map(|cur| cur.hwnd);
+    win::wheel_to(view.filter(|_| slot.grown == Some(true)));
 }
 
 /// What the view says on hover, off its rows: the tray's summary, then a
@@ -2357,6 +2361,7 @@ pub fn close(cx: &mut App) {
         view::remove(pane.handle.into(), cx);
     }
     crate::float_tip::close(cx);
+    win::wheel_to(None);
 }
 
 /// The panel's anchor for a badge click: the badge's rect and corner, or
