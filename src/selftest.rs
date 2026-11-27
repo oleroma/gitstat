@@ -465,7 +465,7 @@ async fn run(out: &std::path::Path, report: &mut String, cx: &mut AsyncApp) -> R
             cx.update(|cx| panel::toggle(anchor, cx)).map_err(gone)?;
             pause(1500, cx).await;
         }
-        crate::flip::take_log();
+        gear_log(report, "between flips");
         let watch = Watch::start(mon.rect, out.join(what.replace(' ', "-")));
         pause(120, cx).await;
         let asked = cx
@@ -524,7 +524,7 @@ async fn run(out: &std::path::Path, report: &mut String, cx: &mut AsyncApp) -> R
             "flip {} {round}",
             if minimise { "minimise" } else { "close" }
         );
-        crate::flip::take_log();
+        gear_log(report, "between flips");
         let watch = Watch::start(mon.rect, out.join(what.replace(' ', "-")));
         pause(120, cx).await;
         let asked = cx
@@ -567,6 +567,16 @@ async fn run(out: &std::path::Path, report: &mut String, cx: &mut AsyncApp) -> R
     pause(800, cx).await;
     crate::frames::mute(false);
     Ok(())
+}
+
+/// Writes what the log says of the gear since it was last taken, and
+/// empties it.
+fn gear_log(report: &mut String, what: &str) {
+    for line in crate::flip::take_log() {
+        if line.contains("gear") {
+            let _ = writeln!(report, "{what}: log {line}");
+        }
+    }
 }
 
 /// Waits for the flip under way to end.

@@ -144,6 +144,37 @@ pub fn paint(
         (Align::Centre, Some(max)) => (max as f32 / s - f32::from(line.width)) / 2.0,
         _ => 0.0,
     };
+    #[cfg(windows)]
+    if text.as_ref() == "⚙" {
+        // Looked into: the gear comes out a quarter px apart from one
+        // time to the next.
+        thread_local! {
+            static LAST: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+        }
+        let first = line.runs.first();
+        let now = format!(
+            "gear at {at:?} max {max:?} size {} width {} ascent {} descent {} line {line_height} \
+             shift {shift} base {} font {:?} glyph {:?} runs {}",
+            look.size,
+            f32::from(line.width),
+            f32::from(line.ascent),
+            f32::from(line.descent),
+            baseline(&line, line_height, s),
+            first.map(|r| r.font_id),
+            first.and_then(|r| r.glyphs.first().map(|g| (
+                g.id,
+                f32::from(g.position.x),
+                g.is_emoji
+            ))),
+            line.runs.len(),
+        );
+        LAST.with(|last| {
+            if *last.borrow() != now {
+                crate::flip::note(&now);
+                *last.borrow_mut() = now;
+            }
+        });
+    }
     glyphs(
         window,
         &line,
