@@ -65,8 +65,12 @@ struct Shot {
 impl Shot {
     /// The colour at screen px (`x`, `y`), which must be inside it.
     fn at(&self, x: i32, y: i32) -> [u8; 3] {
-        let i =
-            ((y - self.rect.top) as usize * self.w as usize + (x - self.rect.left) as usize) * 4;
+        let (dx, dy) = (x - self.rect.left, y - self.rect.top);
+        if dx < 0 || dy < 0 || dx >= self.w as i32 {
+            // Off the picture: the window is not where it was asked to be.
+            return [0; 3];
+        }
+        let i = (dy as usize * self.w as usize + dx as usize) * 4;
         match self.pixels.get(i..i + 3) {
             Some(p) => [p[0], p[1], p[2]],
             None => [0; 3],
