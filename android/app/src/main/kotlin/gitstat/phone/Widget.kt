@@ -127,13 +127,6 @@ private fun WidgetBody(snap: Snapshot?, signedIn: Boolean) {
                         Spacer(GlanceModifier.width(stripDp.dp))
                     }
                     Spacer(GlanceModifier.width(8.dp))
-                    Text(
-                        repo.name,
-                        style = TextStyle(color = text, fontSize = 13.sp, textAlign = TextAlign.End),
-                        maxLines = 1,
-                        modifier = GlanceModifier.width(NAME_DP.dp),
-                    )
-                    Spacer(GlanceModifier.width(6.dp))
                     val tone = when (repo.health) {
                         Health.RED -> if (dark) Palette.redDark else Palette.redLight
                         Health.GREEN -> if (dark) Palette.greenDark else Palette.greenLight
@@ -147,6 +140,13 @@ private fun WidgetBody(snap: Snapshot?, signedIn: Boolean) {
                             Box(GlanceModifier.size(10.dp).cornerRadius(5.dp).background(dot(repo.health))) {}
                         }
                     }
+                    Spacer(GlanceModifier.width(6.dp))
+                    Text(
+                        repo.name,
+                        style = TextStyle(color = text, fontSize = 13.sp, textAlign = TextAlign.Start),
+                        maxLines = 1,
+                        modifier = GlanceModifier.width(NAME_DP.dp),
+                    )
                 }
             }
         }

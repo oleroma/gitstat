@@ -118,7 +118,7 @@ fun RowsView(
         item { top() }
         items(repos, key = { it.slug }) { repo ->
             // As on the PC's panel: the tree on the left running back into history, the
-            // newest commit next to the repo's name on the right.
+            // newest commit next to the repo's icon and name on the right, icons in a column.
             Row(
                 Modifier.fillMaxWidth().padding(end = 12.dp),
                 verticalAlignment = Alignment.CenterVertically,
@@ -127,9 +127,10 @@ fun RowsView(
                 Spacer(Modifier.width(8.dp))
                 Column(
                     Modifier.width(NAME_W).clickable { onRepo(repo) }.padding(vertical = 6.dp),
-                    horizontalAlignment = Alignment.End,
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
+                        RepoMark(repo, 20.dp)
+                        Spacer(Modifier.width(6.dp))
                         Text(
                             repo.name,
                             color = c.text,
@@ -138,8 +139,6 @@ fun RowsView(
                             overflow = TextOverflow.Ellipsis,
                             modifier = Modifier.weight(1f, fill = false),
                         )
-                        Spacer(Modifier.width(6.dp))
-                        RepoMark(repo, 20.dp)
                     }
                     val n = repo.hanging.size
                     Text(
@@ -147,6 +146,8 @@ fun RowsView(
                         color = if (n > 0) c.red else c.muted,
                         fontSize = 11.sp,
                         maxLines = 1,
+                        // Under the name, past the icon.
+                        modifier = Modifier.padding(start = 26.dp),
                     )
                 }
             }
