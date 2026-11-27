@@ -134,7 +134,7 @@ pub fn drawn() -> Option<(u16, u16, u16)> {
 /// What the flips did and when, for the self-test's report.
 static LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-fn note(what: impl AsRef<str>) {
+pub fn note(what: impl AsRef<str>) {
     static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     let ms = EPOCH.get_or_init(Instant::now).elapsed().as_millis();
     if let Ok(mut log) = LOG.lock()
@@ -156,6 +156,16 @@ fn set_drawn(pose: Option<&Pose>) {
         let k = |v: f32| (v * 1000.0).round() as u16;
         *d = pose.map(|p| (k(p.panel), k(p.turn), k(p.window)));
     }
+}
+
+thread_local! {
+    /// How long the frame being drawn took to lay out and to paint, ms.
+    static TOOK: Cell<(f32, f32)> = const { Cell::new((0.0, 0.0)) };
+}
+
+/// The flip's frame took this long to lay out and to paint: for its log.
+pub fn took(lay: Duration, paint: Duration) {
+    TOOK.set((lay.as_secs_f32() * 1000.0, paint.as_secs_f32() * 1000.0));
 }
 
 /// A view has painted itself.
@@ -276,11 +286,13 @@ pub fn drew(pose: &Pose, window: &mut Window, cx: &mut App) {
     run.frames += 1;
     set_drawn(Some(pose));
     note(format!(
-        "frame {} {:.3}/{:.3}/{:.3}{}{}",
+        "frame {} {:.3}/{:.3}/{:.3} lay {:.1} paint {:.1}{}{}",
         run.frames,
         pose.panel,
         pose.turn,
         pose.window,
+        TOOK.get().0,
+        TOOK.get().1,
         if run.held { " held" } else { "" },
         if pose.target.is_none() {
             " no target"
@@ -663,8 +675,14 @@ fn start_open(cx: &mut App) {
     if let Some(t) = cx.try_global::<Ui>().map(|ui| ui.timelines.clone()) {
         t.update(cx, |t, cx| t.drop_hover(cx));
     }
+    crate::overlay::over_flip(cx);
     let maximized = view::opens_maximized(cx);
+    let before = Instant::now();
     view::show_window_cloaked(cx);
+    note(format!(
+        "big window made in {} ms",
+        before.elapsed().as_millis()
+    ));
     let opened = Instant::now();
     cx.spawn(async move |cx| {
         // Where its inside came out, once that has stopped changing (a
@@ -852,9 +870,15 @@ fn start_close(direction: Direction, cx: &mut App) -> bool {
         cx.default_global::<Slot>().run = None;
         false
     };
+    let before = Instant::now();
     if !panel::reopen_cloaked(cx) {
         return call_off(cx);
     }
+    note(format!(
+        "panel's window made in {} ms",
+        before.elapsed().as_millis()
+    ));
+    crate::overlay::over_flip(cx);
     if !fits_stage(rect, win::window_scale(big), cx) {
         return call_off(cx);
     }

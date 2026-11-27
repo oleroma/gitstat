@@ -29,6 +29,8 @@ pub(super) struct Stage {
     pub p: Palette,
     pub dark: bool,
     pub timelines: Option<Entity<Timelines>>,
+    /// How long this frame's layout took, for the flip's log.
+    pub laid_in: std::time::Duration,
 }
 
 /// The flip laid out for this frame.
@@ -83,6 +85,7 @@ impl Element for Stage {
     ) -> Laid {
         let s = window.scale_factor();
         let pose = self.pose;
+        let began = std::time::Instant::now();
         let mut panel_laid = self.panel.lay(bounds, pose.panel, window, cx);
         let panel_picture = self.panel.picture(&panel_laid, s);
         let mut window_laid = self
@@ -101,6 +104,9 @@ impl Element for Stage {
             None => Picture::between(&panel_picture, &panel_picture, 0.0, pose.panel, 0.0),
         };
         picture.want(window, cx);
+        if let (n @ 1.., Some((a, b))) = picture.clashes() {
+            crate::flip::note(format!("{n} words over one another, as {a:?} and {b:?}"));
+        }
 
         // The trees: each repo's that either view shows, from its strip
         // to its column.
@@ -152,6 +158,7 @@ impl Element for Stage {
         };
         // Nothing in a flip takes the mouse.
         window.insert_hitbox(bounds, HitboxBehavior::BlockMouse);
+        self.laid_in = began.elapsed();
         Laid {
             picture,
             trees,
@@ -171,6 +178,7 @@ impl Element for Stage {
         cx: &mut App,
     ) {
         let s = window.scale_factor();
+        let began = std::time::Instant::now();
         // As each view paints itself: the sheet and the fills; the trees
         // and the slots; the words and pictures, and last the rim.
         laid.picture.paint_under(window, cx);
@@ -185,6 +193,7 @@ impl Element for Stage {
             WindowScene::paint_slots(slots, window, cx);
         }
         laid.picture.paint_over(window, cx);
+        crate::flip::took(self.laid_in, began.elapsed());
         crate::flip::painted();
         crate::panel::drew(window, cx);
         crate::flip::drew(&self.pose, window, cx);

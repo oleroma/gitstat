@@ -1420,6 +1420,10 @@ pub(crate) fn tip(
     let lines: Vec<(SharedString, Hsla)> = lines.into_iter().map(|(t, c)| (t.into(), c)).collect();
     let (bg, border) = (p.bg, p.border);
     move |_, cx| {
+        // Nothing is pointed at while the views turn into one another.
+        if crate::flip::running(cx) {
+            return cx.new(|_| gpui::EmptyView).into();
+        }
         let lines = lines.clone();
         cx.new(|_| Tip { lines, bg, border }).into()
     }

@@ -190,7 +190,11 @@ fn turn(t: &Turning, e: f32, colors: &Colors, batch: &mut ink::Batch, s: f32) {
         e,
         strip,
         column: col,
-        now: (mix(strip.0, col.0, e), mix(strip.1, col.1, e)),
+        // Along the same path as everything else that travels.
+        now: {
+            let (x, y) = crate::scene::parts::sway(e);
+            (mix(strip.0, col.0, x), mix(strip.1, col.1, y))
+        },
         sin,
         cos,
         len: mix(strip.0 - f32::from(t.strip.left()), cg.bottom() - col.1, e),

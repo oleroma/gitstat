@@ -187,13 +187,32 @@ fn lerp_px(a: i32, b: i32, t: f32) -> i32 {
     lerp(a as f32, b as f32, t).round() as i32
 }
 
-/// `a` at 0, `b` at 1, every edge on a whole px in between.
+/// How far across and how far down a thing has travelled `t` of the way
+/// through the turn: a quarter of a circle, not a straight line. The
+/// panel's rows lie one under another and the window's columns side by
+/// side, so going across first and up after keeps each row's words clear
+/// of the next row's the whole way; a straight line would cross them.
+pub fn sway(t: f32) -> (f32, f32) {
+    let t = t.clamp(0.0, 1.0);
+    if t <= 0.0 {
+        return (0.0, 0.0);
+    }
+    if t >= 1.0 {
+        return (1.0, 1.0);
+    }
+    let (sin, cos) = (t * std::f32::consts::FRAC_PI_2).sin_cos();
+    (sin, 1.0 - cos)
+}
+
+/// `a` at 0, `b` at 1, every edge on a whole px in between, along the
+/// turn's path ([`sway`]).
 pub fn lerp_rect(a: Rect, b: Rect, t: f32) -> Rect {
+    let (x, y) = sway(t);
     Rect::new(
-        lerp_px(a.left, b.left, t),
-        lerp_px(a.top, b.top, t),
-        lerp_px(a.right, b.right, t),
-        lerp_px(a.bottom, b.bottom, t),
+        lerp_px(a.left, b.left, x),
+        lerp_px(a.top, b.top, y),
+        lerp_px(a.right, b.right, x),
+        lerp_px(a.bottom, b.bottom, y),
     )
 }
 
@@ -415,6 +434,32 @@ impl Picture {
             },
             parts,
         }
+    }
+
+    /// How many pairs of travelling words lie over one another, and one
+    /// such pair: for the self-test, which wants none.
+    pub fn clashes(&self) -> (usize, Option<(String, String)>) {
+        let words: Vec<(&Part, &str)> = self
+            .parts
+            .iter()
+            .filter(|p| p.moving && p.alpha > 0.0)
+            .filter_map(|p| match &p.what {
+                What::Words { text, .. } if !text.is_empty() => Some((p, text.as_ref())),
+                _ => None,
+            })
+            .collect();
+        let mut n = 0;
+        let mut one = None;
+        for (i, (a, ta)) in words.iter().enumerate() {
+            for (b, tb) in &words[i + 1..] {
+                let (a, b) = (a.rect, b.rect);
+                if a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom {
+                    n += 1;
+                    one.get_or_insert_with(|| (ta.to_string(), tb.to_string()));
+                }
+            }
+        }
+        (n, one)
     }
 
     /// Asks for what its parts need drawn ahead: the repos' icons. As a

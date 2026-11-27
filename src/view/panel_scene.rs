@@ -1058,6 +1058,7 @@ impl StatusView {
                     p,
                     dark,
                     timelines: self.timelines.clone(),
+                    laid_in: std::time::Duration::ZERO,
                 }),
                 None => root.child(scene).children(
                     self.timelines

@@ -356,6 +356,41 @@ pub struct OverlaySlot {
 
 impl Global for OverlaySlot {}
 
+/// Whether the badge stays over the panel's window for now: while a flip
+/// is drawn in it, unless the badge sits where the panel itself rests. The
+/// badge shows over the big window, so it shows over the flip into it and
+/// out of it too, and never blinks as the windows change hands.
+fn badge_over_flip(cx: &App) -> bool {
+    if !crate::flip::running(cx) {
+        return false;
+    }
+    let badge = cx.try_global::<OverlaySlot>().and_then(|s| s.placed);
+    match (badge, panel::last_rect(cx)) {
+        (Some(b), Some(p)) => {
+            !(b.left < p.right && p.left < b.right && b.top < p.bottom && p.top < b.bottom)
+        }
+        _ => true,
+    }
+}
+
+/// The panel's window, when it belongs over the badge.
+fn panel_over_badge(cx: &App) -> Option<isize> {
+    panel::hwnd(cx).filter(|_| !badge_over_flip(cx))
+}
+
+/// A flip starts in the panel's window: the badge goes over it, where it
+/// stays over the big window.
+pub fn over_flip(cx: &mut App) {
+    if !badge_over_flip(cx) {
+        return;
+    }
+    let slot = cx.default_global::<OverlaySlot>();
+    if let Some(h) = slot.hwnd.filter(|_| slot.visible) {
+        cx.spawn(async move |_| unsafe { win::reassert_topmost(h) })
+            .detach();
+    }
+}
+
 /// Idempotent: opens, closes, places, shows or hides the badge to match
 /// the config and the state. Changing the corner, offset, size or margin
 /// re-places the window without recreating it.
@@ -386,7 +421,7 @@ pub fn sync(cx: &mut App) {
     let scale = view::sane_scale(mon.scale);
     let physical = |v: f32| (v * scale).round() as i32;
     let pad = layout::badge_pad(scale);
-    let panel = panel::hwnd(cx);
+    let panel = panel_over_badge(cx);
     let slot = cx.default_global::<OverlaySlot>();
     let Some(h) = slot.hwnd else { return };
     if slot.drag.is_some_and(|d| d.is_drag()) {
@@ -623,7 +658,7 @@ fn tick(id: u64, cx: &mut App) -> bool {
         return false;
     }
     if let Some(h) = slot.hwnd.filter(|_| slot.visible) {
-        let panel = panel::hwnd(cx);
+        let panel = panel_over_badge(cx);
         cx.spawn(async move |_| unsafe {
             win::reassert_topmost(h);
             // Topmost puts the badge above the panel; put the panel back.

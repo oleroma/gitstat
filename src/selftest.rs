@@ -704,23 +704,48 @@ fn unlike_box(a: &Shot, b: &Shot, r: Rect) -> Option<Rect> {
     found
 }
 
-/// Saves `shot` inside `r` as `name`.png in `out`.
-fn save_part(out: &std::path::Path, name: &str, shot: &Shot, r: Rect) {
-    let (w, h) = (r.width().max(0) as u32, r.height().max(0) as u32);
-    let mut pixels = Vec::with_capacity((w * h * 4) as usize);
+/// Where `a` and `b` differ inside `r`, as lines for the report: the 48 px
+/// squares with the most px that differ, each with where its first such px
+/// is and both colours there. Also saved as `name`.png in `out`: `r` with
+/// the px that differ white on black.
+fn unlike_cells(out: &std::path::Path, name: &str, a: &Shot, b: &Shot, r: Rect) -> Vec<String> {
+    const CELL: i32 = 48;
+    let (w, h) = (r.width().max(0), r.height().max(0));
+    let cols = (w + CELL - 1) / CELL;
+    let mut cells = std::collections::BTreeMap::new();
+    let mut mask = vec![0u8; (w * h) as usize];
     for y in r.top..r.bottom {
         for x in r.left..r.right {
-            let p = shot.at(x, y);
-            pixels.extend_from_slice(&[p[0], p[1], p[2], 255]);
+            let (p, q) = (a.at(x, y), b.at(x, y));
+            if (0..3).any(|c| p[c].abs_diff(q[c]) > 2) {
+                mask[((y - r.top) * w + (x - r.left)) as usize] = 255;
+                let cell = ((y - r.top) / CELL, (x - r.left) / CELL);
+                cells.entry(cell).or_insert((0u32, (x, y), p, q)).0 += 1;
+            }
         }
     }
     let _ = image::save_buffer(
         out.join(format!("{name}.png")),
-        &pixels,
-        w,
-        h,
-        image::ExtendedColorType::Rgba8,
+        &mask,
+        w as u32,
+        h as u32,
+        image::ExtendedColorType::L8,
     );
+    let mut most: Vec<_> = cells.into_iter().collect();
+    let squares = most.len();
+    most.sort_by_key(|(_, (n, ..))| std::cmp::Reverse(*n));
+    let mut lines = vec![format!(
+        "{squares} of {} squares of {CELL} px differ; the most:",
+        cols * ((h + CELL - 1) / CELL)
+    )];
+    for ((row, col), (n, at, p, q)) in most.into_iter().take(30) {
+        lines.push(format!(
+            "square at ({}, {}): {n} px, first at {at:?} flip {p:?} rest {q:?}",
+            r.left + col * CELL,
+            r.top + row * CELL
+        ));
+    }
+    lines
 }
 
 /// A view at rest: its picture, where it is, and the flip's frame that
@@ -779,31 +804,11 @@ fn tell(
                 if !saved[k] {
                     saved[k] = true;
                     let name = what.replace(' ', "-");
-                    let part = Rect::new(
-                        b.left - 8,
-                        b.top - 8,
-                        (b.right + 8).min(b.left + 1400),
-                        (b.bottom + 8).min(b.top + 700),
-                    );
-                    let part = Rect::new(
-                        part.left.max(c.shot.rect.left),
-                        part.top.max(c.shot.rect.top),
-                        part.right.min(c.shot.rect.right),
-                        part.bottom.min(c.shot.rect.bottom),
-                    );
                     let end = ["start", "end"][k];
-                    save_part(
-                        out,
-                        &format!("{name}-unlike-{end}-{i:03}-flip"),
-                        &c.shot,
-                        part,
-                    );
-                    save_part(
-                        out,
-                        &format!("{name}-unlike-{end}-{i:03}-rest"),
-                        rest.0,
-                        part,
-                    );
+                    let mask = format!("{name}-unlike-{end}-{i:03}-where");
+                    for line in unlike_cells(out, &mask, &c.shot, rest.0, rest.1) {
+                        let _ = write!(report, "\n{what}:     {line}");
+                    }
                 }
             }
         }
