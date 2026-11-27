@@ -160,6 +160,7 @@ private fun RepoScreen(state: UiState) {
     var menu by remember { mutableStateOf(false) }
     var sheet by remember { mutableStateOf<String?>(null) }
     var picked by remember { mutableStateOf<Picked?>(null) }
+    var health by remember { mutableStateOf(false) }
 
     val askNotify = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (!granted) Hub.setNotify(context, false)
@@ -232,19 +233,28 @@ private fun RepoScreen(state: UiState) {
                 RowsView(
                     snap,
                     top = {
-                        Column {
-                            Row(Modifier.fillMaxWidth().padding(start = 16.dp), verticalAlignment = Alignment.CenterVertically) {
-                                Text("gitstat", fontWeight = FontWeight.Bold, fontSize = 20.sp, color = c.text, modifier = Modifier.weight(1f))
-                                actions()
-                            }
-                            summary()
+                        Row(
+                            Modifier.fillMaxWidth().padding(start = 12.dp, top = 4.dp, bottom = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            HealthBadge(snap, state.problem) { health = true }
+                            Spacer(Modifier.width(10.dp))
+                            Text("gitstat", fontWeight = FontWeight.Bold, fontSize = 20.sp, color = c.text, modifier = Modifier.weight(1f))
+                            actions()
                         }
                     },
                     onRepo = { sheet = it.slug },
                     onCommit = { picked = it },
                 )
             } else {
-                Board(snap, menu = actions, summary = summary, onRepo = { sheet = it.slug }, onCommit = { picked = it })
+                Board(
+                    snap,
+                    problem = state.problem,
+                    menu = actions,
+                    onHealth = { health = true },
+                    onRepo = { sheet = it.slug },
+                    onCommit = { picked = it },
+                )
             }
         }
     }
@@ -258,7 +268,60 @@ private fun RepoScreen(state: UiState) {
             }
         }
     }
+    if (snap != null && health) {
+        ModalBottomSheet(onDismissRequest = { health = false }, containerColor = c.surface) {
+            HealthSheet(snap, state.problem) { health = false; sheet = it.slug }
+        }
+    }
     picked?.let { p -> CommitPopup(p) { picked = null } }
+}
+
+/**
+ * The summary of every repo's health: how many have branches not merged, branches and PRs in
+ * all, when it was read and why a read failed, then every repo, red first; tapping a repo
+ * opens its branches.
+ */
+@Composable
+private fun HealthSheet(snap: Snapshot, problem: String?, onRepo: (Repo) -> Unit) {
+    val c = LocalColors.current
+    val repos = remember(snap) { snap.sorted() }
+    val red = snap.redCount
+    val hanging = snap.repos.sumOf { it.hanging.size }
+    val prs = snap.repos.sumOf { it.openPrs.size }
+    val failing = snap.repos.count { it.checksState == Checks.FAILING }
+    val unread = snap.repos.count { it.problem != null }
+    Column(Modifier.verticalScroll(rememberScrollState()).padding(start = 16.dp, end = 16.dp, bottom = 24.dp)) {
+        Text(
+            if (red == 0) "All ${snap.repos.size} repos are merged" else "$red of ${snap.repos.size} repos have branches not merged",
+            color = if (red == 0) c.green else c.red,
+            fontWeight = FontWeight.SemiBold,
+            fontSize = 17.sp,
+        )
+        val totals = buildList {
+            if (hanging > 0) add("${branchCount(hanging)} not merged")
+            add(if (prs == 1) "1 open PR" else "$prs open PRs")
+            if (failing > 0) add("checks failing in $failing")
+            if (unread > 0) add("$unread couldn't be read")
+        }
+        Text(totals.joinToString(" · "), color = c.text, fontSize = 13.sp, modifier = Modifier.padding(top = 2.dp))
+        Text("Read ${ago(snap.readAt)}", color = c.muted, fontSize = 12.sp, modifier = Modifier.padding(top = 2.dp))
+        problem?.let { Text(it, color = c.amber, fontSize = 13.sp, modifier = Modifier.padding(top = 4.dp)) }
+        Spacer(Modifier.height(10.dp))
+        for (repo in repos) {
+            Row(
+                Modifier.fillMaxWidth().clickable { onRepo(repo) }.padding(vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                RepoMark(repo, 20.dp)
+                Spacer(Modifier.width(10.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(repo.name, color = c.text, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(subtitle(repo), color = if (repo.hanging.isNotEmpty()) c.red else c.muted, fontSize = 13.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                }
+                ChecksMark(repo.checksState)
+            }
+        }
+    }
 }
 
 @Composable

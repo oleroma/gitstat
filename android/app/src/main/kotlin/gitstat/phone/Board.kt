@@ -68,8 +68,9 @@ private val DOT = 5.dp
 @Composable
 fun Board(
     snap: Snapshot,
+    problem: String?,
     menu: @Composable () -> Unit,
-    summary: @Composable () -> Unit,
+    onHealth: () -> Unit,
     onRepo: (Repo) -> Unit,
     onCommit: (Picked) -> Unit,
 ) {
@@ -90,6 +91,7 @@ fun Board(
                 contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
+                item(key = "health") { HealthBadge(snap, problem, onHealth) }
                 itemsIndexed(repos, key = { _, r -> r.slug }) { i, repo ->
                     Pill(repo, selected = i == pager.currentPage) {
                         scope.launch { pager.animateScrollToPage(i) }
@@ -98,11 +100,34 @@ fun Board(
             }
             menu()
         }
-        summary()
         HorizontalPager(state = pager, modifier = Modifier.fillMaxSize(), key = { repos[it].slug }) { page ->
             val repo = repos[page]
             RepoPage(repo, trees.getValue(repo.slug), snap.login, "${page + 1} / ${repos.size}", onRepo, onCommit)
         }
+    }
+}
+
+/**
+ * How many repos have branches not merged, as a number in a circle: red, or green at 0, with
+ * an amber ring when the last read failed. Tapping it opens the summary of every repo's health.
+ */
+@Composable
+fun HealthBadge(snap: Snapshot, problem: String?, onClick: () -> Unit) {
+    val c = LocalColors.current
+    val red = snap.redCount
+    val fill = if (red > 0) c.red else c.green
+    val density = LocalDensity.current
+    // Grows with the font size, so the number always fits.
+    val d = 32.dp * maxOf(1f, density.fontScale)
+    Box(
+        Modifier.size(d)
+            .background(fill, CircleShape)
+            .then(if (problem != null) Modifier.border(2.dp, c.amber, CircleShape) else Modifier)
+            .clip(CircleShape)
+            .clickable(onClick = onClick),
+        contentAlignment = androidx.compose.ui.Alignment.Center,
+    ) {
+        Text("$red", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 14.sp, maxLines = 1)
     }
 }
 
