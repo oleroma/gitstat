@@ -199,6 +199,7 @@ pub fn seen_list_scroll(at: f32, max: f32) {
 }
 
 /// Notes a strip the panel drew, for the flip.
+#[allow(dead_code)]
 pub fn seen_strip(path: &Path, bounds: Bounds<Pixels>) {
     STRIPS.with(|s| {
         s.borrow_mut().insert(path.to_path_buf(), bounds);
@@ -257,6 +258,7 @@ pub fn tag(
 
 /// An invisible layer over a column header noting where its top-left
 /// corner is, which its parts are placed beside.
+#[allow(dead_code)]
 pub fn tag_header(path: &Path) -> impl IntoElement {
     let path = path.to_path_buf();
     canvas(
@@ -285,6 +287,7 @@ pub fn clear_column_parts() {
 }
 
 /// Notes a column body the big window drew, for the flip.
+#[allow(dead_code)]
 pub fn seen_column(body: Bounds<Pixels>, window: &Window) {
     let top = f32::from(body.top()) * window.scale_factor();
     BODY_TOP.with(|t| t.set(Some(top)));

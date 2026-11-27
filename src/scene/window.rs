@@ -27,11 +27,95 @@ const PAD_X: f32 = 16.0;
 const PAD_Y: f32 = 12.0;
 const GAP: f32 = 8.0;
 
+/// A column's header: its icon's side, its name's size, and the size of
+/// the line under it.
+pub const HEAD_ICON: f32 = 20.0;
+pub const HEAD_NAME: f32 = 16.0;
+pub const HEAD_LINE: f32 = 14.0;
+const HEAD_PAD_X: f32 = 12.0;
+const HEAD_PAD_Y: f32 = 8.0;
+const HEAD_GAP: f32 = 6.0;
+
 /// One cell of the table, left to right.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CellSpec {
     Spine,
-    Column,
+    Column(HeadSpec),
+}
+
+/// What of a column's header is measured, device px: how wide its
+/// checkout and its status run, and how tall the glance under them is,
+/// when it has one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HeadSpec {
+    pub checkout: i32,
+    pub status: i32,
+    pub glance: Option<i32>,
+}
+
+/// A column, laid out: its header's parts, then its tree's room.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Column {
+    pub icon: Rect,
+    pub name: Rect,
+    pub checkout: Rect,
+    pub status: Rect,
+    /// The name and the line under it, as far across as the header goes:
+    /// where the mouse takes them.
+    pub title: Rect,
+    pub glance: Option<Rect>,
+    /// The line under the header, and the one down the column's right.
+    pub line: Rect,
+    pub edge: Rect,
+    pub body: Rect,
+}
+
+/// Lays a column's header out in `cell`, and its body under it.
+pub fn column(cell: Rect, head: &HeadSpec, scale: f32) -> Column {
+    let e = |v: f32| px(v, scale);
+    let (x, y) = (cell.left, cell.top);
+    let rim = e(1.0).max(1);
+    let inner_right = (cell.right - rim - e(HEAD_PAD_X)).max(x + e(HEAD_PAD_X));
+    let left = x + e(HEAD_PAD_X);
+    // The icon and the name on one line, the icon in its middle; under
+    // them the checkout, then the status.
+    let name_h = line_height(HEAD_NAME);
+    let icon_top = y + e(HEAD_PAD_Y + (name_h - HEAD_ICON) / 2.0);
+    let icon = Rect::new(left, icon_top, left + e(HEAD_ICON), icon_top + e(HEAD_ICON));
+    let name_left = (icon.right + e(GAP)).min(inner_right);
+    let name_top = y + e(HEAD_PAD_Y);
+    let name = Rect::new(name_left, name_top, inner_right, name_top + e(name_h));
+    let line_top = y + e(HEAD_PAD_Y + name_h + 2.0);
+    let line_bottom = line_top + e(line_height(HEAD_LINE));
+    let status_w = head.status.max(0).min(inner_right - left);
+    let checkout_w = head
+        .checkout
+        .max(0)
+        .min((inner_right - left - e(GAP) - status_w).max(0));
+    let checkout = Rect::new(left, line_top, left + checkout_w, line_bottom);
+    let status_left = (checkout.right + e(GAP)).min(inner_right - status_w);
+    let status = Rect::new(status_left, line_top, status_left + status_w, line_bottom);
+    let title = Rect::new(left, name_top, inner_right, line_bottom);
+    let glance = head.glance.map(|tall| {
+        let top = line_bottom + e(HEAD_GAP);
+        Rect::new(left, top, inner_right, top + tall.max(0))
+    });
+    let under = glance.map_or(line_bottom, |g| g.bottom) + e(HEAD_PAD_Y);
+    let under = under.min(cell.bottom);
+    let line = Rect::new(x, under, cell.right - rim, (under + rim).min(cell.bottom));
+    let edge = Rect::new(cell.right - rim, y, cell.right, cell.bottom);
+    let body = Rect::new(x, line.bottom, cell.right - rim, cell.bottom);
+    Column {
+        icon,
+        name,
+        checkout,
+        status,
+        title,
+        glance,
+        line,
+        edge,
+        body,
+    }
 }
 
 /// What the big window shows, as far as its layout goes. Widths and
@@ -91,6 +175,8 @@ pub struct Layout {
     pub table: Rect,
     /// Each cell, top to bottom of the table, where it is now, scrolled.
     pub cells: Vec<Rect>,
+    /// Each cell's column, for the cells that are one.
+    pub columns: Vec<Option<Column>>,
     /// How wide all the cells are, how far the table is scrolled and how
     /// far it can be.
     pub content: i32,
@@ -108,7 +194,7 @@ pub fn cell_edges(cells: &[CellSpec], scale: f32) -> Vec<i32> {
     for cell in cells {
         x += match cell {
             CellSpec::Spine => SPINE,
-            CellSpec::Column => COLUMN,
+            CellSpec::Column(_) => COLUMN,
         };
         edges.push(px(x, scale));
     }
@@ -247,9 +333,17 @@ pub fn layout(spec: &Spec) -> Layout {
     let content = edges.last().copied().unwrap_or(0);
     let max_scroll = (content - w).max(0);
     let scroll = spec.scroll.clamp(0, max_scroll);
-    let cells = edges
+    let cells: Vec<Rect> = edges
         .windows(2)
         .map(|pair| Rect::new(pair[0] - scroll, table.top, pair[1] - scroll, table.bottom))
+        .collect();
+    let columns = cells
+        .iter()
+        .zip(&spec.cells)
+        .map(|(cell, kind)| match kind {
+            CellSpec::Spine => None,
+            CellSpec::Column(head) => Some(column(*cell, head, s)),
+        })
         .collect();
 
     Layout {
@@ -258,6 +352,7 @@ pub fn layout(spec: &Spec) -> Layout {
         header,
         table,
         cells,
+        columns,
         content,
         scroll,
         max_scroll,
@@ -272,6 +367,14 @@ mod tests {
 
     const SCALES: [f32; 6] = [1.0, 1.25, 1.5, 1.75, 2.0, 2.5];
 
+    fn head(scale: f32) -> HeadSpec {
+        HeadSpec {
+            checkout: px(90.0, scale),
+            status: px(120.0, scale),
+            glance: Some(px(22.0, scale)),
+        }
+    }
+
     fn spec(scale: f32) -> Spec {
         let e = |v: f32| px(v, scale);
         Spec {
@@ -281,12 +384,12 @@ mod tests {
             refresh: e(78.0),
             cells: vec![
                 CellSpec::Spine,
-                CellSpec::Column,
-                CellSpec::Column,
+                CellSpec::Column(head(scale)),
+                CellSpec::Column(head(scale)),
                 CellSpec::Spine,
                 CellSpec::Spine,
-                CellSpec::Column,
-                CellSpec::Column,
+                CellSpec::Column(HeadSpec::default()),
+                CellSpec::Column(head(scale)),
             ],
             scroll: 0,
             prs: Some(e(400.0)),
@@ -330,7 +433,7 @@ mod tests {
             for (cell, kind) in l.cells.iter().zip(&spec(scale).cells) {
                 let want = match kind {
                     CellSpec::Spine => SPINE,
-                    CellSpec::Column => COLUMN,
+                    CellSpec::Column(_) => COLUMN,
                 };
                 assert!((cell.width() - px(want, scale)).abs() <= 1);
                 assert_eq!((cell.top, cell.bottom), (l.table.top, l.table.bottom));
@@ -398,6 +501,40 @@ mod tests {
             assert!(inside(l.footer, whole));
             assert!(l.table.height() >= 0 && l.prs.unwrap().height() >= 0);
             assert_eq!(l.table.bottom, l.prs.unwrap().top);
+        }
+    }
+
+    #[test]
+    fn a_columns_header_stays_in_it_and_its_tree_under_it() {
+        for scale in SCALES {
+            let l = layout(&spec(scale));
+            for (cell, column) in l.cells.iter().zip(&l.columns) {
+                let Some(c) = column else { continue };
+                for part in [c.icon, c.name, c.checkout, c.status, c.title] {
+                    assert!(inside(part, *cell), "scale {scale}: {part:?}");
+                }
+                assert!(c.icon.right <= c.name.left);
+                assert!(c.name.bottom <= c.checkout.top);
+                assert!(c.checkout.right <= c.status.left);
+                assert_eq!(c.icon.width(), px(HEAD_ICON, scale));
+                if let Some(g) = c.glance {
+                    assert!(c.status.bottom <= g.top && g.bottom <= c.line.top);
+                }
+                assert_eq!(c.line.bottom, c.body.top);
+                assert_eq!(c.body.bottom, cell.bottom);
+                assert_eq!(c.body.right, c.edge.left);
+                assert_eq!(c.edge.right, cell.right);
+            }
+            // A long checkout gives way to the status.
+            let long = HeadSpec {
+                checkout: px(900.0, scale),
+                status: px(120.0, scale),
+                glance: None,
+            };
+            let c = column(l.cells[1], &long, scale);
+            assert!(inside(c.status, l.cells[1]));
+            assert_eq!(c.status.width(), px(120.0, scale));
+            assert!(c.checkout.right <= c.status.left);
         }
     }
 

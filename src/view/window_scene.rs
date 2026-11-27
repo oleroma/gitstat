@@ -12,13 +12,16 @@
 use super::panel_scene::{hit, measure, put, width};
 use super::{
     Cell, Mode, NEXT_TABLE_SCROLL, Palette, StatusView, cell_of, filter_key, prs_block, refresh,
-    repo_row, spine, table_cells, title_bar, titles, tone_counts,
+    repo_row, spine, status_color, table_cells, title_bar, titles, tone_counts,
 };
+use crate::git::RepoStatus;
 use crate::layout::Rect;
 use crate::scene::paint;
 use crate::scene::panel::{HEADLINE as GLYPH, SMALL, TINY, line_height};
 use crate::scene::text::{self, Align, Look, text};
-use crate::scene::window::{self as place, CellSpec, HEADLINE};
+use crate::scene::window::{
+    self as place, CellSpec, HEAD_ICON, HEAD_LINE, HEAD_NAME, HEADLINE, HeadSpec,
+};
 use crate::state::AppState;
 use crate::timeline::Timelines;
 use gpui::{
@@ -56,6 +59,24 @@ fn caption_font(cx: &App) -> &'static str {
     })
 }
 
+/// A cell of the table: a section's spine or a repo's column, with what
+/// it shows when it is in sight.
+enum CellPart {
+    Spine(Option<AnyElement>),
+    Column(Option<Box<ColumnPart>>),
+}
+
+/// A repo's column: what its header says, and its slots.
+struct ColumnPart {
+    repo: RepoStatus,
+    color: Hsla,
+    checkout: SharedString,
+    status: SharedString,
+    title: Option<AnyElement>,
+    glance: Option<AnyElement>,
+    body: Option<AnyElement>,
+}
+
 /// The big window as one element, as big as its window.
 pub(super) struct WindowScene {
     p: Palette,
@@ -71,8 +92,7 @@ pub(super) struct WindowScene {
     refresh: Option<AnyElement>,
     refresh_words: SharedString,
     checking: bool,
-    /// The table's cells, each with its slot when it is in sight.
-    cells: Vec<(CellSpec, Option<AnyElement>)>,
+    cells: Vec<CellPart>,
     /// What shows in the table's place when there is no table.
     body: Option<AnyElement>,
     prs: Option<AnyElement>,
@@ -167,13 +187,44 @@ impl Element for WindowScene {
             .footer
             .take()
             .map(|slot| measure(slot, w, s, window, cx));
+        // Each column's header, as tall as what it says at a glance.
+        let inner = place::column(
+            Rect::new(0, 0, place::px(place::COLUMN, s), i32::MAX / 2),
+            &HeadSpec::default(),
+            s,
+        )
+        .title
+        .width();
+        let mut glances = Vec::new();
+        let specs: Vec<CellSpec> = self
+            .cells
+            .iter_mut()
+            .map(|cell| match cell {
+                CellPart::Spine(_) => CellSpec::Spine,
+                CellPart::Column(None) => CellSpec::Column(HeadSpec::default()),
+                CellPart::Column(Some(part)) => {
+                    let glance = part
+                        .glance
+                        .take()
+                        .map(|slot| measure(slot, inner, s, window, cx));
+                    let tall = glance.as_ref().map(|(_, tall)| *tall);
+                    glances.push(glance.map(|(el, _)| el));
+                    CellSpec::Column(HeadSpec {
+                        checkout: width(&part.checkout, HEAD_LINE, window),
+                        status: width(&part.status, HEAD_LINE, window),
+                        glance: tall,
+                    })
+                }
+            })
+            .collect();
+        let mut glances = glances.into_iter();
         let wanted = dev(-self.scroll.offset().x);
         let layout = place::layout(&place::Spec {
             scale: s,
             size: (w, h),
             health,
             refresh: width(&self.refresh_words, SMALL, window),
-            cells: self.cells.iter().map(|(kind, _)| *kind).collect(),
+            cells: specs,
             scroll: wanted,
             prs: prs.as_ref().map(|(_, tall)| *tall),
             footer: footer.as_ref().map_or(0, |(_, tall)| *tall),
@@ -224,12 +275,32 @@ impl Element for WindowScene {
                     cells.push(put(slot, layout.table, at, s, window, cx));
                     return;
                 }
-                for ((_, slot), r) in self.cells.iter_mut().zip(&layout.cells) {
-                    if let Some(slot) = slot.take()
-                        && r.right > 0
-                        && r.left < w
-                    {
-                        cells.push(put(slot, *r, at, s, window, cx));
+                for ((cell, r), column) in self
+                    .cells
+                    .iter_mut()
+                    .zip(&layout.cells)
+                    .zip(&layout.columns)
+                {
+                    match (cell, column) {
+                        (CellPart::Spine(slot), _) => {
+                            if let Some(slot) = slot.take() {
+                                cells.push(put(slot, *r, at, s, window, cx));
+                            }
+                        }
+                        (CellPart::Column(Some(part)), Some(c)) => {
+                            if let Some(slot) = part.body.take() {
+                                cells.push(put(slot, c.body, at, s, window, cx));
+                            }
+                            if let Some(slot) = part.title.take() {
+                                cells.push(put(slot, c.title, at, s, window, cx));
+                            }
+                            if let (Some(mut el), Some(g)) = (glances.next().flatten(), c.glance) {
+                                el.prepaint_at(paint::bounds(g, at, s).origin, window, cx);
+                                cells.push(el);
+                            }
+                            crate::repo_marks::want(&part.repo, HEAD_ICON, window, cx);
+                        }
+                        _ => {}
                     }
                 }
             },
@@ -464,6 +535,43 @@ impl Element for WindowScene {
                 bounds: table_bounds,
             }),
             |window| {
+                for (cell, c) in self.cells.iter().zip(&l.columns) {
+                    let (CellPart::Column(Some(part)), Some(c)) = (cell, c) else {
+                        continue;
+                    };
+                    paint::fill(window, b(c.line), p.border);
+                    paint::fill(window, b(c.edge), p.border);
+                    crate::repo_marks::paint(
+                        &part.repo,
+                        b(c.icon),
+                        HEAD_ICON,
+                        part.color,
+                        window,
+                        cx,
+                    );
+                    let name: SharedString = part.repo.name.clone().into();
+                    words(
+                        window,
+                        &name,
+                        Look::new(HEAD_NAME, p.text).bold(),
+                        c.name,
+                        Align::Left,
+                    );
+                    words(
+                        window,
+                        &part.checkout,
+                        Look::new(HEAD_LINE, p.text),
+                        c.checkout,
+                        Align::Left,
+                    );
+                    words(
+                        window,
+                        &part.status,
+                        Look::new(HEAD_LINE, part.color),
+                        c.status,
+                        Align::Left,
+                    );
+                }
                 for slot in &mut laid.cells {
                     slot.paint(window, cx);
                 }
@@ -595,7 +703,7 @@ impl StatusView {
                     .iter()
                     .map(|c| match c {
                         Cell::Spine(..) => CellSpec::Spine,
-                        Cell::Repo(_) => CellSpec::Column,
+                        Cell::Repo(_) => CellSpec::Column(HeadSpec::default()),
                     })
                     .collect();
                 let edges = place::cell_edges(&kinds, s);
@@ -616,13 +724,25 @@ impl StatusView {
                 let scroll = scroll.clamp(0, max);
                 self.table
                     .set_offset(point(px(-(scroll as f32) / s), px(0.0)));
-                for (i, (cell, kind)) in all.iter().zip(kinds).enumerate() {
+                for (i, cell) in all.iter().enumerate() {
                     let seen = edges[i + 1] > scroll && edges[i] < scroll + view;
-                    let slot = seen.then(|| match *cell {
-                        Cell::Spine(section, n) => spine(section, n, state.folded(section), &p),
-                        Cell::Repo(repo) => Timelines::column(t, i, repo, &p, dark, window, cx),
+                    cells.push(match *cell {
+                        Cell::Spine(section, n) => CellPart::Spine(
+                            seen.then(|| spine(section, n, state.folded(section), &p)),
+                        ),
+                        Cell::Repo(repo) => CellPart::Column(seen.then(|| {
+                            let c = Timelines::column(t, i, repo, &p, dark, true, window, cx);
+                            Box::new(ColumnPart {
+                                repo: repo.clone(),
+                                color: status_color(repo, &p),
+                                checkout: c.checkout,
+                                status: c.status,
+                                title: Some(c.title),
+                                glance: c.glance,
+                                body: Some(c.body),
+                            })
+                        })),
                     });
-                    cells.push((kind, slot));
                 }
             }
             _ => {

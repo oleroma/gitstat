@@ -798,8 +798,16 @@ impl StatusView {
                         let color = status_color(s, &p);
                         match &timelines {
                             Some(t) => {
-                                let strip =
-                                    Timelines::strip(t, index + i, s, &p, dark, icons_only, cx);
+                                let strip = Timelines::strip(
+                                    t,
+                                    index + i,
+                                    s,
+                                    &p,
+                                    dark,
+                                    icons_only,
+                                    true,
+                                    cx,
+                                );
                                 RowPart {
                                     repo: (*s).clone(),
                                     color,

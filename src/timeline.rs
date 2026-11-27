@@ -873,6 +873,7 @@ impl Timelines {
     /// One repo's strip in the panel: what lies under its row's parts (its
     /// tree, and where the mouse finds its label), and its label's words
     /// for the scene to draw.
+    #[allow(clippy::too_many_arguments)]
     pub fn strip(
         this: &Entity<Timelines>,
         index: usize,
@@ -880,6 +881,7 @@ impl Timelines {
         p: &Palette,
         dark: bool,
         icons_only: bool,
+        tree: bool,
         cx: &App,
     ) -> Strip {
         let t = this.read(cx);
@@ -924,10 +926,6 @@ impl Timelines {
                 window.insert_hitbox(bounds, HitboxBehavior::Normal)
             },
             move |bounds, hitbox, window, _cx| {
-                // Where the flip starts this repo's tree: every strip, in
-                // view or not, so a tree out of sight turns from its own
-                // row rather than from where it last showed.
-                crate::morph::seen_strip(&paint_path, bounds);
                 let Some(g) = graph else { return };
                 if moving {
                     window.request_animation_frame();
@@ -938,9 +936,20 @@ impl Timelines {
                 );
                 let dots = window.with_content_mask(Some(ContentMask { bounds: mask }), |window| {
                     paint_strip(
-                        bounds, &g, scroll, grow, copied, dirty, true, &colors, window,
+                        bounds,
+                        &g,
+                        scroll,
+                        grow,
+                        copied,
+                        dirty,
+                        (tree, true),
+                        &colors,
+                        window,
                     )
                 });
+                if !tree {
+                    return;
+                }
                 fade(bounds, surface, window);
 
                 // Only dots that show can be hovered: not ones past the
@@ -1475,8 +1484,92 @@ fn lane_offset(lane: usize) -> f32 {
     if lane % 2 == 1 { -step } else { step }
 }
 
+/// The work-in-progress dot's centre, and the ends of the dashed noodle
+/// that joins it to HEAD (at HEAD, at the dot) when there is a HEAD commit.
+pub(crate) type Wip = ((f32, f32), Option<[(f32, f32); 2]>);
+
+/// Where a strip in `bounds` puts its tree: every row and lane on the
+/// device pixel grid, so runs are crisp and bends meet them exactly.
+#[derive(Clone, Copy)]
+pub(crate) struct StripGeo {
+    s: f32,
+    /// The newest row's x; at home HEAD sits PAD in, one step further when
+    /// the work-in-progress dot leads it.
+    top_x: f32,
+    cy: f32,
+    /// The work-in-progress dot takes a column of its own right of HEAD:
+    /// rows newer than HEAD move a step further right to make room.
+    gap: f32,
+    left: f32,
+    right: f32,
+}
+
+impl StripGeo {
+    pub(crate) fn new(
+        bounds: Bounds<Pixels>,
+        g: &RepoGraph,
+        scroll: f32,
+        dirty: bool,
+        s: f32,
+    ) -> Self {
+        let rows = g.layout.nodes.len();
+        let (left, right) = (f32::from(bounds.left()), f32::from(bounds.right()));
+        let head = g.head_row.filter(|&row| row < rows);
+        let gap = head
+            .filter(|&row| dirty && row > 0)
+            .map_or(0.0, |row| row as f32);
+        Self {
+            s,
+            top_x: right - PAD - if dirty { STEP } else { 0.0 } + scroll,
+            cy: f32::from(bounds.center().y),
+            gap,
+            left,
+            right,
+        }
+    }
+
+    pub(crate) fn x(&self, row: f32) -> f32 {
+        let x = self.top_x - row * STEP + if row < self.gap - 0.5 { STEP } else { 0.0 };
+        ink::pos(self.s, x, STROKE)
+    }
+
+    pub(crate) fn y(&self, lane: f32) -> f32 {
+        ink::pos(self.s, self.cy + lane_offset(lane.round() as usize), STROKE)
+    }
+
+    /// The rows whose dots are in view, one step of slack each side.
+    pub(crate) fn rows(&self, rows: usize) -> (usize, usize) {
+        let lo = (((self.top_x - self.right) / STEP).floor() - 1.0).max(0.0) as usize;
+        let hi = ((((self.top_x - self.left) / STEP).ceil() + 1.0).max(0.0) as usize).min(rows);
+        (lo, hi)
+    }
+
+    /// The work-in-progress dot: its centre, and the ends of the dashed
+    /// noodle that joins it to HEAD (at HEAD, at the dot), when there is
+    /// a HEAD commit. `r` is the dot's radius.
+    pub(crate) fn wip(&self, g: &RepoGraph, r: f32) -> Wip {
+        let rows = g.layout.nodes.len();
+        let head = g.head_row.filter(|&row| row < rows);
+        // Right of HEAD, on a lane no noodle crosses that column in; with no
+        // HEAD commit (unborn, or not loaded yet) right of the newest row.
+        let (hx, hy, lane) = match head {
+            Some(row) => (
+                self.x(row as f32),
+                self.y(g.layout.nodes[row].lane as f32),
+                g.layout.free_lane_above(row),
+            ),
+            None => (self.x(0.0), self.cy, 0),
+        };
+        let center = (ink::pos(self.s, hx + STEP, STROKE), self.y(lane as f32));
+        let noodle = head.map(|_| [(hx + DOT, hy), (hx + STEP - r, center.1)]);
+        (center, noodle)
+    }
+}
+
 /// Paints the visible part of a strip; returns where each painted dot is
-/// and what it is, for hit-testing.
+/// and what it is, for hit-testing. Without `tree`, only its tag and
+/// stash marks (when `marks`): what the flip fades with the panel while it
+/// draws the tree itself.
 #[allow(clippy::too_many_arguments)]
 fn paint_strip(
     bounds: Bounds<Pixels>,
@@ -1485,42 +1578,31 @@ fn paint_strip(
     grow: Grow,
     copied: Option<usize>,
     dirty: bool,
-    marks: bool,
+    (tree, marks): (bool, bool),
     colors: &Colors,
     window: &mut Window,
 ) -> Vec<(Point<Pixels>, Dot)> {
     let rows = g.layout.nodes.len();
-    let (left, right) = (f32::from(bounds.left()), f32::from(bounds.right()));
-    let head = g.head_row.filter(|&row| row < rows);
-    // The work-in-progress dot takes a column of its own right of HEAD:
-    // rows newer than HEAD move a step further right to make room.
-    let gap = head
-        .filter(|&row| dirty && row > 0)
-        .map_or(0.0, |row| row as f32);
-    // The newest row's x; at home HEAD sits PAD in, one step further when
-    // the work-in-progress dot leads it.
-    let top_x = right - PAD - if dirty { STEP } else { 0.0 } + scroll;
-    let cy = f32::from(bounds.center().y);
-    // On the device pixel grid, so runs are crisp and bends meet them
-    // exactly.
+    let left = f32::from(bounds.left());
     let s = window.scale_factor();
-    let x = |row: f32| {
-        let x = top_x - row * STEP + if row < gap - 0.5 { STEP } else { 0.0 };
-        ink::pos(s, x, STROKE)
-    };
-    let y = |lane: f32| ink::pos(s, cy + lane_offset(lane.round() as usize), STROKE);
+    let geo = StripGeo::new(bounds, g, scroll, dirty, s);
+    let x = |row: f32| geo.x(row);
+    let y = |lane: f32| geo.y(lane);
     let at = |pos: graph::Pos| point(px(x(pos.row)), px(y(pos.lane)));
     let folded = |lane: f32| lane.round() as usize >= LANES;
 
     // Rows whose dots are in view, one step of slack each side.
-    let lo = (((top_x - right) / STEP).floor() - 1.0).max(0.0) as usize;
-    let hi = ((((top_x - left) / STEP).ceil() + 1.0).max(0.0) as usize).min(rows);
+    let (lo, hi) = geo.rows(rows);
     if lo >= hi && rows > 0 && lo >= rows {
         return Vec::new();
     }
 
     // Under everything, a soft band along each other worktree's line.
-    for b in g.bands.iter().filter(|b| b.top < hi && b.bottom + 1 >= lo) {
+    for b in g
+        .bands
+        .iter()
+        .filter(|b| tree && b.top < hi && b.bottom + 1 >= lo)
+    {
         let color = colors.band(g, b, b.lane >= LANES);
         let yb = y(b.lane as f32);
         let r = BAND / 2.0;
@@ -1535,7 +1617,7 @@ fn paint_strip(
     }
 
     let mut dots = Vec::with_capacity(hi.saturating_sub(lo) + 1);
-    for e in g.layout.visible_edges(lo, hi) {
+    for e in g.layout.visible_edges(lo, hi).filter(|_| tree) {
         let base = if e.first {
             colors.node(g, e.child.0)
         } else {
@@ -1570,22 +1652,11 @@ fn paint_strip(
     }
 
     if dirty {
-        // Right of HEAD, on a lane no noodle crosses that column in; with no
-        // HEAD commit (unborn, or not loaded yet) right of the newest row.
-        let (hx, hy, lane) = match head {
-            Some(row) => (
-                x(row as f32),
-                y(g.layout.nodes[row].lane as f32),
-                g.layout.free_lane_above(row),
-            ),
-            None => (x(0.0), cy, 0),
-        };
-        let center = point(px(ink::pos(s, hx + STEP, STROKE)), px(y(lane as f32)));
-        dots.push((center, Dot::Wip));
         let r = grow.radius(Dot::Wip, DOT + 0.5, DOT_HOVER);
-        if head.is_some() {
+        let (c, noodle) = geo.wip(g, r);
+        dots.push((point(px(c.0), px(c.1)), Dot::Wip));
+        if let Some([from, to]) = noodle.filter(|_| tree) {
             // Joined to HEAD by a short dashed noodle.
-            let (from, to) = ((hx + DOT, hy), (hx + STEP - r, f32::from(center.y)));
             let [a, c1, c2, b] = graph::noodle(to, from, (-1.0, 0.0));
             ink::cubic(
                 window,
@@ -1595,14 +1666,15 @@ fn paint_strip(
                 Some(ink::Dash { on: 2.0, off: 2.0 }),
             );
         }
-        let c = (f32::from(center.x), f32::from(center.y));
-        ink::circle(
-            window,
-            c,
-            r,
-            Some(colors.bg),
-            Some((1.0, colors.unpushed, true)),
-        );
+        if tree {
+            ink::circle(
+                window,
+                c,
+                r,
+                Some(colors.bg),
+                Some((1.0, colors.unpushed, true)),
+            );
+        }
     }
 
     for row in lo..hi {
@@ -1619,12 +1691,13 @@ fn paint_strip(
         let head = g.ctx.refs.is_head(id);
         let r = grow.radius(Dot::Commit(row), DOT, DOT_HOVER);
         let c = (f32::from(center.x), f32::from(center.y));
-        if copied == Some(row) {
+        if copied == Some(row) && tree {
             // Its id just went to the clipboard.
             let ring = r + 3.0;
             ink::circle(window, c, ring, None, Some((1.0, colors.head, false)));
         }
-        if head {
+        if !tree {
+        } else if head {
             ink::circle(window, c, r + 3.0, Some(colors.head.opacity(0.22)), None);
             ink::circle(window, c, r, Some(colors.head), None);
         } else if node.class == Class::Unpulled || node.merge {
@@ -1714,7 +1787,7 @@ pub fn paint_still_strip(
             Grow::default(),
             None,
             dirty,
-            false,
+            (true, false),
             &colors,
             window,
         );
