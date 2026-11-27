@@ -16,7 +16,6 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -25,8 +24,8 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
@@ -35,6 +34,7 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -158,7 +158,8 @@ private fun RepoScreen(state: UiState) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var menu by remember { mutableStateOf(false) }
-    var open by remember { mutableStateOf(setOf<String>()) }
+    var sheet by remember { mutableStateOf<String?>(null) }
+    var picked by remember { mutableStateOf<Picked?>(null) }
 
     val askNotify = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (!granted) Hub.setNotify(context, false)
@@ -210,24 +211,48 @@ private fun RepoScreen(state: UiState) {
             modifier = Modifier.fillMaxSize().padding(pad),
         ) {
             val snap = state.snapshot
-            LazyColumn(
-                Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(start = 12.dp, end = 12.dp, bottom = 24.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                item { Summary(snap, state.problem, state.refreshing) }
-                if (snap != null) {
-                    items(snap.sorted(), key = { it.slug }) { repo ->
-                        RepoCard(
-                            repo = repo,
-                            login = snap.login,
-                            expanded = repo.slug in open,
-                            onToggle = { open = if (repo.slug in open) open - repo.slug else open + repo.slug },
-                        )
-                    }
-                }
+            val summary: @Composable () -> Unit = {
+                Box(Modifier.padding(horizontal = 12.dp, vertical = 4.dp)) { Summary(snap, state.problem, state.refreshing) }
+            }
+            if (snap == null) {
+                Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) { summary() }
+            } else {
+                Board(snap, header = summary, onRepo = { sheet = it.slug }, onCommit = { picked = it })
             }
         }
+    }
+
+    val snap = state.snapshot
+    val repo = snap?.repos?.firstOrNull { it.slug == sheet }
+    if (snap != null && repo != null) {
+        ModalBottomSheet(onDismissRequest = { sheet = null }, containerColor = c.surface) {
+            Column(Modifier.verticalScroll(rememberScrollState()).padding(start = 16.dp, end = 16.dp, bottom = 24.dp)) {
+                RepoCard(repo, snap.login, expanded = true, onToggle = {})
+            }
+        }
+    }
+    picked?.let { p ->
+        ModalBottomSheet(onDismissRequest = { picked = null }, containerColor = c.surface) {
+            CommitCard(p)
+        }
+    }
+}
+
+@Composable
+private fun CommitCard(p: Picked) {
+    val c = LocalColors.current
+    val uri = LocalUriHandler.current
+    Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 28.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text(p.commit.subject, color = c.text, fontWeight = FontWeight.SemiBold)
+        val meta = listOfNotNull(
+            p.repo.name,
+            p.branch,
+            p.commit.author.ifEmpty { null },
+            ago(p.commit.time * 1000),
+            p.commit.id.take(7),
+        )
+        Text(meta.joinToString(" · "), color = c.muted, fontSize = 13.sp)
+        TextButton(onClick = { uri.openUri("${p.repo.url}/commit/${p.commit.id}") }) { Text("Open on GitHub") }
     }
 }
 

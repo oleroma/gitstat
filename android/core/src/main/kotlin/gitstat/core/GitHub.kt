@@ -96,8 +96,11 @@ class GitHub(private val post: (query: String) -> String) {
 
     companion object {
         /** Repos per details query; each repo reads up to [MAX_BRANCHES] compared branches. */
-        const val BATCH = 10
-        const val MAX_BRANCHES = 50
+        const val BATCH = 5
+        const val MAX_BRANCHES = 30
+        /** Commits read from the default branch, and from each other branch, for the trees. */
+        const val MAIN_DEPTH = 60
+        const val BRANCH_DEPTH = 25
         const val MAX_OPEN = 30
         const val MAX_MERGED = 50
         const val MAX_REPO_PAGES = 10
@@ -123,10 +126,12 @@ class GitHub(private val post: (query: String) -> String) {
             append("query{")
             batch.forEachIndexed { i, r ->
                 append("r$i:repository(owner:${quote(r.owner)},name:${quote(r.name)}){")
-                append("defaultBranchRef{target{...on Commit{statusCheckRollup{state}}}} ")
+                append("defaultBranchRef{target{oid ...on Commit{statusCheckRollup{state} ")
+                append("history(first:$MAIN_DEPTH){nodes{$COMMIT}}}}} ")
                 append("refs(refPrefix:\"refs/heads/\",first:$MAX_BRANCHES,")
                 append("orderBy:{field:TAG_COMMIT_DATE,direction:DESC}){totalCount ")
-                append("nodes{name target{oid ...on Commit{committedDate}} ")
+                append("nodes{name target{oid ...on Commit{committedDate ")
+                append("history(first:$BRANCH_DEPTH){nodes{$COMMIT}}}} ")
                 append("compare(headRef:${quote(r.defaultBranch)}){aheadBy behindBy}}} ")
                 append("open:pullRequests(states:OPEN,first:$MAX_OPEN,")
                 append("orderBy:{field:UPDATED_AT,direction:DESC})")
@@ -138,6 +143,8 @@ class GitHub(private val post: (query: String) -> String) {
             }
             append("}")
         }
+
+        private const val COMMIT = "oid committedDate messageHeadline author{name} parents(first:3){nodes{oid}}"
 
         /** A GraphQL string literal: JSON's escaping is GraphQL's. */
         fun quote(s: String): String = JsonPrimitive(s).toString()
@@ -179,9 +186,30 @@ class GitHub(private val post: (query: String) -> String) {
                     committedAt = target.str("committedDate") ?: "",
                     pr = open.firstOrNull { it.headBranch == name },
                     mergedByPr = oid.isNotEmpty() && (name to oid) in mergedTips,
+                    tip = oid,
                 )
             }
+            val seen = HashSet<String>()
+            val commits = mutableListOf<Commit>()
+            val histories = listOf(o.obj("defaultBranchRef").obj("target")) +
+                refs.arr("nodes").mapNotNull { (it as? JsonObject)?.obj("target") }
+            for (t in histories) {
+                for (c in t.obj("history").arr("nodes")) {
+                    val n = c as? JsonObject ?: continue
+                    val id = n.str("oid") ?: continue
+                    if (!seen.add(id)) continue
+                    commits += Commit(
+                        id = id,
+                        parents = n.obj("parents").arr("nodes").mapNotNull { (it as? JsonObject)?.str("oid") },
+                        time = n.str("committedDate")?.let { seconds(it) } ?: 0,
+                        subject = (n.str("messageHeadline") ?: "").take(120),
+                        author = n.obj("author").str("name") ?: "",
+                    )
+                }
+            }
             return repo.copy(
+                defaultTip = o.obj("defaultBranchRef").obj("target").str("oid") ?: "",
+                commits = Tree.order(commits),
                 checks = checks.name,
                 branches = branches,
                 branchCount = refs.int("totalCount") ?: (branches.size + 1),
@@ -189,6 +217,9 @@ class GitHub(private val post: (query: String) -> String) {
                 problem = null,
             )
         }
+
+        private fun seconds(iso: String): Long? =
+            runCatching { java.time.Instant.parse(iso).epochSecond }.getOrNull()
 
         private fun encode(s: String) = java.net.URLEncoder.encode(s, "UTF-8").replace("+", "%20")
 

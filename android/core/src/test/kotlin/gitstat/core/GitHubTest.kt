@@ -157,3 +157,18 @@ class SnapshotTest {
         assertEquals(null, Snapshot.fromJson("not json"))
     }
 }
+
+class QueryTest {
+    @Test
+    fun queriesAreBalanced() {
+        val q = GitHub.detailsQuery(listOf(Repo("o/a", "u", false, false, "", "main"), Repo("o/b", "u", false, false, "", "dev")))
+        var depth = 0
+        for (ch in q) {
+            if (ch == '{') depth++
+            if (ch == '}') depth--
+            assertTrue(depth >= 0, q)
+        }
+        assertEquals(0, depth, q)
+        assertTrue("history(first:${GitHub.MAIN_DEPTH})" in q)
+    }
+}

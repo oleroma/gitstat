@@ -41,6 +41,8 @@ data class Branch(
     val pr: Pr? = null,
     /** Its tip is the head of a merged pull request (a squash or rebase merge). */
     val mergedByPr: Boolean = false,
+    /** Its tip commit's id. */
+    val tip: String = "",
 ) {
     /** A branch counts as hanging while it holds work the default branch doesn't have. */
     val hanging: Boolean get() = notInMain > 0 && !mergedByPr
@@ -64,6 +66,10 @@ data class Repo(
     val openPrs: List<Pr> = emptyList(),
     /** Set when this repo's details couldn't be read. */
     val problem: String? = null,
+    /** The default branch's tip commit's id. */
+    val defaultTip: String = "",
+    /** Recent commits of every branch read, newest first with children before parents. */
+    val commits: List<Commit> = emptyList(),
 ) {
     val name: String get() = slug.substringAfter('/')
     val owner: String get() = slug.substringBefore('/')
