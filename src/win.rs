@@ -34,7 +34,7 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CreateWindowExW, FindWindowExW, FindWindowW, HTMINBUTTON, IsIconic, IsZoomed,
-    PostMessageW, SC_MINIMIZE, SIZE_MINIMIZED, SendMessageW, WM_CLOSE, WM_MOUSEMOVE,
+    PostMessageW, SC_MINIMIZE, SIZE_MINIMIZED, SendMessageW, WM_CLOSE, WM_MOUSEMOVE, WM_NCHITTEST,
     WM_NCLBUTTONUP, WM_SIZE, WM_SYSCOMMAND, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -482,6 +482,33 @@ pub fn tell_mouse(h: isize, x: i32, y: i32) {
             let at = ((at.y as u16 as isize) << 16) | (at.x as u16 as isize);
             PostMessageW(hwnd, WM_MOUSEMOVE, 0, at);
         }
+    }
+}
+
+/// `h`'s whole window, its frame too, screen px.
+pub fn window_rect(h: isize) -> Option<Rect> {
+    let hwnd = live(h)?;
+    let mut r = RECT::default();
+    (unsafe { GetWindowRect(hwnd, &mut r) } != 0).then(|| rect(r))
+}
+
+/// What `h` says is at (`x`, `y`) on screen, Windows' hit-test code (2 its
+/// title bar, 8, 9 and 20 its three buttons, 12 its top edge), with the
+/// mouse told to be there first: for the self-test.
+///
+/// # Safety
+/// Call only from a spawned task outside `update`.
+pub unsafe fn hit_test(h: isize, x: i32, y: i32) -> Option<isize> {
+    let hwnd = live(h)?;
+    let mut at = POINT { x, y };
+    unsafe {
+        if ScreenToClient(hwnd, &mut at) == 0 {
+            return None;
+        }
+        let client = ((at.y as u16 as isize) << 16) | (at.x as u16 as isize);
+        SendMessageW(hwnd, WM_MOUSEMOVE, 0, client);
+        let screen = ((y as u16 as isize) << 16) | (x as u16 as isize);
+        Some(SendMessageW(hwnd, WM_NCHITTEST, 0, screen))
     }
 }
 

@@ -100,7 +100,7 @@ pub(super) struct Laid {
 
 /// `slot` in a box of its own, `r` device px from the corner at `at`,
 /// laid out and ready to paint.
-fn put(
+pub(super) fn put(
     slot: AnyElement,
     r: Rect,
     at: (i32, i32),
@@ -129,7 +129,7 @@ fn put(
 }
 
 /// `slot` laid out `width` device px wide, and how tall it comes out.
-fn measure(
+pub(super) fn measure(
     slot: AnyElement,
     width: i32,
     s: f32,
@@ -147,7 +147,7 @@ fn measure(
 }
 
 /// A text's width, whole device px, never narrower than it runs.
-fn width(words: &str, size: f32, window: &Window) -> i32 {
+pub(super) fn width(words: &str, size: f32, window: &Window) -> i32 {
     let look = Look::new(size, gpui::black());
     (text::width(words, &look, window) * window.scale_factor()).ceil() as i32
 }
@@ -593,7 +593,7 @@ impl Element for PanelScene {
 
 /// A place on the top bar or in the list that takes the mouse: as big as
 /// the box it is put in.
-fn hit(id: impl Into<ElementId>, live: bool, p: &Palette) -> gpui::Stateful<gpui::Div> {
+pub(super) fn hit(id: impl Into<ElementId>, live: bool, p: &Palette) -> gpui::Stateful<gpui::Div> {
     let hover = p.hover;
     div()
         .id(id)

@@ -7,7 +7,7 @@
 //! is rounded once, from the window's corner.
 
 use super::panel::{BUTTON, SMALL, TINY, line_height};
-use super::px;
+pub use super::px;
 use crate::layout::Rect;
 
 /// The title bar's height, and each of its three buttons' width, logical

@@ -12,9 +12,6 @@
 //! - [`paint`]: the other parts' painters.
 
 pub mod panel;
-// Laid out and tested ahead of the big window's own scene, which draws
-// from it next.
-#[allow(dead_code)]
 pub mod window;
 
 #[cfg(windows)]

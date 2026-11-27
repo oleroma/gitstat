@@ -63,6 +63,25 @@ impl Shot {
         }
     }
 
+    /// How bright it is over `r` (screen px, cut to what it shows), all
+    /// channels summed.
+    fn light(&self, r: Rect) -> u64 {
+        let h = (self.pixels.len() / 4 / self.w.max(1) as usize) as i32;
+        let r = Rect::new(
+            r.left.max(self.rect.left),
+            r.top.max(self.rect.top),
+            r.right.min(self.rect.right),
+            r.bottom.min(self.rect.top + h),
+        );
+        let mut sum = 0u64;
+        for y in r.top..r.bottom {
+            for x in r.left..r.right {
+                sum += self.at(x, y).iter().map(|&c| u64::from(c)).sum::<u64>();
+            }
+        }
+        sum
+    }
+
     /// How far apart `self` and `other` are at most, in any channel, over
     /// `r` (screen px, cut to what both show).
     fn differs(&self, other: &Shot, r: Rect) -> u8 {
@@ -117,6 +136,28 @@ async fn run(out: &std::path::Path, report: &mut String, cx: &mut AsyncApp) -> R
         pause(100, cx).await;
     }
     pause(2500, cx).await;
+    // GitHub's pull requests come later: the panel is tested with them.
+    let waited = Instant::now();
+    let prs = loop {
+        let (prs, problem) = cx
+            .update(|cx| {
+                let s = cx.global::<Ui>().state.read(cx);
+                (s.open_prs().len(), s.github_problem.clone())
+            })
+            .map_err(gone)?;
+        if prs > 0 || problem.is_some() || waited.elapsed() > Duration::from_secs(12) {
+            break (prs, problem);
+        }
+        pause(200, cx).await;
+    };
+    let _ = writeln!(
+        report,
+        "pull requests: {} open, problem {:?}, after {} ms more",
+        prs.0,
+        prs.1,
+        waited.elapsed().as_millis()
+    );
+    pause(500, cx).await;
     let mon = win::primary_monitor();
     let _ = writeln!(
         report,
@@ -222,6 +263,48 @@ async fn run(out: &std::path::Path, report: &mut String, cx: &mut AsyncApp) -> R
             report,
             "panel: change from the screen before, below/right/above its edge:{shadow}"
         );
+        // The shadow alone: how much light is left of what was there, in
+        // a line along each side at each distance (100 = untouched).
+        let mut left_of = String::new();
+        for d in [1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96] {
+            let rim = 2;
+            let bands = [
+                Rect::new(
+                    mx - 60,
+                    rect.bottom + rim + d,
+                    mx + 60,
+                    rect.bottom + rim + d + 1,
+                ),
+                Rect::new(
+                    rect.right + rim + d,
+                    my - 60,
+                    rect.right + rim + d + 1,
+                    my + 60,
+                ),
+                Rect::new(mx - 60, rect.top - rim - d - 1, mx + 60, rect.top - rim - d),
+                Rect::new(
+                    rect.left - rim - d - 1,
+                    my - 60,
+                    rect.left - rim - d,
+                    my + 60,
+                ),
+            ];
+            let _ = write!(left_of, " {d}px:");
+            for band in bands {
+                match (rest.light(band) * 100).checked_div(before.light(band)) {
+                    Some(left) => {
+                        let _ = write!(left_of, " {left}");
+                    }
+                    None => {
+                        let _ = write!(left_of, " -");
+                    }
+                }
+            }
+        }
+        let _ = writeln!(
+            report,
+            "panel: light left under its shadow, % below/right/above/left:{left_of}"
+        );
         let far = (140.0 * mon.scale) as i32;
         let strip = Rect::new(
             rect.right + far,
@@ -265,8 +348,81 @@ async fn run(out: &std::path::Path, report: &mut String, cx: &mut AsyncApp) -> R
     let client = cx
         .update(|cx| view::window_hwnd(cx).and_then(win::client_rect))
         .map_err(gone)?;
-    let _ = writeln!(report, "window: client {client:?}");
-    shot(out, "window-rest", mon.rect, cx).await;
+    let hwnd = cx.update(view::window_hwnd).map_err(gone)?;
+    let frame = hwnd.and_then(win::window_rect);
+    let _ = writeln!(report, "window: frame {frame:?} client {client:?}");
+    let whole = shot(out, "window-rest", mon.rect, cx).await;
+    let (Some(h), Some(client)) = (hwnd, client) else {
+        return Err("the big window did not open".into());
+    };
+    let inside = client.left >= mon.work.left
+        && client.top >= mon.work.top
+        && client.right <= mon.work.right
+        && client.bottom <= mon.work.bottom;
+    let _ = writeln!(report, "window: inside the work area: {inside}");
+    // Its own title bar: its colour, and Windows finding its parts where
+    // they are drawn.
+    let e = |v: f32| (v * mon.scale).round() as i32;
+    let mid = client.top + e(16.0);
+    let button = |i: i32| client.right - e(46.0) * (2 - i) - e(23.0);
+    if let Some(whole) = &whole {
+        let _ = writeln!(
+            report,
+            "window: title bar {:?} beside its name, {:?} between name and buttons; top bar {:?}; \
+             rim left {:?} top {:?}",
+            whole.at(client.left + e(4.0), mid),
+            whole.at((client.left + button(0)) / 2, mid),
+            whole.at(client.left + e(4.0), client.top + e(36.0)),
+            whole.at(client.left - 1, mid),
+            whole.at(client.left + e(100.0), client.top - 1),
+        );
+    }
+    let hits = unsafe {
+        [
+            win::hit_test(h, (client.left + button(0)) / 2, mid),
+            win::hit_test(h, button(0), mid),
+            win::hit_test(h, button(1), mid),
+            win::hit_test(h, button(2), mid),
+            win::hit_test(h, (client.left + button(0)) / 2, client.top + 1),
+            win::hit_test(h, client.left + e(100.0), client.top + e(60.0)),
+        ]
+    };
+    let _ = writeln!(
+        report,
+        "window: Windows finds title bar, minimise, maximise, close, top edge, inside \
+         (want 2, 8, 9, 20, 12, 1): {hits:?}"
+    );
+    pause(300, cx).await;
+    shot(
+        out,
+        "window-title-bar",
+        Rect::new(
+            client.left - e(12.0),
+            client.top - e(12.0),
+            client.right + e(12.0),
+            client.top + e(110.0),
+        ),
+        cx,
+    )
+    .await;
+    shot(
+        out,
+        "window-bottom",
+        Rect::new(
+            client.left - e(12.0),
+            client.bottom - e(300.0),
+            client.left + e(700.0),
+            client.bottom + e(12.0),
+        ),
+        cx,
+    )
+    .await;
+    if !inside {
+        return Err("the big window reaches off the work area".into());
+    }
+    if hits[..4] != [Some(2), Some(8), Some(9), Some(20)] {
+        return Err("Windows does not find the title bar's parts where they are drawn".into());
+    }
     cx.update(view::close_window).map_err(gone)?;
     pause(500, cx).await;
     Ok(())

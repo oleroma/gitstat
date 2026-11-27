@@ -69,3 +69,54 @@ pub fn health(
         fill(window, bounds(part, at, s), dim(color));
     }
 }
+
+/// gitstat's own icon, as the exe carries it.
+const APP_ICON: &str = include_str!("../../assets/gitstat.svg");
+
+thread_local! {
+    /// The app's icon, by its side in device px.
+    static APP_ICONS: std::cell::RefCell<std::collections::HashMap<u32, Option<std::sync::Arc<gpui::RenderImage>>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Paints the app's icon in the square `r` (device px from the corner at
+/// `at`), drawn at exactly that many px.
+pub fn app_icon(window: &mut Window, r: Rect, at: (i32, i32)) {
+    let n = r.width().min(r.height());
+    if n <= 0 {
+        return;
+    }
+    let n = n as u32;
+    let image = APP_ICONS.with(|icons| {
+        icons
+            .borrow_mut()
+            .entry(n)
+            .or_insert_with(|| {
+                use resvg::{tiny_skia, usvg};
+                let tree = usvg::Tree::from_str(APP_ICON, &usvg::Options::default()).ok()?;
+                let mut pixmap = tiny_skia::Pixmap::new(n, n)?;
+                let k = n as f32 / tree.size().width().max(1.0);
+                resvg::render(
+                    &tree,
+                    tiny_skia::Transform::from_scale(k, k),
+                    &mut pixmap.as_mut(),
+                );
+                // GPUI wants BGRA.
+                let mut rgba = pixmap.take_demultiplied();
+                for px in rgba.as_chunks_mut::<4>().0 {
+                    px.swap(0, 2);
+                }
+                let buffer = image::RgbaImage::from_raw(n, n, rgba)?;
+                Some(std::sync::Arc::new(gpui::RenderImage::new([
+                    image::Frame::new(buffer),
+                ])))
+            })
+            .clone()
+    });
+    if let Some(image) = image {
+        let s = window.scale_factor();
+        window
+            .paint_image(bounds(r, at, s), Default::default(), image, 0, false)
+            .ok();
+    }
+}

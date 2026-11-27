@@ -31,6 +31,8 @@ pub struct Look {
     pub size: f32,
     pub weight: f32,
     pub color: Hsla,
+    /// Their font, when not the window's own.
+    pub family: Option<&'static str>,
 }
 
 impl Look {
@@ -39,11 +41,17 @@ impl Look {
             size,
             weight: 400.0,
             color,
+            family: None,
         }
     }
 
     pub fn bold(mut self) -> Self {
         self.weight = 600.0;
+        self
+    }
+
+    pub fn family(mut self, family: &'static str) -> Self {
+        self.family = Some(family);
         self
     }
 }
@@ -58,6 +66,9 @@ pub enum Align {
 fn run(len: usize, look: &Look, window: &Window) -> TextRun {
     let mut font = window.text_style().font();
     font.weight = FontWeight(look.weight);
+    if let Some(family) = look.family {
+        font.family = family.into();
+    }
     TextRun {
         len,
         font,
