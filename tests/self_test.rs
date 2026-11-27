@@ -13,7 +13,11 @@ use std::time::{Duration, Instant};
 
 #[test]
 fn gitstat_tests_itself_on_screen() {
-    if std::env::var_os("GITHUB_ACTIONS").is_some() {
+    // Only when asked: it takes over the screen while it runs, which is
+    // in the way while the PC is in use.
+    if std::env::var_os("GITHUB_ACTIONS").is_some()
+        || std::env::var_os("GITSTAT_SELF_TEST").is_none()
+    {
         return;
     }
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("self-test");
