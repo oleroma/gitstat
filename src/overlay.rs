@@ -2041,7 +2041,7 @@ fn grown_frame(badge: Rect, corner: Corner, work: Rect, scale: f32, view: Held) 
         radius: view.radius,
         rows: view.rows,
         health: view.health,
-        buttons: 1,
+        buttons: 0,
         tail: view.tail,
         scroll: 0,
     });
