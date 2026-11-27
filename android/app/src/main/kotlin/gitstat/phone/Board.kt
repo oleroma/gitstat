@@ -140,14 +140,16 @@ private fun TreeCanvas(repo: Repo, tree: Tree, onCommit: (Picked) -> Unit) {
     val dark = isSystemInDarkTheme()
     val inks = remember(dark) { TreeInks(dark) }
     val density = LocalDensity.current
-    val rowPx = with(density) { ROW.toPx() }
+    // Rows grow with the phone's font size, so subjects are never cut.
+    val row = ROW * maxOf(1f, density.fontScale)
+    val rowPx = with(density) { row.toPx() }
     val lanes = tree.width.coerceAtMost(MAX_LANES)
     val treeW: Dp = LANE * lanes + 14.dp
     val branchAt = remember(repo) {
         repo.branches.associate { it.tip to it.name } + (repo.defaultTip to repo.defaultBranch)
     }
     Box(
-        Modifier.fillMaxWidth().height(ROW * tree.rows + 6.dp).pointerInput(repo) {
+        Modifier.fillMaxWidth().height(row * tree.rows + 6.dp).pointerInput(repo) {
             detectTapGestures { at ->
                 val row = (at.y / rowPx).toInt()
                 if (row in 0 until tree.rows) {
@@ -157,7 +159,7 @@ private fun TreeCanvas(repo: Repo, tree: Tree, onCommit: (Picked) -> Unit) {
             }
         },
     ) {
-        Canvas(Modifier.width(treeW).height(ROW * tree.rows + 6.dp)) {
+        Canvas(Modifier.width(treeW).height(row * tree.rows + 6.dp)) {
             val lanePx = LANE.toPx()
             val x0 = 7.dp.toPx() + lanePx / 2
             fun x(l: Float) = x0 + l.coerceAtMost((lanes - 1).toFloat()) * lanePx
@@ -191,7 +193,7 @@ private fun TreeCanvas(repo: Repo, tree: Tree, onCommit: (Picked) -> Unit) {
         // Each commit's subject beside its dot, one per row.
         Column(Modifier.padding(start = treeW)) {
             for (commit in repo.commits) {
-                Box(Modifier.height(ROW).padding(end = 8.dp), contentAlignment = androidx.compose.ui.Alignment.CenterStart) {
+                Box(Modifier.height(row).padding(end = 8.dp), contentAlignment = androidx.compose.ui.Alignment.CenterStart) {
                     Text(
                         commit.subject,
                         color = c.text,
