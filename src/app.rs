@@ -274,6 +274,27 @@ fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
                         cx.global::<Shared>()
                             .send_monitors(Command::Pushed(report.pushed.clone()));
                     }
+                    // Repos a pull request was opened in: into the
+                    // floating view.
+                    let opened: Vec<String> = {
+                        let s = state.read(cx);
+                        crate::state::new_pr_repos(&s.prs, &report.prs)
+                            .iter()
+                            .filter_map(|p| s.statuses.iter().find(|st| &st.path == p))
+                            .map(AppState::listed_name)
+                            .collect()
+                    };
+                    if !opened.is_empty() {
+                        let now = unix_now();
+                        change_setting(
+                            move |c| {
+                                for name in &opened {
+                                    c.float.note(name, crate::config::FloatEvent::Pr, now);
+                                }
+                            },
+                            cx,
+                        );
+                    }
                     state.update(cx, |s, _| {
                         let (prs, repos) = (s.config.github_prs, s.config.github_repos);
                         s.github_report(report);
@@ -312,6 +333,7 @@ fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
                     move |c| {
                         c.float.pinned = lists.pinned;
                         c.float.hidden = lists.hidden;
+                        c.float.taken_out = lists.taken_out;
                         c.float.order = lists.order;
                     },
                     cx,
@@ -416,9 +438,10 @@ fn on_update(slot: usize, update: Update, cx: &mut App) -> (bool, bool) {
             (false, false)
         }
         Update::Status(status, fetched) => {
-            let (line, changes) = {
+            let (line, changes, events) = {
                 let s = state.read(cx);
                 let old = s.statuses.iter().find(|o| o.path == status.path);
+                let events = crate::state::float_events(old, &status);
                 (
                     crate::notify::behind(&s.config.notify, old, &status),
                     // Remote branches your own pull or fetch moved are no news.
@@ -427,8 +450,21 @@ fn on_update(slot: usize, update: Update, cx: &mut App) -> (bool, bool) {
                     } else {
                         Vec::new()
                     },
+                    events,
                 )
             };
+            if !events.is_empty() {
+                let name = AppState::listed_name(&status);
+                let now = unix_now();
+                change_setting(
+                    move |c| {
+                        for e in events {
+                            c.float.note(&name, e, now);
+                        }
+                    },
+                    cx,
+                );
+            }
             // One fetch, one notification: the behind line goes with
             // what the fetch brought in.
             if !changes.is_empty() {
@@ -549,6 +585,7 @@ fn on_action(action: TrayAction, cx: &mut App) -> bool {
                             if pin {
                                 // Pinned, it is no longer one taken out.
                                 float.hidden.retain(|h| !same_name(h, &name));
+                                float.taken_out.retain(|h, _| !same_name(h, &name));
                                 float.pinned.push(name);
                             }
                         },
@@ -730,6 +767,12 @@ fn listed_name(target: &crate::repo_menu::Target) -> String {
     } else {
         target.name.clone()
     }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 fn change_setting(f: impl FnOnce(&mut Config), cx: &mut App) {

@@ -83,12 +83,6 @@ struct CardRect(Option<(i32, i32, i32, i32)>);
 
 impl gpui::Global for CardRect {}
 
-thread_local! {
-    /// The card's rect as last drawn, for the floating view's trace.
-    static CARD_RECT_NOW: std::cell::Cell<Option<(i32, i32, i32, i32)>> =
-        const { std::cell::Cell::new(None) };
-}
-
 /// The mouse is on the card that shows.
 fn card_holds_mouse(cx: &App) -> bool {
     if on_float_tip(cx) {
@@ -664,16 +658,7 @@ impl Timelines {
         }
     }
 
-    #[track_caller]
     fn unhover(&mut self) {
-        #[cfg(windows)]
-        if self.card {
-            crate::float_tip::trace(format!(
-                "card unhovered from {}; card rect {:?}",
-                std::panic::Location::caller(),
-                CARD_RECT_NOW.with(|c| c.get())
-            ));
-        }
         self.letting_go = false;
         self.leave(Instant::now());
         self.hover = None;
@@ -1332,14 +1317,6 @@ impl Timelines {
                             return;
                         };
                         let e = |v: Pixels| (f32::from(v) * s).round() as i32;
-                        CARD_RECT_NOW.with(|r| {
-                            r.set(Some((
-                                c.left + e(b.left()),
-                                c.top + e(b.top()),
-                                c.left + e(b.right()),
-                                c.top + e(b.bottom()),
-                            )))
-                        });
                         cx.set_global(CardRect(Some((
                             c.left + e(b.left()),
                             c.top + e(b.top()),

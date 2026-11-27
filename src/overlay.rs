@@ -1338,17 +1338,9 @@ pub fn left(cx: &mut App) {
     // the view's edge. It stays a moment for the mouse to get there, and
     // as long as the mouse is on it.
     if crate::float_tip::shown_hwnd(cx).is_some() {
-        crate::float_tip::trace(format!(
-            "left, watching: {}",
-            crate::float_tip::trace_where(cx)
-        ));
         crate::float_tip::watch_mouse(cx);
         return;
     }
-    crate::float_tip::trace(format!(
-        "left, letting go: {}",
-        crate::float_tip::trace_where(cx)
-    ));
     let_go(cx);
 }
 
@@ -1546,6 +1538,9 @@ fn take_out(name: &str, cx: &mut App) {
     if !lists.hidden.iter().any(same) {
         lists.hidden.push(name.to_string());
     }
+    // Out until something new happens in it.
+    lists.taken_out.retain(|n, _| !same(n));
+    lists.taken_out.insert(name.to_string(), unix_now());
     changed(before, lists, cx);
 }
 
@@ -2383,10 +2378,6 @@ fn sync_tooltip(lines: Lines, cx: &mut App) {
                         if off < crate::float_tip::GRACE {
                             return false;
                         }
-                        crate::float_tip::trace(format!(
-                            "tooltip replaced after grace: {}",
-                            crate::float_tip::trace_where(cx)
-                        ));
                         replace_tooltip(asked, cx);
                         true
                     })

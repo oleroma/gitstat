@@ -28,6 +28,10 @@ pub enum Setting {
     FloatHealth,
     FloatPrs,
     FloatCards,
+    FloatOnCommit,
+    FloatOnBranch,
+    FloatOnPr,
+    FloatOnChanges,
     OverlayHideSynced,
     OverlayHideFullscreen,
     FolderIcons,
@@ -53,6 +57,10 @@ impl Setting {
             Setting::FloatHealth => cfg.float.health,
             Setting::FloatPrs => cfg.float.prs,
             Setting::FloatCards => cfg.float.cards,
+            Setting::FloatOnCommit => cfg.float.on_commit,
+            Setting::FloatOnBranch => cfg.float.on_branch,
+            Setting::FloatOnPr => cfg.float.on_pr,
+            Setting::FloatOnChanges => cfg.float.on_changes,
             Setting::Overlay => cfg.overlay.enabled,
             Setting::OverlayHideSynced => cfg.overlay.hide_when_synced,
             Setting::OverlayHideFullscreen => cfg.overlay.hide_in_fullscreen,
@@ -79,6 +87,10 @@ impl Setting {
             Setting::FloatHealth => &mut cfg.float.health,
             Setting::FloatPrs => &mut cfg.float.prs,
             Setting::FloatCards => &mut cfg.float.cards,
+            Setting::FloatOnCommit => &mut cfg.float.on_commit,
+            Setting::FloatOnBranch => &mut cfg.float.on_branch,
+            Setting::FloatOnPr => &mut cfg.float.on_pr,
+            Setting::FloatOnChanges => &mut cfg.float.on_changes,
             Setting::Overlay => &mut cfg.overlay.enabled,
             Setting::OverlayHideSynced => &mut cfg.overlay.hide_when_synced,
             Setting::OverlayHideFullscreen => &mut cfg.overlay.hide_in_fullscreen,
@@ -695,6 +707,7 @@ fn badges(cfg: &Config, p: &Palette) -> Vec<AnyElement> {
     } else {
         0.0
     };
+    let auto = on && days > 0.0;
     let recent = [
         (0.0, "Off"),
         (1.0, "1 day"),
@@ -814,7 +827,7 @@ fn badges(cfg: &Config, p: &Palette) -> Vec<AnyElement> {
             "Floating view",
             "Right-click the badge and it grows into a small view that stays on top: a row \
              per repo, its tree and its icon. It lists the repos you pin from their menu and \
-             the ones you worked on lately. Right-click it again and it is the badge.",
+             the ones something new happened in lately. Right-click it again and it is the badge.",
             vec![
                 setting_row(
                     "Corners",
@@ -843,9 +856,47 @@ fn badges(cfg: &Config, p: &Palette) -> Vec<AnyElement> {
                     p,
                 ),
                 setting_row(
-                    "Repos worked on lately",
-                    "Listed after the pinned ones, the latest first.",
+                    "Active repos",
+                    "Something new in a repo brings it in, after the pinned ones, the latest \
+                     first, for this long. Middle-click one and it stays out until something \
+                     new happens in it again.",
                     segmented("float-recent", recent, on, p),
+                    p,
+                ),
+                flag(
+                    "float-on-commit",
+                    "New commits",
+                    "A commit on any branch, yours or fetched, or a checkout.",
+                    Setting::FloatOnCommit,
+                    auto,
+                    cfg,
+                    p,
+                ),
+                flag(
+                    "float-on-branch",
+                    "New branches",
+                    "A branch made here, or one a fetch brings in.",
+                    Setting::FloatOnBranch,
+                    auto,
+                    cfg,
+                    p,
+                ),
+                flag(
+                    "float-on-pr",
+                    "New pull requests",
+                    "One opened on its GitHub repo.",
+                    Setting::FloatOnPr,
+                    auto && cfg.github_prs,
+                    cfg,
+                    p,
+                ),
+                flag(
+                    "float-on-changes",
+                    "Local changes",
+                    "Files in it start to change.",
+                    Setting::FloatOnChanges,
+                    auto,
+                    cfg,
                     p,
                 ),
                 flag(
@@ -1518,6 +1569,10 @@ mod tests {
             Setting::FloatHealth,
             Setting::FloatPrs,
             Setting::FloatCards,
+            Setting::FloatOnCommit,
+            Setting::FloatOnBranch,
+            Setting::FloatOnPr,
+            Setting::FloatOnChanges,
             Setting::Overlay,
             Setting::OverlayHideSynced,
             Setting::OverlayHideFullscreen,

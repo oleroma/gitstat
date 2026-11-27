@@ -3,6 +3,7 @@
 
 use crate::git::{DEFAULT_DEPTH, MAX_DEPTH};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub const FILE_NAME: &str = "config.json";
@@ -126,14 +127,28 @@ pub struct FloatConfig {
     /// The repos pinned to it, by name as gitstat shows them, in the
     /// order they are listed.
     pub pinned: Vec<String>,
-    /// Repos taken out of it though lately worked on, by name.
+    /// Repos taken out of it, by name: each stays out until something
+    /// new happens in it after `taken_out` says it went.
     pub hidden: Vec<String>,
+    /// When each repo was taken out, Unix seconds, by name. One in
+    /// `hidden` without a time (from before) stays out for good.
+    pub taken_out: BTreeMap<String, i64>,
     /// The order its rows were put in by hand, by name: the repos named
     /// here come first, in this order, then the rest.
     pub order: Vec<String>,
-    /// Repos worked on in this many days are listed after the pinned
-    /// ones; 0 lists the pinned ones alone.
+    /// A repo something new happened in (what the `on_` switches pick)
+    /// within this many days is listed after the pinned ones; 0 lists
+    /// the pinned ones alone.
     pub recent_days: f64,
+    /// What brings a repo in: a commit on any branch or a checkout, a
+    /// new branch, a new pull request, files starting to change.
+    pub on_commit: bool,
+    pub on_branch: bool,
+    pub on_pr: bool,
+    pub on_changes: bool,
+    /// When each of those last happened in a repo, by name, for those
+    /// git doesn't keep a time of.
+    pub events: BTreeMap<String, FloatEvents>,
     /// Its width in logical px.
     pub width: f32,
     /// How solid its background is, 0.2 to 1.
@@ -146,13 +161,79 @@ pub struct FloatConfig {
     pub cards: bool,
 }
 
+/// When something new last happened in a repo, of the kinds git keeps no
+/// time of, Unix seconds; 0 for never.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FloatEvents {
+    pub branch: i64,
+    pub pr: i64,
+    pub changes: i64,
+}
+
+/// A kind of thing that happens in a repo and brings it into the
+/// floating view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FloatEvent {
+    Branch,
+    Pr,
+    Changes,
+}
+
+impl FloatConfig {
+    /// Notes that `what` happened in the repo listed as `name` at `at`.
+    pub fn note(&mut self, name: &str, what: FloatEvent, at: i64) {
+        let key = self
+            .events
+            .keys()
+            .find(|k| same_name(k, name))
+            .cloned()
+            .unwrap_or_else(|| name.to_string());
+        let e = self.events.entry(key).or_default();
+        let slot = match what {
+            FloatEvent::Branch => &mut e.branch,
+            FloatEvent::Pr => &mut e.pr,
+            FloatEvent::Changes => &mut e.changes,
+        };
+        *slot = (*slot).max(at);
+    }
+
+    /// The last time something that brings it in happened in the repo
+    /// listed as `name`, with `worked` its newest commit or checkout.
+    pub fn last_event(&self, name: &str, worked: i64) -> i64 {
+        let e = self
+            .events
+            .iter()
+            .find(|(k, _)| same_name(k, name))
+            .map(|(_, e)| *e)
+            .unwrap_or_default();
+        [
+            (self.on_commit, worked),
+            (self.on_branch, e.branch),
+            (self.on_pr, e.pr),
+            (self.on_changes, e.changes),
+        ]
+        .into_iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, t)| t)
+        .max()
+        .unwrap_or(0)
+    }
+}
+
 impl Default for FloatConfig {
     fn default() -> Self {
         Self {
             pinned: Vec::new(),
             hidden: Vec::new(),
+            taken_out: BTreeMap::new(),
             order: Vec::new(),
             recent_days: 3.0,
+            on_commit: true,
+            on_branch: true,
+            on_pr: true,
+            on_changes: true,
+            events: BTreeMap::new(),
             width: 220.0,
             opacity: 1.0,
             health: true,

@@ -436,9 +436,12 @@ from an older version keeps working:
 | `overlay.radius` | unset | **Settings ▸ Icon and badge ▸ Corners**: the radius of the badge's and the floating view's corners in px at 100% scale. Unset is half the size: a disc. |
 | `overlay.grown` | false | The badge is grown into the floating view. A right click on either turns it into the other. |
 | `float.pinned` | `[]` | The repos pinned to the floating view, by name, from a repo's right-click menu. |
-| `float.hidden` | `[]` | Repos taken out of the floating view though worked on lately. Pinning one brings it back. |
+| `float.hidden` | `[]` | Repos taken out of the floating view (middle-click). Each stays out until something new happens in it after `float.taken_out` says it went; pinning one brings it back. |
+| `float.taken_out` | `{}` | When each repo was taken out, Unix seconds, by name. |
 | `float.order` | `[]` | The order the view's rows were dragged into; repos not named here follow. |
-| `float.recent_days` | 3 | Repos worked on in this many days are listed after the pinned ones. 0 lists the pinned ones alone. |
+| `float.recent_days` | 3 | Repos something new happened in within this many days are listed after the pinned ones. 0 lists the pinned ones alone. |
+| `float.on_commit`, `float.on_branch`, `float.on_pr`, `float.on_changes` | true | What counts as something new: a commit on any branch or a checkout, a new branch (made or fetched), a new pull request, files starting to change. |
+| `float.events` | `{}` | When a new branch, pull request or change last came in each repo, by name, kept by gitstat. |
 | `float.width` | 220 | The view's width in px at 100% scale, 120 to 1600. Drag its free side edge to change it. |
 | `float.opacity` | 1.0 | How solid the view's background is, 0.2 to 1. |
 | `float.health` | true | The bar of green, amber and red repos along the view's top. |
