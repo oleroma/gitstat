@@ -1290,14 +1290,20 @@ impl Timelines {
             .child(
                 canvas(
                     |b, window, cx| {
+                        // From the window's inside on the screen: GPUI's
+                        // own window bounds are off by the work area's
+                        // corner.
                         let s = window.scale_factor();
-                        let o = window.bounds().origin;
+                        let Some(c) = crate::win::hwnd(window).and_then(crate::win::client_rect)
+                        else {
+                            return;
+                        };
                         let e = |v: Pixels| (f32::from(v) * s).round() as i32;
                         cx.set_global(CardRect(Some((
-                            e(o.x + b.left()),
-                            e(o.y + b.top()),
-                            e(o.x + b.right()),
-                            e(o.y + b.bottom()),
+                            c.left + e(b.left()),
+                            c.top + e(b.top()),
+                            c.left + e(b.right()),
+                            c.top + e(b.bottom()),
                         ))));
                     },
                     |_, _, _, _| {},

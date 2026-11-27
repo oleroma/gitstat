@@ -979,6 +979,8 @@ pub struct OverlaySlot {
     tip_asked: u64,
     /// A press hushed the tooltip, until the mouse goes somewhere else.
     tip_hushed: bool,
+    /// What the tooltip asked for last is of.
+    tip_spot: Spot,
     /// The mouse is over the window.
     mouse_in: bool,
     /// Whether it is the view (or on its way to it); none before the
@@ -2325,7 +2327,10 @@ fn sync_tooltip(lines: Lines, cx: &mut App) {
     if slot.tip_text == lines {
         return;
     }
-    let same_spot = !slot.tip_text.is_empty() && !lines.is_empty();
+    // The same thing says something new: in place. Another: after the
+    // wait, where the mouse is then.
+    let same_spot = slot.tip_spot == slot.spot && !slot.tip_text.is_empty() && !lines.is_empty();
+    slot.tip_spot = slot.spot;
     slot.tip_text = lines.clone();
     slot.tip_asked += 1;
     if let (true, Some(at)) = (same_spot, slot.tip_at) {
