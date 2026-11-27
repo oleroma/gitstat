@@ -97,10 +97,20 @@ pub fn layout(spec: &Spec) -> Layout {
     let w = spec.width.max(spec.badge).max(2 * m + e(LABEL) + e(STRIP));
     let (left, right) = (m, w - m);
 
-    let top = Rect::new(0, 0, w, m + e(TOP) + e(GAP) / 2);
+    // The top bar is as tall as what it holds: buttons, else the health
+    // bar alone, else nothing.
+    let bar_h = if spec.buttons > 0 {
+        e(TOP)
+    } else if spec.health {
+        e(BAR)
+    } else {
+        0
+    };
+    let gap = if bar_h > 0 { e(GAP) } else { 0 };
+    let top = Rect::new(0, 0, w, m + bar_h + gap / 2);
     let mut buttons = Vec::new();
     let mut x = right;
-    let button_top = m + (e(TOP) - e(BUTTON)) / 2;
+    let button_top = m + (bar_h - e(BUTTON)) / 2;
     for _ in 0..spec.buttons {
         buttons.push(Rect::new(
             x - e(BUTTON),
@@ -112,11 +122,11 @@ pub fn layout(spec: &Spec) -> Layout {
     }
     let bar_right = if spec.buttons > 0 { x - e(GAP) / 2 } else { x };
     let bar = (spec.health && bar_right - left >= e(BAR) * 3).then(|| {
-        let bar_top = m + (e(TOP) - e(BAR)) / 2;
+        let bar_top = m + (bar_h - e(BAR)) / 2;
         Rect::new(left, bar_top, bar_right, bar_top + e(BAR))
     });
 
-    let list_top = m + e(TOP) + e(GAP);
+    let list_top = m + bar_h + gap;
     let tail_h = spec.tail as i32 * e(TAIL);
     let content = if spec.rows == 0 {
         e(EMPTY)
