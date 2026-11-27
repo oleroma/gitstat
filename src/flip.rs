@@ -940,17 +940,25 @@ fn start_close(direction: Direction, cx: &mut App) -> bool {
                     run.held = false;
                     // One step, between two frames: the panel's window,
                     // showing the big window, in the big window's place.
+                    let at = Instant::now();
                     win::dwm_flush();
+                    let flushed = at.elapsed();
                     win::uncloak(stage);
                     win::cloak(big);
+                    let swapped = at.elapsed();
                     // The big window is off the screen: the panel takes
                     // the keyboard.
                     panel::activate(cx);
                     // Activating put it over the badge: the badge back
                     // over it at once.
                     crate::overlay::over_flip(cx);
+                    let front = at.elapsed();
                     view::close_window(cx);
                     redraw_stage(cx);
+                    note(format!(
+                        "swap: flushed {flushed:?}, swapped {swapped:?}, in front {front:?}, big window closed {:?}",
+                        at.elapsed()
+                    ));
                 }
                 None => {
                     slot.run = None;
