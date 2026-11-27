@@ -700,6 +700,67 @@ async fn float(
             }
         }
     }
+
+    // Putting its rows in order: the view shows what that is done with,
+    // and is itself again afterwards.
+    let send = |grown: bool, cx: &mut AsyncApp| {
+        cx.update(|cx| {
+            cx.global::<Ui>()
+                .input
+                .unbounded_send(crate::state::Input::OverlayGrown(grown))
+                .ok();
+        })
+        .map_err(gone)
+    };
+    let rest = async |grown: bool, cx: &mut AsyncApp| -> Result<(), String> {
+        let began = Instant::now();
+        loop {
+            pause(20, cx).await;
+            if cx.update(|cx| crate::overlay::resting(cx)).map_err(gone)? == Some(grown) {
+                pause(300, cx).await;
+                return Ok(());
+            }
+            if began.elapsed() > Duration::from_secs(6) {
+                return Err(format!("float edit: never at rest, grown {grown}"));
+            }
+        }
+    };
+    send(true, cx)?;
+    rest(true, cx).await?;
+    let sheet = cx.update(|cx| crate::overlay::placed(cx)).map_err(gone)?;
+    let mut shots = Vec::new();
+    for (name, edit) in [
+        ("plain", None),
+        ("edit", Some(true)),
+        ("after", Some(false)),
+    ] {
+        if let Some(on) = edit {
+            cx.update(|cx| crate::overlay::set_editing(on, cx))
+                .map_err(gone)?;
+            pause(400, cx).await;
+        }
+        let Some(now) = shot(out, &format!("float-edit-{name}"), area, cx).await else {
+            return Err("no picture of the screen".into());
+        };
+        shots.push(now);
+    }
+    send(false, cx)?;
+    rest(false, cx).await?;
+    if let (Some(sheet), [plain, edit, after]) = (sheet, &shots[..]) {
+        let shown = changed(edit, plain, inner(sheet));
+        let left = changed(after, plain, inner(sheet));
+        let _ = writeln!(
+            report,
+            "float edit: putting the rows in order changes {shown} px of the view, and leaves \
+             {left} px changed afterwards (must be 0)"
+        );
+        if shown == 0 {
+            return Err("float edit: the view shows nothing to put its rows in order with".into());
+        }
+        if left > 0 {
+            return Err(format!("float edit: {left} px stay changed afterwards"));
+        }
+    }
     Ok(())
 }
 

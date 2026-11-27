@@ -2,7 +2,7 @@
 
 use crate::config::Corner;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Rect {
     pub left: i32,
     pub top: i32,

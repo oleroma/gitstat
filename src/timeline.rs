@@ -876,7 +876,6 @@ impl Timelines {
         status: &RepoStatus,
         p: &Palette,
         dark: bool,
-        icons_only: bool,
         tree: bool,
         float: bool,
         cx: &App,
@@ -1060,7 +1059,7 @@ impl Timelines {
         // Its icon and words are the scene's parts, drawn over this: here
         // only where the mouse finds them, and what it says when it rests.
         let mut lines = vec![(status.name.clone(), p.text)];
-        if icons_only {
+        if float {
             lines.push((checkout.clone(), p.muted));
         }
         lines.push((status_text.clone(), status_color));

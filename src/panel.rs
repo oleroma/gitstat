@@ -237,7 +237,7 @@ pub fn guess_place(cx: &mut App) -> Option<Rect> {
         crate::overlay::anchor(cx).or_else(|| win::tray_area().map(|r| Anchor::Tray(Some(r))))?;
     let state = cx.try_global::<Ui>()?.state.clone();
     let rows = view::panel_rows(state.read(cx));
-    let rect = place(anchor, Height::Rows(rows), cx);
+    let rect = place(anchor, Height::Rows(rows));
     let slot = cx.default_global::<PanelSlot>();
     slot.anchor = Some(anchor);
     slot.rect = Some(rect);
@@ -381,7 +381,7 @@ fn open(anchor: Anchor, slide: bool, cloaked: bool, cx: &mut App) {
         }
     }
     let rows = view::panel_rows(state.read(cx));
-    let rect = place(anchor, Height::Rows(rows), cx);
+    let rect = place(anchor, Height::Rows(rows));
     // Slides in from the taskbar's side, or the badge's top or bottom.
     let ms = state.read(cx).config.panel_slide_ms;
     let slide = (slide && ms > 0).then(|| {
@@ -526,7 +526,7 @@ pub struct Sheet {
 /// its rows need, and as tall as its monitor's work area less the gaps.
 pub fn room(cx: &App) -> Option<(i32, i32)> {
     let anchor = cx.try_global::<PanelSlot>()?.anchor?;
-    let r = place(anchor, Height::Px(i32::MAX / 4), cx);
+    let r = place(anchor, Height::Px(i32::MAX / 4));
     Some((r.width(), r.height()))
 }
 
@@ -544,7 +544,7 @@ pub fn sheet(height: i32, window: &Window, cx: &mut App) -> Option<Sheet> {
         slot.height = height;
         slot.fitted = Some(Instant::now());
     }
-    let rect = place(anchor, Height::Px(height), cx);
+    let rect = place(anchor, Height::Px(height));
     let slot = cx.default_global::<PanelSlot>();
     slot.rect = Some(rect);
     let client = win::client_rect(h).or(slot.area)?;
@@ -759,16 +759,8 @@ enum Height {
 }
 
 /// The panel's rect in physical px, `height` high, next to `anchor`.
-fn place(anchor: Anchor, height: Height, cx: &App) -> Rect {
-    // Icons only: the strips' labels shrink to their icons.
-    let icons_only = cx
-        .try_global::<Ui>()
-        .is_some_and(|ui| ui.state.read(cx).config.icons_only);
-    let width = if icons_only {
-        WIDTH - (crate::scene::panel::LABEL - crate::scene::panel::ICON_LABEL)
-    } else {
-        WIDTH
-    };
+fn place(anchor: Anchor, height: Height) -> Rect {
+    let width = WIDTH;
     let anchor_rect = anchor_rect(anchor);
     let (ax, ay) = anchor_rect.centre();
     let mon = win::monitor_at(ax, ay);

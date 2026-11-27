@@ -148,6 +148,18 @@ its place relative to that corner when the resolution or the taskbar changes.
 Picking a **Corner** in the settings puts it back `margin` from the edges. By default it hides while a fullscreen app or a presentation
 is running; it can also hide while everything is synced.
 
+**Right-click it** and it grows into a small floating view that stays on top
+like the badge: a row per repo, its tree and its icon, with the words in
+tooltips. It lists the repos you pin (**Pin to the floating view** in a repo's
+right-click menu) and the ones you worked on in the last few days. A click on
+a repo's icon opens it in the big window; a right click on the view turns it
+back into the badge. Drag the view by its top bar, and drag its free side edge
+to make it wider or narrower. The pencil in its top bar puts the rows in
+order: drag a row by its handle, take one out with its ✕, and undo either with
+the arrow beside **done**. **Settings ▸ Icon and badge ▸ Floating view** has
+its corners, how see-through it is, how many days count as lately, and its
+health bar and pull request marks.
+
 ### Folder icons in Explorer
 
 **Settings ▸ Folder icons** gives each repo folder an icon that
@@ -359,14 +371,24 @@ from an older version keeps working:
   "watch": true,
   "panel": true,
   "window": true,
-  "icons_only": false,
   "overlay": {
     "enabled": false,
     "corner": "bottom-right",
     "size": 44,
     "margin": 16,
     "hide_when_synced": false,
-    "hide_in_fullscreen": true
+    "hide_in_fullscreen": true,
+    "grown": false
+  },
+  "float": {
+    "pinned": [],
+    "hidden": [],
+    "order": [],
+    "recent_days": 3.0,
+    "width": 220,
+    "opacity": 1.0,
+    "health": true,
+    "prs": true
   },
   "folder_icons": false,
   "folder_icon_mode": "status",
@@ -400,7 +422,6 @@ from an older version keeps working:
 | `watch` | true | Pick up local changes from file-system events. false checks on the interval only. |
 | `panel` | true | A tray left-click (and a badge click) opens the status panel. |
 | `window` | true | The status window is available from the menu, a double-click and the panel's ⧉ button. |
-| `icons_only` | false | **Settings ▸ Status views ▸ Icons only**: the panel and the badge show pictures, no words. Each repo is its `.gitstat/icon.svg` (or a status dot) beside its graph, the header a bar of green, amber and red repos, the badge a ring of the same colours around a dot in the most urgent one. Hover any of them for the words. |
 | `scroll_together` | true | **Settings ▸ Status views ▸ Scroll columns together**: every column of the big view scrolls with the one under the mouse, with thin lines between the rows. Off, each column scrolls on its own. |
 | `overlay.enabled` | false | Show the corner badge. |
 | `overlay.corner` | `bottom-right` | `top-left`, `top-right`, `bottom-left` or `bottom-right`. |
@@ -409,6 +430,16 @@ from an older version keeps working:
 | `overlay.margin` | 16 | Distance from the screen edges in px at 100% scale, 0 to 200, unless the badge was dragged. |
 | `overlay.hide_when_synced` | false | Hide the badge while every repo is synced. |
 | `overlay.hide_in_fullscreen` | true | Hide the badge while a fullscreen app or a presentation runs. |
+| `overlay.radius` | unset | **Settings ▸ Icon and badge ▸ Corners**: the radius of the badge's and the floating view's corners in px at 100% scale. Unset is half the size: a disc. |
+| `overlay.grown` | false | The badge is grown into the floating view. A right click on either turns it into the other. |
+| `float.pinned` | `[]` | The repos pinned to the floating view, by name, from a repo's right-click menu. |
+| `float.hidden` | `[]` | Repos taken out of the floating view though worked on lately. Pinning one brings it back. |
+| `float.order` | `[]` | The order the view's rows were dragged into; repos not named here follow. |
+| `float.recent_days` | 3 | Repos worked on in this many days are listed after the pinned ones. 0 lists the pinned ones alone. |
+| `float.width` | 220 | The view's width in px at 100% scale, 120 to 480. Drag its free side edge to change it. |
+| `float.opacity` | 1.0 | How solid the view's background is, 0.2 to 1. |
+| `float.health` | true | The bar of green, amber and red repos along the view's top. |
+| `float.prs` | true | A mark per open pull request along the view's bottom. |
 | `folder_icons` | false | Status icons on the repo folders, see above. Setting it by hand skips the confirmation. |
 | `folder_icon_mode` | `status` | `status` for the status folders, `repo-svg` for each repo's own `.gitstat/icon.svg` where it has one, see [Repo icons](#repo-icons). Only matters while `folder_icons` is on. |
 | `github_prs` | true | **Settings ▸ GitHub ▸ Pull requests**: open pull requests in the panel and big mode, read through `gh`, see [GitHub pull requests](#github-pull-requests). Also lets a sweep skip fetching repos with no new push, see [How status stays current](#how-status-stays-current). |

@@ -128,6 +128,9 @@ pub struct FloatConfig {
     pub pinned: Vec<String>,
     /// Repos taken out of it though lately worked on, by name.
     pub hidden: Vec<String>,
+    /// The order its rows were put in by hand, by name: the repos named
+    /// here come first, in this order, then the rest.
+    pub order: Vec<String>,
     /// Repos worked on in this many days are listed after the pinned
     /// ones; 0 lists the pinned ones alone.
     pub recent_days: f64,
@@ -146,6 +149,7 @@ impl Default for FloatConfig {
         Self {
             pinned: Vec::new(),
             hidden: Vec::new(),
+            order: Vec::new(),
             recent_days: 3.0,
             width: 220.0,
             opacity: 1.0,
@@ -201,9 +205,6 @@ pub struct Config {
     pub panel: bool,
     /// The normal status window is available.
     pub window: bool,
-    /// The panel and the badge show pictures only: repo icons, the graph
-    /// and coloured marks, their words in tooltips.
-    pub icons_only: bool,
     pub overlay: OverlayConfig,
     /// The floating view the badge grows into.
     pub float: FloatConfig,
@@ -347,7 +348,6 @@ impl Default for Config {
             watch: true,
             panel: true,
             window: true,
-            icons_only: false,
             overlay: OverlayConfig::default(),
             float: FloatConfig::default(),
             folder_icons: false,

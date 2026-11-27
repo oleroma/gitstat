@@ -56,7 +56,7 @@ pub(super) const GEAR: &str = "\u{e713}";
 
 /// The font the title bar's glyphs come from: Windows 11's, else Windows
 /// 10's.
-pub(super) fn caption_font(cx: &App) -> &'static str {
+pub(crate) fn caption_font(cx: &App) -> &'static str {
     static FONT: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
     FONT.get_or_init(|| {
         let fluent = "Segoe Fluent Icons";
@@ -984,7 +984,7 @@ impl StatusView {
             checking: sweeping,
             cells,
             body,
-            prs: prs_block(state, Mode::Window, false, &p, cx),
+            prs: prs_block(state, Mode::Window, &p, cx),
             footer: Some(footer(state, &p)),
             scroll: table,
             stage: staged.map(|(r, _)| r),

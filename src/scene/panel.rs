@@ -17,9 +17,10 @@ pub const WIDTH: f32 = 480.0;
 pub const STRIP: f32 = 36.0;
 /// The label column at a row's right: icon, name, checkout and status.
 pub const LABEL: f32 = 168.0;
-/// The label column in icons-only mode: the repo's icon alone.
+/// The label column of a row that is its repo's icon alone: the floating
+/// view's.
 pub const ICON_LABEL: f32 = 40.0;
-/// A repo icon beside its name, and alone in icons-only mode.
+/// A repo icon beside its name, and one alone.
 pub const MARK: f32 = 16.0;
 pub const ICON_MARK: f32 = 22.0;
 /// A section's heading.
@@ -62,8 +63,6 @@ pub struct Spec {
     /// The panel's width and the most it may be tall, device px.
     pub width: i32,
     pub max_height: i32,
-    /// Pictures only: no words in the top bar or the rows, no bottom bar.
-    pub icons_only: bool,
     /// The health row's three counts' widths, when it shows.
     pub health: Option<[i32; 3]>,
     /// How many buttons the top bar has.
@@ -71,7 +70,7 @@ pub struct Spec {
     pub sections: Vec<SectionSpec>,
     /// What follows the rows in the list, top to bottom: each one's height.
     pub tail: Vec<i32>,
-    /// The bottom bar's height; none in icons-only mode.
+    /// The bottom bar's height.
     pub footer: Option<i32>,
     /// How far the list is scrolled.
     pub scroll: i32,
@@ -103,8 +102,7 @@ pub struct Header {
     pub rect: Rect,
     /// Its bottom edge line.
     pub line: Rect,
-    /// The headline's and the subline's line boxes; empty in icons-only
-    /// mode.
+    /// The headline's and the subline's line boxes.
     pub headline: Rect,
     pub subline: Rect,
     /// The health bar, and its counts' line boxes.
@@ -122,8 +120,6 @@ pub struct Heading {
     /// Its words' line box, and its fold arrow's.
     pub label: Rect,
     pub arrow: Rect,
-    /// Icons only, folded: its repos' icons in a row, as many as fit.
-    pub marks: Vec<Rect>,
 }
 
 /// A repo's row.
@@ -138,8 +134,7 @@ pub struct Row {
     pub strip: Rect,
     pub label: Rect,
     pub icon: Rect,
-    /// The line boxes of its name, checkout and status; empty in
-    /// icons-only mode.
+    /// The line boxes of its name, checkout and status.
     pub name: Rect,
     pub checkout: Rect,
     pub status: Rect,
@@ -176,17 +171,13 @@ pub fn layout(spec: &Spec) -> Layout {
     let w = spec.width.max(0);
 
     // The top bar: the titles, then the buttons at its right.
-    let titles_h = if spec.icons_only {
-        BUTTON
-    } else {
-        line_height(HEADLINE)
-            + line_height(TINY)
-            + if spec.health.is_some() {
-                4.0 + line_height(TINY)
-            } else {
-                0.0
-            }
-    };
+    let titles_h = line_height(HEADLINE)
+        + line_height(TINY)
+        + if spec.health.is_some() {
+            4.0 + line_height(TINY)
+        } else {
+            0.0
+        };
     let header_h = PAD_Y + titles_h + PAD_Y + 1.0;
     let n = spec.buttons as i32;
     let button = e(BUTTON);
@@ -209,15 +200,7 @@ pub fn layout(spec: &Spec) -> Layout {
         )
     };
     let mut counts = [Rect::new(0, 0, 0, 0); 3];
-    let (headline, subline, bar) = if spec.icons_only {
-        let top = e(PAD_Y + (BUTTON - 6.0) / 2.0);
-        let none = Rect::new(titles_left, e(PAD_Y), titles_left, e(PAD_Y));
-        (
-            none,
-            none,
-            Some(Rect::new(titles_left, top, titles_right, top + e(6.0))),
-        )
-    } else {
+    let (headline, subline, bar) = {
         let health_top = PAD_Y + line_height(HEADLINE) + line_height(TINY) + 4.0;
         let bar = spec.health.map(|widths| {
             let taken: i32 = widths.iter().map(|cw| cw + e(GAP)).sum();
@@ -302,7 +285,7 @@ pub fn layout(spec: &Spec) -> Layout {
 
     // Where the list's parts are now, scrolled.
     let at = |v: f32| e(header_h + v) - scroll;
-    let label_w = e(if spec.icons_only { ICON_LABEL } else { LABEL });
+    let label_w = e(LABEL);
     let label_left = (w - label_w).max(0);
     let mut headings = Vec::new();
     let mut rows = Vec::new();
@@ -313,25 +296,11 @@ pub fn layout(spec: &Spec) -> Layout {
         let text_bottom = text_top + e(line_height(SMALL));
         let arrow_left = w - e(PAD_X) - sec.arrow;
         let label_right = (arrow_left - e(10.0)).max(e(PAD_X));
-        let marks = if spec.icons_only && sec.rows.is_none() {
-            let side = e(MARK);
-            let mark_top = at(p.heading + (HEADING - MARK) / 2.0);
-            (0..sec.count as i32)
-                .map(|i| {
-                    let left = e(PAD_X) + i * (side + e(4.0));
-                    Rect::new(left, mark_top, left + side, mark_top + side)
-                })
-                .take_while(|r| r.right <= label_right)
-                .collect()
-        } else {
-            Vec::new()
-        };
         headings.push(Heading {
             section: sec.section,
             rect: Rect::new(0, top, w, bottom),
             label: Rect::new(e(PAD_X), text_top, label_right, text_bottom),
             arrow: Rect::new(arrow_left, text_top, arrow_left + sec.arrow, text_bottom),
-            marks,
         });
         let Some((rows_top, specs)) = &p.rows else {
             continue;
@@ -341,18 +310,7 @@ pub fn layout(spec: &Spec) -> Layout {
             let (top, bottom) = (at(top_l), at(top_l + STRIP));
             let rect = Rect::new(0, top, w, bottom);
             let label = Rect::new(label_left, top, w, bottom);
-            let none = Rect::new(label_left, top, label_left, top);
-            let (icon, name, checkout, status) = if spec.icons_only {
-                let side = e(ICON_MARK);
-                let left = label_left + e((ICON_LABEL - ICON_MARK) / 2.0);
-                let icon_top = at(top_l + (STRIP - ICON_MARK) / 2.0);
-                (
-                    Rect::new(left, icon_top, left + side, icon_top + side),
-                    none,
-                    none,
-                    none,
-                )
-            } else {
+            let (icon, name, checkout, status) = {
                 let side = e(MARK);
                 let left = label_left + e(GAP);
                 let icon_top = at(top_l + (STRIP - MARK) / 2.0);
@@ -448,7 +406,6 @@ mod tests {
             scale,
             width: e(WIDTH),
             max_height: e(900.0),
-            icons_only: false,
             health: Some([e(22.0), e(20.0), e(14.0)]),
             buttons: 3,
             sections: vec![
@@ -616,30 +573,6 @@ mod tests {
             assert_eq!(unscrolled.footer, scrolled.footer);
             s.scroll = 1_000_000;
             assert_eq!(layout(&s).scroll, unscrolled.max_scroll);
-        }
-    }
-
-    #[test]
-    fn icons_only_shows_pictures_alone() {
-        for scale in SCALES {
-            let mut s = spec(scale);
-            s.icons_only = true;
-            s.footer = None;
-            s.health = None;
-            let l = layout(&s);
-            assert!(l.footer.is_none());
-            assert_eq!(l.size.1, l.list.bottom);
-            for r in &l.rows {
-                assert_eq!(r.label.width(), px(ICON_LABEL, scale));
-                assert_eq!(r.icon.width(), px(ICON_MARK, scale));
-                assert!(inside(r.icon, r.label));
-                assert_eq!(r.name.width(), 0);
-            }
-            // The folded section shows its repos' icons, as many as fit.
-            let folded = &l.headings[1];
-            assert_eq!(folded.marks.len(), 12);
-            assert!(folded.marks.iter().all(|m| inside(*m, folded.rect)));
-            assert!(l.headings[0].marks.is_empty());
         }
     }
 }

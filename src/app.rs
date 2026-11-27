@@ -307,6 +307,24 @@ fn handle_batch(batch: Vec<Input>, cx: &mut App) -> bool {
                 change_setting(|c| c.overlay.grown = grown, cx);
                 changed = true;
             }
+            Input::FloatLists(lists) => {
+                change_setting(
+                    move |c| {
+                        c.float.pinned = lists.pinned;
+                        c.float.hidden = lists.hidden;
+                        c.float.order = lists.order;
+                    },
+                    cx,
+                );
+                // Nothing to save: the view still lets go of its own.
+                overlay::sync(cx);
+                changed = true;
+            }
+            Input::FloatWidth(width) => {
+                change_setting(move |c| c.float.width = width, cx);
+                overlay::sync(cx);
+                changed = true;
+            }
             Input::OverlayMoved(rect) => {
                 let (corner, x, y) = overlay::drop_position(rect);
                 change_setting(
@@ -572,6 +590,16 @@ fn on_action(action: TrayAction, cx: &mut App) -> bool {
         TrayAction::SetSort(s) => change_setting(|c| c.sort = s, cx),
         TrayAction::SetPanelSlide(ms) => change_setting(|c| c.panel_slide_ms = ms, cx),
         TrayAction::SetFlipSpeed(ms) => change_setting(|c| c.flip_ms = ms, cx),
+        TrayAction::SetOverlayRadius(radius) => change_setting(
+            |c| {
+                // A disc stays one whatever size the badge is given.
+                let half = c.overlay_size() / 2.0;
+                c.overlay.radius = (radius < half).then_some(radius.max(0.0));
+            },
+            cx,
+        ),
+        TrayAction::SetFloatOpacity(opacity) => change_setting(|c| c.float.opacity = opacity, cx),
+        TrayAction::SetFloatRecent(days) => change_setting(|c| c.float.recent_days = days, cx),
         TrayAction::Fold(section) => change_setting(|c| c.folds.toggle(section), cx),
         TrayAction::SetInterval(minutes) => change_setting(|c| c.interval_minutes = minutes, cx),
         TrayAction::SetDepth(depth) => change_setting(|c| c.depth = depth, cx),

@@ -25,6 +25,7 @@ mod panel_scene;
 pub(crate) use panel_scene::put;
 mod stage;
 mod window_scene;
+pub(crate) use window_scene::caption_font;
 
 /// The window's smallest opening size; big mode grows it to fit columns.
 const WINDOW_SIZE: (f32, f32) = (420.0, 520.0);
@@ -901,48 +902,46 @@ fn repo_row(index: usize, s: &RepoStatus, p: &Palette, mode: Mode, cx: &App) -> 
         .into_any_element()
 }
 
-/// A draft PR's mark in icons-only mode, drawn rather than typed.
-const DRAFT_GLYPH: &str = "◌";
-
 /// What a pull request's row says on its right, most pressing first:
-/// (glyph for icons-only mode, words, colour).
-fn pr_marks(pr: &Pr, p: &Palette) -> Vec<(&'static str, &'static str, Hsla)> {
+/// (words, colour).
+fn pr_marks(pr: &Pr, p: &Palette) -> Vec<(&'static str, Hsla)> {
     let mut marks = Vec::new();
     if pr.review_requested {
-        marks.push(("◉", "review requested", p.amber));
+        marks.push(("review requested", p.amber));
     }
     match pr.checks {
-        Checks::Failing => marks.push(("✗", "checks failing", p.red)),
-        Checks::Pending => marks.push(("●", "checks running", p.amber)),
-        Checks::Passing => marks.push(("✓", "checks pass", p.green)),
+        Checks::Failing => marks.push(("checks failing", p.red)),
+        Checks::Pending => marks.push(("checks running", p.amber)),
+        Checks::Passing => marks.push(("checks pass", p.green)),
         Checks::None => {}
     }
     if pr.mergeable == Mergeable::Conflicts {
-        marks.push(("⚠", "conflicts", p.red));
+        marks.push(("conflicts", p.red));
     }
     match pr.review {
-        Review::ChangesRequested => marks.push(("✎", "changes requested", p.red)),
-        Review::Approved => marks.push(("★", "approved", p.green)),
-        Review::Required if !pr.review_requested => marks.push(("…", "awaiting review", p.muted)),
+        Review::ChangesRequested => marks.push(("changes requested", p.red)),
+        Review::Approved => marks.push(("approved", p.green)),
+        Review::Required if !pr.review_requested => marks.push(("awaiting review", p.muted)),
         _ => {}
     }
     if pr.state == PrState::Draft {
-        marks.push((DRAFT_GLYPH, "draft", p.muted));
+        marks.push(("draft", p.muted));
     }
     marks
 }
 
+/// A pull request as one mark: the colour of what presses most about
+/// it, and all of it in words.
+pub(crate) fn pr_tone(pr: &Pr, p: &Palette) -> (Hsla, String) {
+    let marks = pr_marks(pr, p);
+    let color = marks.first().map_or(p.muted, |m| m.1);
+    let words: Vec<&str> = marks.iter().map(|m| m.0).collect();
+    (color, words.join(", "))
+}
+
 /// One open pull request; a click opens it on GitHub (and closes the
 /// panel, not the window). Only a browser link: nothing is changed on GitHub.
-fn pr_row(
-    index: usize,
-    s: &RepoStatus,
-    pr: &Pr,
-    p: &Palette,
-    mode: Mode,
-    icons_only: bool,
-    cx: &App,
-) -> AnyElement {
+fn pr_row(index: usize, s: &RepoStatus, pr: &Pr, p: &Palette, mode: Mode, cx: &App) -> AnyElement {
     let marks = pr_marks(pr, p);
     let url = pr.url.clone();
     let tone = if pr.needs_attention() {
@@ -957,7 +956,7 @@ fn pr_row(
         (pr.title.clone(), p.text),
         (format!("{} by {}", pr.head_branch, pr.author), p.muted),
     ];
-    lines.extend(marks.iter().map(|&(_, words, c)| (words.to_string(), c)));
+    lines.extend(marks.iter().map(|&(words, c)| (words.to_string(), c)));
     let right = div()
         .flex()
         .flex_none()
@@ -967,21 +966,8 @@ fn pr_row(
         .children(
             marks
                 .iter()
-                .take(if icons_only { 5 } else { 2 })
-                .map(|&(glyph, words, c)| match (icons_only, glyph) {
-                    // The font's dotted circle comes out jagged at this
-                    // size; a dashed ring is drawn smooth.
-                    (true, DRAFT_GLYPH) => div()
-                        .flex_none()
-                        .size(px(11.))
-                        .rounded_full()
-                        .border_1()
-                        .border_dashed()
-                        .border_color(c),
-                    _ => div()
-                        .text_color(c)
-                        .child(text(if icons_only { glyph } else { words })),
-                }),
+                .take(2)
+                .map(|&(words, c)| div().text_color(c).child(text(words))),
         );
     div()
         .id(("pr", index))
@@ -1013,7 +999,7 @@ fn pr_row(
                 .min_w_0()
                 .truncate()
                 .text_color(p.text)
-                .when(!icons_only, |d| d.child(text(pr.title.clone()))),
+                .child(text(pr.title.clone())),
         )
         .child(right)
         .into_any_element()
@@ -1028,7 +1014,6 @@ fn pr_rows(
     problem: Option<&str>,
     p: &Palette,
     mode: Mode,
-    icons_only: bool,
     // Big mode: whether the list is folded, and what folds or unfolds it.
     fold: Option<(bool, OnClick)>,
     cx: &App,
@@ -1073,7 +1058,7 @@ fn pr_rows(
         };
         out.push(head.into_any_element());
         for (i, (s, pr)) in open_prs.iter().enumerate().filter(|_| !folded) {
-            out.push(pr_row(i, s, pr, p, mode, icons_only, cx));
+            out.push(pr_row(i, s, pr, p, mode, cx));
         }
     } else if let Some(problem) = problem {
         out.push(
@@ -1111,13 +1096,7 @@ fn remote_problem_row(problem: &str, p: &Palette) -> AnyElement {
 /// the big window the list under the columns, a few rows high and
 /// scrolling when there are more. Tagged for the flip, which slides it
 /// out of and into the bottom bar. None when there's nothing to list.
-pub(crate) fn prs_block(
-    state: &AppState,
-    mode: Mode,
-    icons_only: bool,
-    p: &Palette,
-    cx: &App,
-) -> Option<AnyElement> {
+pub(crate) fn prs_block(state: &AppState, mode: Mode, p: &Palette, cx: &App) -> Option<AnyElement> {
     let open_prs = state.open_prs();
     let pr_problem = state
         .github_problem
@@ -1134,7 +1113,6 @@ pub(crate) fn prs_block(
         pr_problem,
         p,
         mode,
-        icons_only,
         Some((
             state.folded(Section::PullRequests),
             fold(Section::PullRequests),
@@ -1418,7 +1396,7 @@ pub(crate) fn status_details(s: &RepoStatus, p: &Palette) -> Vec<(String, Hsla)>
     lines
 }
 
-/// A tooltip builder showing `lines`, for icons-only mode.
+/// A tooltip builder showing `lines`.
 pub(crate) fn tip(
     lines: Vec<(String, Hsla)>,
     p: &Palette,

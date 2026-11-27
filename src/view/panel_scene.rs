@@ -21,7 +21,7 @@ use crate::git::RepoStatus;
 use crate::layout::Rect;
 use crate::panel;
 use crate::scene::paint;
-use crate::scene::panel::{self as place, HEADLINE, ICON_MARK, MARK, SMALL, TINY, line_height};
+use crate::scene::panel::{self as place, HEADLINE, MARK, SMALL, TINY, line_height};
 use crate::scene::parts::{Key, Part, Picture, Sheet, What};
 use crate::scene::text::{self, Look, text};
 use crate::state::AppState;
@@ -54,8 +54,6 @@ struct SectionPart {
     color: Hsla,
     words: SharedString,
     slot: Option<AnyElement>,
-    /// Icons only, folded: its repos, for their icons in its heading.
-    marks: Vec<(Arc<RepoStatus>, Hsla)>,
     rows: Vec<RowPart>,
 }
 
@@ -75,14 +73,11 @@ struct RowPart {
 pub(super) struct PanelScene {
     p: Palette,
     dark: bool,
-    icons_only: bool,
     headline: SharedString,
     headline_color: Hsla,
     subline: SharedString,
     /// The health bar's counts, and whether a check runs.
     health: Option<([usize; 3], bool)>,
-    /// Icons only: where the mouse reads the summary.
-    summary: Option<AnyElement>,
     buttons: Vec<Button>,
     sections: Vec<SectionPart>,
     tail: Vec<AnyElement>,
@@ -222,7 +217,7 @@ impl PanelScene {
             panel::room(cx).unwrap_or((dev(bounds.size.width), dev(bounds.size.height)));
 
         let counts = match self.health {
-            Some((n, _)) if !self.icons_only => count_words(n, &self.p),
+            Some((n, _)) => count_words(n, &self.p),
             _ => Vec::new(),
         };
         let health = (counts.len() == 3).then(|| {
@@ -264,7 +259,6 @@ impl PanelScene {
             scale: s,
             width: room_w,
             max_height: room_h,
-            icons_only: self.icons_only,
             health,
             buttons: self.buttons.len(),
             sections,
@@ -283,12 +277,8 @@ impl PanelScene {
         };
         // The icons its parts show, drawn by the time they are painted.
         for sec in &self.sections {
-            for (repo, _) in &sec.marks {
-                crate::repo_marks::want(repo, MARK, window, cx);
-            }
-            let side = if self.icons_only { ICON_MARK } else { MARK };
             for row in sec.rows.iter().filter(|_| sec.open) {
-                crate::repo_marks::want(&row.repo, side, window, cx);
+                crate::repo_marks::want(&row.repo, MARK, window, cx);
             }
         }
         Laid {
@@ -327,20 +317,20 @@ impl PanelScene {
 
         // The top bar.
         let h = &l.header;
-        if !self.icons_only {
-            parts.push(Part::words(
-                Key::Headline,
-                sh(h.headline),
-                self.headline.clone(),
-                Look::new(HEADLINE, self.headline_color).bold(),
-            ));
-            parts.push(Part::words(
-                Key::Subline,
-                sh(h.subline),
-                self.subline.clone(),
-                Look::new(TINY, p.muted),
-            ));
-        }
+
+        parts.push(Part::words(
+            Key::Headline,
+            sh(h.headline),
+            self.headline.clone(),
+            Look::new(HEADLINE, self.headline_color).bold(),
+        ));
+        parts.push(Part::words(
+            Key::Subline,
+            sh(h.subline),
+            self.subline.clone(),
+            Look::new(TINY, p.muted),
+        ));
+
         if let (Some(bar), Some((counts, checking))) = (h.bar, self.health) {
             parts.push(Part::new(
                 Key::Health,
@@ -397,32 +387,17 @@ impl PanelScene {
                 )
                 .clipped(),
             );
-            if !self.icons_only {
-                parts.push(
-                    Part::words(
-                        own.clone(),
-                        sh(heading.label),
-                        sec.words.clone(),
-                        Look::new(SMALL, sec.color),
-                    )
-                    .clipped(),
-                );
-            }
-            for ((repo, color), r) in sec.marks.iter().zip(&heading.marks) {
-                parts.push(
-                    Part::new(
-                        own.clone(),
-                        sh(*r),
-                        What::Icon {
-                            status: repo.clone(),
-                            side: MARK,
-                            dot: *color,
-                            ends: None,
-                        },
-                    )
-                    .clipped(),
-                );
-            }
+
+            parts.push(
+                Part::words(
+                    own.clone(),
+                    sh(heading.label),
+                    sec.words.clone(),
+                    Look::new(SMALL, sec.color),
+                )
+                .clipped(),
+            );
+
             parts.push(
                 Part::words(
                     own.clone(),
@@ -443,42 +418,42 @@ impl PanelScene {
                         sh(row.icon),
                         What::Icon {
                             status: part.repo.clone(),
-                            side: if self.icons_only { ICON_MARK } else { MARK },
+                            side: MARK,
                             dot: part.color,
                             ends: None,
                         },
                     )
                     .clipped(),
                 );
-                if !self.icons_only {
-                    parts.push(
-                        Part::words(
-                            Key::Name(path.clone()),
-                            sh(row.name),
-                            part.repo.name.clone(),
-                            Look::new(SMALL, p.text),
-                        )
-                        .clipped(),
-                    );
-                    parts.push(
-                        Part::words(
-                            Key::Checkout(path.clone()),
-                            sh(row.checkout),
-                            part.checkout.clone(),
-                            Look::new(TINY, p.muted),
-                        )
-                        .clipped(),
-                    );
-                    parts.push(
-                        Part::words(
-                            Key::Status(path.clone()),
-                            sh(row.status),
-                            part.status.clone(),
-                            Look::new(TINY, part.color),
-                        )
-                        .clipped(),
-                    );
-                }
+
+                parts.push(
+                    Part::words(
+                        Key::Name(path.clone()),
+                        sh(row.name),
+                        part.repo.name.clone(),
+                        Look::new(SMALL, p.text),
+                    )
+                    .clipped(),
+                );
+                parts.push(
+                    Part::words(
+                        Key::Checkout(path.clone()),
+                        sh(row.checkout),
+                        part.checkout.clone(),
+                        Look::new(TINY, p.muted),
+                    )
+                    .clipped(),
+                );
+                parts.push(
+                    Part::words(
+                        Key::Status(path.clone()),
+                        sh(row.status),
+                        part.status.clone(),
+                        Look::new(TINY, part.color),
+                    )
+                    .clipped(),
+                );
+
                 if let Some(edge) = row.edge {
                     parts.push(
                         Part::fill(own.clone(), sh(edge), part.color)
@@ -535,12 +510,6 @@ impl PanelScene {
         let (layout, at) = (&laid.layout, laid.at);
         // The top bar's.
         let mut top = Vec::new();
-        if let (Some(slot), Some(bar)) = (self.summary.take(), layout.header.bar) {
-            let half = place::px(place::BUTTON, s) / 2;
-            let mid = (bar.top + bar.bottom) / 2;
-            let r = Rect::new(bar.left, mid - half, bar.right, mid + half);
-            top.push(put(slot, r, at, s, alpha, window, cx));
-        }
         for (button, r) in self.buttons.iter_mut().zip(&layout.header.buttons) {
             if let Some(slot) = button.slot.take() {
                 top.push(put(slot, *r, at, s, alpha, window, cx));
@@ -801,7 +770,6 @@ impl StatusView {
         let timelines = self.timelines.clone();
         let state = self.state.clone();
         let state = state.read(cx);
-        let icons_only = state.config.icons_only;
         let sweeping = state.sweeping;
         let (headline, headline_color, subline) = titles(state, &p);
 
@@ -857,21 +825,7 @@ impl StatusView {
             ),
         });
 
-        // Pictures only: the top bar's words move into a tooltip.
-        let summary = icons_only.then(|| {
-            let mut lines = vec![
-                (headline.to_string(), headline_color),
-                (subline.clone(), p.muted),
-                (mode_text(&state.mode), p.muted),
-            ];
-            if let Some(c) = &state.capped {
-                lines.push((format!("Repo list incomplete: {c}"), p.amber));
-            }
-            hit("summary", false, &p)
-                .tooltip(tip(lines, &p))
-                .into_any_element()
-        });
-        let health = (icons_only || (state.has_result && !state.statuses.is_empty()))
+        let health = (state.has_result && !state.statuses.is_empty())
             .then(|| (tone_counts(&state.statuses), sweeping));
 
         // The sections, each with its heading and its rows unless folded;
@@ -899,8 +853,6 @@ impl StatusView {
                     (format!("{n} GitHub repos not cloned here"), p.text),
                     ("Their trees come from GitHub".to_string(), p.muted),
                 ]),
-                Section::NeedsYou if icons_only => Some(vec![(format!("{n} need you"), p.red)]),
-                Section::Synced if icons_only => Some(vec![(format!("{n} synced"), p.green)]),
                 _ => None,
             };
             let id = match section {
@@ -912,20 +864,6 @@ impl StatusView {
                 .when_some(tooltip, |d, lines| d.tooltip(tip(lines, &p)))
                 .on_click(fold(section))
                 .into_any_element();
-            let marks = if icons_only && !open {
-                repos
-                    .iter()
-                    .map(|s| {
-                        let mark = match section {
-                            Section::NeedsYou => status_color(s, &p),
-                            _ => color,
-                        };
-                        (Arc::new((*s).clone()), mark)
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
             let rows = if open {
                 repos
                     .iter()
@@ -934,17 +872,8 @@ impl StatusView {
                         let color = status_color(s, &p);
                         match &timelines {
                             Some(t) => {
-                                let strip = Timelines::strip(
-                                    t,
-                                    index + i,
-                                    s,
-                                    &p,
-                                    dark,
-                                    icons_only,
-                                    !staged,
-                                    false,
-                                    cx,
-                                );
+                                let strip =
+                                    Timelines::strip(t, index + i, s, &p, dark, !staged, false, cx);
                                 RowPart {
                                     repo: Arc::new((*s).clone()),
                                     color,
@@ -977,7 +906,6 @@ impl StatusView {
                 color,
                 words: section_text(section, n).into(),
                 slot: Some(slot),
-                marks,
                 rows,
             });
         }
@@ -994,7 +922,7 @@ impl StatusView {
         if let Some(problem) = remote_problem.filter(|_| no_remote) {
             tail.push(remote_problem_row(problem, &p));
         }
-        tail.extend(prs_block(state, super::Mode::Panel, icons_only, &p, cx));
+        tail.extend(prs_block(state, super::Mode::Panel, &p, cx));
         let problem = state.problem();
         if state.has_result && state.statuses.is_empty() && problem.is_none() {
             let words = match state.config.depth() {
@@ -1019,16 +947,14 @@ impl StatusView {
         let scene = PanelScene {
             p,
             dark,
-            icons_only,
             headline,
             headline_color,
             subline: subline.into(),
             health,
-            summary,
             buttons,
             sections,
             tail,
-            footer: (!icons_only).then(|| footer(state, &p)),
+            footer: Some(footer(state, &p)),
             scroll: self.list.clone(),
         };
         div()

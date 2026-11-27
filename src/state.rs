@@ -385,13 +385,14 @@ impl AppState {
 
     /// The floating view's repos at `now` (Unix seconds): the pinned ones
     /// in their order, then those worked on lately, the latest first,
-    /// but for the ones taken out of it.
-    pub fn float_repos(&self, now: i64) -> Vec<&RepoStatus> {
+    /// but for the ones taken out of it; the ones put in an order by hand
+    /// before the rest. `lists` are the config's, or the ones the view
+    /// holds until the config has them.
+    pub fn float_repos_of(&self, lists: &FloatLists, now: i64) -> Vec<&RepoStatus> {
         use crate::config::same_name;
-        let float = &self.config.float;
         let all = || self.statuses.iter().chain(&self.remote_statuses);
         let mut listed: Vec<&RepoStatus> = Vec::new();
-        for name in &float.pinned {
+        for name in &lists.pinned {
             if let Some(s) = all().find(|s| same_name(&Self::listed_name(s), name))
                 && !listed.iter().any(|l| l.path == s.path)
             {
@@ -406,13 +407,22 @@ impl AppState {
                 .filter(|s| worked(s) > 0 && now - worked(s) <= within)
                 .filter(|s| {
                     let name = Self::listed_name(s);
-                    !float.hidden.iter().any(|h| same_name(h, &name))
+                    !lists.hidden.iter().any(|h| same_name(h, &name))
                         && !listed.iter().any(|l| l.path == s.path)
                 })
                 .collect();
             recent.sort_by_cached_key(|s| (std::cmp::Reverse(worked(s)), s.name.to_lowercase()));
             listed.extend(recent);
         }
+        // Stable: the ones not put in an order keep theirs, after the rest.
+        listed.sort_by_cached_key(|s| {
+            let name = Self::listed_name(s);
+            lists
+                .order
+                .iter()
+                .position(|o| same_name(o, &name))
+                .unwrap_or(usize::MAX)
+        });
         listed
     }
 
@@ -542,6 +552,25 @@ fn severity(s: &RepoStatus) -> u8 {
     }
 }
 
+/// What the floating view lists, and how: see [`crate::config::FloatConfig`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FloatLists {
+    pub pinned: Vec<String>,
+    pub hidden: Vec<String>,
+    pub order: Vec<String>,
+}
+
+impl FloatLists {
+    pub fn of(config: &Config) -> Self {
+        let float = &config.float;
+        Self {
+            pinned: float.pinned.clone(),
+            hidden: float.hidden.clone(),
+            order: float.order.clone(),
+        }
+    }
+}
+
 /// Everything the UI loop reacts to, funnelled through one channel.
 #[cfg(windows)]
 pub enum Input {
@@ -555,6 +584,11 @@ pub enum Input {
     OverlayGrown(bool),
     /// The badge was dragged and dropped with its disc here (physical px).
     OverlayMoved(crate::layout::Rect),
+    /// The floating view's rows were put in an order, or one was taken
+    /// out, or that was undone.
+    FloatLists(FloatLists),
+    /// The floating view was made this wide, logical px.
+    FloatWidth(f32),
     /// The folder-icon worker's report: skipped folders and why.
     FolderSkips(Vec<(PathBuf, String)>),
     /// A GitHub pull request poll.
@@ -594,13 +628,20 @@ mod tests {
         s.config.float.pinned = vec!["OLD".into(), "missing".into(), "yesterday".into()];
         s.config.float.hidden = vec!["gone".into()];
         let names = |s: &AppState| -> Vec<String> {
-            s.float_repos(now).iter().map(|r| r.name.clone()).collect()
+            s.float_repos_of(&FloatLists::of(&s.config), now)
+                .iter()
+                .map(|r| r.name.clone())
+                .collect()
         };
         assert_eq!(names(&s), ["old", "Yesterday", "today"]);
         // Lately worked on turned off: the pinned ones alone.
         s.config.float.recent_days = 0.0;
         assert_eq!(names(&s), ["old", "Yesterday"]);
         assert!(s.pinned(&s.statuses[0]) && !s.pinned(&s.statuses[1]));
+        // Put in an order by hand: those first, the rest as they were.
+        s.config.float.recent_days = 3.0;
+        s.config.float.order = vec!["today".into(), "nowhere".into(), "yesterday".into()];
+        assert_eq!(names(&s), ["today", "Yesterday", "old"]);
     }
 
     fn state(statuses: Vec<RepoStatus>) -> AppState {
