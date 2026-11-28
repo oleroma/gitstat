@@ -54,6 +54,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -169,6 +170,9 @@ private fun RepoScreen(state: UiState) {
     var sheet by remember { mutableStateOf<String?>(null) }
     var picked by remember { mutableStateOf<Picked?>(null) }
     var health by remember { mutableStateOf(false) }
+    // The commit under the finger during a sweep, and the last one picked, which stays ringed.
+    var sweep by remember { mutableStateOf<Sweep?>(null) }
+    var lastPicked by remember { mutableStateOf<Picked?>(null) }
     // The repo the vertical view opens at, when one was tapped in the horizontal view.
     var focus by rememberSaveable { mutableStateOf<String?>(null) }
     // The repo lit in the horizontal view, and whether that view should scroll to it on opening.
@@ -231,6 +235,10 @@ private fun RepoScreen(state: UiState) {
             modifier = Modifier.fillMaxSize().padding(pad),
         ) {
             val snap = state.snapshot
+            val shown = sweep?.picked ?: picked ?: lastPicked
+            CompositionLocalProvider(
+                LocalTouch provides Touch(shown?.let { it.repo.slug to it.commit.id }) { sweep = it },
+            ) {
             val summary: @Composable () -> Unit = {
                 Box(Modifier.padding(horizontal = 12.dp, vertical = 4.dp)) { Summary(snap, state.problem, state.refreshing) }
             }
@@ -260,7 +268,7 @@ private fun RepoScreen(state: UiState) {
                     jump = jump,
                     onHighlight = { lit = it; jump = false },
                     onRepo = { lit = it.slug; jump = false; focus = it.slug; Hub.setRows(context, false) },
-                    onCommit = { picked = it },
+                    onCommit = { picked = it; lastPicked = it },
                 )
             } else {
                 Board(
@@ -271,9 +279,12 @@ private fun RepoScreen(state: UiState) {
                     onHealth = { health = true },
                     onTab = { lit = it.slug; jump = true; Hub.setRows(context, true) },
                     onRepo = { sheet = it.slug },
-                    onCommit = { picked = it },
+                    onCommit = { picked = it; lastPicked = it },
                 )
             }
+            }
+            // A sweep's card, in the half of the screen away from the finger.
+            sweep?.let { SweepCard(it, Modifier.align(if (it.top) Alignment.TopCenter else Alignment.BottomCenter)) }
         }
     }
 

@@ -42,6 +42,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
@@ -212,14 +213,18 @@ private fun StripCanvas(repo: Repo, tree: Tree, width: Dp, onCommit: (Picked) ->
     val dark = isSystemInDarkTheme()
     val inks = remember(dark) { TreeInks(dark) }
     val c = LocalColors.current
+    val sel = LocalTouch.current.selected?.takeIf { it.first == repo.slug }?.second
+    val selRow = repo.commits.indexOfFirst { it.id == sel }
     Canvas(
-        Modifier.width(width).height(STRIP_H).pointerInput(repo) {
-            detectTapGestures { at ->
+        Modifier.width(width).height(STRIP_H).commitTouches(
+            repo,
+            rowAt = { at, size ->
                 val right = size.width - STEP.toPx() / 2
-                val row = Math.round((right - at.x) / STEP.toPx())
-                if (row in 0 until tree.rows) onCommit(pick(repo, tree, row, inks))
-            }
-        },
+                Math.round((right - at.x) / STEP.toPx()).takeIf { it in 0 until tree.rows }
+            },
+            pick = { pick(repo, tree, it, inks) },
+            onCommit = onCommit,
+        ),
     ) {
         val step = STEP.toPx()
         val lane = STRIP_LANE.toPx()
@@ -230,6 +235,11 @@ private fun StripCanvas(repo: Repo, tree: Tree, width: Dp, onCommit: (Picked) ->
             val n = l.coerceAtMost((STRIP_LANES - 1).toFloat())
             val k = kotlin.math.ceil(n / 2f)
             return if (n.toInt() % 2 == 1) mid - k * lane else mid + k * lane
+        }
+        // The picked commit: a band across the strip behind it, and a ring round its dot.
+        val selInk = if (selRow >= 0) Color(inks.node(tree, selRow)) else Color.Transparent
+        if (selRow >= 0) {
+            drawRect(selInk.copy(alpha = 0.16f), Offset(x(selRow.toFloat()) - step / 2, 0f), Size(step, size.height))
         }
         val stroke = Stroke(width = 1.6.dp.toPx(), cap = StrokeCap.Round)
         for (e in tree.edges) {
@@ -251,6 +261,7 @@ private fun StripCanvas(repo: Repo, tree: Tree, width: Dp, onCommit: (Picked) ->
             val at = Offset(x(row.toFloat()), y(n.lane.toFloat()))
             drawCircle(Color(inks.node(tree, row)), r, at)
             if (n.merge) drawCircle(c.bg, r * 0.45f, at)
+            if (row == selRow) drawCircle(selInk, r * 1.9f, at, style = Stroke(1.6.dp.toPx()))
         }
     }
 }

@@ -48,6 +48,8 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -259,15 +261,23 @@ private fun TreeCanvas(repo: Repo, tree: Tree, onCommit: (Picked) -> Unit) {
     val rowPx = with(density) { row.toPx() }
     val lanes = tree.width.coerceAtMost(MAX_LANES)
     val treeW: Dp = LANE * lanes + 14.dp
+    // The picked commit's row is tinted and its dot ringed.
+    val sel = LocalTouch.current.selected?.takeIf { it.first == repo.slug }?.second
+    val selRow = repo.commits.indexOfFirst { it.id == sel }
+    val selColor = if (selRow >= 0) Color(inks.node(tree, selRow)) else Color.Transparent
     Box(
-        Modifier.fillMaxWidth().height(row * tree.rows + 6.dp).pointerInput(repo) {
-            detectTapGestures { at ->
-                val row = (at.y / rowPx).toInt()
-                if (row in 0 until tree.rows) {
-                    onCommit(pick(repo, tree, row, inks))
+        Modifier.fillMaxWidth().height(row * tree.rows + 6.dp)
+            .drawBehind {
+                if (selRow >= 0) {
+                    drawRect(selColor.copy(alpha = 0.16f), Offset(0f, selRow * rowPx), Size(size.width, rowPx))
                 }
             }
-        },
+            .commitTouches(
+                repo,
+                rowAt = { at, _ -> (at.y / rowPx).toInt().takeIf { it in 0 until tree.rows } },
+                pick = { pick(repo, tree, it, inks) },
+                onCommit = onCommit,
+            ),
     ) {
         Canvas(Modifier.width(treeW).height(row * tree.rows + 6.dp)) {
             val lanePx = LANE.toPx()
@@ -298,6 +308,7 @@ private fun TreeCanvas(repo: Repo, tree: Tree, onCommit: (Picked) -> Unit) {
                 val at = Offset(x(n.lane.toFloat()), y(row.toFloat()))
                 drawCircle(Color(inks.node(tree, row)), r, at)
                 if (n.merge) drawCircle(c.surface, r * 0.45f, at)
+                if (row == selRow) drawCircle(selColor, r * 1.9f, at, style = Stroke(1.6.dp.toPx()))
             }
         }
         // Each commit's subject beside its dot, one per row.
