@@ -321,23 +321,29 @@ private fun todos(snap: Snapshot, c: Colors): List<Todo> = buildList {
         if (repo.checksState == Checks.FAILING) {
             add(Todo(TodoKind.CHECKS, repo, "Checks failing on ${repo.defaultBranch}", "pushed ${ago(repo.pushedAt)}", c.red, "${repo.url}/actions", repo.pushedAt))
         }
-        for (b in repo.hanging) {
+        // Branches not merged with no PR; a branch with a PR is listed as its PR.
+        for (b in repo.hanging.filter { it.pr == null }) {
             val parts = listOfNotNull(
                 "+${b.notInMain} not in ${repo.defaultBranch}",
-                b.pr?.let { "PR #${it.number}" + if (it.draft) " draft" else "" } ?: "no PR",
+                "no PR",
                 ago(b.committedAt).takeIf { it.isNotEmpty() },
             )
-            add(Todo(TodoKind.BRANCH, repo, b.name, parts.joinToString(" · "), c.red, b.pr?.url ?: b.url, b.committedAt))
+            add(Todo(TodoKind.BRANCH, repo, b.name, parts.joinToString(" · "), c.red, b.url, b.committedAt))
         }
-        // Open PRs not already listed with their branch.
-        for (pr in repo.openPrs.filter { pr -> repo.hanging.none { it.pr?.number == pr.number } }) {
-            val since = repo.branches.firstOrNull { it.name == pr.headBranch }?.committedAt.orEmpty()
+        for (pr in repo.openPrs) {
+            val branch = repo.branches.firstOrNull { it.name == pr.headBranch || it.pr?.number == pr.number }
+            val since = branch?.committedAt.orEmpty()
+            val parts = listOfNotNull(
+                pr.headBranch,
+                branch?.takeIf { it.hanging }?.let { "+${it.notInMain} not in ${repo.defaultBranch}" },
+                ago(since).takeIf { it.isNotEmpty() },
+            )
             add(
                 Todo(
                     if (pr.draft) TodoKind.DRAFT else TodoKind.PR,
                     repo,
                     "#${pr.number} ${pr.title}",
-                    listOfNotNull(if (pr.draft) "draft PR" else "open PR", pr.headBranch, ago(since).takeIf { it.isNotEmpty() }).joinToString(" · "),
+                    parts.joinToString(" · "),
                     if (pr.draft) c.muted else c.green,
                     pr.url,
                     since,
