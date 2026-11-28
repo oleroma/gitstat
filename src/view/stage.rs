@@ -112,31 +112,24 @@ impl Element for Stage {
             crate::flip::note(format!("{n} words over one another, as {a:?} and {b:?}"));
         }
 
-        // The trees: each repo's that either view shows, from its strip
-        // to its column.
+        // The trees: every repo's, from its strip to its column, wherever
+        // either is, so that all turn and travel together; the sheet in
+        // between cuts off what is out of sight.
         let b = |r: Rect| paint::bounds(r, (0, 0), s);
-        let meets = |a: Rect, b: Rect| {
-            a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
-        };
         let bodies = self
             .window
             .as_ref()
             .zip(window_laid.as_ref())
             .map(|(scene, laid)| scene.bodies(laid))
             .unwrap_or_default();
-        let (list, table) = (panel_picture.body, window_picture.as_ref().map(|p| p.body));
         let mut trees = Vec::new();
         if let Some(timelines) = &self.timelines {
             let timelines = timelines.read(cx);
             for (path, dirty, strip) in self.panel.strips(&panel_laid) {
                 let column = bodies.iter().find(|(p, _)| *p == path).map(|(_, r)| *r);
-                let shown = meets(strip, list)
-                    || column
-                        .zip(table)
-                        .is_some_and(|(column, table)| meets(column, table));
                 // A tree with no column to turn to (the window isn't
                 // known yet) stays its strip's.
-                if !shown || (column.is_none() && pose.turn > 0.0) {
+                if column.is_none() && pose.turn > 0.0 {
                     continue;
                 }
                 let Some(graph) = timelines.graph_of(&path) else {

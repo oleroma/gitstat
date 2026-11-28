@@ -904,7 +904,11 @@ impl StatusView {
                     table.set_offset(point(px(-(scroll as f32) / s), px(0.0)));
                 }
                 for (i, cell) in all.iter().enumerate() {
-                    let seen = edges[i + 1] > scroll && edges[i] < scroll + view;
+                    // A flip builds them all: the repos out of sight turn
+                    // and travel to their own places with the rest, and
+                    // the table cuts them off there.
+                    let seen = staged.is_some()
+                        || (edges[i + 1] > scroll && edges[i] < scroll + view);
                     cells.push(match *cell {
                         Cell::Spine(section, n) => CellPart::Spine(
                             section,

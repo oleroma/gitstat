@@ -13,8 +13,10 @@
 //! and the column's own code: a tree come to rest is the view's, px for
 //! px.
 //!
-//! On the way its history is as long as the strip's box at first and the
-//! column's at last, and is cut there, in its own frame.
+//! On the way it turns at its full length: its history grows from the
+//! strip's box out past anything the screen could show early in the turn,
+//! is cut only by the sheet it is drawn in, and settles back to the
+//! column's box at the end (and the other way round, closing).
 
 use super::column::{self, ColumnGeo};
 use super::{Colors, StripGeo, ink};
@@ -56,9 +58,12 @@ pub fn paint_turning(trees: &[Turning], e: f32, dark: bool, p: &Palette, window:
         return;
     }
     let s = window.scale_factor();
+    // Farther than anything in the window from anywhere in it.
+    let size = window.viewport_size();
+    let reach = f32::from(size.width).hypot(f32::from(size.height));
     let mut batch = ink::Batch::new(window);
     for t in trees {
-        turn(t, e, &colors, &mut batch, s);
+        turn(t, e, reach, &colors, &mut batch, s);
     }
     batch.paint(window);
 }
@@ -108,6 +113,24 @@ impl Frame {
 
 fn mix(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
+}
+
+/// How far into the turn a tree's history grows from its strip's length
+/// to its full length, and how far from its end it settles to its
+/// column's.
+const GROW: f32 = 0.2;
+
+/// 0 at or below 0, 1 at or above 1, smooth in between.
+fn smooth(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// How much history shows at progress `e`, px: the strip's length at 0,
+/// `full` through the turn, the column's at 1.
+fn length(strip: f32, full: f32, column: f32, e: f32) -> f32 {
+    let grown = mix(strip, full.max(strip), smooth(e / GROW));
+    mix(grown, column, smooth((e - (1.0 - GROW)) / GROW))
 }
 
 /// A point of the cubic `c`.
@@ -179,7 +202,7 @@ fn cut_run(a: P, b: P, min: f32) -> Option<(P, P)> {
     }
 }
 
-fn turn(t: &Turning, e: f32, colors: &Colors, batch: &mut ink::Batch, s: f32) {
+fn turn(t: &Turning, e: f32, reach: f32, colors: &Colors, batch: &mut ink::Batch, s: f32) {
     let g = &*t.graph;
     let rows = g.layout.nodes.len();
     let sg = StripGeo::new(t.strip, g, 0.0, t.dirty, s);
@@ -197,10 +220,19 @@ fn turn(t: &Turning, e: f32, colors: &Colors, batch: &mut ink::Batch, s: f32) {
         },
         sin,
         cos,
-        len: mix(strip.0 - f32::from(t.strip.left()), cg.bottom() - col.1, e),
+        len: length(
+            strip.0 - f32::from(t.strip.left()),
+            reach.max(cg.bottom() - col.1),
+            cg.bottom() - col.1,
+            e,
+        ),
     };
     let at = |row: f32, lane: f32| f.local((sg.x(row), sg.y(lane)), cg.at(row, lane));
-    let hi = sg.rows(rows).1.max(cg.rows().1).min(rows);
+    // The rows as far as the history shows, and one past.
+    let shown = (0..rows)
+        .find(|&row| at(row as f32, 0.0).0 < -f.len)
+        .map_or(rows, |row| row + 1);
+    let hi = sg.rows(rows).1.max(cg.rows().1).max(shown).min(rows);
     let wide =
         |strip: f32, column: f32| mix(ink::device_width(strip, s), ink::device_width(column, s), e);
     let stroke = wide(super::STROKE, column::STROKE);
@@ -368,6 +400,23 @@ mod tests {
         // Half way it has swung down and to the left of the strip's.
         let mid = at(0.5);
         assert!(mid.0 < s.0 && mid.1 > s.1);
+    }
+
+    #[test]
+    fn the_history_turns_at_full_length_and_settles_at_each_end() {
+        let (strip, full, column) = (120.0, 2900.0, 700.0);
+        assert_eq!(length(strip, full, column, 0.0), strip);
+        assert_eq!(length(strip, full, column, 1.0), column);
+        for e in [GROW, 0.3, 0.5, 0.7, 1.0 - GROW] {
+            assert_eq!(length(strip, full, column, e), full);
+        }
+        // It grows and settles without a jump.
+        let mut last = strip;
+        for i in 1..=1000 {
+            let now = length(strip, full, column, i as f32 / 1000.0);
+            assert!((now - last).abs() < 30.0);
+            last = now;
+        }
     }
 
     #[test]
