@@ -4,6 +4,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -52,6 +53,7 @@ import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
@@ -71,6 +73,9 @@ private val STRIP_LANE = 7.dp
 private val STRIP_DOT = 4.5.dp
 private val STRIP_H = 52.dp
 private val NAME_W = 116.dp
+/** Between the tree and the name, and the margin at the screen's edges. */
+private val GAP = 8.dp
+private val EDGE = 12.dp
 private const val STRIP_LANES = 5
 
 /** What a commit card needs, picked from a tree. */
@@ -137,45 +142,62 @@ fun RowsView(
             // As on the PC's panel: the tree on the left running back into history, the
             // newest commit next to the repo's icon and name on the right, icons in a column.
             val lit = repo.slug == highlight
-            Row(
+            val tree = trees.getValue(repo.slug)
+            // One scroller per row: the tree running back into history on the left, the
+            // newest commit next to the repo's icon and name, and past them its info. It rests
+            // with the name at the right edge; pushed past the newest commit, it snaps with the
+            // icon at the left edge and the info filling the rest of the screen.
+            BoxWithConstraints(
                 Modifier.fillMaxWidth()
-                    .background(if (lit) c.of(repo.health).copy(alpha = 0.14f) else Color.Transparent)
-                    .padding(end = 12.dp),
-                verticalAlignment = Alignment.CenterVertically,
+                    .background(if (lit) c.of(repo.health).copy(alpha = 0.14f) else Color.Transparent),
             ) {
-                Strip(
-                    repo,
-                    trees.getValue(repo.slug),
-                    onScroll = { onHighlight(repo.slug) },
-                    onCommit = { onHighlight(repo.slug); onCommit(it) },
-                    modifier = Modifier.weight(1f),
-                )
-                Spacer(Modifier.width(8.dp))
-                Column(
-                    Modifier.width(NAME_W)
-                        .combinedClickable(onLongClick = { uri.openUri(repo.url) }) { onRepo(repo) }
-                        .padding(vertical = 6.dp),
+                val w = maxWidth
+                val view = (w - NAME_W - GAP - EDGE).coerceAtLeast(0.dp)
+                val treeW = maxOf(view, STEP * (tree.rows + 1))
+                val infoW = (w - NAME_W - EDGE).coerceAtLeast(0.dp)
+                val density = LocalDensity.current
+                val rest = with(density) { (treeW - view).roundToPx() }
+                val info = with(density) { (treeW + GAP - EDGE).roundToPx() }
+                val scroll = remember(rest, info) { ScrollState(rest) }
+                SnapBetween(scroll, rest, info) { onHighlight(repo.slug) }
+                Row(
+                    Modifier.horizontalScroll(scroll),
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        RepoMark(repo, 20.dp)
-                        Spacer(Modifier.width(6.dp))
+                    StripCanvas(repo, tree, treeW) { onHighlight(repo.slug); onCommit(it) }
+                    Spacer(Modifier.width(GAP))
+                    Column(
+                        Modifier.width(NAME_W)
+                            .combinedClickable(onLongClick = { uri.openUri(repo.url) }) { onRepo(repo) }
+                            .padding(vertical = 6.dp),
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            RepoMark(repo, 20.dp)
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                repo.name,
+                                color = c.text,
+                                fontSize = 14.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f, fill = false),
+                            )
+                        }
+                        val n = repo.hanging.size
                         Text(
-                            repo.name,
-                            color = c.text,
-                            fontSize = 14.sp,
+                            if (repo.problem != null) "couldn't read" else if (n > 0) "$n not merged" else "all merged",
+                            color = if (n > 0) c.red else c.muted,
+                            fontSize = 11.sp,
                             maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.weight(1f, fill = false),
+                            // Under the name, past the icon.
+                            modifier = Modifier.padding(start = 26.dp),
                         )
                     }
-                    val n = repo.hanging.size
-                    Text(
-                        if (repo.problem != null) "couldn't read" else if (n > 0) "$n not merged" else "all merged",
-                        color = if (n > 0) c.red else c.muted,
-                        fontSize = 11.sp,
-                        maxLines = 1,
-                        // Under the name, past the icon.
-                        modifier = Modifier.padding(start = 26.dp),
+                    RepoFacts(
+                        repo,
+                        snap.login,
+                        compact = true,
+                        modifier = Modifier.width(infoW).padding(start = 4.dp, end = EDGE),
                     )
                 }
             }
@@ -184,59 +206,51 @@ fun RowsView(
     }
 }
 
+/** [repo]'s tree as a strip [width] wide, newest commit at the right end. */
 @Composable
-private fun Strip(repo: Repo, tree: Tree, onScroll: () -> Unit, onCommit: (Picked) -> Unit, modifier: Modifier) {
+private fun StripCanvas(repo: Repo, tree: Tree, width: Dp, onCommit: (Picked) -> Unit) {
     val dark = isSystemInDarkTheme()
     val inks = remember(dark) { TreeInks(dark) }
     val c = LocalColors.current
-    BoxWithConstraints(modifier.height(STRIP_H)) {
-        val view = maxWidth
-        val content = maxOf(view, STEP * (tree.rows + 1))
-        // Reversed, so it starts at the right end, at the newest commit.
-        val scroll = rememberScrollState()
-        LaunchedEffect(scroll.isScrollInProgress) { if (scroll.isScrollInProgress) onScroll() }
-        Box(Modifier.horizontalScroll(scroll, reverseScrolling = true)) {
-            Canvas(
-                Modifier.width(content).height(STRIP_H).pointerInput(repo) {
-                    detectTapGestures { at ->
-                        val right = size.width - STEP.toPx() / 2
-                        val row = Math.round((right - at.x) / STEP.toPx())
-                        if (row in 0 until tree.rows) onCommit(pick(repo, tree, row, inks))
-                    }
-                },
-            ) {
-                val step = STEP.toPx()
-                val lane = STRIP_LANE.toPx()
-                val right = size.width - step / 2
-                val mid = size.height / 2
-                fun x(r: Float) = right - r * step
-                fun y(l: Float): Float {
-                    val n = l.coerceAtMost((STRIP_LANES - 1).toFloat())
-                    val k = kotlin.math.ceil(n / 2f)
-                    return if (n.toInt() % 2 == 1) mid - k * lane else mid + k * lane
-                }
-                val stroke = Stroke(width = 1.6.dp.toPx(), cap = StrokeCap.Round)
-                for (e in tree.edges) {
-                    val color = Color(inks.edge(tree, e))
-                    for (s in Tree.segments(e, tree.rows)) {
-                        val a = Offset(x(s.row1), y(s.lane1))
-                        val b = Offset(x(s.row2), y(s.lane2))
-                        if (s.curve && a.y != b.y) {
-                            val xm = (a.x + b.x) / 2
-                            drawPath(Path().apply { moveTo(a.x, a.y); cubicTo(xm, a.y, xm, b.y, b.x, b.y) }, color, style = stroke)
-                        } else {
-                            drawLine(color, a, b, strokeWidth = stroke.width, cap = StrokeCap.Round)
-                        }
-                    }
-                }
-                val r = STRIP_DOT.toPx()
-                for (row in 0 until tree.rows) {
-                    val n = tree.nodes[row]
-                    val at = Offset(x(row.toFloat()), y(n.lane.toFloat()))
-                    drawCircle(Color(inks.node(tree, row)), r, at)
-                    if (n.merge) drawCircle(c.bg, r * 0.45f, at)
+    Canvas(
+        Modifier.width(width).height(STRIP_H).pointerInput(repo) {
+            detectTapGestures { at ->
+                val right = size.width - STEP.toPx() / 2
+                val row = Math.round((right - at.x) / STEP.toPx())
+                if (row in 0 until tree.rows) onCommit(pick(repo, tree, row, inks))
+            }
+        },
+    ) {
+        val step = STEP.toPx()
+        val lane = STRIP_LANE.toPx()
+        val right = size.width - step / 2
+        val mid = size.height / 2
+        fun x(r: Float) = right - r * step
+        fun y(l: Float): Float {
+            val n = l.coerceAtMost((STRIP_LANES - 1).toFloat())
+            val k = kotlin.math.ceil(n / 2f)
+            return if (n.toInt() % 2 == 1) mid - k * lane else mid + k * lane
+        }
+        val stroke = Stroke(width = 1.6.dp.toPx(), cap = StrokeCap.Round)
+        for (e in tree.edges) {
+            val color = Color(inks.edge(tree, e))
+            for (s in Tree.segments(e, tree.rows)) {
+                val a = Offset(x(s.row1), y(s.lane1))
+                val b = Offset(x(s.row2), y(s.lane2))
+                if (s.curve && a.y != b.y) {
+                    val xm = (a.x + b.x) / 2
+                    drawPath(Path().apply { moveTo(a.x, a.y); cubicTo(xm, a.y, xm, b.y, b.x, b.y) }, color, style = stroke)
+                } else {
+                    drawLine(color, a, b, strokeWidth = stroke.width, cap = StrokeCap.Round)
                 }
             }
+        }
+        val r = STRIP_DOT.toPx()
+        for (row in 0 until tree.rows) {
+            val n = tree.nodes[row]
+            val at = Offset(x(row.toFloat()), y(n.lane.toFloat()))
+            drawCircle(Color(inks.node(tree, row)), r, at)
+            if (n.merge) drawCircle(c.bg, r * 0.45f, at)
         }
     }
 }

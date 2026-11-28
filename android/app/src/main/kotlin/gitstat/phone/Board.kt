@@ -23,6 +23,8 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -33,6 +35,12 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
@@ -169,12 +177,35 @@ private fun RepoPage(
     onCommit: (Picked) -> Unit,
 ) {
     val c = LocalColors.current
+    // The repo's info sits above its header: the page rests with it scrolled out of sight
+    // and, pulled down past the top, snaps with it in full view.
+    val scroll = rememberScrollState()
+    var infoH by remember { mutableIntStateOf(0) }
+    var ready by remember { mutableStateOf(false) }
+    LaunchedEffect(infoH) {
+        if (infoH > 0 && !ready) {
+            scroll.scrollTo(infoH)
+            ready = true
+        }
+    }
+    SnapBetween(scroll, 0, infoH)
+    BoxWithConstraints(Modifier.fillMaxSize()) {
+    // At least a screen below the info, so a short tree still rests with the info hidden.
+    val page = maxHeight
     Column(
         Modifier.fillMaxSize().padding(horizontal = 8.dp)
             .background(c.surface, RoundedCornerShape(12.dp))
             .border(1.dp, c.border, RoundedCornerShape(12.dp))
-            .verticalScroll(rememberScrollState()),
+            .clip(RoundedCornerShape(12.dp))
+            // Hidden until it rests below the info, so the info never flashes up.
+            .graphicsLayer { alpha = if (ready) 1f else 0f }
+            .verticalScroll(scroll),
     ) {
+        Column(Modifier.fillMaxWidth().onSizeChanged { infoH = it.height }) {
+            RepoFacts(repo, login, compact = false, modifier = Modifier.fillMaxWidth().padding(14.dp))
+            Box(Modifier.fillMaxWidth().height(1.dp).background(c.border))
+        }
+        Column(Modifier.fillMaxWidth().heightIn(min = page)) {
         Column(
             Modifier.fillMaxWidth().clickable { onRepo(repo) }.padding(horizontal = 14.dp, vertical = 8.dp),
         ) {
@@ -212,6 +243,8 @@ private fun RepoPage(
             TreeCanvas(repo, tree, onCommit)
         }
         Spacer(Modifier.height(24.dp))
+        }
+    }
     }
 }
 

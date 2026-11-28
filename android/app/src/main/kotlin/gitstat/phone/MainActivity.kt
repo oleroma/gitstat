@@ -90,7 +90,7 @@ private fun Screen() {
 fun ago(millis: Long): String =
     DateUtils.getRelativeTimeSpanString(millis, System.currentTimeMillis(), DateUtils.MINUTE_IN_MILLIS).toString()
 
-private fun ago(iso: String): String =
+fun ago(iso: String): String =
     runCatching { ago(Instant.parse(iso).toEpochMilli()) }.getOrDefault("")
 
 // ---------------------------------------------------------------- sign in
