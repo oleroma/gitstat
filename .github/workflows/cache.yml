@@ -8,7 +8,8 @@ name: Main cache
 on:
   push:
     branches: [main]
-    paths-ignore: ["**.md"]
+    # Pushes that change only files no build uses (lib.sh pipeline_file) leave the caches as they are.
+    paths-ignore: [".agents/**", ".github/workflows/**", "**.md", "docs/**", ".gitignore", ".gitattributes", ".claude/**", ".gitstat/**", "LICENSE*"]
 
 permissions:
   contents: read
