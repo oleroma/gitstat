@@ -26,6 +26,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -105,13 +106,18 @@ fun pick(repo: Repo, tree: Tree, row: Int, inks: TreeInks): Picked {
  * The horizontal view, like gitstat's panel on the PC: a row per repo, red ones first, each
  * with its icon and name and its tree as a strip, newest commit at the right. The list scrolls
  * down; each strip scrolls sideways through its own history. Tapping a repo's name calls
- * [onRepo] (its page in the vertical view); a long press opens it on GitHub.
+ * [onRepo] (its page in the vertical view); a long press opens it on GitHub. The repo
+ * [highlight] names is lit; scrolling a strip or tapping a commit lights that repo
+ * ([onHighlight]). With [jump], the list starts scrolled to the lit repo.
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun RowsView(
     snap: Snapshot,
     top: @Composable () -> Unit,
+    highlight: String?,
+    jump: Boolean,
+    onHighlight: (String) -> Unit,
     onRepo: (Repo) -> Unit,
     onCommit: (Picked) -> Unit,
 ) {
@@ -119,16 +125,31 @@ fun RowsView(
     val uri = LocalUriHandler.current
     val repos = remember(snap) { snap.sorted() }
     val trees = remember(snap) { repos.associate { it.slug to it.tree() } }
-    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 24.dp)) {
+    val list = rememberLazyListState()
+    LaunchedEffect(jump, highlight) {
+        val i = repos.indexOfFirst { it.slug == highlight }
+        // Item 0 is the header, so item i is the row above the lit one: it stays in sight too.
+        if (jump && i >= 0) list.animateScrollToItem(i)
+    }
+    LazyColumn(Modifier.fillMaxSize(), state = list, contentPadding = PaddingValues(bottom = 24.dp)) {
         item { top() }
         items(repos, key = { it.slug }) { repo ->
             // As on the PC's panel: the tree on the left running back into history, the
             // newest commit next to the repo's icon and name on the right, icons in a column.
+            val lit = repo.slug == highlight
             Row(
-                Modifier.fillMaxWidth().padding(end = 12.dp),
+                Modifier.fillMaxWidth()
+                    .background(if (lit) c.of(repo.health).copy(alpha = 0.14f) else Color.Transparent)
+                    .padding(end = 12.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Strip(repo, trees.getValue(repo.slug), onCommit, Modifier.weight(1f))
+                Strip(
+                    repo,
+                    trees.getValue(repo.slug),
+                    onScroll = { onHighlight(repo.slug) },
+                    onCommit = { onHighlight(repo.slug); onCommit(it) },
+                    modifier = Modifier.weight(1f),
+                )
                 Spacer(Modifier.width(8.dp))
                 Column(
                     Modifier.width(NAME_W)
@@ -164,7 +185,7 @@ fun RowsView(
 }
 
 @Composable
-private fun Strip(repo: Repo, tree: Tree, onCommit: (Picked) -> Unit, modifier: Modifier) {
+private fun Strip(repo: Repo, tree: Tree, onScroll: () -> Unit, onCommit: (Picked) -> Unit, modifier: Modifier) {
     val dark = isSystemInDarkTheme()
     val inks = remember(dark) { TreeInks(dark) }
     val c = LocalColors.current
@@ -172,7 +193,9 @@ private fun Strip(repo: Repo, tree: Tree, onCommit: (Picked) -> Unit, modifier: 
         val view = maxWidth
         val content = maxOf(view, STEP * (tree.rows + 1))
         // Reversed, so it starts at the right end, at the newest commit.
-        Box(Modifier.horizontalScroll(rememberScrollState(), reverseScrolling = true)) {
+        val scroll = rememberScrollState()
+        LaunchedEffect(scroll.isScrollInProgress) { if (scroll.isScrollInProgress) onScroll() }
+        Box(Modifier.horizontalScroll(scroll, reverseScrolling = true)) {
             Canvas(
                 Modifier.width(content).height(STRIP_H).pointerInput(repo) {
                     detectTapGestures { at ->

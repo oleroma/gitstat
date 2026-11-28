@@ -164,6 +164,9 @@ private fun RepoScreen(state: UiState) {
     var health by remember { mutableStateOf(false) }
     // The repo the vertical view opens at, when one was tapped in the horizontal view.
     var focus by rememberSaveable { mutableStateOf<String?>(null) }
+    // The repo lit in the horizontal view, and whether that view should scroll to it on opening.
+    var lit by rememberSaveable { mutableStateOf<String?>(null) }
+    var jump by remember { mutableStateOf(false) }
 
     val askNotify = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (!granted) Hub.setNotify(context, false)
@@ -246,7 +249,10 @@ private fun RepoScreen(state: UiState) {
                             actions()
                         }
                     },
-                    onRepo = { focus = it.slug; Hub.setRows(context, false) },
+                    highlight = lit,
+                    jump = jump,
+                    onHighlight = { lit = it; jump = false },
+                    onRepo = { lit = it.slug; jump = false; focus = it.slug; Hub.setRows(context, false) },
                     onCommit = { picked = it },
                 )
             } else {
@@ -256,6 +262,7 @@ private fun RepoScreen(state: UiState) {
                     problem = state.problem,
                     menu = actions,
                     onHealth = { health = true },
+                    onTab = { lit = it.slug; jump = true; Hub.setRows(context, true) },
                     onRepo = { sheet = it.slug },
                     onCommit = { picked = it },
                 )

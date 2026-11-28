@@ -7,9 +7,7 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.draw.clip
-import kotlinx.coroutines.launch
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -73,6 +71,8 @@ fun Board(
     problem: String?,
     menu: @Composable () -> Unit,
     onHealth: () -> Unit,
+    /** A repo's tab was tapped: back to the list of rows, that repo lit. */
+    onTab: (Repo) -> Unit,
     onRepo: (Repo) -> Unit,
     onCommit: (Picked) -> Unit,
 ) {
@@ -82,7 +82,6 @@ fun Board(
     val pager = rememberPagerState(initialPage = start) { repos.size }
     LaunchedEffect(focus) { if (focus != null) pager.scrollToPage(start) }
     val pills = rememberLazyListState()
-    val scope = rememberCoroutineScope()
     // The pill of the repo on screen stays in view as you swipe.
     LaunchedEffect(pager.currentPage) {
         if (repos.isNotEmpty()) pills.animateScrollToItem((pager.currentPage - 1).coerceAtLeast(0))
@@ -99,9 +98,7 @@ fun Board(
             ) {
                 item(key = "health") { HealthBadge(snap, problem, onHealth) }
                 itemsIndexed(repos, key = { _, r -> r.slug }) { i, repo ->
-                    Pill(repo, selected = i == pager.currentPage) {
-                        scope.launch { pager.animateScrollToPage(i) }
-                    }
+                    Pill(repo, selected = i == pager.currentPage) { onTab(repo) }
                 }
             }
         }
