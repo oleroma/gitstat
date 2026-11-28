@@ -24,8 +24,8 @@ class RefreshWorker(context: Context, params: WorkerParameters) : CoroutineWorke
     override suspend fun doWork(): Result {
         if (Store(applicationContext).token == null) return Result.success()
         Hub.refresh(applicationContext)
-        // A failed read waits for the next run instead of retrying sooner.
-        return Result.success()
+        // Offline: try again once connected (WorkManager backs off); any other failure waits for the next run.
+        return if (Hub.offline && runAttemptCount < 5) Result.retry() else Result.success()
     }
 
     companion object {

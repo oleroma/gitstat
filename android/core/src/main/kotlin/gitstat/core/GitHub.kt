@@ -271,7 +271,8 @@ class GitHub(private val post: (query: String) -> String) {
                     else -> throw GitHubException("GitHub answered $code: ${messageOf(text) ?: "no details"}", fatal = true)
                 }
             } catch (e: IOException) {
-                throw GitHubException("Couldn't reach GitHub: ${e.message ?: e.javaClass.simpleName}", fatal = true)
+                // No connection, or it dropped: the phone is offline rather than GitHub broken.
+                throw GitHubException("No connection to GitHub", fatal = true, offline = true)
             } finally {
                 c.disconnect()
             }
@@ -296,6 +297,8 @@ class GitHubException(
     message: String,
     val auth: Boolean = false,
     val fatal: Boolean = auth,
+    /** GitHub couldn't be reached at all, such as with no connection. */
+    val offline: Boolean = false,
 ) : Exception(message)
 
 private val EMPTY = JsonObject(emptyMap())

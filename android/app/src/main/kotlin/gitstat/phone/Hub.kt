@@ -47,6 +47,9 @@ object Hub {
     val state: StateFlow<UiState> = _state.asStateFlow()
     private val lock = Mutex()
     @Volatile private var loaded = false
+    /** The last refresh failed for want of a connection; the background read retries soon. */
+    @Volatile var offline = false
+        private set
 
     fun load(context: Context) {
         if (loaded) return
@@ -72,6 +75,7 @@ object Hub {
         _state.update { it.copy(refreshing = true) }
         try {
             val before = withContext(Dispatchers.IO) { store.snapshot() }
+            offline = false
             val problem = try {
                 val snap = withContext(Dispatchers.IO) { GitHub(GitHub.https(token)).read() }
                 withContext(Dispatchers.IO) { store.save(snap) }
@@ -79,7 +83,12 @@ object Hub {
                 if (store.notify) notifyRed(context, snap.newlyRed(before))
                 null
             } catch (e: GitHubException) {
-                e.message ?: "GitHub couldn't be read"
+                offline = e.offline
+                if (e.offline) {
+                    before?.let { "Offline. Showing what was read ${ago(it.readAt)}." } ?: "Offline. Pull down to read once connected."
+                } else {
+                    e.message ?: "GitHub couldn't be read"
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
