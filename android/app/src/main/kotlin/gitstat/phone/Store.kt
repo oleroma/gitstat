@@ -41,6 +41,11 @@ class Store(context: Context) {
         get() = prefs.getBoolean(KEY_ROWS, false)
         set(value) = prefs.edit { putBoolean(KEY_ROWS, value) }
 
+    /** The to-do kinds ([TodoKind] names) unticked in the to-do list's filter. */
+    var todoHidden: Set<String>
+        get() = prefs.getStringSet(KEY_TODO_HIDDEN, null)?.toSet() ?: emptySet()
+        set(value) = prefs.edit { putStringSet(KEY_TODO_HIDDEN, value) }
+
     /** Why the last refresh failed, or null when it worked. */
     var problem: String?
         get() = prefs.getString(KEY_PROBLEM, null)
@@ -69,6 +74,7 @@ class Store(context: Context) {
         const val KEY_NOTIFY = "notify"
         const val KEY_PROBLEM = "problem"
         const val KEY_ROWS = "rows"
+        const val KEY_TODO_HIDDEN = "todo_hidden"
     }
 }
 

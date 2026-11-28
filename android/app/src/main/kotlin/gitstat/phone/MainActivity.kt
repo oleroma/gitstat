@@ -1,5 +1,12 @@
 package gitstat.phone
 
+import androidx.compose.foundation.Canvas
+import androidx.compose.material3.Checkbox
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Build
@@ -287,8 +294,17 @@ private fun RepoScreen(state: UiState) {
     picked?.let { p -> CommitPopup(p) { picked = null } }
 }
 
+/** The kinds of thing in the to-do list, each with its badge and its line in the filter. */
+enum class TodoKind(val label: String) {
+    BRANCH("Unmerged branches"),
+    PR("Open PRs"),
+    CHECKS("Failing checks"),
+    UNREAD("Couldn't read"),
+}
+
 /** One thing to do in the to-do list, and where tapping it goes. */
 private class Todo(
+    val kind: TodoKind,
     val repo: Repo,
     val title: String,
     val detail: String,
@@ -300,9 +316,9 @@ private class Todo(
 
 private fun todos(snap: Snapshot, c: Colors): List<Todo> = buildList {
     for (repo in snap.repos) {
-        repo.problem?.let { add(Todo(repo, "Couldn't read", it, c.amber, repo.url, "")) }
+        repo.problem?.let { add(Todo(TodoKind.UNREAD, repo, "Couldn't read", it, c.amber, repo.url, "")) }
         if (repo.checksState == Checks.FAILING) {
-            add(Todo(repo, "Checks failing on ${repo.defaultBranch}", "pushed ${ago(repo.pushedAt)}", c.red, "${repo.url}/actions", repo.pushedAt))
+            add(Todo(TodoKind.CHECKS, repo, "Checks failing on ${repo.defaultBranch}", "pushed ${ago(repo.pushedAt)}", c.red, "${repo.url}/actions", repo.pushedAt))
         }
         for (b in repo.hanging) {
             val parts = listOfNotNull(
@@ -310,13 +326,14 @@ private fun todos(snap: Snapshot, c: Colors): List<Todo> = buildList {
                 b.pr?.let { "PR #${it.number}" + if (it.draft) " draft" else "" } ?: "no PR",
                 ago(b.committedAt).takeIf { it.isNotEmpty() },
             )
-            add(Todo(repo, b.name, parts.joinToString(" · "), c.red, b.pr?.url ?: b.url, b.committedAt))
+            add(Todo(TodoKind.BRANCH, repo, b.name, parts.joinToString(" · "), c.red, b.pr?.url ?: b.url, b.committedAt))
         }
         // Open PRs not already listed with their branch.
         for (pr in repo.openPrs.filter { pr -> repo.hanging.none { it.pr?.number == pr.number } }) {
             val since = repo.branches.firstOrNull { it.name == pr.headBranch }?.committedAt.orEmpty()
             add(
                 Todo(
+                    TodoKind.PR,
                     repo,
                     "#${pr.number} ${pr.title}",
                     listOfNotNull(if (pr.draft) "draft PR" else "open PR", pr.headBranch, ago(since).takeIf { it.isNotEmpty() }).joinToString(" · "),
@@ -338,16 +355,52 @@ private fun todos(snap: Snapshot, c: Colors): List<Todo> = buildList {
 private fun TodoSheet(snap: Snapshot, problem: String?) {
     val c = LocalColors.current
     val uri = LocalUriHandler.current
-    val items = remember(snap, c) { todos(snap, c) }
+    val context = LocalContext.current
+    val all = remember(snap, c) { todos(snap, c) }
+    var hidden by remember { mutableStateOf(Store(context).todoHidden) }
+    var filter by remember { mutableStateOf(false) }
+    val items = all.filter { it.kind.name !in hidden }
     Column(Modifier.verticalScroll(rememberScrollState()).padding(start = 16.dp, end = 16.dp, bottom = 24.dp)) {
-        Text(
-            when (items.size) { 0 -> "Nothing to do"; 1 -> "1 thing to do"; else -> "${items.size} things to do" },
-            color = if (items.isEmpty()) c.green else c.text,
-            fontWeight = FontWeight.SemiBold,
-            fontSize = 17.sp,
-        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                when (items.size) { 0 -> "Nothing to do"; 1 -> "1 thing to do"; else -> "${items.size} things to do" },
+                color = if (items.isEmpty()) c.green else c.text,
+                fontWeight = FontWeight.SemiBold,
+                fontSize = 17.sp,
+                modifier = Modifier.weight(1f),
+            )
+            // Tick the kinds to show; kept for next time.
+            Box {
+                TextButton(onClick = { filter = true }) {
+                    Text(if (hidden.isEmpty()) "Filter" else "Filter · ${TodoKind.entries.size - hidden.size}/${TodoKind.entries.size}")
+                }
+                DropdownMenu(expanded = filter, onDismissRequest = { filter = false }) {
+                    for (k in TodoKind.entries) {
+                        val on = k.name !in hidden
+                        DropdownMenuItem(
+                            leadingIcon = { Checkbox(checked = on, onCheckedChange = null) },
+                            text = {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    KindBadge(k, 16.dp)
+                                    Spacer(Modifier.width(8.dp))
+                                    Text("${k.label} (${all.count { it.kind == k }})")
+                                }
+                            },
+                            onClick = {
+                                hidden = if (on) hidden + k.name else hidden - k.name
+                                Store(context).todoHidden = hidden
+                            },
+                        )
+                    }
+                }
+            }
+        }
         if (items.isEmpty()) {
-            Text("Every branch is merged and no PR is open.", color = c.muted, fontSize = 13.sp)
+            Text(
+                if (all.isEmpty()) "Every branch is merged and no PR is open." else "Nothing of the kinds ticked in Filter.",
+                color = c.muted,
+                fontSize = 13.sp,
+            )
         }
         Spacer(Modifier.height(6.dp))
         for (t in items) {
@@ -355,7 +408,11 @@ private fun TodoSheet(snap: Snapshot, problem: String?) {
                 Modifier.fillMaxWidth().clickable { uri.openUri(t.url) }.padding(vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                RepoMark(t.repo, 20.dp)
+                // The repo's icon with a badge saying what kind of thing it is.
+                Box(Modifier.size(26.dp)) {
+                    RepoMark(t.repo, 22.dp)
+                    KindBadge(t.kind, 13.dp, Modifier.align(Alignment.BottomEnd))
+                }
                 Spacer(Modifier.width(10.dp))
                 Column(Modifier.weight(1f)) {
                     Text(
@@ -380,6 +437,59 @@ private fun TodoSheet(snap: Snapshot, problem: String?) {
         Box(Modifier.fillMaxWidth().height(1.dp).background(c.border))
         Text("Read ${ago(snap.readAt)} · ${snap.repos.size} repos", color = c.muted, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
         problem?.let { Text(it, color = c.amber, fontSize = 13.sp, modifier = Modifier.padding(top = 4.dp)) }
+    }
+}
+
+/**
+ * A to-do kind's badge: a small disc in its colour with a white sign, a branch, a pull
+ * request, a cross for failing checks, a "!" for a repo that couldn't be read.
+ */
+@Composable
+fun KindBadge(kind: TodoKind, size: Dp, modifier: Modifier = Modifier) {
+    val c = LocalColors.current
+    val fill = when (kind) {
+        TodoKind.BRANCH -> c.red
+        TodoKind.PR -> c.green
+        TodoKind.CHECKS -> c.red
+        TodoKind.UNREAD -> c.amber
+    }
+    Canvas(modifier.size(size)) {
+        val d = this.size.minDimension
+        drawCircle(c.surface, d / 2)
+        drawCircle(fill, d / 2 - d * 0.08f)
+        val w = Color.White
+        val sw = d * 0.1f
+        fun p(x: Float, y: Float) = Offset(x * d, y * d)
+        when (kind) {
+            TodoKind.BRANCH -> {
+                drawLine(w, p(0.38f, 0.26f), p(0.38f, 0.74f), sw, StrokeCap.Round)
+                drawPath(
+                    Path().apply { moveTo(0.64f * d, 0.34f * d); cubicTo(0.64f * d, 0.55f * d, 0.38f * d, 0.5f * d, 0.38f * d, 0.66f * d) },
+                    w,
+                    style = Stroke(sw, cap = StrokeCap.Round),
+                )
+                drawCircle(w, d * 0.08f, p(0.64f, 0.3f))
+            }
+            TodoKind.PR -> {
+                drawLine(w, p(0.34f, 0.28f), p(0.34f, 0.72f), sw, StrokeCap.Round)
+                drawLine(w, p(0.66f, 0.46f), p(0.66f, 0.72f), sw, StrokeCap.Round)
+                drawPath(
+                    Path().apply { moveTo(0.66f * d, 0.46f * d); lineTo(0.66f * d, 0.32f * d); lineTo(0.5f * d, 0.32f * d) },
+                    w,
+                    style = Stroke(sw, cap = StrokeCap.Round),
+                )
+                drawLine(w, p(0.5f, 0.32f), p(0.57f, 0.25f), sw, StrokeCap.Round)
+                drawLine(w, p(0.5f, 0.32f), p(0.57f, 0.39f), sw, StrokeCap.Round)
+            }
+            TodoKind.CHECKS -> {
+                drawLine(w, p(0.33f, 0.33f), p(0.67f, 0.67f), sw * 1.2f, StrokeCap.Round)
+                drawLine(w, p(0.67f, 0.33f), p(0.33f, 0.67f), sw * 1.2f, StrokeCap.Round)
+            }
+            TodoKind.UNREAD -> {
+                drawLine(w, p(0.5f, 0.26f), p(0.5f, 0.56f), sw * 1.2f, StrokeCap.Round)
+                drawCircle(w, d * 0.07f, p(0.5f, 0.72f))
+            }
+        }
     }
 }
 
