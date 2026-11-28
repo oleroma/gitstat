@@ -3,8 +3,7 @@ name: Prune old builds
 # Deletes old builds' build/<n> tags and pre-releases (.agents/prune-releases): keeps the newest
 # 20 and every build on an open PR's branch. Then puts the newest file of every part from main's
 # builds on the "latest" release (.agents/update-latest). Runs after each push to main, daily,
-# and when agent-publish starts it. On the 1st of the month, when CI minutes start again, it also
-# switches builds while the PC is off back from the cloud session to CI (.agents/away-builds).
+# and when agent-publish starts it.
 # PC builds also prune after each upload.
 on:
   push:
@@ -36,12 +35,3 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash .agents/update-latest
-      - name: Build in CI again from the 1st of the month
-        if: github.event_name == 'schedule'
-        run: |
-          set -euo pipefail
-          [ "$(date -u +%d)" = 01 ] && [ "$(tr -dc a-z <.agents/away-builds 2>/dev/null)" = cloud ] || exit 0
-          echo ci >.agents/away-builds
-          git -c user.name=github-actions -c user.email=41898282+github-actions[bot]@users.noreply.github.com \
-            commit -qm "Build in CI again while the PC is off (new month)" .agents/away-builds
-          git push origin HEAD:main
