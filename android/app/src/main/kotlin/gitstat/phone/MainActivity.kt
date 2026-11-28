@@ -298,6 +298,7 @@ private fun RepoScreen(state: UiState) {
 enum class TodoKind(val label: String) {
     BRANCH("Unmerged branches"),
     PR("Open PRs"),
+    DRAFT("Draft PRs"),
     CHECKS("Failing checks"),
     UNREAD("Couldn't read"),
 }
@@ -333,7 +334,7 @@ private fun todos(snap: Snapshot, c: Colors): List<Todo> = buildList {
             val since = repo.branches.firstOrNull { it.name == pr.headBranch }?.committedAt.orEmpty()
             add(
                 Todo(
-                    TodoKind.PR,
+                    if (pr.draft) TodoKind.DRAFT else TodoKind.PR,
                     repo,
                     "#${pr.number} ${pr.title}",
                     listOfNotNull(if (pr.draft) "draft PR" else "open PR", pr.headBranch, ago(since).takeIf { it.isNotEmpty() }).joinToString(" · "),
@@ -450,6 +451,7 @@ fun KindBadge(kind: TodoKind, size: Dp, modifier: Modifier = Modifier) {
     val fill = when (kind) {
         TodoKind.BRANCH -> c.red
         TodoKind.PR -> c.green
+        TodoKind.DRAFT -> c.muted
         TodoKind.CHECKS -> c.red
         TodoKind.UNREAD -> c.amber
     }
@@ -470,7 +472,7 @@ fun KindBadge(kind: TodoKind, size: Dp, modifier: Modifier = Modifier) {
                 )
                 drawCircle(w, d * 0.08f, p(0.64f, 0.3f))
             }
-            TodoKind.PR -> {
+            TodoKind.PR, TodoKind.DRAFT -> {
                 drawLine(w, p(0.34f, 0.28f), p(0.34f, 0.72f), sw, StrokeCap.Round)
                 drawLine(w, p(0.66f, 0.46f), p(0.66f, 0.72f), sw, StrokeCap.Round)
                 drawPath(
