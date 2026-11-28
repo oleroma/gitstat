@@ -119,7 +119,7 @@ fun Board(
 
 /**
  * How many repos have branches not merged, as a number in a circle: red, or green at 0, with
- * an amber ring when the last read failed. Tapping it opens the summary of every repo's health.
+ * an amber ring when the last read failed. Tapping it opens the to-do list across all repos.
  */
 @Composable
 fun HealthBadge(snap: Snapshot, problem: String?, onClick: () -> Unit) {

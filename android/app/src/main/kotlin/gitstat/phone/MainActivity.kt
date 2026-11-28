@@ -281,57 +281,105 @@ private fun RepoScreen(state: UiState) {
     }
     if (snap != null && health) {
         ModalBottomSheet(onDismissRequest = { health = false }, containerColor = c.surface) {
-            HealthSheet(snap, state.problem) { health = false; sheet = it.slug }
+            TodoSheet(snap, state.problem)
         }
     }
     picked?.let { p -> CommitPopup(p) { picked = null } }
 }
 
+/** One thing to do in the to-do list, and where tapping it goes. */
+private class Todo(
+    val repo: Repo,
+    val title: String,
+    val detail: String,
+    val color: Color,
+    val url: String,
+    /** When it last moved, ISO; empty when unknown, which sorts last. */
+    val since: String,
+)
+
+private fun todos(snap: Snapshot, c: Colors): List<Todo> = buildList {
+    for (repo in snap.repos) {
+        repo.problem?.let { add(Todo(repo, "Couldn't read", it, c.amber, repo.url, "")) }
+        if (repo.checksState == Checks.FAILING) {
+            add(Todo(repo, "Checks failing on ${repo.defaultBranch}", "pushed ${ago(repo.pushedAt)}", c.red, "${repo.url}/actions", repo.pushedAt))
+        }
+        for (b in repo.hanging) {
+            val parts = listOfNotNull(
+                "+${b.notInMain} not in ${repo.defaultBranch}",
+                b.pr?.let { "PR #${it.number}" + if (it.draft) " draft" else "" } ?: "no PR",
+                ago(b.committedAt).takeIf { it.isNotEmpty() },
+            )
+            add(Todo(repo, b.name, parts.joinToString(" · "), c.red, b.pr?.url ?: b.url, b.committedAt))
+        }
+        // Open PRs not already listed with their branch.
+        for (pr in repo.openPrs.filter { pr -> repo.hanging.none { it.pr?.number == pr.number } }) {
+            val since = repo.branches.firstOrNull { it.name == pr.headBranch }?.committedAt.orEmpty()
+            add(
+                Todo(
+                    repo,
+                    "#${pr.number} ${pr.title}",
+                    listOfNotNull(if (pr.draft) "draft PR" else "open PR", pr.headBranch, ago(since).takeIf { it.isNotEmpty() }).joinToString(" · "),
+                    if (pr.draft) c.muted else c.green,
+                    pr.url,
+                    since,
+                ),
+            )
+        }
+    }
+}.sortedWith(compareBy<Todo> { it.since.isEmpty() }.thenBy { it.since })
+
 /**
- * The summary of every repo's health: how many have branches not merged, branches and PRs in
- * all, when it was read and why a read failed, then every repo, red first; tapping a repo
- * opens its branches.
+ * Everything left to do across the repos, oldest first: branches not merged, open PRs,
+ * failing checks and repos that couldn't be read. Tapping one opens it on GitHub; when the
+ * repos were read and why a read failed is at the bottom.
  */
 @Composable
-private fun HealthSheet(snap: Snapshot, problem: String?, onRepo: (Repo) -> Unit) {
+private fun TodoSheet(snap: Snapshot, problem: String?) {
     val c = LocalColors.current
-    val repos = remember(snap) { snap.sorted() }
-    val red = snap.redCount
-    val hanging = snap.repos.sumOf { it.hanging.size }
-    val prs = snap.repos.sumOf { it.openPrs.size }
-    val failing = snap.repos.count { it.checksState == Checks.FAILING }
-    val unread = snap.repos.count { it.problem != null }
+    val uri = LocalUriHandler.current
+    val items = remember(snap, c) { todos(snap, c) }
     Column(Modifier.verticalScroll(rememberScrollState()).padding(start = 16.dp, end = 16.dp, bottom = 24.dp)) {
         Text(
-            if (red == 0) "All ${snap.repos.size} repos are merged" else "$red of ${snap.repos.size} repos have branches not merged",
-            color = if (red == 0) c.green else c.red,
+            when (items.size) { 0 -> "Nothing to do"; 1 -> "1 thing to do"; else -> "${items.size} things to do" },
+            color = if (items.isEmpty()) c.green else c.text,
             fontWeight = FontWeight.SemiBold,
             fontSize = 17.sp,
         )
-        val totals = buildList {
-            if (hanging > 0) add("${branchCount(hanging)} not merged")
-            add(if (prs == 1) "1 open PR" else "$prs open PRs")
-            if (failing > 0) add("checks failing in $failing")
-            if (unread > 0) add("$unread couldn't be read")
+        if (items.isEmpty()) {
+            Text("Every branch is merged and no PR is open.", color = c.muted, fontSize = 13.sp)
         }
-        Text(totals.joinToString(" · "), color = c.text, fontSize = 13.sp, modifier = Modifier.padding(top = 2.dp))
-        Text("Read ${ago(snap.readAt)}", color = c.muted, fontSize = 12.sp, modifier = Modifier.padding(top = 2.dp))
-        problem?.let { Text(it, color = c.amber, fontSize = 13.sp, modifier = Modifier.padding(top = 4.dp)) }
-        Spacer(Modifier.height(10.dp))
-        for (repo in repos) {
+        Spacer(Modifier.height(6.dp))
+        for (t in items) {
             Row(
-                Modifier.fillMaxWidth().clickable { onRepo(repo) }.padding(vertical = 8.dp),
+                Modifier.fillMaxWidth().clickable { uri.openUri(t.url) }.padding(vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                RepoMark(repo, 20.dp)
+                RepoMark(t.repo, 20.dp)
                 Spacer(Modifier.width(10.dp))
                 Column(Modifier.weight(1f)) {
-                    Text(repo.name, color = c.text, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    Text(subtitle(repo), color = if (repo.hanging.isNotEmpty()) c.red else c.muted, fontSize = 13.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    Text(
+                        t.title,
+                        color = c.text,
+                        fontFamily = if (t.title.startsWith("#")) FontFamily.Default else FontFamily.Monospace,
+                        fontSize = 14.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        t.repo.name + " · " + t.detail,
+                        color = t.color,
+                        fontSize = 12.sp,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
                 }
-                ChecksMark(repo.checksState)
             }
         }
+        Spacer(Modifier.height(10.dp))
+        Box(Modifier.fillMaxWidth().height(1.dp).background(c.border))
+        Text("Read ${ago(snap.readAt)} · ${snap.repos.size} repos", color = c.muted, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
+        problem?.let { Text(it, color = c.amber, fontSize = 13.sp, modifier = Modifier.padding(top = 4.dp)) }
     }
 }
 
