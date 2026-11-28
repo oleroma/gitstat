@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Full checks, run once per feature before the merge by agent-check (on the PC, or the fallback
 # with checks), not by builds. The quick tests already ran in the builds, so
-# they aren't repeated here.
+# they aren't repeated here. Only the parts this branch builds (hooks/parts) are checked.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 export CARGO_TARGET_DIR=build/target
+parts="$(bash .agents/hooks/parts)"
 
-cargo clippy --locked --all-targets -- -D warnings
+if grep -qx exe <<<"$parts"; then cargo clippy --locked --all-targets -- -D warnings; fi
+if grep -qx apk <<<"$parts"; then bash .agents/hooks/phone-gradle :app:lintRelease; fi
