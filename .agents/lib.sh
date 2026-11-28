@@ -356,7 +356,7 @@ checkout_branch() {
 # documentation and rules (*.md files and docs/), and git and agent settings.
 pipeline_file() {
   case "$1" in
-    .agents/* | .github/workflows/* | *.md | docs/* | .gitignore | .gitattributes | .claude/* | LICENSE*) return 0 ;;
+    .agents/* | .github/workflows/* | *.md | docs/* | .gitignore | .gitattributes | .claude/* | .gitstat/* | LICENSE*) return 0 ;;
     *) return 1 ;;
   esac
 }
