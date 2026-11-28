@@ -246,6 +246,61 @@ mark_checked() {
   gh api -X POST "repos/$SLUG/statuses/$1" -f state=success -f context=full-check -f description="$2" >/dev/null
 }
 
+# away_builds: where builds and full checks run while the PC is off: "cloud" (this cloud session,
+# agent-build cloud) when main's .agents/away-builds says cloud and the repo has a cloud-setup
+# hook, else "ci". Read from main, so a switch applies to open branches at once.
+away_builds() {
+  git -C "$WORKTREE" fetch -q origin main || true
+  if [ "$(git -C "$WORKTREE" show origin/main:.agents/away-builds 2>/dev/null | tr -dc a-z)" = cloud ] &&
+    [ -f "$WORKTREE/.agents/hooks/cloud-setup" ]; then
+    echo cloud
+  else
+    echo ci
+  fi
+}
+
+# cloud_publish <id> <kind> [file...]: hands a cloud session's build (kind build, with its files)
+# or passed full checks (kind check) to cloud-publish.yml, which does the GitHub writes a cloud
+# session can't: the build/<n> tag, the pre-release, the commit statuses. Pushes a commit on top
+# of HEAD that adds build/cloud-result/ (result.env and the files) to the branch cloud-results/<id>,
+# then waits for that run, which deletes the branch. Sets RUN and RUN_URL; returns 1 if the run failed.
+cloud_publish() {
+  local id="$1" kind="$2" sha idx f commit i state
+  shift 2
+  sha="$(git -C "$WORKTREE" rev-parse HEAD)"
+  idx="$BUILD_DIR/cloud-index"
+  rm -f "$idx"
+  printf 'kind=%s\nsha=%s\nbranch=%s\nnumber=%s\nversion=%s\n' \
+    "$kind" "$sha" "$BRANCH" "${BUILD_NUMBER:-}" "${VERSION:-}" >"$BUILD_DIR/cloud-result.env"
+  GIT_INDEX_FILE="$idx" git -C "$WORKTREE" read-tree HEAD
+  GIT_INDEX_FILE="$idx" git -C "$WORKTREE" update-index --add --cacheinfo \
+    "100644,$(git -C "$WORKTREE" hash-object -w "$BUILD_DIR/cloud-result.env"),build/cloud-result/result.env"
+  for f in "$@"; do
+    GIT_INDEX_FILE="$idx" git -C "$WORKTREE" update-index --add --cacheinfo \
+      "100644,$(git -C "$WORKTREE" hash-object -w "$f"),build/cloud-result/files/$(basename "$f")"
+  done
+  commit="$(git -C "$WORKTREE" commit-tree "$(GIT_INDEX_FILE="$idx" git -C "$WORKTREE" write-tree)" -p "$sha" -m "Cloud $kind of ${sha:0:7}")"
+  rm -f "$idx"
+  git -C "$WORKTREE" push -q origin "$commit:refs/heads/cloud-results/$id" ||
+    die "Couldn't push the cloud $kind to cloud-results/$id."
+  RUN=""
+  for i in $(seq 1 30); do
+    sleep 4
+    RUN="$(gh run list -R "$SLUG" --workflow cloud-publish.yml --branch "cloud-results/$id" --limit 10 \
+      --json databaseId,headSha --jq "[.[] | select(.headSha == \"$commit\")][0].databaseId // empty")"
+    if [ -n "$RUN" ]; then break; fi
+  done
+  [ -n "$RUN" ] || die "Pushed the cloud $kind to cloud-results/$id but couldn't find its cloud-publish run."
+  RUN_URL="https://github.com/$SLUG/actions/runs/$RUN"
+  while :; do
+    sleep 10
+    state="$(gh_retry api "repos/$SLUG/actions/runs/$RUN" --jq '"\(.status) \(.conclusion // "")"')" ||
+      die "Lost contact with GitHub while cloud-publish was running: $RUN_URL (the run goes on)."
+    case "$state" in completed*) break ;; esac
+  done
+  [ "$state" = "completed success" ]
+}
+
 # report_pr <what> <result text>: posts a PC script's result, whatever it is, as a comment on the
 # open PR whose head is this commit ("PC build of <sha> finished: ..."). The thread agent watches
 # its PR, so the comment wakes it even when the Remote Control report never reaches it.

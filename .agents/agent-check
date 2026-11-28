@@ -2,7 +2,8 @@
 # Before the merge (step 5), or when Olex says "check": runs the full checks (the full-check
 # hook) once on <branch>'s newest commit and marks the commit checked for agent-merge. Builds
 # don't run them. On the PC it checks out <branch> in the repo and posts its result on the feature's PR, like
-# agent-build pc; in CI it runs fallback.yml with checks only.
+# agent-build pc; in CI it runs fallback.yml with checks only, or, while main's .agents/away-builds
+# says cloud, runs them in the cloud session itself.
 # Usage:
 #   .agents/agent-check pc <branch>   on the PC, in D:\dev\<repo>
 #   .agents/agent-check ci <branch>   in the cloud
@@ -20,6 +21,23 @@ if [ "$MODE" = ci ]; then
   require_feature_branch
   sha="$(git rev-parse HEAD)"
   if checked "$sha"; then status "✅ Full checks already passed at ${sha:0:7}."; finish done "The full checks already passed at ${sha:0:7}."; fi
+  # While main's .agents/away-builds says cloud, the checks run in this cloud session, and
+  # cloud-publish.yml marks the commit checked (cloud_publish), since a cloud session can't.
+  if [ "$(away_builds)" = cloud ]; then
+    [ -f "$WORKTREE/.github/workflows/cloud-publish.yml" ] ||
+      die "This branch has no .github/workflows/cloud-publish.yml: merge main into it, then run agent-check again."
+    status "🔎 Running the full checks in the cloud session (CI minutes saved)."
+    # shellcheck source=/dev/null
+    source "$WORKTREE/.agents/hooks/cloud-setup" || die "The cloud-setup hook failed (see the log)."
+    if ! bash "$WORKTREE/.agents/hooks/full-check"; then
+      status "❌ Full checks failed at ${sha:0:7}."
+      finish checks-failed "Full checks failed at ${sha:0:7} (see the log)." "Fix them, build again (step 3), then run agent-check again."
+    fi
+    cloud_publish "check-${sha:0:7}-$(date +%s)" check ||
+      die "Full checks passed, but marking ${sha:0:7} checked failed: $RUN_URL"
+    status "✅ Full checks passed in the cloud session at ${sha:0:7}."
+    finish done "Full checks passed in the cloud session at ${sha:0:7}." "agent-merge can merge it now."
+  fi
   if ! run_fallback checks; then
     status "❌ Full checks failed in CI at ${sha:0:7}: [CI run]($RUN_URL)"
     failed="$(failed_steps "$RUN" | paste -sd ';' -)"

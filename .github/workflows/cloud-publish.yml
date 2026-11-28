@@ -1,0 +1,83 @@
+name: Cloud publish
+
+# A cloud session can't push tags, make releases or set commit statuses. While main's
+# .agents/away-builds says cloud, agent-build ci and agent-check ci build or check in the cloud
+# session and push the result to a cloud-results/<id> branch: a commit on top of the commit they
+# built that adds build/cloud-result/ (result.env and the build files). This run does the GitHub
+# writes for them, as fallback.yml does for its own builds, then deletes the branch.
+# The number claim (build-number --cloud pushes the built commit itself) is skipped and costs no minutes.
+on:
+  push:
+    branches: ["cloud-results/**"]
+
+permissions:
+  contents: write # the build/<n> tag, the pre-release, deleting the cloud-results branch
+  statuses: write # marks the commit built or checked
+
+jobs:
+  publish:
+    if: startsWith(github.event.head_commit.message, 'Cloud build of ') || startsWith(github.event.head_commit.message, 'Cloud check of ')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 2
+
+      # result.env is checked before anything uses it.
+      - name: Read the result
+        id: result
+        run: |
+          set -euo pipefail
+          get() { sed -n "s/^$1=//p" build/cloud-result/result.env | head -n 1; }
+          kind="$(get kind)" sha="$(get sha)" branch="$(get branch)" number="$(get number)" version="$(get version)"
+          [[ "$kind" =~ ^(build|check)$ ]] || { echo "Bad kind: $kind" >&2; exit 1; }
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] && [ "$sha" = "$(git rev-parse HEAD^)" ] || { echo "Bad sha: $sha" >&2; exit 1; }
+          if [ "$kind" = build ]; then
+            [[ "$number" =~ ^[0-9]+$ ]] && [ "$GITHUB_REF_NAME" = "cloud-results/$number" ] || { echo "Bad number: $number" >&2; exit 1; }
+            [[ "$version" =~ ^[A-Za-z0-9._+-]+$ ]] || { echo "Bad version: $version" >&2; exit 1; }
+            [[ "$branch" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "Bad branch: $branch" >&2; exit 1; }
+            ls build/cloud-result/files/* >/dev/null || { echo "No build files" >&2; exit 1; }
+          fi
+          { echo "kind=$kind"; echo "sha=$sha"; echo "branch=$branch"; echo "number=$number"; echo "version=$version"; } >> "$GITHUB_OUTPUT"
+
+      - name: Publish for Obtainium
+        if: steps.result.outputs.kind == 'build'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.result.outputs.sha }}
+          N: ${{ steps.result.outputs.number }}
+          VERSION: ${{ steps.result.outputs.version }}
+          BRANCH: ${{ steps.result.outputs.branch }}
+        run: |
+          set -euo pipefail
+          git push origin "$SHA:refs/tags/build/$N"
+          for f in build/cloud-result/files/*; do echo "$(basename "$f")  SHA-256 \`$(sha256sum "$f" | cut -d' ' -f1)\`" >> "$GITHUB_STEP_SUMMARY"; done
+          gh release create "build/$N" build/cloud-result/files/* --verify-tag --prerelease --title "$VERSION" \
+            --notes "$(bash .agents/release-notes "$SHA" "$N" "Cloud build of $BRANCH ($SHA)")"
+
+      # agent-build pc reuses this build's pre-release when this status says it was built.
+      - name: Mark the commit built
+        if: steps.result.outputs.kind == 'build'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.result.outputs.sha }}
+          VERSION: ${{ steps.result.outputs.version }}
+        run: >-
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA"
+          -f state=success -f context=ci-build -f description="Built in the cloud session: version $VERSION"
+          -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+      - name: Mark the commit checked
+        if: steps.result.outputs.kind == 'check'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.result.outputs.sha }}
+        run: >-
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA"
+          -f state=success -f context=full-check -f description="Passed in the cloud session"
+          -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+      - name: Delete the result branch
+        if: always()
+        run: git push origin --delete "$GITHUB_REF_NAME"

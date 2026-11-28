@@ -11,7 +11,8 @@
 # files or documentation: Olex tests those himself. Only Olex passes --force to build anyway.
 # Usage:
 #   .agents/agent-build pc <branch> [--replace] [--force]   on the PC, in D:\dev\<repo>: checks out <branch> there and builds it
-#   .agents/agent-build ci <branch> [--replace] [--force]   in the cloud: checks out <branch>, builds it in CI
+#   .agents/agent-build ci <branch> [--replace] [--force]   in the cloud: checks out <branch>, builds it in CI,
+#                                                           or in the cloud session itself while main's .agents/away-builds says cloud
 # Without <branch> it builds what's checked out where it runs.
 source "$(dirname "$0")/lib.sh"
 cd "$WORKTREE"
@@ -133,6 +134,27 @@ installed_emoji() {
   echo 🪟
 }
 
+# read_build_files <hook output>: adds each build file the build hook printed ("build-file: <path>
+# <version>", one line per file) to the caller's files and names, and sets version from the first.
+read_build_files() {
+  local line rel v
+  while IFS= read -r line; do
+    case "$line" in
+      "build-file: "*)
+        line="${line#build-file: }"
+        rel="${line% *}"
+        v="${line##* }"
+        [ -n "$rel" ] && [ "$rel" != "$line" ] || die "Bad build-file line from the build hook: $line"
+        [ -f "$WORKTREE/$rel" ] || die "Build file not found: $rel"
+        files+=("$WORKTREE/$rel")
+        names+=("$(basename "$rel")")
+        if [ -z "$version" ]; then version="$v"; fi
+        ;;
+    esac
+  done <"$1"
+  [ "${#files[@]}" -gt 0 ] || die "The build hook printed no \"build-file: <path> <version>\" line."
+}
+
 build_pc() {
   report() { report_pr "PC build" "$@"; }
 
@@ -191,22 +213,7 @@ build_pc() {
     fi
     cat "$out_file"
 
-    # The hook prints one "build-file: <path> <version>" line per build file.
-    while IFS= read -r line; do
-      case "$line" in
-        "build-file: "*)
-          line="${line#build-file: }"
-          rel="${line% *}"
-          v="${line##* }"
-          [ -n "$rel" ] && [ "$rel" != "$line" ] || die "Bad build-file line from the build hook: $line"
-          [ -f "$WORKTREE/$rel" ] || die "Build file not found: $rel"
-          files+=("$WORKTREE/$rel")
-          names+=("$(basename "$rel")")
-          if [ -z "$version" ]; then version="$v"; fi
-          ;;
-      esac
-    done <"$out_file"
-    [ "${#files[@]}" -gt 0 ] || die "The build hook printed no \"build-file: <path> <version>\" line."
+    read_build_files "$out_file"
   fi
 
   # One folder per build, and the newest build files directly in build/.
@@ -305,6 +312,48 @@ build_pc() {
   finish done "${summary[@]}"
 }
 
+# build_cloud: builds in this cloud session instead of CI, while main's .agents/away-builds says
+# cloud (away_builds), to save CI minutes. The repo's cloud-setup hook sets the session up (SDK,
+# signing key); quick tests and build run here, and cloud-publish.yml publishes the files as the
+# usual build/<n> pre-release (cloud_publish), since a cloud session can't.
+build_cloud() {
+  local what commit sha out_file="$BUILD_DIR/logs/build-output.txt" version="" files=() names=() url
+  what="$(what_emoji)"
+  sha="$(git rev-parse HEAD)"
+  commit="${sha:0:7}"
+  [ -f "$WORKTREE/.github/workflows/cloud-publish.yml" ] ||
+    die "This branch has no .github/workflows/cloud-publish.yml: merge main into it, then build again."
+  status "🔨⛅$what Building in the cloud session (CI minutes saved)."
+  # shellcheck source=/dev/null
+  source "$HOOKS/cloud-setup" || die "The cloud-setup hook failed (see the log). Not built."
+  if [ -f "$HOOKS/quick-test" ]; then
+    bash "$HOOKS/quick-test" || { status "❌$what Quick tests failed at $commit."; finish checks-failed "Quick tests failed at $commit (see the log). Not built."; }
+  fi
+  BUILD_NUMBER="$(bash "$AGENTS_DIR/build-number" --cloud)" || die "Couldn't claim a build number on GitHub. Not built."
+  export BUILD_NUMBER
+  # A build that ends before cloud_publish pushed its result gives its number back.
+  CLAIM="cloud-results/$BUILD_NUMBER"
+  cleanup() { if [ -n "${CLAIM:-}" ]; then git push -q origin --delete "$CLAIM" || true; fi; }
+  if ! bash "$HOOKS/build" >"$out_file"; then
+    cat "$out_file"
+    status "❌$what Build failed at $commit."
+    finish checks-failed "Build failed at $commit (see the log)."
+  fi
+  cat "$out_file"
+  read_build_files "$out_file"
+  VERSION="$version"
+  CLAIM=""
+  if ! cloud_publish "$BUILD_NUMBER" build "${files[@]}"; then
+    status "❌ Build $BUILD_NUMBER built but not published: [publish run]($RUN_URL)"
+    die "Built $version-$commit in the cloud, but publishing it failed: $RUN_URL"
+  fi
+  url="https://github.com/$SLUG/releases/tag/build/$BUILD_NUMBER"
+  status "📦 Build $BUILD_NUMBER published: [build $BUILD_NUMBER]($url)"
+  local summary=("Built $version-$commit in the cloud session, published by $RUN_URL" "Full checks: before the merge (agent-check).")
+  mapfile -t -O "${#summary[@]}" summary < <(release_lines "$BUILD_NUMBER")
+  finish done "${summary[@]}"
+}
+
 build_ci() {
   require_feature_branch
   git fetch origin "$BRANCH"
@@ -313,6 +362,7 @@ build_ci() {
   guard_workflow_change
   guard_other_build "$(git rev-parse HEAD)"
   warn_unbuilt "$(git rev-parse HEAD)"
+  if [ "$(away_builds)" = cloud ]; then build_cloud; fi
 
   # The run does what a PC build does: quick tests, build, publish. run_fallback shows the
   # release links as soon as the build is published. The full checks run before the merge.
