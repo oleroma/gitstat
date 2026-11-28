@@ -190,7 +190,7 @@ private fun RepoPage(
             ready = true
         }
     }
-    SnapBetween(scroll, 0, infoH)
+    val fling = peekFling(scroll, rest = infoH, info = 0, historyBelow = false)
     BoxWithConstraints(Modifier.fillMaxSize()) {
     // At least a screen below the info, so a short tree still rests with the info hidden.
     val page = maxHeight
@@ -201,7 +201,7 @@ private fun RepoPage(
             .clip(RoundedCornerShape(12.dp))
             // Hidden until it rests below the info, so the info never flashes up.
             .graphicsLayer { alpha = if (ready) 1f else 0f }
-            .verticalScroll(scroll),
+            .verticalScroll(scroll, flingBehavior = fling),
     ) {
         Column(Modifier.fillMaxWidth().onSizeChanged { infoH = it.height }) {
             RepoFacts(repo, login, compact = false, modifier = Modifier.fillMaxWidth().padding(14.dp))

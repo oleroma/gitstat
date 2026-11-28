@@ -1,16 +1,21 @@
 package gitstat.phone
 
+import androidx.compose.animation.core.AnimationState
+import androidx.compose.animation.core.DecayAnimationSpec
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animate
+import androidx.compose.animation.core.animateDecay
+import androidx.compose.animation.core.calculateTargetValue
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.rememberSplineBasedDecay
 import androidx.compose.foundation.ScrollState
+import androidx.compose.foundation.gestures.FlingBehavior
+import androidx.compose.foundation.gestures.ScrollScope
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
-import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -102,33 +107,73 @@ fun RepoFacts(repo: Repo, login: String, compact: Boolean, modifier: Modifier = 
 }
 
 /**
- * Makes [scroll] settle at [a] or at [b] (a < b) when it stops anywhere between them: on the
- * side it was heading to, unless it barely moved off where it was. [onScroll] is called as a
- * scroll starts.
+ * A fling that settles a scroller with an info panel past its end at one of two points: [rest]
+ * (the panel just out of sight) or [info] (the panel in full view). Between them it goes where
+ * the swipe was heading, or to the nearer one when it barely moved. Past [rest], on the
+ * history side ([historyBelow]: values below [rest]), it flings freely, but a fling from the
+ * history doesn't run on into the panel: it stops at [rest].
  */
-@Composable
-fun SnapBetween(scroll: ScrollState, a: Int, b: Int, onScroll: () -> Unit = {}) {
-    var dir by remember(scroll) { mutableIntStateOf(0) }
-    LaunchedEffect(scroll) {
-        var prev = scroll.value
-        snapshotFlow { scroll.value }.collect {
-            if (it != prev) dir = if (it > prev) 1 else -1
-            prev = it
+class PeekFling(
+    private val rest: Int,
+    private val info: Int,
+    private val historyBelow: Boolean,
+    private val decay: DecayAnimationSpec<Float>,
+) : FlingBehavior {
+    override suspend fun ScrollScope.performFling(initialVelocity: Float): Float {
+        val lo = minOf(rest, info).toFloat()
+        val hi = maxOf(rest, info).toFloat()
+        // Where the scroller is as the fling starts (set by [peekFling]).
+        val at = current
+        val inHistory = if (historyBelow) at < lo - 0.5f else at > hi + 0.5f
+        val landing = decay.calculateTargetValue(at, initialVelocity)
+        val towardInfo = if (info > rest) initialVelocity else -initialVelocity
+        val target: Float? = when {
+            inHistory && (if (historyBelow) landing > rest else landing < rest) -> rest.toFloat()
+            inHistory -> null
+            towardInfo > FLICK -> info.toFloat()
+            towardInfo < -FLICK -> rest.toFloat()
+            else -> if (kotlin.math.abs(at - info) < kotlin.math.abs(at - rest)) info.toFloat() else rest.toFloat()
         }
+        var velocityLeft = 0f
+        if (target == null) {
+            var last = at
+            AnimationState(at, initialVelocity).animateDecay(decay) {
+                val delta = value - last
+                val used = scrollBy(delta)
+                last = value
+                velocityLeft = velocity
+                if (kotlin.math.abs(delta - used) > 0.5f) cancelAnimation()
+            }
+            return velocityLeft
+        }
+        var last = at
+        animate(at, target, initialVelocity, spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMediumLow)) { value, _ ->
+            scrollBy(value - last)
+            last = value
+        }
+        return 0f
     }
-    LaunchedEffect(scroll.isScrollInProgress, a, b) {
-        if (scroll.isScrollInProgress) {
-            onScroll()
-            return@LaunchedEffect
+
+    /** The scroller's position when a fling starts, set by [peekFling]. */
+    var current = 0f
+
+    private companion object {
+        /** px/s past which a swipe counts as heading somewhere. */
+        const val FLICK = 400f
+    }
+}
+
+/** A [PeekFling] for [scroll], reading its position as each fling starts. */
+@Composable
+fun peekFling(scroll: ScrollState, rest: Int, info: Int, historyBelow: Boolean): FlingBehavior {
+    val decay = rememberSplineBasedDecay<Float>()
+    val fling = remember(rest, info, historyBelow, decay) { PeekFling(rest, info, historyBelow, decay) }
+    return remember(fling, scroll) {
+        object : FlingBehavior {
+            override suspend fun ScrollScope.performFling(initialVelocity: Float): Float {
+                fling.current = scroll.value.toFloat()
+                return with(fling) { performFling(initialVelocity) }
+            }
         }
-        val v = scroll.value
-        if (b <= a || v <= a || v >= b) return@LaunchedEffect
-        val nudge = (b - a) * 0.15f
-        val to = when {
-            dir > 0 -> if (v - a > nudge) b else a
-            dir < 0 -> if (b - v > nudge) a else b
-            else -> if (v - a > (b - a) / 2) b else a
-        }
-        scroll.animateScrollTo(to)
     }
 }

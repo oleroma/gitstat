@@ -160,9 +160,10 @@ fun RowsView(
                 val rest = with(density) { (treeW - view).roundToPx() }
                 val info = with(density) { (treeW + GAP - EDGE).roundToPx() }
                 val scroll = remember(rest, info) { ScrollState(rest) }
-                SnapBetween(scroll, rest, info) { onHighlight(repo.slug) }
+                val fling = peekFling(scroll, rest, info, historyBelow = true)
+                LaunchedEffect(scroll.isScrollInProgress) { if (scroll.isScrollInProgress) onHighlight(repo.slug) }
                 Row(
-                    Modifier.horizontalScroll(scroll),
+                    Modifier.horizontalScroll(scroll, flingBehavior = fling),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     StripCanvas(repo, tree, treeW) { onHighlight(repo.slug); onCommit(it) }
@@ -198,7 +199,8 @@ fun RowsView(
                         repo,
                         snap.login,
                         compact = true,
-                        modifier = Modifier.width(infoW).padding(start = 4.dp, end = EDGE),
+                        // Starts past the screen's edge margin, so none of it shows while the row rests.
+                        modifier = Modifier.width(infoW).padding(start = EDGE + 8.dp, end = EDGE),
                     )
                 }
             }
